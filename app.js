@@ -226,7 +226,10 @@ function subClassifyAsset(raw) {
   if (t.endsWith('=X')) return 'currencies';
 
   // Indices: ^prefix + foreign exchange index suffixes
-  if (t.startsWith('^') || /\.(SS|ME|HK|SZ|KS|KQ|SI|AX|TA|JO)$/.test(t) || t === 'DX-Y.NYB') {
+  // EXCEPT DX-Y.NYB which is the dollar currency index — that belongs in
+  // Currencies even though it's structured like an index symbol.
+  if (t === 'DX-Y.NYB') return 'currencies';
+  if (t.startsWith('^') || /\.(SS|ME|HK|SZ|KS|KQ|SI|AX|TA|JO)$/.test(t)) {
     return 'indices';
   }
 
@@ -1348,6 +1351,342 @@ function _pulseSessionPct(ticker) {
   return null;
 }
 
+// ============================================================
+//   CROSS-ASSET SIGNAL EXTRACTOR
+//
+//   Single source of truth for live signals derived from futures,
+//   currencies, indices, metals, and supply-chain performance. Every tab
+//   that wants to surface cross-asset context calls this function and reads
+//   the named signals it returns.
+//
+//   Design principle: ONE function returns a structured signal object;
+//   many consumers read it. Avoids the failure mode where each tab grows
+//   its own ad-hoc pulse logic and the system slowly drifts into N
+//   inconsistent "regime" implementations.
+//
+//   Why this is honest: every signal returned carries its own epistemic
+//   tier label. Live tape moves get tagged LIVE. Computed averages get
+//   tagged COMPUTED. Supply-chain performance from price history is
+//   COMPUTED (it's an aggregation of LIVE data, but the aggregation is
+//   ours and can be wrong). Nothing here is a PREDICTION.
+//
+//   Returned shape:
+//     {
+//       computedAt: ISO timestamp,
+//       signals: {
+//         dollarStrength:       { value, tone, tier, sub, source: ['UUP', 'DX-Y.NYB'] },
+//         safeHavenBid:         { value, tone, tier, sub, source: ['GLD', '^VIX', 'TLT'] },
+//         industrialDemand:     { value, tone, tier, sub, source: ['CPER', 'XLB', 'PICK'] },
+//         energyComplex:        { value, tone, tier, sub, source: ['USO', 'XLE', 'AMLP'] },
+//         globalIndices:        { value, tone, tier, sub, source: ['^GSPC', '^FTSE', ...] },
+//         agriculturalGoods:    { value, tone, tier, sub, source: ['WEAT', 'SOYB'] },
+//         logisticsMomentum:    { value, tone, tier, sub, source: ['BDRY', 'IYT', 'JETS', ...] },
+//         chainPerformance:     { value, tone, tier, sub, sourceCount },   // computed from SUPPLY_CHAINS
+//         macroAlignment:       { value, tone, tier, sub },                // CACHED — from regime
+//       },
+//       missingTickers: [],   // which inputs weren't in stockbook
+//     }
+//
+//   Each signal:
+//     value:  -1..+1 normalized score where 0 = neutral
+//     tone:   'bull' | 'bear' | 'warn' | 'flat'
+//     tier:   'LIVE' (price moves today) | 'COMPUTED' (aggregation) | 'CACHED' (pipeline data)
+//     sub:    short human-readable explanation
+//     source: which tickers feed this signal (so consumers can show provenance)
+// ============================================================
+function extractCrossAssetSignals() {
+  const sbRows = state.stockbook?.rows || [];
+  const findRow = (t) => sbRows.find(r => r.ticker === t);
+  const sessionPct = (t) => {
+    const r = findRow(t);
+    if (!r) return null;
+    if (isFinite(r.changePct))  return r.changePct;
+    if (isFinite(r.sessionPct)) return r.sessionPct;
+    if (isFinite(r.price) && isFinite(r.priorClose) && r.priorClose > 0) {
+      return ((r.price - r.priorClose) / r.priorClose) * 100;
+    }
+    return null;
+  };
+  // Average session % across a list of tickers — only counts those with valid data.
+  // Also tracks which tickers were missing (no row in stockbook or no live price)
+  // so consumers can show "this signal has partial data" notices.
+  const missing = [];
+  const avgPct = (tickers) => {
+    const vals = tickers.map(t => {
+      const v = sessionPct(t);
+      if (v == null) missing.push(t);
+      return v;
+    }).filter(v => v != null);
+    if (vals.length === 0) return null;
+    return vals.reduce((s, x) => s + x, 0) / vals.length;
+  };
+  // Tone classifier — value in % move. Bull/bear thresholds chosen to match
+  // typical daily volatility (anything >0.5% is meaningfully directional).
+  const toneFor = (v, bullCut = 0.5, bearCut = -0.5, warnCut = -1.5) => {
+    if (v == null) return 'flat';
+    if (v >= bullCut) return 'bull';
+    if (v <= warnCut) return 'bear';
+    if (v <= bearCut) return 'warn';
+    return 'flat';
+  };
+
+  // ----- 1. Dollar strength -----
+  // UUP = dollar bull ETF. DX-Y.NYB = dollar index. Both moving same direction
+  // → strong dollar signal. Strong dollar = headwind for ex-US + commodities.
+  const dollarTickers = ['UUP', 'DX-Y.NYB'];
+  const dollarPct = avgPct(dollarTickers);
+  const dollarSignals = {
+    value: dollarPct == null ? 0 : Math.max(-1, Math.min(1, dollarPct / 2)),
+    tone: toneFor(dollarPct, 0.4, -0.4, -1.2),
+    tier: 'LIVE',
+    sub: dollarPct == null
+      ? 'No live dollar data — UUP / DX-Y.NYB not in stockbook'
+      : dollarPct > 0.4
+        ? `Strong dollar +${dollarPct.toFixed(2)}% — headwind for ex-US + commodities`
+        : dollarPct < -0.4
+          ? `Dollar weakness ${dollarPct.toFixed(2)}% — tailwind for ex-US + commodities`
+          : 'Dollar flat',
+    source: dollarTickers,
+    raw: dollarPct,
+  };
+
+  // ----- 2. Safe-haven bid -----
+  // Gold up + TLT up + VIX up = flight to safety. Composite of (GLD avg with
+  // TLT) minus VIX move sign (high VIX = fear, so we positively contribute).
+  const goldPct = sessionPct('GLD');
+  const bondsPct = sessionPct('TLT');
+  const vixPct = sessionPct('^VIX');
+  const safeHavenVals = [goldPct, bondsPct].filter(v => v != null);
+  const safeHavenAvg = safeHavenVals.length ? safeHavenVals.reduce((s,x)=>s+x,0) / safeHavenVals.length : null;
+  // VIX adds to safe-haven score when it rises (fear), subtracts when it falls
+  const safeHavenComposite = safeHavenAvg == null ? null : safeHavenAvg + (vixPct != null ? vixPct * 0.3 : 0);
+  if (goldPct == null) missing.push('GLD');
+  if (bondsPct == null) missing.push('TLT');
+  if (vixPct == null)  missing.push('^VIX');
+  const safeHaven = {
+    value: safeHavenComposite == null ? 0 : Math.max(-1, Math.min(1, safeHavenComposite / 1.5)),
+    tone: toneFor(safeHavenComposite, 0.5, -0.5, -1.5),
+    tier: 'LIVE',
+    sub: safeHavenComposite == null
+      ? 'Partial data — GLD/TLT/^VIX not all loaded'
+      : safeHavenComposite > 0.5
+        ? `Safe-haven bid — gold/bonds rallying${vixPct > 1 ? `, VIX +${vixPct.toFixed(1)}%` : ''}`
+        : safeHavenComposite < -0.5
+          ? 'Safe-haven assets selling — risk-on or rate fears'
+          : 'Safe havens flat',
+    source: ['GLD', 'TLT', '^VIX'],
+    raw: safeHavenComposite,
+  };
+
+  // ----- 3. Industrial demand -----
+  // Copper is the canonical global industrial demand read. Materials sector
+  // confirms or contradicts. Adding base-metals mining ETF for breadth.
+  const industrialTickers = ['CPER', 'XLB', 'PICK'];
+  const industrialPct = avgPct(industrialTickers);
+  const industrial = {
+    value: industrialPct == null ? 0 : Math.max(-1, Math.min(1, industrialPct / 1.5)),
+    tone: toneFor(industrialPct, 0.4, -0.4, -1.2),
+    tier: 'LIVE',
+    sub: industrialPct == null
+      ? 'Industrial demand proxies not loaded'
+      : industrialPct > 0.4
+        ? `Industrial demand strong +${industrialPct.toFixed(2)}% — bullish for cyclicals/EM`
+        : industrialPct < -0.4
+          ? `Industrial demand weak ${industrialPct.toFixed(2)}% — watch out for cyclicals`
+          : 'Industrial flat',
+    source: industrialTickers,
+    raw: industrialPct,
+  };
+
+  // ----- 4. Energy complex -----
+  const energyTickers = ['USO', 'XLE', 'AMLP'];
+  const energyPct = avgPct(energyTickers);
+  const energy = {
+    value: energyPct == null ? 0 : Math.max(-1, Math.min(1, energyPct / 1.5)),
+    tone: toneFor(energyPct, 0.5, -0.5),
+    tier: 'LIVE',
+    sub: energyPct == null
+      ? 'Energy proxies not loaded'
+      : energyPct > 0.5
+        ? `Energy complex rallying +${energyPct.toFixed(2)}% — inflation pressure / supply news`
+        : energyPct < -0.5
+          ? `Energy weak ${energyPct.toFixed(2)}% — disinflation tailwind / demand worry`
+          : 'Energy flat',
+    source: energyTickers,
+    raw: energyPct,
+  };
+
+  // ----- 5. Global indices (US + foreign) -----
+  // US first since it sets the broader tone, then a basket of foreign indices
+  // to detect divergence. Stockbook may not have all of these loaded yet —
+  // the avgPct call handles missing tickers gracefully.
+  const indexTickers = ['^GSPC', '^IXIC', '^FTSE', '^N225', '^GDAXI', '^HSI'];
+  const indexPct = avgPct(indexTickers);
+  const globalIndices = {
+    value: indexPct == null ? 0 : Math.max(-1, Math.min(1, indexPct / 1.5)),
+    tone: toneFor(indexPct, 0.3, -0.3),
+    tier: 'LIVE',
+    sub: indexPct == null
+      ? 'Global indices not loaded — refresh stockbook'
+      : `Global tape ${indexPct >= 0 ? '+' : ''}${indexPct.toFixed(2)}% avg across ${indexTickers.length} indices`,
+    source: indexTickers,
+    raw: indexPct,
+  };
+
+  // ----- 6. Agricultural goods -----
+  const agTickers = ['WEAT', 'SOYB'];
+  const agPct = avgPct(agTickers);
+  const agriculture = {
+    value: agPct == null ? 0 : Math.max(-1, Math.min(1, agPct / 1.5)),
+    tone: toneFor(agPct, 0.5, -0.5),
+    tier: 'LIVE',
+    sub: agPct == null ? 'Ag proxies not loaded'
+       : agPct > 0.5  ? `Grains rallying — food inflation pressure`
+       : agPct < -0.5 ? `Grains weak — deflationary food story`
+       : 'Grains flat',
+    source: agTickers,
+    raw: agPct,
+  };
+
+  // ----- 7. Logistics momentum -----
+  // Same proxies as Global Trade tab — reuse for consistency. BDRY (shipping),
+  // IYT (transports), JETS (air), AMLP (pipelines), UNP (rail), CPER (industrial).
+  const logisticsTickers = ['BDRY', 'BWET', 'IYT', 'XTN', 'JETS', 'AMLP', 'UNP'];
+  const logisticsPct = avgPct(logisticsTickers);
+  const logistics = {
+    value: logisticsPct == null ? 0 : Math.max(-1, Math.min(1, logisticsPct / 1.5)),
+    tone: toneFor(logisticsPct, 0.4, -0.4),
+    tier: 'LIVE',
+    sub: logisticsPct == null
+      ? 'Logistics proxies not loaded'
+      : logisticsPct > 0.4
+        ? `Logistics accelerating +${logisticsPct.toFixed(2)}% — global trade picking up`
+        : logisticsPct < -0.4
+          ? `Logistics decelerating ${logisticsPct.toFixed(2)}% — trade slowdown signal`
+          : 'Logistics flat',
+    source: logisticsTickers,
+    raw: logisticsPct,
+  };
+
+  // ----- 8. Supply chain performance -----
+  // Aggregate over chains the user actually has exposure to.
+  // getSupplyChainExposureForPortfolio returns top chains by weight; we read
+  // their 1-week price performance for each chain's participating tickers.
+  let chainPerformanceValue = null;
+  let chainCount = 0;
+  let chainSub = 'No chain exposure detected';
+  try {
+    if (typeof getSupplyChainExposureForPortfolio === 'function') {
+      const exposure = getSupplyChainExposureForPortfolio();
+      if (exposure?.topChains?.length && typeof getChainPerformance === 'function') {
+        const perfs = [];
+        for (const c of exposure.topChains.slice(0, 5)) {
+          const perf = getChainPerformance(c.chainId);
+          const w1 = perf?.windows?.['1w']?.medianReturn;
+          if (w1 != null) { perfs.push(w1); chainCount++; }
+        }
+        if (perfs.length > 0) {
+          chainPerformanceValue = perfs.reduce((s,x)=>s+x,0) / perfs.length;
+          chainSub = `Your top ${chainCount} chains avg ${chainPerformanceValue >= 0 ? '+' : ''}${(chainPerformanceValue * 100).toFixed(2)}% over 1w`;
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[cross-asset] chain performance failed:', e.message);
+  }
+  const chainPerformance = {
+    value: chainPerformanceValue == null ? 0 : Math.max(-1, Math.min(1, chainPerformanceValue * 20)),
+    tone: chainPerformanceValue == null ? 'flat'
+        : chainPerformanceValue > 0.01  ? 'bull'
+        : chainPerformanceValue < -0.01 ? 'bear'
+        : 'flat',
+    tier: 'COMPUTED',
+    sub: chainSub,
+    source: [],
+    sourceCount: chainCount,
+    raw: chainPerformanceValue,
+  };
+
+  // ----- 9. Macro alignment (CACHED — from regime) -----
+  // Surface the cached regime call as a signal so consumers can blend it
+  // with the live ones. Clearly tagged CACHED so users don't conflate.
+  const r = state.marketRegime;
+  let macroValue = 0;
+  let macroTone = 'flat';
+  let macroSub = 'No cached regime data loaded';
+  if (r?.regime) {
+    const map = {
+      expansion: 0.6, risk_on_melt_up: 0.85,
+      neutral: 0,
+      inflation_shock: -0.4, recession_fear: -0.7, risk_off: -0.85,
+    };
+    macroValue = map[r.regime] ?? 0;
+    macroTone = macroValue > 0.3 ? 'bull' : macroValue < -0.3 ? 'bear' : 'flat';
+    const label = (typeof REGIME_LABELS !== 'undefined' && REGIME_LABELS[r.regime]?.label) || r.regime;
+    macroSub = `Cached regime: ${label} · ${Math.round((r.confidence || 0) * 100)}% confidence`;
+  }
+  const macroAlignment = {
+    value: macroValue,
+    tone: macroTone,
+    tier: 'CACHED',
+    sub: macroSub,
+    source: ['regime_current.json'],
+    raw: macroValue,
+  };
+
+  return {
+    computedAt: new Date().toISOString(),
+    signals: {
+      dollarStrength: dollarSignals,
+      safeHavenBid: safeHaven,
+      industrialDemand: industrial,
+      energyComplex: energy,
+      globalIndices: globalIndices,
+      agriculturalGoods: agriculture,
+      logisticsMomentum: logistics,
+      chainPerformance: chainPerformance,
+      macroAlignment: macroAlignment,
+    },
+    missingTickers: [...new Set(missing)],
+  };
+}
+
+// Convenience renderer for cross-asset signal grids — used by Macro Quad,
+// Scenarios, Valuation Company tab, etc. Same visual language everywhere.
+//
+// Caller passes:
+//   signals       — object from extractCrossAssetSignals().signals
+//   keys          — array of signal keys to render (lets each tab pick relevant subset)
+//   labels        — optional {key: label} override map
+function renderCrossAssetSignalCards(signals, keys, labels = {}) {
+  if (!signals) return '';
+  const defaultLabels = {
+    dollarStrength:    'Dollar Strength',
+    safeHavenBid:      'Safe-Haven Bid',
+    industrialDemand:  'Industrial Demand',
+    energyComplex:     'Energy Complex',
+    globalIndices:     'Global Indices',
+    agriculturalGoods: 'Agriculture',
+    logisticsMomentum: 'Logistics Momentum',
+    chainPerformance:  'Your Chain Exposure',
+    macroAlignment:    'Macro Regime',
+  };
+  return keys.map(k => {
+    const s = signals[k];
+    if (!s) return '';
+    const lbl = labels[k] || defaultLabels[k] || k;
+    return `
+      <div class="cross-asset-card tone-${s.tone}">
+        <div class="cross-asset-card-head">
+          <span>${escapeHtml(lbl)}</span>
+          <span class="tier-pill tier-${s.tier.toLowerCase()}" style="margin:0;font-size:7px;padding:1px 5px" title="${s.tier === 'LIVE' ? 'Computed from intraday tape' : s.tier === 'COMPUTED' ? 'Aggregation of live data' : 'From last pipeline run'}">${s.tier}</span>
+        </div>
+        <div class="cross-asset-card-body">${escapeHtml(s.sub)}</div>
+      </div>
+    `;
+  }).join('');
+}
+
 function computeLiveMarketPulse() {
   // Each card returns { label, value, sub, tone } or null if data unavailable
   const cards = [];
@@ -1552,6 +1891,36 @@ function renderLivePulse() {
       <div class="live-pulse-card-sub">${escapeHtml(c.sub)}</div>
     </div>
   `).join('');
+
+  // ===== CROSS-ASSET SIGNAL LAYER =====
+  // Below the per-instrument cards, render the synthesized cross-asset signals
+  // (dollar strength, safe-haven bid, industrial demand, energy, global indices,
+  // agriculture, logistics, chain exposure). These are computed by the single
+  // extractCrossAssetSignals() function and shared with Scenarios + Valuation tab.
+  // Single source of truth for cross-asset context.
+  try {
+    const xa = extractCrossAssetSignals();
+    const keys = ['dollarStrength', 'safeHavenBid', 'industrialDemand', 'energyComplex',
+                  'globalIndices', 'agriculturalGoods', 'logisticsMomentum', 'chainPerformance'];
+    // Inject below the live-pulse grid in the same section
+    let xaWrap = document.getElementById('regime-cross-asset-wrap');
+    if (!xaWrap) {
+      xaWrap = document.createElement('div');
+      xaWrap.id = 'regime-cross-asset-wrap';
+      xaWrap.style.marginTop = '14px';
+      grid.parentNode.insertBefore(xaWrap, grid.nextSibling);
+    }
+    const partialNote = xa.missingTickers.length > 0
+      ? `<div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-top:6px"><em>Partial data:</em> ${xa.missingTickers.length} ticker${xa.missingTickers.length === 1 ? '' : 's'} not yet in stockbook (${xa.missingTickers.slice(0, 4).join(', ')}${xa.missingTickers.length > 4 ? '…' : ''}). Hit Refresh All to fill in.</div>`
+      : '';
+    xaWrap.innerHTML = `
+      <div class="regime-section-title" style="margin-top:0">CROSS-ASSET SIGNALS <small>· dollar, gold, metals, energy, global indices, logistics · synthesized from your stockbook</small></div>
+      <div class="cross-asset-grid">${renderCrossAssetSignalCards(xa.signals, keys)}</div>
+      ${partialNote}
+    `;
+  } catch (e) {
+    console.warn('[regime cross-asset] failed:', e.message);
+  }
 }
 
 // Hook live pulse into regime dashboard rendering. Called by renderRegimeDashboard
@@ -4755,6 +5124,22 @@ const PRIMED_REFERENCE_TICKERS = [
   'MCHI','EWG','EWJ','EWY','INDA','EWU','EWQ','EWZ','EWI','EWC','EWW',
   // Global Trade tab — product / commodity proxies
   'PICK','WEAT','SOYB','SOXX','LIT','REMX',
+  // World currencies — Yahoo =X format covers most pairs free of charge.
+  // Majors first (USD-quoted), then crosses, then EM pairs.
+  // Stored in Stock Book → Currencies tab.
+  // Majors (USD/X)
+  'EURUSD=X','GBPUSD=X','USDJPY=X','USDCHF=X','AUDUSD=X','NZDUSD=X','USDCAD=X',
+  // Cross-rate majors (no USD)
+  'EURGBP=X','EURJPY=X','GBPJPY=X','EURCHF=X','AUDJPY=X','EURAUD=X','GBPCHF=X',
+  // EM + commodity currencies
+  'USDMXN=X','USDBRL=X','USDINR=X','USDCNY=X','USDKRW=X','USDZAR=X','USDTRY=X',
+  'USDSGD=X','USDHKD=X','USDSEK=X','USDNOK=X','USDPLN=X','USDTHB=X','USDIDR=X',
+  // Dollar index proxy + crypto FX
+  'DX-Y.NYB','BTC-USD','ETH-USD','SOL-USD','XRP-USD','ADA-USD','DOGE-USD',
+  // Foreign equity indices — these were misrouting to Currencies in the old
+  // filter logic. Now go to the Indices tab cleanly.
+  '^FTSE','^N225','^HSI','^GDAXI','^FCHI','^STOXX50E','^SSEC','^BSESN','^KS11',
+  '^BVSP','^MXX','^AXJO','^TWII','^STI','^TA125.TA',
 ];
 // Kick off pre-fetch after a short delay so it doesn't block initial render.
 // Each call is ~50KB; 30 tickers ≈ 1.5MB total, but uses HTTP/2 multiplexing.
@@ -7184,18 +7569,26 @@ function renderStockBook() {
   } else if (sb.section === 'metals') {
     rows = rows.filter(r => r._subClass === 'metals');
   } else if (sb.section === 'currencies') {
-    // Currencies = FX pairs + currency futures + DX-Y.NYB
-    rows = rows.filter(r => r._subClass === 'currencies' || classifyAsset(r.ticker) === 'fx');
+    // Currencies = ONLY FX pairs (=X) + currency futures (6E=F, etc.) + dollar index proxies.
+    // Foreign indices like ^FTSE were previously double-counted here because the
+    // legacy classifyAsset() bucket returns 'fx' for them. Now we trust the
+    // finer _subClass = 'currencies' tag, which only includes true currency
+    // instruments. Foreign equity indices go to the Indices tab only.
+    rows = rows.filter(r => r._subClass === 'currencies');
   } else if (sb.section === 'indices') {
-    rows = rows.filter(r => r._subClass === 'indices' || classifyAsset(r.ticker) === 'index');
+    // Indices = ALL equity indices (US + foreign) plus index futures (ES, NQ, etc.).
+    // Includes ^FTSE/^N225/^HSI/^GDAXI etc. which were previously misrouted to
+    // Currencies. Excludes currency indices like DX-Y.NYB (those are currencies).
+    rows = rows.filter(r => r._subClass === 'indices');
   } else if (sb.section === 'commodities') {
     // Commodities = all non-financial futures (energy, grains, softs, livestock, generic)
     rows = rows.filter(r => ['energy', 'grains', 'softs', 'livestock', 'commodities', 'metals'].includes(r._subClass));
   } else if (sb.section === 'options') {
     rows = rows.filter(r => r._subClass === 'options' || classifyAsset(r.ticker) === 'option');
   } else if (sb.section === 'fx') {
-    // Legacy 'fx' bucket — keep for any existing deep-links pointed at it
-    rows = rows.filter(r => classifyAsset(r.ticker) === 'fx');
+    // Legacy 'fx' bucket — keep for any existing deep-links pointed at it.
+    // Maps to the new 'currencies' subClass for consistency.
+    rows = rows.filter(r => r._subClass === 'currencies');
   }
 
   const search = (sb.search || '').toLowerCase().trim();
@@ -7250,27 +7643,145 @@ function renderStockBook() {
   const th = (key, label) =>
     `<th class="sortable" data-sort="${key}">${label}${sortIcon(key)}</th>`;
 
+  // ============================================================
+  //   COLUMN VISIBILITY SYSTEM
+  //
+  //   Per-section, persistent column show/hide. The user can hide columns
+  //   that aren't useful for the current category (e.g. Beta makes no sense
+  //   for currencies/crypto, so they'd toggle it off in the Indices view).
+  //
+  //   Storage layout in localStorage at key `valuatio.sb.columns.v1`:
+  //     {
+  //       "equities":   { ticker: true, name: true, sector: true, ... },
+  //       "indices":    { ticker: true, name: true, marketCap: false, beta: false, ... },
+  //       ...
+  //     }
+  //
+  //   Each section gets its own visibility map. Default-visible columns
+  //   inherit when the section's map is missing or a column hasn't been
+  //   toggled yet.
+  //
+  //   Columns not applicable to a section (e.g. P/E for crypto) are
+  //   silently filtered from the picker for that section.
+  // ============================================================
+  const SB_COLUMNS_KEY = 'valuatio.sb.columns.v1';
+
+  // Master column registry. Each entry:
+  //   id              — unique column key (matches sort key where applicable)
+  //   label           — display label in picker + table header
+  //   defaultVisible  — whether shown by default in applicable sections
+  //   applicableTo    — array of section names where this column is offered
+  //                     in the picker. 'all' means every non-portfolio section.
+  //   sortable        — true if header is clickable to sort
+  const SB_COLUMNS_REGISTRY = [
+    { id: 'ticker',      label: 'Ticker',        defaultVisible: true,  applicableTo: 'all', sortable: true,  required: true },
+    { id: 'name',        label: 'Name',          defaultVisible: true,  applicableTo: 'all', sortable: true },
+    { id: 'function',    label: 'Function',      defaultVisible: true,  applicableTo: ['derivatives'], sortable: true },
+    { id: 'sector',      label: 'Sector',        defaultVisible: true,  applicableTo: ['equities', 'crypto', 'futures', 'metals', 'currencies', 'indices', 'commodities', 'options', 'universe'], sortable: true },
+    { id: 'subSector',   label: 'Sub-Sector',    defaultVisible: true,  applicableTo: 'all', sortable: true },
+    { id: 'industry',    label: 'Industry',      defaultVisible: true,  applicableTo: ['equities', 'crypto', 'futures', 'metals', 'currencies', 'indices', 'commodities', 'options', 'universe'], sortable: true },
+    { id: 'coreSegments',label: 'Core Segments', defaultVisible: true,  applicableTo: ['derivatives'] },
+    { id: 'description', label: 'Description',   defaultVisible: true,  applicableTo: 'all' },
+    { id: 'status',      label: 'Status',        defaultVisible: true,  applicableTo: 'all', sortable: true },
+    { id: 'price',       label: 'Price',         defaultVisible: true,  applicableTo: 'all', sortable: true },
+    { id: 'marketCap',   label: 'Mkt Cap',       defaultVisible: true,  applicableTo: ['equities', 'derivatives', 'crypto', 'options', 'universe'], sortable: true },
+    { id: 'pe',          label: 'P/E',           defaultVisible: true,  applicableTo: ['equities', 'options', 'universe'], sortable: true },
+    { id: 'beta',        label: 'Beta',          defaultVisible: true,  applicableTo: ['equities', 'derivatives', 'options', 'universe'], sortable: true },
+    { id: 'source',      label: 'Source',        defaultVisible: true,  applicableTo: 'all' },
+    { id: 'actions',     label: 'Actions',       defaultVisible: true,  applicableTo: 'all', required: true },
+  ];
+
+  // Return the list of columns applicable to a given section
+  const sbColumnsForSection = (section) => {
+    return SB_COLUMNS_REGISTRY.filter(c =>
+      c.applicableTo === 'all' || c.applicableTo.includes(section)
+    );
+  };
+
+  const loadColumnVisibility = () => {
+    try {
+      const raw = localStorage.getItem(SB_COLUMNS_KEY);
+      return raw ? JSON.parse(raw) : {};
+    } catch { return {}; }
+  };
+  const saveColumnVisibility = (map) => {
+    try { localStorage.setItem(SB_COLUMNS_KEY, JSON.stringify(map)); } catch {}
+  };
+
+  // True if column should be rendered in the current section
+  const isColumnVisible = (colId, section) => {
+    // Required columns always render (Ticker + Actions — losing those breaks
+    // the table entirely, so we don't let users hide them)
+    const col = SB_COLUMNS_REGISTRY.find(c => c.id === colId);
+    if (col?.required) return true;
+    // If column doesn't apply to this section, treat as hidden (won't render)
+    if (col && col.applicableTo !== 'all' && !col.applicableTo.includes(section)) {
+      return false;
+    }
+    const map = loadColumnVisibility();
+    const sectionMap = map[section] || {};
+    if (colId in sectionMap) return sectionMap[colId];
+    // Default to the registry's defaultVisible if no user choice yet
+    return col ? col.defaultVisible : true;
+  };
+
+  // Set a column's visibility for the current section and persist
+  const setColumnVisibility = (colId, section, visible) => {
+    const map = loadColumnVisibility();
+    if (!map[section]) map[section] = {};
+    map[section][colId] = visible;
+    saveColumnVisibility(map);
+  };
+
+  // Reset to defaults for the current section
+  const resetColumnsForSection = (section) => {
+    const map = loadColumnVisibility();
+    delete map[section];
+    saveColumnVisibility(map);
+  };
+
+  // Conditional th helper — only emits if column is visible
+  const thIf = (colId, label) => {
+    if (!isColumnVisible(colId, sb.section)) return '';
+    const col = SB_COLUMNS_REGISTRY.find(c => c.id === colId);
+    if (col?.sortable) return th(colId, label);
+    return `<th>${label}</th>`;
+  };
+
+  // Conditional td helper — only emits if column is visible
+  const tdIf = (colId, html) => {
+    if (!isColumnVisible(colId, sb.section)) return '';
+    return html;
+  };
+
   // Sections without per-share fundamentals: crypto, futures, fx (derivatives already excludes PE)
   const hidePE = ['derivatives', 'crypto', 'futures', 'fx'].includes(sb.section);
   const hideBeta = ['crypto', 'futures', 'fx'].includes(sb.section);
 
   content.innerHTML = `
+    <div class="sb-columns-toolbar">
+      <button class="btn btn-ghost sb-col-picker-btn" id="sb-col-picker-btn" title="Show or hide columns for this tab — saved per-tab">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+        Columns
+      </button>
+      <div class="sb-col-picker-popover" id="sb-col-picker-popover" style="display:none"></div>
+    </div>
     <div class="sb-table-wrap">
       <table class="sb-table">
         <thead>
           <tr>
-            ${th('ticker', 'Ticker')}
-            ${th('name', 'Name')}
+            ${thIf('ticker', 'Ticker')}
+            ${thIf('name', 'Name')}
             ${sb.section === 'derivatives'
-              ? `${th('function', 'Function')}${th('subSector', 'Sub-Sector')}<th>Core Segments</th>`
-              : `${th('sector', 'Sector')}${th('subSector', 'Sub-Sector')}${th('industry', 'Industry')}`}
-            <th>Description</th>
-            ${th('status', 'Status')}
-            ${th('price', 'Price')}
-            ${th('marketCap', 'Mkt Cap')}
-            ${hidePE ? '' : th('pe', 'P/E')}
-            ${hideBeta ? '' : th('beta', 'Beta')}
-            <th>Source</th>
+              ? `${thIf('function', 'Function')}${thIf('subSector', 'Sub-Sector')}${thIf('coreSegments', 'Core Segments')}`
+              : `${thIf('sector', 'Sector')}${thIf('subSector', 'Sub-Sector')}${thIf('industry', 'Industry')}`}
+            ${thIf('description', 'Description')}
+            ${thIf('status', 'Status')}
+            ${thIf('price', 'Price')}
+            ${thIf('marketCap', 'Mkt Cap')}
+            ${hidePE ? '' : thIf('pe', 'P/E')}
+            ${hideBeta ? '' : thIf('beta', 'Beta')}
+            ${thIf('source', 'Source')}
             <th></th>
           </tr>
         </thead>
@@ -7281,24 +7792,24 @@ function renderStockBook() {
               ? `<span class="sb-function-badge sb-fn-${r.instrumentType}">${escapeHtml(r.function)}</span>`
               : '—';
             const taxonomyCells = sb.section === 'derivatives'
-              ? `<td>${functionBadge}</td>
-                 <td class="sb-sector">${r.subSector || '—'}</td>
-                 <td class="sb-segments" title="${r.coreSegments ? escapeHtml(r.coreSegments) : ''}">${r.coreSegments ? escapeHtml(r.coreSegments) : '—'}</td>`
-              : `<td class="sb-sector">${r.sector || '—'}</td>
-                 <td class="sb-sector">${r.subSector || '—'}</td>
-                 <td class="sb-sector">${r.industry || '—'}</td>`;
+              ? `${tdIf('function', `<td>${functionBadge}</td>`)}
+                 ${tdIf('subSector', `<td class="sb-sector">${r.subSector || '—'}</td>`)}
+                 ${tdIf('coreSegments', `<td class="sb-segments" title="${r.coreSegments ? escapeHtml(r.coreSegments) : ''}">${r.coreSegments ? escapeHtml(r.coreSegments) : '—'}</td>`)}`
+              : `${tdIf('sector', `<td class="sb-sector">${r.sector || '—'}</td>`)}
+                 ${tdIf('subSector', `<td class="sb-sector">${r.subSector || '—'}</td>`)}
+                 ${tdIf('industry', `<td class="sb-sector">${r.industry || '—'}</td>`)}`;
             return `
             <tr data-tic="${r.ticker}" ${r.isDerivative ? 'data-derivative="1"' : ''}>
-              <td class="sb-tic">${r.ticker}${r.isDerivative ? ' <span class="sb-deriv-marker">⚡</span>' : ''}</td>
-              <td class="sb-name">${r.name || '—'}</td>
+              ${tdIf('ticker', `<td class="sb-tic">${r.ticker}${r.isDerivative ? ' <span class="sb-deriv-marker">⚡</span>' : ''}</td>`)}
+              ${tdIf('name', `<td class="sb-name">${r.name || '—'}</td>`)}
               ${taxonomyCells}
-              <td class="sb-desc" data-full="${r.description ? escapeHtml(r.description) : ''}">${r.description ? escapeHtml(r.description) : '<span style="color:var(--ink-faint)">—</span>'}</td>
-              <td>${r.status ? `<span class="sb-status sb-status-${statusClass}">${escapeHtml(r.status)}</span>` : '—'}</td>
-              <td>${r.price != null ? fmt$H(r.price) : '—'}</td>
-              <td>${r.marketCap != null ? fmt$H(r.marketCap) : '—'}</td>
-              ${hidePE ? '' : `<td>${r.pe != null ? r.pe.toFixed(2) : '—'}</td>`}
-              ${hideBeta ? '' : `<td>${r.beta != null ? r.beta.toFixed(2) : '—'}</td>`}
-              <td><span class="sb-source-tag ${r.source.includes('sheet') ? 'sheet' : r.source.includes('av') ? 'av' : 'manual'}">${r.source}</span></td>
+              ${tdIf('description', `<td class="sb-desc" data-full="${r.description ? escapeHtml(r.description) : ''}">${r.description ? escapeHtml(r.description) : '<span style="color:var(--ink-faint)">—</span>'}</td>`)}
+              ${tdIf('status', `<td>${r.status ? `<span class="sb-status sb-status-${statusClass}">${escapeHtml(r.status)}</span>` : '—'}</td>`)}
+              ${tdIf('price', `<td>${r.price != null ? fmt$H(r.price) : '—'}</td>`)}
+              ${tdIf('marketCap', `<td>${r.marketCap != null ? fmt$H(r.marketCap) : '—'}</td>`)}
+              ${hidePE ? '' : tdIf('pe', `<td>${r.pe != null ? r.pe.toFixed(2) : '—'}</td>`)}
+              ${hideBeta ? '' : tdIf('beta', `<td>${r.beta != null ? r.beta.toFixed(2) : '—'}</td>`)}
+              ${tdIf('source', `<td><span class="sb-source-tag ${r.source.includes('sheet') ? 'sheet' : r.source.includes('av') ? 'av' : 'manual'}">${r.source}</span></td>`)}
               <td class="sb-action-cell">
                 <button class="sb-icon-btn" data-act="value" data-tic="${r.ticker}">Value</button>
                 ${r.isDerivative ? `<button class="sb-icon-btn" data-act="holdings" data-tic="${r.ticker}" title="View ETF holdings">Holdings</button>` : ''}
@@ -7358,6 +7869,79 @@ function renderStockBook() {
   // sessionStorage so reloading keeps the user's layout choice for the session.
   // (We don't persist to localStorage since column counts vary by section.)
   attachColumnResizers(content.querySelector('.sb-table'));
+
+  // ===== COLUMN PICKER WIRING =====
+  // Click "Columns" button → toggles a popover listing every column applicable
+  // to the current section, with a checkbox per column. State persists to
+  // localStorage per-section via setColumnVisibility().
+  const colBtn = content.querySelector('#sb-col-picker-btn');
+  const colPopover = content.querySelector('#sb-col-picker-popover');
+  if (colBtn && colPopover) {
+    const renderPicker = () => {
+      const cols = sbColumnsForSection(sb.section);
+      const hiddenByContext = (col) => {
+        // Some columns are auto-hidden by section context (PE for crypto, etc.)
+        // — surface that in the picker so users understand why they're greyed out.
+        if (col.id === 'pe' && hidePE) return 'auto-hidden for this asset class';
+        if (col.id === 'beta' && hideBeta) return 'auto-hidden for this asset class';
+        return null;
+      };
+      colPopover.innerHTML = `
+        <div class="sb-col-picker-head">
+          <strong>Columns for "${escapeHtml(sb.section)}"</strong>
+          <button class="btn btn-ghost sb-col-reset-btn" title="Reset to defaults for this tab">Reset</button>
+        </div>
+        <div class="sb-col-picker-list">
+          ${cols.map(c => {
+            const visible = isColumnVisible(c.id, sb.section);
+            const reason = hiddenByContext(c);
+            const disabled = !!reason || !!c.required;
+            const disabledTitle = c.required ? 'Required column — cannot be hidden'
+                                : reason     ? reason
+                                : '';
+            return `
+              <label class="sb-col-picker-item ${disabled ? 'disabled' : ''}" ${disabledTitle ? `title="${escapeHtml(disabledTitle)}"` : ''}>
+                <input type="checkbox" data-col="${c.id}" ${visible ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
+                <span>${escapeHtml(c.label)}</span>
+                ${reason ? `<span class="sb-col-picker-note">${escapeHtml(reason)}</span>` : ''}
+                ${c.required ? `<span class="sb-col-picker-note">required</span>` : ''}
+              </label>
+            `;
+          }).join('')}
+        </div>
+        <div class="sb-col-picker-foot">
+          Saved per-tab · "${escapeHtml(sb.section)}" view remembered next time
+        </div>
+      `;
+      // Wire checkbox toggles
+      colPopover.querySelectorAll('input[data-col]').forEach(chk => {
+        chk.addEventListener('change', () => {
+          setColumnVisibility(chk.dataset.col, sb.section, chk.checked);
+          renderStockBook();   // re-render with new visibility
+        });
+      });
+      // Wire reset
+      colPopover.querySelector('.sb-col-reset-btn')?.addEventListener('click', () => {
+        resetColumnsForSection(sb.section);
+        renderStockBook();
+      });
+    };
+    colBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (colPopover.style.display === 'none') {
+        renderPicker();
+        colPopover.style.display = '';
+      } else {
+        colPopover.style.display = 'none';
+      }
+    });
+    // Click-outside to close
+    document.addEventListener('click', (e) => {
+      if (!colPopover.contains(e.target) && e.target !== colBtn && !colBtn.contains(e.target)) {
+        colPopover.style.display = 'none';
+      }
+    }, { once: true });
+  }
   // Whole row click → value
   content.querySelectorAll('tbody tr').forEach(tr => {
     tr.addEventListener('click', () => {
@@ -22750,6 +23334,126 @@ async function renderCompanyOverview() {
     console.error('[company-overview] supplyChainSection build failed:', e.message);
   }
 
+  // ===== Cross-Asset Context =====
+  // Surfaces the cross-asset signals relevant to THIS ticker's sector. The
+  // mapping is intentional: a Materials stock cares more about industrial
+  // demand + dollar; an Energy stock cares more about energy + dollar; an
+  // Industrial cares about logistics + chain performance; a Tech stock about
+  // global indices + safe-haven (defensive rotation hurts it).
+  //
+  // We don't try to be comprehensive — each sector gets 3-4 most-relevant
+  // signals. Less noise, more signal. The Macro Quad tab shows the full set
+  // when the user wants the broad view.
+  let crossAssetSection = '';
+  try {
+    const xa = extractCrossAssetSignals();
+    const sectorRaw = (s.sector || '').toLowerCase();
+    // Pick which signals to surface based on sector
+    let keys = [];
+    if (/material|chem|metal/.test(sectorRaw))         keys = ['industrialDemand', 'dollarStrength', 'logisticsMomentum', 'chainPerformance'];
+    else if (/energy/.test(sectorRaw))                 keys = ['energyComplex', 'dollarStrength', 'logisticsMomentum', 'macroAlignment'];
+    else if (/industrial/.test(sectorRaw))             keys = ['logisticsMomentum', 'industrialDemand', 'energyComplex', 'chainPerformance'];
+    else if (/financial/.test(sectorRaw))              keys = ['globalIndices', 'macroAlignment', 'dollarStrength', 'safeHavenBid'];
+    else if (/utilit/.test(sectorRaw))                 keys = ['safeHavenBid', 'energyComplex', 'macroAlignment', 'dollarStrength'];
+    else if (/consumer.*defensive|staples/.test(sectorRaw)) keys = ['safeHavenBid', 'agriculturalGoods', 'dollarStrength', 'macroAlignment'];
+    else if (/consumer.*cyclical|discretionary/.test(sectorRaw)) keys = ['globalIndices', 'macroAlignment', 'dollarStrength', 'logisticsMomentum'];
+    else if (/tech/.test(sectorRaw))                   keys = ['globalIndices', 'macroAlignment', 'safeHavenBid', 'chainPerformance'];
+    else if (/health/.test(sectorRaw))                 keys = ['safeHavenBid', 'macroAlignment', 'dollarStrength', 'globalIndices'];
+    else if (/real.?estate/.test(sectorRaw))           keys = ['safeHavenBid', 'macroAlignment', 'dollarStrength', 'logisticsMomentum'];
+    else if (/communication/.test(sectorRaw))          keys = ['globalIndices', 'macroAlignment', 'dollarStrength', 'chainPerformance'];
+    // Foreign-listing tickers care extra about FX
+    else if (/\.(ks|tw|hk|t|l|sr|sz|ss)$/i.test(s.ticker)) keys = ['dollarStrength', 'globalIndices', 'macroAlignment', 'chainPerformance'];
+    else keys = ['macroAlignment', 'globalIndices', 'safeHavenBid', 'dollarStrength'];
+
+    crossAssetSection = `
+      <div class="company-card">
+        <h4>Cross-Asset Context
+          <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· market signals most relevant to ${escapeHtml(s.sector || s.ticker)}</span>
+        </h4>
+        <div class="cross-asset-grid">${renderCrossAssetSignalCards(xa.signals, keys)}</div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);line-height:1.6;margin-top:8px;padding-top:8px;border-top:1px dashed var(--rule)">
+          These signals are LIVE intraday observations + the CACHED regime call. They are <em>context</em> for valuing this ticker — not a buy/sell signal. See Macro Quad for the full cross-asset dashboard.
+        </div>
+      </div>
+    `;
+  } catch (e) {
+    console.warn('[company-overview] cross-asset section failed:', e.message);
+  }
+
+  // ===== News Per Ticker =====
+  // Surfaces ONLY articles where this ticker appears (either as the primary
+  // ticker field or in the entities array — covers both "AAPL beats" and
+  // "Microsoft, Apple, Google announce…" cases).
+  //
+  // The user asked specifically: "news only for the unique ticker being valued
+  // or when the unique ticker is mentioned." So we check both fields.
+  //
+  // Top 8 most recent, sorted by datetime descending. Click → opens News tab.
+  let tickerNewsSection = '';
+  try {
+    const allItems = (state.news?.items?.length ? state.news.items : null)
+      || ((typeof loadNewsCache === 'function') ? (loadNewsCache()?.items || []) : []);
+    const tic = (s.ticker || '').toUpperCase();
+    if (allItems.length > 0 && tic) {
+      // Match if tx.ticker === ticker OR entities array contains the ticker
+      const tickerArticles = allItems.filter(n => {
+        if (!n.headline) return false;
+        const primaryMatch = (n.ticker || '').toUpperCase() === tic;
+        const entityMatch = Array.isArray(n.entities) && n.entities.some(e =>
+          (typeof e === 'string' ? e : e?.ticker || '').toUpperCase() === tic
+        );
+        const headlineMention = (n.headline || '').toUpperCase().includes(tic + ' ')
+                             || (n.headline || '').toUpperCase().includes(' ' + tic);
+        return primaryMatch || entityMatch || headlineMention;
+      });
+      // Sort by datetime desc
+      tickerArticles.sort((a, b) => {
+        const ta = new Date(a.datetime || a.publishedAt || 0).getTime();
+        const tb = new Date(b.datetime || b.publishedAt || 0).getTime();
+        return tb - ta;
+      });
+      const articles = tickerArticles.slice(0, 8);
+      const articleStates = typeof loadArticleStates === 'function' ? loadArticleStates() : {};
+      const articleRows = articles.length === 0
+        ? `<div style="color:var(--ink-faint);font-family:var(--mono);font-size:11px;padding:14px 0;font-style:italic">No news articles yet mentioning ${escapeHtml(tic)}. The news pipeline pulls market-cap-sorted articles nightly — check back after the next refresh.</div>`
+        : articles.map(n => {
+            const dt = n.datetime || n.publishedAt;
+            const when = dt ? (typeof fmtRelativeTime === 'function' ? fmtRelativeTime(dt) : new Date(dt).toLocaleDateString()) : '';
+            const priorityColor = n.priority === 'critical' ? '#d97a6c'
+                                : n.priority === 'high'     ? '#e0b04c'
+                                : n.priority === 'medium'   ? '#7faaca'
+                                : 'var(--ink-faint)';
+            const isRead = articleStates?.[typeof articleKey === 'function' ? articleKey(n) : '']?.status === 'read';
+            return `
+              <div class="ticker-news-row${isRead ? ' read' : ''}" onclick="switchTab('news')" style="cursor:pointer">
+                <div class="ticker-news-priority" style="background:${priorityColor}"></div>
+                <div class="ticker-news-content">
+                  <div class="ticker-news-headline">${escapeHtml(n.headline)}</div>
+                  <div class="ticker-news-meta">
+                    ${n.source ? `<span>${escapeHtml(n.source)}</span> · ` : ''}
+                    ${when ? `<span>${escapeHtml(when)}</span>` : ''}
+                    ${n.priority ? ` · <span style="color:${priorityColor};text-transform:uppercase;font-weight:600">${escapeHtml(n.priority)}</span>` : ''}
+                  </div>
+                </div>
+              </div>
+            `;
+          }).join('');
+      tickerNewsSection = `
+        <div class="company-card">
+          <h4>News for ${escapeHtml(tic)}
+            <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· articles where ${escapeHtml(tic)} appears · click any row to open News tab</span>
+          </h4>
+          <div class="ticker-news-list">
+            ${articleRows}
+          </div>
+          ${articles.length > 0 ? `<div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:8px;text-transform:uppercase;letter-spacing:0.08em">Showing ${articles.length} of ${tickerArticles.length} total · sorted by recency</div>` : ''}
+        </div>
+      `;
+    }
+  } catch (e) {
+    console.warn('[company-overview] ticker-news section failed:', e.message);
+  }
+
   // Final assembly — done as string concatenation, not template literal, so a
   // failure in one section doesn't blank the whole page.
   const html =
@@ -22760,6 +23464,8 @@ async function renderCompanyOverview() {
     descriptionSection +
     productsSection +
     supplyChainSection +
+    crossAssetSection +
+    tickerNewsSection +
     leadershipPreviewSection +
     foundersSection +
     filingsSection +
@@ -27025,6 +27731,21 @@ function onScenariosTabActive() {
     _scenariosWired = true;
   }
   _scnRenderShocks();
+  // Cross-asset starting context — useful for understanding shock transmission
+  // from the *current* state of markets. A "+10% oil" shock applied from $80
+  // crude is a different beast than from $40 crude. Don't fabricate that
+  // calibration — surface the live cross-asset state as context the user reads.
+  try {
+    const xa = extractCrossAssetSignals();
+    const grid = document.getElementById('scn-cross-asset-grid');
+    if (grid) {
+      const keys = ['energyComplex', 'dollarStrength', 'industrialDemand', 'safeHavenBid',
+                    'globalIndices', 'logisticsMomentum'];
+      grid.innerHTML = `<div class="cross-asset-grid">${renderCrossAssetSignalCards(xa.signals, keys)}</div>`;
+    }
+  } catch (e) {
+    console.warn('[scenarios cross-asset] failed:', e.message);
+  }
 }
 
 

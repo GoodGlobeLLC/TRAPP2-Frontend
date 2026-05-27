@@ -2641,6 +2641,23 @@
 
   .tab-panel { display: none; }
   .tab-panel.active { display: block; }
+  /* Panels that don't have a toolbar with its own padding need the panel
+     itself to provide horizontal breathing room. Scenarios, Supply Chains,
+     Global Trade — these contain a news-header directly inside the tab-panel
+     with no parent padding. Without this rule the content sits flush against
+     the viewport edge and the user perceives a "shifted left" header. */
+  .tab-panel[data-panel="scenarios"],
+  .tab-panel[data-panel="supplychain"],
+  .tab-panel[data-panel="globaltrade"] {
+    padding: 0 32px;
+  }
+  @media (max-width: 700px) {
+    .tab-panel[data-panel="scenarios"],
+    .tab-panel[data-panel="supplychain"],
+    .tab-panel[data-panel="globaltrade"] {
+      padding: 0 16px;
+    }
+  }
 
   /* ===== MACRO TAB ===== */
   .macro-toolbar {
@@ -6325,6 +6342,172 @@
   #gt-sources-content .source-row.have { border-left-color: #5b8a72; }
   #gt-sources-content .source-row.partial { border-left-color: #c4965a; }
   #gt-sources-content .source-row.todo { border-left-color: #a5645a; }
+  /* ============================================================
+     STOCK BOOK COLUMN PICKER — per-tab show/hide controls
+     ============================================================ */
+  .sb-columns-toolbar {
+    position: relative;
+    padding: 8px 32px 0;
+    display: flex;
+    justify-content: flex-end;
+  }
+  .sb-col-picker-btn {
+    font-size: 11px !important;
+    padding: 6px 12px !important;
+    display: inline-flex;
+    align-items: center;
+  }
+  .sb-col-picker-popover {
+    position: absolute;
+    top: 38px;
+    right: 32px;
+    z-index: 50;
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    border-top: 3px solid var(--amber);
+    border-radius: 0 0 3px 3px;
+    min-width: 260px;
+    max-width: 320px;
+    max-height: 480px;
+    overflow-y: auto;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+  }
+  .sb-col-picker-head {
+    padding: 12px 16px 10px;
+    border-bottom: 1px solid var(--rule);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-family: var(--mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--ink-dim);
+  }
+  .sb-col-picker-head strong { color: var(--ink); }
+  .sb-col-reset-btn {
+    font-size: 9px !important;
+    padding: 3px 8px !important;
+  }
+  .sb-col-picker-list {
+    padding: 6px 0;
+  }
+  .sb-col-picker-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 16px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--ink);
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+  .sb-col-picker-item:hover { background: var(--bg-elev); }
+  .sb-col-picker-item.disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .sb-col-picker-item input[type="checkbox"] {
+    accent-color: var(--amber);
+    flex-shrink: 0;
+    cursor: pointer;
+  }
+  .sb-col-picker-item.disabled input[type="checkbox"] { cursor: not-allowed; }
+  .sb-col-picker-note {
+    margin-left: auto;
+    font-size: 9px;
+    color: var(--ink-faint);
+    font-style: italic;
+  }
+  .sb-col-picker-foot {
+    padding: 8px 16px;
+    border-top: 1px solid var(--rule);
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--ink-faint);
+    line-height: 1.5;
+  }
+  /* ============================================================
+     CROSS-ASSET SIGNAL CARDS — shared visual language across tabs.
+     Used by Macro Quad, Scenarios, Valuation Company tab, and others
+     that consume extractCrossAssetSignals().
+     ============================================================ */
+  .cross-asset-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 10px;
+    margin: 12px 0 18px;
+  }
+  .cross-asset-card {
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--ink-faint);
+    padding: 10px 12px;
+    border-radius: 0 3px 3px 0;
+  }
+  .cross-asset-card.tone-bull { border-left-color: #5b8a72; }
+  .cross-asset-card.tone-bear { border-left-color: #a5645a; }
+  .cross-asset-card.tone-warn { border-left-color: #c4965a; }
+  .cross-asset-card.tone-flat { border-left-color: var(--ink-faint); }
+  .cross-asset-card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--ink-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 4px;
+    font-weight: 600;
+  }
+  .cross-asset-card-body {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--ink);
+    line-height: 1.5;
+  }
+  /* Ticker-specific news rows on Valuation Company tab */
+  .ticker-news-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .ticker-news-row {
+    display: flex;
+    gap: 10px;
+    align-items: stretch;
+    padding: 8px 10px;
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    transition: background 0.1s, border-color 0.1s;
+  }
+  .ticker-news-row:hover {
+    background: var(--bg-elev);
+    border-color: var(--amber);
+  }
+  .ticker-news-row.read { opacity: 0.55; }
+  .ticker-news-priority {
+    width: 3px;
+    flex-shrink: 0;
+    border-radius: 2px;
+  }
+  .ticker-news-content { flex: 1; min-width: 0; }
+  .ticker-news-headline {
+    font-family: var(--sans);
+    font-size: 12px;
+    color: var(--ink);
+    line-height: 1.4;
+    margin-bottom: 3px;
+  }
+  .ticker-news-meta {
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--ink-faint);
+    letter-spacing: 0.04em;
+  }
 </style>
 </head>
 <body>
@@ -7481,6 +7664,19 @@
       <button class="seg-btn" data-horizon="10y">10 Years</button>
       <button class="seg-btn" data-horizon="all">All horizons</button>
     </div>
+  </section>
+
+  <!-- ============================================================
+       CROSS-ASSET CONTEXT — what's already happening in the market
+       BEFORE the user-defined shock is applied. Helps calibrate the
+       starting point: a +10% oil shock from already-elevated levels
+       transmits differently than from already-depressed levels.
+       ============================================================ -->
+  <section class="scn-section" id="scn-cross-asset-section">
+    <div class="scn-section-title">
+      Current Market Context <small>· live cross-asset state — not part of the shock, but informs the starting point</small>
+    </div>
+    <div id="scn-cross-asset-grid"></div>
   </section>
 
   <!-- RESULTS -->
