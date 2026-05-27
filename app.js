@@ -1265,6 +1265,11 @@ function renderRegimeDashboard() {
   } else if (notes) {
     notes.style.display = 'none';
   }
+
+  // Live market pulse — refresh whenever the dashboard renders. This pulls
+  // fresh intraday data from the stockbook (VIX, SPY, sector ETFs, yields)
+  // and shows it alongside the cached regime as an independent consistency check.
+  try { renderLivePulse(); } catch (e) { console.warn('Live pulse render failed:', e); }
 }
 
 function renderProbBars(elId, probs) {
@@ -1292,6 +1297,276 @@ function renderForecastBars() {
   }
   renderProbBars('regime-forecast-bars', probs);
 }
+
+// ============================================================
+//   LIVE MARKET PULSE
+//
+//   These are intraday observations — LIVE data, computed in the browser
+//   from the most recent stockbook rows. The point is to give the user a
+//   real-time consistency check on the cached regime call.
+//
+//   ⚠ Important epistemic separation:
+//   - The cached regime call ("Risk-On Melt Up", "Recession Fear", etc.)
+//     comes from the pipeline. It's daily, computed from historical-window
+//     features, and is by nature a SNAPSHOT of a slowly-drifting state.
+//   - The live pulse is RIGHT NOW. VIX, breadth, dispersion. It's what the
+//     market is actually doing today.
+//   - When the two disagree, we surface that explicitly. The user shouldn't
+//     trust the cached call blindly when intraday tape contradicts it.
+//
+//   "History rhymes but never repeats" — the Markov forecast bars below the
+//   pulse show what the historical transition matrix predicts. That's a
+//   *base rate*, not a forecast. We label them HISTORICAL BASE RATE so the
+//   user never confuses Markov continuity with actual prediction.
+//
+//   Signals computed (each maps stockbook live data to a 'tone'):
+//     1. VIX level + change          → volatility regime
+//     2. SPY 1d % vs 5d %            → momentum acceleration / divergence
+//     3. Sector breadth              → broad participation or narrow rally
+//     4. Defensive vs Cyclical       → risk appetite (XLP/XLU vs XLY/XLK ratio)
+//     5. Yield curve (10y - 2y)      → growth vs recession signal
+//     6. Dollar strength (DXY)       → global risk regime
+// ============================================================
+
+const REGIME_LIVE_PULSE_TICKERS = ['^VIX', 'SPY', '^GSPC', 'XLP', 'XLU', 'XLY', 'XLK', '^TNX', '^FVX', 'UUP', 'XLE', 'XLF', 'XLB'];
+
+function _pulseGetRow(ticker) {
+  const rows = state.stockbook?.rows || [];
+  return rows.find(r => r.ticker === ticker);
+}
+
+// Pull session % change. Prefer the live "session %" if the pipeline gave us
+// one; fall back to comparing price vs prior close. Returns null when missing.
+function _pulseSessionPct(ticker) {
+  const r = _pulseGetRow(ticker);
+  if (!r) return null;
+  if (isFinite(r.changePct))   return r.changePct;
+  if (isFinite(r.sessionPct))  return r.sessionPct;
+  if (isFinite(r.price) && isFinite(r.priorClose) && r.priorClose > 0) {
+    return ((r.price - r.priorClose) / r.priorClose) * 100;
+  }
+  return null;
+}
+
+function computeLiveMarketPulse() {
+  // Each card returns { label, value, sub, tone } or null if data unavailable
+  const cards = [];
+
+  // 1. VIX absolute level + intraday change
+  const vix = _pulseGetRow('^VIX');
+  if (vix && isFinite(vix.price)) {
+    const px = vix.price;
+    const pct = _pulseSessionPct('^VIX');
+    // VIX zones based on the historical distribution: <14 calm, 14-20 normal,
+    // 20-30 elevated, 30+ panic
+    const tone = px < 14   ? 'bull'
+               : px < 20   ? 'flat'
+               : px < 30   ? 'warn'
+               : 'bear';
+    const zone = px < 14 ? 'calm'
+               : px < 20 ? 'normal'
+               : px < 30 ? 'elevated'
+               : 'panic';
+    cards.push({
+      label: 'VIX', value: px.toFixed(2),
+      sub: `${zone}${pct != null ? ' · ' + (pct >= 0 ? '+' : '') + pct.toFixed(1) + '% today' : ''}`,
+      tone,
+      signal: { name: 'vix', zone, level: px, change: pct },
+    });
+  }
+
+  // 2. SPY day move + 5d momentum check
+  const spy = _pulseGetRow('SPY');
+  if (spy && isFinite(spy.price)) {
+    const day = _pulseSessionPct('SPY');
+    const tone = day == null   ? 'flat'
+               : day >  0.3    ? 'bull'
+               : day < -0.3    ? 'bear'
+               : 'flat';
+    cards.push({
+      label: 'S&P 500 (SPY)', value: '$' + spy.price.toFixed(2),
+      sub: day != null ? (day >= 0 ? '+' : '') + day.toFixed(2) + '% today' : 'price only',
+      tone,
+      signal: { name: 'spy_day', pct: day },
+    });
+  }
+
+  // 3. Risk-on / Risk-off (cyclicals vs defensives ratio change)
+  const xlp = _pulseSessionPct('XLP');
+  const xlu = _pulseSessionPct('XLU');
+  const xly = _pulseSessionPct('XLY');
+  const xlk = _pulseSessionPct('XLK');
+  if ([xlp, xlu, xly, xlk].every(v => v != null)) {
+    const defAvg = (xlp + xlu) / 2;
+    const cycAvg = (xly + xlk) / 2;
+    const spread = cycAvg - defAvg;   // positive = risk-on, negative = risk-off
+    const tone = spread >  0.3 ? 'bull'
+               : spread < -0.3 ? 'bear'
+               : 'flat';
+    const label = spread >  0.3 ? 'Risk-On'
+                : spread < -0.3 ? 'Risk-Off'
+                : 'Mixed';
+    cards.push({
+      label: 'Risk Appetite', value: label,
+      sub: `Cyclicals ${cycAvg >= 0 ? '+' : ''}${cycAvg.toFixed(2)}% · Defensives ${defAvg >= 0 ? '+' : ''}${defAvg.toFixed(2)}%`,
+      tone,
+      signal: { name: 'risk_appetite', spread, cycAvg, defAvg },
+    });
+  }
+
+  // 4. Yield curve (10y minus 2y) — uses ^TNX (10y) and ^FVX (5y) as proxies.
+  // True 10y-2y requires ^TYX/^IRX which may not be in the user's tickers;
+  // using 10y - 5y still surfaces inversion risk and is widely tracked.
+  const tnx = _pulseGetRow('^TNX');
+  const fvx = _pulseGetRow('^FVX');
+  if (tnx && fvx && isFinite(tnx.price) && isFinite(fvx.price)) {
+    const t10 = tnx.price / 10;   // ^TNX is quoted as 10× yield
+    const t5  = fvx.price / 10;
+    const spread = t10 - t5;
+    const tone = spread > 0.5  ? 'bull'
+               : spread > 0    ? 'flat'
+               : spread > -0.5 ? 'warn'
+               : 'bear';
+    cards.push({
+      label: '10y − 5y Yield', value: (spread >= 0 ? '+' : '') + (spread * 100).toFixed(0) + ' bp',
+      sub: `10y ${t10.toFixed(2)}% · 5y ${t5.toFixed(2)}%${spread < 0 ? ' · inverted' : ''}`,
+      tone,
+      signal: { name: 'yield_curve', spread, t10, t5 },
+    });
+  }
+
+  // 5. Dollar strength via UUP
+  const uup = _pulseGetRow('UUP');
+  if (uup) {
+    const pct = _pulseSessionPct('UUP');
+    if (pct != null) {
+      const tone = pct >  0.4 ? 'warn'   // strong dollar = headwind for ex-US + commodities
+                 : pct < -0.4 ? 'bull'   // weak dollar = tailwind for global
+                 : 'flat';
+      cards.push({
+        label: 'Dollar (UUP)', value: '$' + (uup.price || 0).toFixed(2),
+        sub: `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}% today${pct > 0.4 ? ' · DXY rally' : pct < -0.4 ? ' · DXY weakness' : ''}`,
+        tone,
+        signal: { name: 'dxy', pct },
+      });
+    }
+  }
+
+  // 6. Energy + financials breadth check (XLE and XLF often diverge from index)
+  const xle = _pulseSessionPct('XLE');
+  const xlf = _pulseSessionPct('XLF');
+  if (xle != null && xlf != null) {
+    const tone = (xle > 0 && xlf > 0) ? 'bull'
+               : (xle < 0 && xlf < 0) ? 'bear'
+               : 'flat';
+    const label = (xle > 0 && xlf > 0) ? 'Cyclicals confirming'
+                : (xle < 0 && xlf < 0) ? 'Cyclicals weak'
+                : 'Mixed signal';
+    cards.push({
+      label: 'Energy + Financials', value: label,
+      sub: `XLE ${xle >= 0 ? '+' : ''}${xle.toFixed(2)}% · XLF ${xlf >= 0 ? '+' : ''}${xlf.toFixed(2)}%`,
+      tone,
+      signal: { name: 'cyclical_breadth', xle, xlf },
+    });
+  }
+
+  return cards;
+}
+
+// Compare the live pulse against the cached regime call. If they materially
+// disagree, surface a banner explaining the deviation. This is the explicit
+// "history vs. now" check the user asked for.
+function computePulseDeviation(cards) {
+  const r = state.marketRegime;
+  if (!r || !r.regime) return null;
+  // Tally tones across cards
+  const toneCount = { bull: 0, bear: 0, warn: 0, flat: 0 };
+  for (const c of cards) toneCount[c.tone] = (toneCount[c.tone] || 0) + 1;
+  const total = cards.length || 1;
+  const bullFrac = toneCount.bull / total;
+  const bearFrac = (toneCount.bear + toneCount.warn) / total;
+  // Map cached regime to expected tone bias
+  const cachedBias = ['expansion', 'risk_on_melt_up'].includes(r.regime) ? 'bull'
+                   : ['recession_fear', 'risk_off', 'inflation_shock'].includes(r.regime) ? 'bear'
+                   : 'neutral';
+  if (cachedBias === 'bull' && bearFrac >= 0.5) {
+    return {
+      tone: 'bear',
+      message: `Live tape is mostly bearish (${toneCount.bear} bear · ${toneCount.warn} warn out of ${total}) while the cached regime is <strong>${(REGIME_LABELS[r.regime] || {}).label || r.regime}</strong>. The pipeline hasn't seen today's tape yet. Weight today's price action heavier than the cached call.`,
+    };
+  }
+  if (cachedBias === 'bear' && bullFrac >= 0.5) {
+    return {
+      tone: 'info',
+      message: `Live tape is showing risk-on (${toneCount.bull} bull out of ${total}) while the cached regime is <strong>${(REGIME_LABELS[r.regime] || {}).label || r.regime}</strong>. Could be a counter-trend bounce or an early regime shift the daily computation hasn't caught yet.`,
+    };
+  }
+  if (toneCount.flat >= total * 0.6) {
+    return {
+      tone: 'info',
+      message: `Live tape is flat and mixed today — no strong directional signal to confirm or contradict the cached regime call. Wait for confirmation.`,
+    };
+  }
+  return {
+    tone: 'ok',
+    message: `Live tape is consistent with the cached regime call — ${cachedBias === 'bull' ? 'risk-on confirmation' : cachedBias === 'bear' ? 'risk-off confirmation' : 'mixed signals'}.`,
+  };
+}
+
+function renderLivePulse() {
+  const wrap = document.getElementById('regime-live-pulse');
+  const grid = document.getElementById('live-pulse-grid');
+  const banner = document.getElementById('live-pulse-banner');
+  const epistemic = document.getElementById('regime-epistemic-note');
+  if (!wrap || !grid) return;
+
+  const cards = computeLiveMarketPulse();
+  if (cards.length === 0) {
+    wrap.style.display = 'none';
+    if (epistemic) epistemic.style.display = 'none';
+    return;
+  }
+  wrap.style.display = '';
+  if (epistemic) epistemic.style.display = '';
+
+  // Banner: live vs cached deviation
+  const deviation = computePulseDeviation(cards);
+  if (deviation) {
+    banner.className = `live-pulse-banner banner-${deviation.tone === 'bear' ? '' : deviation.tone}`.trim();
+    const icon = deviation.tone === 'bear' ? '⚠'
+               : deviation.tone === 'ok'   ? '✓'
+               : 'ℹ';
+    banner.innerHTML = `<span class="live-pulse-banner-icon">${icon}</span> ${deviation.message}`;
+    banner.style.display = '';
+  } else {
+    banner.style.display = 'none';
+  }
+
+  grid.innerHTML = cards.map(c => `
+    <div class="live-pulse-card tone-${c.tone}">
+      <div class="live-pulse-card-label">
+        <span>${escapeHtml(c.label)}</span>
+        <span class="tier-pill tier-live" style="margin:0;font-size:7px;padding:1px 5px" title="Real-time observation, not a historical forecast">LIVE</span>
+      </div>
+      <div class="live-pulse-card-value">${escapeHtml(c.value)}</div>
+      <div class="live-pulse-card-sub">${escapeHtml(c.sub)}</div>
+    </div>
+  `).join('');
+}
+
+// Hook live pulse into regime dashboard rendering. Called by renderRegimeDashboard
+// after the cached regime data renders, plus on a 60-sec interval while the
+// Macro Quad tab is visible.
+function _refreshLivePulseIfVisible() {
+  const tab = document.getElementById('regime-live-pulse');
+  if (!tab) return;
+  // Only refresh if the section is in the DOM and Macro Quad is active
+  const macroTab = document.querySelector('.tab.active[data-tab="macro"], .tab-content.active#macro-tab');
+  if (macroTab || tab.offsetParent !== null) {
+    try { renderLivePulse(); } catch (e) { console.warn('live pulse refresh failed:', e); }
+  }
+}
+setInterval(_refreshLivePulseIfVisible, 60_000);
 
 // Wire forecast step tabs + theme toggle on DOM ready
 document.addEventListener('DOMContentLoaded', () => {
@@ -4474,6 +4749,12 @@ const PRIMED_REFERENCE_TICKERS = [
   'TLT','IEF','SHY','BND','AGG','LQD','HYG','GOVT','TIP',
   // Commodities + crypto + FX (new asset classes)
   'GLD','SLV','USO','UNG','BTC-USD','ETH-USD','UUP',
+  // Global Trade tab — logistics proxies (shipping, transports, airlines, pipelines)
+  'BDRY','BWET','IYT','XTN','JETS','AMLP','UNP','CPER',
+  // Global Trade tab — country ETFs (top 12 economies)
+  'MCHI','EWG','EWJ','EWY','INDA','EWU','EWQ','EWZ','EWI','EWC','EWW',
+  // Global Trade tab — product / commodity proxies
+  'PICK','WEAT','SOYB','SOXX','LIT','REMX',
 ];
 // Kick off pre-fetch after a short delay so it doesn't block initial render.
 // Each call is ~50KB; 30 tickers ≈ 1.5MB total, but uses HTTP/2 multiplexing.
@@ -6543,6 +6824,7 @@ function switchTab(tabName) {
       tabName === 'news'  ? 'News Feed · sorted by market cap · search, "My News" preset, lead+closer summarization' :
       tabName === 'scenarios' ? 'Scenarios · shock-and-transmission engine · ranged estimates with epistemic tiers' :
       tabName === 'supplychain' ? 'Supply Chains · upstream / midstream / downstream linkages · cross-portfolio exposure discovery' :
+      tabName === 'globaltrade' ? 'Global Trade · country-level flows · live logistics proxies · explicit epistemic tiers' :
       tabName === 'ta' ? 'Technical Analysis · price charts · Fibonacci · MAs · correlation · inflation-adjusted' :
       'Intrinsic Value Engine · DCF · CAPM · Multiples · Monte Carlo';
   }
@@ -6555,6 +6837,11 @@ function switchTab(tabName) {
       const baseDir = state._historyManifest.baseUrl.replace(/\/history\/?$/, '/');
       loadRegimeSnapshot(baseDir).catch(() => {});
     }
+  }
+
+  // Auto-load Global Trade — pulls from existing stockbook data, no separate fetch needed
+  if (tabName === 'globaltrade' && typeof loadGlobalTradeTab === 'function') {
+    loadGlobalTradeTab();
   }
 
   // Auto-load on first visit
@@ -17529,33 +17816,55 @@ function renderStockBookPortfolio(content) {
     return (isNeg ? -n : n) / 100;
   }
 
+  // ============================================================
+  //   POSITION MULTIPLIER — handles options contract multiplier
+  //
+  //   Options are quoted PER SHARE but each contract represents 100 shares.
+  //   So a "100 calls at $0.35" position is worth 100 × $0.35 × 100 = $3,500,
+  //   NOT $35. The same multiplier applies to P/L calculations.
+  //
+  //   Most equities/ETFs/crypto are 1× (no multiplier). Standard equity
+  //   options are 100×. Futures vary by contract (S&P 500 e-mini is 50×,
+  //   crude oil is 1000×, etc.) — for now we treat futures as 1× since
+  //   the user's spec didn't include multiplier metadata. When/if they
+  //   add it we can plumb it through positionMultiplier the same way.
+  // ============================================================
+  function positionMultiplier(entry) {
+    if (!entry) return 1;
+    // Explicit multiplier on the entry's option metadata wins
+    if (entry.optionMeta?.multiplier) return entry.optionMeta.multiplier;
+    // Fall back to classifyAsset / assetType detection
+    if (entry.assetType === 'option') return 100;
+    if (classifyAsset(entry.ticker) === 'option') return 100;
+    return 1;
+  }
+
   // Compute P/L for a single entry. Returns { plPct, plDollar } or {plPct: null, plDollar: null}
   // Uses ENTRY PRICE (costBasis) — NOT sheet's "P/L since" column.
   //
   // Math by asset class:
-  //   • Equity Long:  P/L = (price - cost) * qty - fees
-  //   • Equity Short: P/L = (cost - price) * qty - fees   (sign-flipped)
-  //   • Future Long/Short: same as equity (sign-flip on short)
-  //   • Option:       skipped — we don't fetch live option mid-prices from
-  //                   any source, and computing intrinsic value from the
-  //                   underlying ignores time value. Better to leave blank
-  //                   than show misleading numbers.
+  //   • Equity Long:  P/L $ = (price - cost) × qty - fees
+  //   • Equity Short: P/L $ = (cost - price) × qty - fees       (sign-flipped)
+  //   • Option Long:  P/L $ = (price - cost) × qty × 100 - fees (100× contract multiplier)
+  //   • Option Short: P/L $ = (cost - price) × qty × 100 - fees
+  //
+  //   For options without a current price (Yahoo didn't return one), we still
+  //   show "—" for plPct — but the cost basis carries the correct ×100 in
+  //   the aggregate so portfolio totals are right.
   function computePL(entry, currentPrice) {
-    // Options: never compute synthetic P/L — show '—' since we lack live mid.
-    if (entry.assetType === 'option' || classifyAsset(entry.ticker) === 'option') {
-      return { plPct: null, plDollar: null };
-    }
     if (!entry.costBasis || !currentPrice || !isFinite(entry.costBasis) || !isFinite(currentPrice)) {
       return { plPct: null, plDollar: null };
     }
     const direction = entry.position === 'Short' ? -1 : 1;
+    const multiplier = positionMultiplier(entry);
+    // P/L % is per-unit (doesn't depend on multiplier — it's just price move)
     const plPct = direction * (currentPrice - entry.costBasis) / entry.costBasis;
     const qty = entry.qty || 0;
     const fees = parseFloat(entry.fees) || 0;
     const isActive = ACTIVE_POSITIONS.includes(entry.position);
-    // P/L $ subtracts broker fees from gross gain/loss
+    // P/L $ — multiplier baked in for options
     const plDollar = (isActive && qty > 0)
-      ? direction * (currentPrice - entry.costBasis) * qty - fees
+      ? direction * (currentPrice - entry.costBasis) * qty * multiplier - fees
       : null;
     return { plPct, plDollar };
   }
@@ -17583,9 +17892,13 @@ function renderStockBookPortfolio(content) {
       const fees = parseFloat(e.fees) || 0;
       totalFees += fees;
       if (e.qty && e.costBasis) {
-        const cost = e.qty * e.costBasis;
+        // Options contract multiplier (100×) baked into both cost basis and
+        // market value so the dollar totals are sized correctly. A 100-call
+        // position at $0.35 premium is $3,500 of cost basis, not $35.
+        const mult = positionMultiplier(e);
+        const cost = e.qty * e.costBasis * mult;
         const direction = e.position === 'Short' ? -1 : 1;
-        const value = e.qty * (e.livePrice || e.costBasis);
+        const value = e.qty * (e.livePrice || e.costBasis) * mult;
         const positionPL = direction * (value - cost) - fees;
         totalCost += cost;
         totalValue += value;
@@ -17646,7 +17959,8 @@ function renderStockBookPortfolio(content) {
     enriched.forEach(e => {
       if (!ACTIVE_POSITIONS.includes(e.position) || !e.qty || !e.costBasis) return;
       const sector = e.sbRow?.sector || 'Unknown';
-      const value = e.qty * (e.livePrice || e.costBasis);
+      // Multiplier so option positions don't under-weight in the alignment calc
+      const value = e.qty * (e.livePrice || e.costBasis) * positionMultiplier(e);
       totalActiveValue += value;
       sectorBreakdown[sector] = (sectorBreakdown[sector] || 0) + value;
       if (bias.favor.includes(sector)) alignedValue += value;
@@ -17824,8 +18138,11 @@ function renderStockBookPortfolio(content) {
     const isActive = ACTIVE_POSITIONS.includes(e.position);
     const isPassive = e.position === 'Watching' || e.position === 'Tracking';
     const entryDateDisplay = e.addedAt ? new Date(e.addedAt).toISOString().slice(0, 10) : '—';
-    // Market value of this position at current price
-    const mktValue = (isActive && e.qty && e.livePrice) ? e.qty * e.livePrice : null;
+    // Market value of this position at current price.
+    // For options: qty × price × 100 (contract multiplier). Equity stays 1×.
+    const mktValue = (isActive && e.qty && e.livePrice)
+      ? e.qty * e.livePrice * positionMultiplier(e)
+      : null;
     // For watching/tracking: show today's % change (no $ value since no qty)
     return `
       <tr data-id="${e.id}" data-tic="${e.ticker}" data-pos="${e.position || ''}">
@@ -18078,6 +18395,9 @@ function renderPortfolioChart(enriched, range) {
       sbRow: e.sbRow,
       isHistorical: !!isHistorical,
       soldAt: e.soldAt || null,
+      // Contract multiplier carried through so chart MTM math sizes options
+      // correctly. For equities/futures/FX this is 1, for options it's 100.
+      multiplier: positionMultiplier(e),
     };
   };
 
@@ -18141,10 +18461,19 @@ function renderPortfolioChart(enriched, range) {
     if (!dateIso) continue;
     const fee = parseFloat(tx.fee) || 0;
     let delta = 0;
-    if (tx.type === 'buy')        delta = -((tx.cost) || (tx.qty * tx.price + fee));
-    else if (tx.type === 'sell')  delta = (tx.proceeds != null) ? tx.proceeds : (tx.qty * tx.price - fee);
-    else if (tx.type === 'short') delta = (tx.qty * tx.price) - fee;
-    else if (tx.type === 'cover') delta = -((tx.qty * tx.price) + fee);
+    // Equity / generic types
+    if (tx.type === 'buy')               delta = -((tx.cost) || (tx.qty * tx.price + fee));
+    else if (tx.type === 'sell')         delta = (tx.proceeds != null) ? tx.proceeds : (tx.qty * tx.price - fee);
+    else if (tx.type === 'short')        delta = (tx.qty * tx.price) - fee;
+    else if (tx.type === 'cover')        delta = -((tx.qty * tx.price) + fee);
+    // Option types — the tx.cost field already carries qty × premium × 100
+    // so we just consume it directly. buy-to-open uses cash (premium paid);
+    // sell-to-open credits proceeds; buy-to-close/sell-to-close mirror them
+    // on the unwind side.
+    else if (tx.type === 'buy-to-open')  delta = -((tx.cost) || (tx.qty * tx.price * 100 + fee));
+    else if (tx.type === 'sell-to-open') delta = (tx.proceeds != null) ? tx.proceeds : (tx.qty * tx.price * 100 - fee);
+    else if (tx.type === 'sell-to-close')delta = (tx.proceeds != null) ? tx.proceeds : (tx.qty * tx.price * 100 - fee);
+    else if (tx.type === 'buy-to-close') delta = -((tx.cost) || (tx.qty * tx.price * 100 + fee));
     if (delta !== 0) cashEvents.push({ date: dateIso, cashDelta: delta });
   }
   cashEvents.sort((a, b) => a.date.localeCompare(b.date));
@@ -18189,11 +18518,11 @@ function renderPortfolioChart(enriched, range) {
       if (entryIso && date < entryIso) continue;
 
       if (p.isHistorical || p.position !== 'Short') {
-        // OPEN LONG or pre-sale historical long — asset = qty × current price
-        openPositionMtm += p.qty * price;
+        // OPEN LONG or pre-sale historical long — asset = qty × price × multiplier
+        openPositionMtm += p.qty * price * (p.multiplier || 1);
       } else {
-        // OPEN SHORT — liability = qty × current price (cost to cover)
-        openPositionMtm -= p.qty * price;
+        // OPEN SHORT — liability = qty × price × multiplier (cost to cover)
+        openPositionMtm -= p.qty * price * (p.multiplier || 1);
       }
       totalFees += p.fees;
       contributors++;
@@ -18785,6 +19114,57 @@ function renderTransactionsLedger(content, summary, subTabs) {
     .reduce((s, t) => s + (t.qty * t.entryPrice), 0);
   const totalRealizedPLPct = realizedCostBasis > 0 ? (totalRealizedPL / realizedCostBasis) * 100 : 0;
 
+  // ============================================================
+  //   UNREALIZED P/L COMPUTATION (per OPEN transaction)
+  //
+  //   For BUY / SHORT / BUY-TO-OPEN / SELL-TO-OPEN that haven't been closed,
+  //   compute current paper P/L using the latest Stock Book price.
+  //
+  //   Options use the 100× contract multiplier (detected by OCC ticker shape
+  //   or buy-to-open/sell-to-open type).
+  //
+  //   Direction: long types (buy/buy-to-open) gain when price > entry;
+  //              short types (short/sell-to-open) gain when price < entry.
+  //
+  //   Closed transactions (matched sell/cover for an earlier entry) show '—'.
+  //   This is best-effort: we don't perfectly FIFO-match buys against sells,
+  //   so we use a simpler heuristic — sells/covers themselves show realized P/L,
+  //   and OPEN trade rows show unrealized P/L from the live price.
+  // ============================================================
+  const sbRowsForTx = state.stockbook?.rows || [];
+  const sbPriceFor = (tic) => {
+    const r = sbRowsForTx.find(row => row.ticker === tic);
+    return r ? (r.price ?? r.fmpPrice ?? null) : null;
+  };
+  const isOcc = (tic) => /^[A-Z]+\d{6}[CP]\d{8}$/.test(String(tic || '').toUpperCase());
+  const txMultiplier = (tx) => {
+    // Use 100× contract multiplier for option-shaped tickers or option tx types
+    if (isOcc(tx.ticker)) return 100;
+    if (tx.type === 'buy-to-open' || tx.type === 'sell-to-open' ||
+        tx.type === 'buy-to-close' || tx.type === 'sell-to-close') return 100;
+    return 1;
+  };
+  const txUnrealizedPL = (tx) => {
+    // Only OPEN entry-side transactions get unrealized P/L
+    const isOpenEntry = (tx.type === 'buy' || tx.type === 'short' ||
+                        tx.type === 'buy-to-open' || tx.type === 'sell-to-open');
+    if (!isOpenEntry) return null;
+    const livePrice = sbPriceFor(tx.ticker);
+    if (!isFinite(livePrice) || !livePrice || !tx.price || !tx.qty) return null;
+    const isShort = tx.type === 'short' || tx.type === 'sell-to-open';
+    const direction = isShort ? -1 : 1;
+    const mult = txMultiplier(tx);
+    return direction * (livePrice - tx.price) * tx.qty * mult - (tx.fee || 0);
+  };
+
+  // Sum unrealized P/L across all open trades for the summary stat
+  let totalUnrealizedPL = 0;
+  let openTradeCount = 0;
+  for (const tx of transactions) {
+    const u = txUnrealizedPL(tx);
+    if (u != null) { totalUnrealizedPL += u; openTradeCount++; }
+  }
+
   // Each row is now a "receipt" — for sells, it shows the full ledger with notes.
   // BUYs and SHORTs are compact; SELLs expand to show entry, sell, and notes.
   const txRowsHtml = transactions.slice().reverse().map(tx => {
@@ -18805,6 +19185,13 @@ function renderTransactionsLedger(content, summary, subTabs) {
     const plPct = tx.realizedPLPct != null ? tx.realizedPLPct
                 : (tx.type === 'sell' && tx.entryPrice ? ((tx.price - tx.entryPrice) / tx.entryPrice) * 100 : null);
 
+    // Unrealized P/L for OPEN entry-side transactions (paper P/L if you marked
+    // to market right now). Skipped for sells/covers (those have realized P/L
+    // already), and skipped if no live price is available.
+    const unrealizedPL = txUnrealizedPL(tx);
+    const showUPL = unrealizedPL != null;
+    const uplColor = (unrealizedPL || 0) >= 0 ? '#5b8a72' : '#a5645a';
+
     // For SELL transactions, build the expanded receipt with all details and the position's note history
     let receiptDetail = '';
     if (tx.type === 'sell') {
@@ -18819,7 +19206,7 @@ function renderTransactionsLedger(content, summary, subTabs) {
         : '';
       receiptDetail = `
         <tr class="tx-receipt" data-tx="${tx.id}" style="display:none">
-          <td colspan="9" style="padding:0;background:var(--bg-elev);border-bottom:2px solid var(--rule)">
+          <td colspan="10" style="padding:0;background:var(--bg-elev);border-bottom:2px solid var(--rule)">
             <div style="padding:14px 18px;font-family:var(--mono);font-size:11px;line-height:1.7">
               <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));gap:14px;margin-bottom:10px">
                 <div><span style="color:var(--ink-faint);font-size:9px;letter-spacing:0.08em">COST BASIS</span><br><strong style="color:var(--ink)">${fmt$(tx.entryPrice)}</strong></div>
@@ -18846,6 +19233,7 @@ function renderTransactionsLedger(content, summary, subTabs) {
         <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${tx.fee ? fmt$(tx.fee) : '—'}</td>
         <td style="font-family:var(--mono);font-size:11px;color:${cashColor};font-weight:600">${cashFlow >= 0 ? '+' : ''}${fmt$(cashFlow)}</td>
         <td style="font-family:var(--mono);font-size:11px;color:${showPL ? plColor : 'var(--ink-faint)'};font-weight:${showPL ? '600' : '400'}">${showPL ? ((tx.realizedPL || 0) >= 0 ? '+' : '') + fmt$(tx.realizedPL || 0) : '—'}</td>
+        <td style="font-family:var(--mono);font-size:11px;color:${showUPL ? uplColor : 'var(--ink-faint)'};font-weight:${showUPL ? '600' : '400'}" title="${showUPL ? `Mark-to-market vs entry @ ${fmt$(tx.price)} · live ${fmt$(sbPriceFor(tx.ticker))}${txMultiplier(tx) > 1 ? ` · ${txMultiplier(tx)}× contract` : ''}` : 'No live price · or position already closed'}">${showUPL ? ((unrealizedPL || 0) >= 0 ? '+' : '') + fmt$(unrealizedPL) : '—'}</td>
         <td style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${tx.entryPrice != null && tx.type === 'sell' ? fmt$(tx.entryPrice) + ' @ ' + (tx.entryDate?.slice(0,10) || '—') : '—'}</td>
       </tr>
       ${receiptDetail}
@@ -18875,13 +19263,18 @@ function renderTransactionsLedger(content, summary, subTabs) {
         <div class="portfolio-stat-value" style="color:${totalRealizedPL >= 0 ? '#5b8a72' : '#a5645a'}">${totalRealizedPL >= 0 ? '+' : ''}${fmt$(totalRealizedPL)}</div>
         <div class="portfolio-stat-sub" style="color:${totalRealizedPLPct >= 0 ? '#5b8a72' : '#a5645a'}">${totalRealizedPLPct >= 0 ? '+' : ''}${totalRealizedPLPct.toFixed(2)}% on ${transactions.filter(t => t.type === 'sell').length} sell${transactions.filter(t => t.type === 'sell').length === 1 ? '' : 's'}</div>
       </div>
+      <div class="portfolio-stat" title="Paper P/L if you marked every open position to market right now. Excludes already-closed trades.">
+        <div class="portfolio-stat-label">Unrealized P/L</div>
+        <div class="portfolio-stat-value" style="color:${totalUnrealizedPL >= 0 ? '#5b8a72' : '#a5645a'}">${openTradeCount === 0 ? '—' : (totalUnrealizedPL >= 0 ? '+' : '') + fmt$(totalUnrealizedPL)}</div>
+        <div class="portfolio-stat-sub">${openTradeCount === 0 ? 'no open trades' : `mark-to-market across ${openTradeCount} open ${openTradeCount === 1 ? 'trade' : 'trades'}`}</div>
+      </div>
       <div class="portfolio-stat">
         <div class="portfolio-stat-label">Total Broker Fees</div>
         <div class="portfolio-stat-value" style="color:var(--ink-dim)">${fmt$(totalFees)}</div>
       </div>
     </div>
     <div style="padding:10px 14px;background:var(--bg-elev);font-family:var(--mono);font-size:10px;color:var(--ink-faint);line-height:1.7;border-left:2px solid var(--amber);margin-bottom:14px">
-      Immutable transaction ledger — no edits or deletions allowed. <strong style="color:var(--ink-dim)">Click any SELL row to expand the full receipt</strong> with cost basis, dates, P/L, and notes.
+      Immutable transaction ledger — no edits or deletions allowed. <strong style="color:var(--ink-dim)">Click any SELL row to expand the full receipt</strong> with cost basis, dates, P/L, and notes. <strong style="color:var(--ink-dim)">Unrealized P/L</strong> shows mark-to-market on open BUY/SHORT/BUY-TO-OPEN/SELL-TO-OPEN rows using the latest live price.
     </div>
     <div class="sb-table-wrap">
       <table class="sb-table portfolio-table">
@@ -18895,10 +19288,11 @@ function renderTransactionsLedger(content, summary, subTabs) {
             <th>Fee</th>
             <th>Cash Flow</th>
             <th>Realized P/L</th>
+            <th title="Mark-to-market against live price for open entry-side trades">Unrealized P/L</th>
             <th>Original Entry</th>
           </tr>
         </thead>
-        <tbody>${txRowsHtml || '<tr><td colspan="9" style="text-align:center;padding:30px;color:var(--ink-faint);font-style:italic">No transactions yet · add a position or sell one to create the first record</td></tr>'}</tbody>
+        <tbody>${txRowsHtml || '<tr><td colspan="10" style="text-align:center;padding:30px;color:var(--ink-faint);font-style:italic">No transactions yet · add a position or sell one to create the first record</td></tr>'}</tbody>
       </table>
     </div>
   `;
@@ -19803,6 +20197,18 @@ function _saveImportFromModal() {
   }
   document.getElementById('portfolio-add-modal').remove();
   flashStatus(`Imported ${added} · fetching data in background…`, 'success');
+  // System notification: remind user to add these to tickers.txt later.
+  // This is the kind of "thing I need to do" the user asked the notifications
+  // system to surface.
+  if (added > 0 && typeof addNotification === 'function') {
+    addNotification({
+      title: `${added} ticker${added === 1 ? '' : 's'} need adding to tickers.txt`,
+      detail: `Import to GoodGlobe Index complete. Open Stock Book → GoodGlobe Index sub-tab → Download Manual .txt, then paste into your repo's data/tickers.txt so the nightly pipeline picks them up.`,
+      category: 'pipeline',
+      source: 'system',
+      dedupKey: `import-pending-tickers-txt`,   // dedupes so multiple imports don't pile up
+    });
+  }
   // Stagger ingest calls so we don't hammer Yahoo with N parallel requests on
   // a bulk paste. 400ms spacing yields ~2.5 req/sec which is well within the
   // unauthenticated rate budget for most sources.
@@ -28515,3 +28921,1285 @@ document.addEventListener('DOMContentLoaded', () => {
     else console.warn('[fab] openAddPositionModal not available');
   });
 });
+
+// ============================================================
+//   NOTIFICATIONS SYSTEM
+//
+//   Persistent reminder/notification system stored in localStorage.
+//   Each notification has:
+//     - id          : unique
+//     - title       : short headline
+//     - detail      : optional longer description
+//     - category    : 'todo' | 'fix' | 'pipeline' | 'target' | 'note'
+//     - createdAt   : ISO timestamp
+//     - fireAt      : ISO timestamp when it becomes "active"
+//     - status      : 'pending' (fireAt > now) | 'active' (fired, unread)
+//                   | 'read' | 'dismissed'
+//     - source      : 'manual' | 'system' (auto-created by the app)
+//
+//   Auto-generated system notifications fire when:
+//     - Manual ticker imports happen → "N tickers need adding to tickers.txt"
+//     - Stockbook fetch errors → "Failed to fetch X — needs attention"
+//     - Other system events as they're added later
+//
+//   Future hook: price-target notifications will fire when a watched
+//   ticker crosses a level. For now we have the schema + UI; the price-
+//   check loop hooks into the existing live-quote refresh.
+// ============================================================
+const NOTIFICATIONS_KEY = 'valuatio.notifications.v1';
+
+function loadNotifications() {
+  try {
+    const raw = localStorage.getItem(NOTIFICATIONS_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch (e) {
+    console.warn('[notif] load failed:', e.message);
+    return [];
+  }
+}
+
+function saveNotifications(arr) {
+  try {
+    localStorage.setItem(NOTIFICATIONS_KEY, JSON.stringify(arr));
+  } catch (e) {
+    console.warn('[notif] save failed:', e.message);
+  }
+}
+
+// Add a notification. If a similar one already exists (matching dedupKey),
+// the existing one's timestamps update instead of creating a duplicate.
+// `dedupKey` is useful for system-generated notifications — same warning
+// shouldn't spam the list every refresh.
+function addNotification({
+  title, detail, category = 'todo',
+  fireAt = null, source = 'manual', dedupKey = null,
+}) {
+  if (!title || !title.trim()) return null;
+  const arr = loadNotifications();
+  const now = new Date().toISOString();
+  const fire = fireAt || now;
+  if (dedupKey) {
+    const existing = arr.find(n => n.dedupKey === dedupKey && n.status !== 'dismissed');
+    if (existing) {
+      existing.title = title;
+      existing.detail = detail || existing.detail;
+      existing.fireAt = fire;
+      existing.lastUpdated = now;
+      // Keep status — don't re-mark an already-read notif as active
+      saveNotifications(arr);
+      updateNotifBadge();
+      return existing.id;
+    }
+  }
+  const id = `n-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const notif = {
+    id, title: title.trim(), detail: (detail || '').trim(), category,
+    createdAt: now, fireAt: fire,
+    status: new Date(fire).getTime() <= Date.now() ? 'active' : 'pending',
+    source, dedupKey: dedupKey || null,
+  };
+  arr.push(notif);
+  saveNotifications(arr);
+  updateNotifBadge();
+  return id;
+}
+
+function updateNotificationStatus(id, status) {
+  const arr = loadNotifications();
+  const n = arr.find(x => x.id === id);
+  if (!n) return;
+  n.status = status;
+  saveNotifications(arr);
+  updateNotifBadge();
+}
+
+function deleteNotification(id) {
+  const arr = loadNotifications().filter(n => n.id !== id);
+  saveNotifications(arr);
+  updateNotifBadge();
+}
+
+// Check all pending notifications and promote any whose fire time has arrived.
+// Runs on a 60-sec interval (cheap) so reminders surface promptly.
+function processNotificationQueue() {
+  const arr = loadNotifications();
+  const now = Date.now();
+  let changed = false;
+  for (const n of arr) {
+    if (n.status === 'pending' && new Date(n.fireAt).getTime() <= now) {
+      n.status = 'active';
+      changed = true;
+    }
+  }
+  if (changed) {
+    saveNotifications(arr);
+    updateNotifBadge();
+    // If the drawer is open, refresh it
+    const drawer = document.getElementById('notif-drawer');
+    if (drawer && drawer.style.display !== 'none') renderNotificationsList();
+  }
+}
+
+function updateNotifBadge() {
+  const badge = document.getElementById('notif-badge');
+  if (!badge) return;
+  const arr = loadNotifications();
+  const activeCount = arr.filter(n => n.status === 'active').length;
+  if (activeCount > 0) {
+    badge.textContent = activeCount > 99 ? '99+' : String(activeCount);
+    badge.style.display = '';
+  } else {
+    badge.style.display = 'none';
+  }
+}
+
+// Format relative time: "5m ago", "2h ago", "3d ago", "in 2h", "in 3d"
+function fmtRelativeTime(iso) {
+  if (!iso) return '';
+  const target = new Date(iso).getTime();
+  const now = Date.now();
+  const diff = target - now;
+  const abs = Math.abs(diff);
+  const isFuture = diff > 0;
+  const min = Math.round(abs / 60000);
+  const hr  = Math.round(abs / 3600000);
+  const day = Math.round(abs / 86400000);
+  let label;
+  if (min < 1) label = 'just now';
+  else if (min < 60) label = `${min}m`;
+  else if (hr < 24)  label = `${hr}h`;
+  else label = `${day}d`;
+  if (label === 'just now') return label;
+  return isFuture ? `in ${label}` : `${label} ago`;
+}
+
+function renderNotificationsList() {
+  const list = document.getElementById('notif-list');
+  if (!list) return;
+  const arr = loadNotifications();
+  // Sort: active (unread fired) first → pending (scheduled) → read → dismissed last
+  const statusRank = { active: 0, pending: 1, read: 2, dismissed: 3 };
+  const sorted = arr.slice().sort((a, b) => {
+    const sa = statusRank[a.status] ?? 9;
+    const sb = statusRank[b.status] ?? 9;
+    if (sa !== sb) return sa - sb;
+    // Within same status, most recently fired/scheduled first
+    return new Date(b.fireAt).getTime() - new Date(a.fireAt).getTime();
+  });
+  if (sorted.length === 0) {
+    list.innerHTML = `<div class="notif-empty">No notifications yet. Add a reminder above, or the system will create them as it detects issues.</div>`;
+    return;
+  }
+  list.innerHTML = sorted.map(n => {
+    const isUnfired = n.status === 'pending';
+    const isDismissed = n.status === 'dismissed';
+    const catLabel = ({ todo: 'TO-DO', fix: 'FIX', pipeline: 'PIPELINE', target: 'TARGET', note: 'NOTE' })[n.category] || n.category.toUpperCase();
+    return `
+      <div class="notif-item cat-${n.category} ${isUnfired ? 'unfired' : ''} ${isDismissed ? 'dismissed' : ''}" data-id="${n.id}">
+        <div class="notif-item-head">
+          <div class="notif-item-title">${escapeHtml(n.title)}</div>
+          <div class="notif-item-cat">${catLabel}</div>
+        </div>
+        ${n.detail ? `<div class="notif-item-detail">${escapeHtml(n.detail)}</div>` : ''}
+        <div class="notif-item-meta">
+          <span>${isUnfired ? `Fires ${fmtRelativeTime(n.fireAt)}` : `${fmtRelativeTime(n.fireAt)}${n.source === 'system' ? ' · auto' : ''}`}</span>
+          <span class="notif-item-actions">
+            ${n.status === 'active' ? `<button class="notif-action-btn" data-act="read" data-id="${n.id}">Mark read</button>` : ''}
+            ${n.status === 'read'   ? `<button class="notif-action-btn" data-act="active" data-id="${n.id}" title="Mark as unread again">Unread</button>` : ''}
+            ${n.status !== 'dismissed' ? `<button class="notif-action-btn" data-act="dismiss" data-id="${n.id}">Dismiss</button>` : `<button class="notif-action-btn" data-act="delete" data-id="${n.id}">Delete</button>`}
+          </span>
+        </div>
+      </div>
+    `;
+  }).join('');
+  // Wire action buttons
+  list.querySelectorAll('.notif-action-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = btn.dataset.id;
+      const act = btn.dataset.act;
+      if (act === 'read')     updateNotificationStatus(id, 'read');
+      if (act === 'active')   updateNotificationStatus(id, 'active');
+      if (act === 'dismiss')  updateNotificationStatus(id, 'dismissed');
+      if (act === 'delete')   deleteNotification(id);
+      renderNotificationsList();
+    });
+  });
+}
+
+// ============================================================
+//   HOME PANEL — settings, preferences, import/export
+// ============================================================
+const PREFS_KEY = 'valuatio.prefs.v1';
+
+function loadPrefs() {
+  try { return JSON.parse(localStorage.getItem(PREFS_KEY) || '{}'); }
+  catch { return {}; }
+}
+function savePrefs(p) {
+  try { localStorage.setItem(PREFS_KEY, JSON.stringify(p)); } catch {}
+}
+
+function applyPrefs() {
+  const p = loadPrefs();
+  if (p.theme) document.documentElement.setAttribute('data-theme', p.theme);
+  if (p.accentColor) document.documentElement.style.setProperty('--amber', p.accentColor);
+  if (p.density === 'compact') document.documentElement.setAttribute('data-density', 'compact');
+  else document.documentElement.removeAttribute('data-density');
+  if (p.hideTape === true) {
+    const tape = document.getElementById('ticker-tape');
+    if (tape) tape.style.display = 'none';
+  }
+}
+
+function renderHomeStats() {
+  const grid = document.getElementById('home-stats-grid');
+  if (!grid) return;
+  const portfolio = (typeof loadPortfolio === 'function') ? loadPortfolio() : [];
+  const txCount = (typeof loadTransactions === 'function') ? loadTransactions().length : 0;
+  const ggCount = (typeof getGoodGlobeIndexEntries === 'function') ? getGoodGlobeIndexEntries().length : 0;
+  const sbCount = state.stockbook?.rows?.length || 0;
+  const notifCount = loadNotifications().filter(n => n.status === 'active').length;
+  const stats = [
+    { label: 'Portfolio Positions', val: portfolio.length },
+    { label: 'Transactions Logged', val: txCount },
+    { label: 'GoodGlobe Index',     val: ggCount },
+    { label: 'Stock Book Rows',     val: sbCount },
+    { label: 'Active Notifications', val: notifCount },
+    { label: 'Theme',                val: (loadPrefs().theme || 'dark') },
+  ];
+  grid.innerHTML = stats.map(s => `
+    <div class="home-stat-card">
+      <div class="home-stat-card-label">${escapeHtml(s.label)}</div>
+      <div class="home-stat-card-value">${escapeHtml(String(s.val))}</div>
+    </div>
+  `).join('');
+}
+
+// Storage usage breakdown — surfaces what's taking space so user knows
+// what they can safely clear.
+function renderStorageStats() {
+  const wrap = document.getElementById('home-storage-stats');
+  if (!wrap) return;
+  const buckets = {};
+  let total = 0;
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (!k) continue;
+    const v = localStorage.getItem(k) || '';
+    const size = (k.length + v.length) * 2;  // rough UTF-16 bytes
+    total += size;
+    // Bucket by prefix
+    const bucket = k.startsWith('valuatio.news')      ? 'News'
+                 : k.startsWith('valuatio.transactions') ? 'Transactions'
+                 : k.startsWith('valuatio.cashPosition') ? 'Cash'
+                 : k.startsWith('valuatio.personalBook') ? 'Portfolio'
+                 : k.startsWith('valuatio.probability')  ? 'Probability'
+                 : k.startsWith('valuatio.leadership')   ? 'Leadership'
+                 : k.startsWith('valuatio.cpi')          ? 'CPI'
+                 : k.startsWith('valuatio.goodglobe')    ? 'GoodGlobe Index'
+                 : k.startsWith('valuatio.notifications')? 'Notifications'
+                 : k.startsWith('valuatio.prefs')        ? 'Preferences'
+                 : k.startsWith('valuatio.overrides')    ? 'Overrides'
+                 : k.startsWith('valuatio.bonds')        ? 'Bonds'
+                 : k.startsWith('valuatio.priceHistory') ? 'Price History'
+                 : k.startsWith('valuatio.macro')        ? 'Macro'
+                 : 'Other';
+    buckets[bucket] = (buckets[bucket] || 0) + size;
+  }
+  const fmt = (b) => b < 1024 ? `${b}B` : b < 1024 * 1024 ? `${(b/1024).toFixed(1)}KB` : `${(b/1024/1024).toFixed(2)}MB`;
+  const rows = Object.entries(buckets).sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `<div><span class="key">${escapeHtml(k)}:</span> <span class="val">${fmt(v)}</span></div>`)
+    .join('');
+  wrap.innerHTML = rows + `<div style="margin-top:6px;padding-top:6px;border-top:1px solid var(--rule)"><span class="key">Total used:</span> <span class="val">${fmt(total)}</span> <span class="key">· browsers typically allow ~5-10MB</span></div>`;
+}
+
+// ============================================================
+//   PDF IMPORT — smart routing of imported PDFs
+//
+//   PDFs have a few known shapes in this app:
+//   (a) Leadership export (contains a JSON sentinel marker we wrote on export)
+//   (b) Generic financial PDF (10-K, annual report, ticker report) — extract
+//       text and try to identify a ticker mentioned in the first page; if so,
+//       attach as an enrichment note to that stockbook row's notes
+//   (c) Unknown — store the raw text in a "imported" bucket so the data isn't
+//       lost; user can browse it later
+//
+//   This is best-effort. The goal is "don't lose data" — even if we can't
+//   classify, the text is captured locally and surfaced in the import log.
+// ============================================================
+async function handleHomeImportFile(file, logEl) {
+  const append = (msg, cls = '') => {
+    const div = document.createElement('div');
+    div.className = `home-import-log-entry ${cls}`;
+    div.innerHTML = msg;
+    logEl.insertBefore(div, logEl.firstChild);
+  };
+  try {
+    append(`<strong>${escapeHtml(file.name)}</strong> · ${(file.size/1024).toFixed(1)}KB · reading…`);
+    const ext = file.name.toLowerCase().split('.').pop();
+
+    // ===== JSON full-snapshot import =====
+    if (ext === 'json') {
+      const text = await file.text();
+      let parsed;
+      try { parsed = JSON.parse(text); }
+      catch (e) {
+        append(`Could not parse JSON: ${escapeHtml(e.message)}`, 'error');
+        return;
+      }
+      // Full snapshot has a _valuatio.exportFormat marker we wrote on export
+      if (parsed._valuatio && parsed._valuatio.exportFormat === 'full-snapshot') {
+        const keys = Object.keys(parsed.localStorage || {});
+        if (!confirm(`Restore ${keys.length} keys from snapshot taken ${parsed._valuatio.exportedAt}?\n\nThis OVERWRITES existing data. A backup of your current state will be downloaded first.`)) {
+          append('Restore cancelled', 'warn');
+          return;
+        }
+        // Auto-backup current state first
+        try {
+          const backup = exportFullSnapshot();
+          downloadJsonBlob(backup, `valuatio-backup-before-restore-${Date.now()}.json`);
+        } catch (e) { console.warn('Pre-restore backup failed:', e); }
+        // Restore
+        let restored = 0;
+        for (const [k, v] of Object.entries(parsed.localStorage || {})) {
+          try { localStorage.setItem(k, v); restored++; } catch {}
+        }
+        append(`Restored ${restored} localStorage keys · refresh the page to see all data`, 'ok');
+        addNotification({
+          title: `Snapshot restored — ${restored} keys`,
+          detail: `Imported from ${file.name}. Backup of pre-restore state was downloaded.`,
+          category: 'note', source: 'system',
+        });
+        return;
+      }
+      // Leadership profile JSON (export from leadership manager)
+      if (parsed.name && (parsed.slug || parsed.qid)) {
+        if (typeof saveLeadershipPerson === 'function') {
+          saveLeadershipPerson(parsed);
+          append(`Imported leadership profile: <strong>${escapeHtml(parsed.name)}</strong>`, 'ok');
+          return;
+        }
+      }
+      // Unknown JSON — store under valuatio.imported.{filename}
+      const importKey = `valuatio.imported.${file.name.replace(/\.json$/i, '')}`;
+      localStorage.setItem(importKey, text);
+      append(`Unknown JSON format — stored as <code>${escapeHtml(importKey)}</code>`, 'warn');
+      return;
+    }
+
+    // ===== TXT import — treat as ticker list (one per line) =====
+    if (ext === 'txt') {
+      const text = await file.text();
+      const tickers = text.split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+      let added = 0;
+      for (const line of tickers) {
+        const tic = line.split(/\s+/)[0].toUpperCase();
+        if (tic && typeof recordInGoodGlobeIndex === 'function') {
+          recordInGoodGlobeIndex(tic, 'Manual', {
+            assetType: typeof subClassifyAsset === 'function' ? subClassifyAsset(tic) : 'equity',
+            source: 'manual_import',
+          });
+          added++;
+        }
+      }
+      append(`Added ${added} tickers to GoodGlobe Index from <strong>${escapeHtml(file.name)}</strong>`, 'ok');
+      addNotification({
+        title: `${added} tickers imported from ${file.name}`,
+        detail: `These need to be added to your data/tickers.txt in the GitHub repo so the nightly pipeline picks them up. Open Stock Book → GoodGlobe Index → Download Manual .txt.`,
+        category: 'pipeline', source: 'system',
+        dedupKey: `import-txt-${file.name}`,
+      });
+      return;
+    }
+
+    // ===== CSV import — try to detect transactions or a generic table =====
+    if (ext === 'csv') {
+      const text = await file.text();
+      const lines = text.split(/\r?\n/).filter(l => l.trim());
+      const importKey = `valuatio.imported.csv.${file.name}.${Date.now()}`;
+      localStorage.setItem(importKey, text);
+      append(`CSV with ${lines.length} rows stored as <code>${escapeHtml(importKey)}</code> · review manually`, 'warn');
+      addNotification({
+        title: `CSV imported: ${file.name}`,
+        detail: `${lines.length} rows captured at ${importKey}. Manual review recommended.`,
+        category: 'note', source: 'system',
+      });
+      return;
+    }
+
+    // ===== PDF import — extract text via pdf.js, smart-route =====
+    if (ext === 'pdf') {
+      if (!window.pdfjsLib) {
+        append(`PDF library not loaded — text extraction unavailable. Raw file stored as base64.`, 'warn');
+        const buf = await file.arrayBuffer();
+        const b64 = btoa(String.fromCharCode(...new Uint8Array(buf).slice(0, 5_000_000)));   // cap at 5MB to avoid blowing localStorage
+        localStorage.setItem(`valuatio.imported.pdf.${file.name}.${Date.now()}`, b64);
+        return;
+      }
+      const buf = await file.arrayBuffer();
+      const pdf = await window.pdfjsLib.getDocument({ data: buf }).promise;
+      append(`Reading ${pdf.numPages} pages…`);
+      const pages = [];
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const tc = await page.getTextContent();
+        pages.push(tc.items.map(it => it.str).join(' '));
+      }
+      const fullText = pages.join('\n\n').trim();
+
+      // Detect leadership PDF (we embed a sentinel JSON marker on export)
+      const sentinelStart = '<<<VALUATIO_LEADERSHIP_DATA';
+      const sentinelEnd   = 'VALUATIO_LEADERSHIP_DATA>>>';
+      const startIdx = fullText.indexOf(sentinelStart);
+      const endIdx   = fullText.indexOf(sentinelEnd);
+      if (startIdx >= 0 && endIdx > startIdx) {
+        const jsonStr = fullText.slice(startIdx + sentinelStart.length, endIdx).trim();
+        try {
+          const data = JSON.parse(jsonStr);
+          if (data.name && typeof saveLeadershipPerson === 'function') {
+            saveLeadershipPerson(data);
+            append(`Restored leadership profile: <strong>${escapeHtml(data.name)}</strong>`, 'ok');
+            return;
+          }
+        } catch (e) {
+          append(`Sentinel found but JSON failed to parse: ${escapeHtml(e.message)}`, 'warn');
+        }
+      }
+
+      // Try to find a ticker mentioned in the first page (common in 10-K covers)
+      const firstPage = pages[0] || '';
+      const tickerMatch = firstPage.match(/\b(?:Common Stock|Symbol|Ticker)[:\s]+([A-Z]{1,5})\b/) ||
+                          firstPage.match(/\(([A-Z]{2,5}):\s*[A-Z]+\)/) ||   // (NASDAQ: AAPL)
+                          firstPage.match(/\bNYSE:\s*([A-Z]{1,5})\b/) ||
+                          firstPage.match(/\bNasdaq:\s*([A-Z]{1,5})\b/i);
+      const detectedTicker = tickerMatch?.[1]?.toUpperCase();
+
+      if (detectedTicker) {
+        // Attach as a note on the stockbook row (or queue for manual review)
+        const importKey = `valuatio.imported.pdf.${detectedTicker}.${Date.now()}`;
+        localStorage.setItem(importKey, fullText.slice(0, 100_000));   // cap at 100KB per PDF
+        append(`Detected ticker <strong>${escapeHtml(detectedTicker)}</strong> · ${fullText.length.toLocaleString()} chars stored at <code>${escapeHtml(importKey)}</code>`, 'ok');
+        addNotification({
+          title: `PDF imported: ${detectedTicker}`,
+          detail: `${file.name} (${pdf.numPages} pages) was indexed and linked to ticker ${detectedTicker}. Full text stored locally.`,
+          category: 'note', source: 'system',
+        });
+        // Also flag the ticker in GoodGlobe Index if missing
+        if (typeof recordInGoodGlobeIndex === 'function') {
+          recordInGoodGlobeIndex(detectedTicker, 'Manual', { source: 'pdf_import' });
+        }
+        return;
+      }
+
+      // Generic PDF — store with a generated key
+      const importKey = `valuatio.imported.pdf.unrouted.${file.name.replace(/\.pdf$/i, '')}.${Date.now()}`;
+      localStorage.setItem(importKey, fullText.slice(0, 100_000));
+      append(`No ticker auto-detected · ${pdf.numPages} pages, ${fullText.length.toLocaleString()} chars stored at <code>${escapeHtml(importKey)}</code>`, 'warn');
+      addNotification({
+        title: `PDF imported (no ticker detected): ${file.name}`,
+        detail: `${pdf.numPages} pages, ${fullText.length.toLocaleString()} chars stored locally. Manual review recommended.`,
+        category: 'fix', source: 'system',
+      });
+      return;
+    }
+
+    append(`Unsupported file type <code>.${ext}</code>`, 'error');
+  } catch (e) {
+    console.error('[import]', e);
+    append(`Failed: ${escapeHtml(e.message)}`, 'error');
+  }
+}
+
+// Export everything in localStorage as a versioned JSON snapshot
+function exportFullSnapshot() {
+  const snapshot = {
+    _valuatio: {
+      exportFormat: 'full-snapshot',
+      exportFormatVersion: 1,
+      exportedAt: new Date().toISOString(),
+      appVersion: 'valuatio-2026',
+    },
+    localStorage: {},
+  };
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (!k) continue;
+    // Only export valuatio.* keys + a few related ones
+    if (k.startsWith('valuatio.') || k.startsWith('sb-col-widths-')) {
+      snapshot.localStorage[k] = localStorage.getItem(k);
+    }
+  }
+  return snapshot;
+}
+
+function downloadJsonBlob(obj, filename) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
+// Build a human-readable PDF report — portfolio summary + transactions +
+// GoodGlobe Index + notifications + storage stats. Uses jsPDF if loaded,
+// falls back to a printable HTML page in a new tab otherwise.
+async function exportPdfReport() {
+  // Aggregate the report content
+  const portfolio = (typeof loadPortfolio === 'function') ? loadPortfolio() : [];
+  const txs = (typeof loadTransactions === 'function') ? loadTransactions() : [];
+  const gg = (typeof getGoodGlobeIndexEntries === 'function') ? getGoodGlobeIndexEntries() : [];
+  const notifs = loadNotifications();
+  const cash = (typeof getCashPosition === 'function') ? getCashPosition() : 0;
+
+  const html = `
+    <!DOCTYPE html><html><head><meta charset="utf-8"><title>Valuatio Report — ${new Date().toISOString().slice(0,10)}</title>
+    <style>
+      body { font-family: Georgia, serif; padding: 32px; max-width: 800px; margin: auto; color: #222; }
+      h1 { font-size: 28px; margin: 0 0 4px; }
+      h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.12em; color: #666; margin: 28px 0 8px; border-bottom: 1px solid #ccc; padding-bottom: 4px; }
+      .sub { color: #888; font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 24px; }
+      table { width: 100%; border-collapse: collapse; font-family: monospace; font-size: 10px; }
+      th, td { padding: 5px 8px; text-align: left; border-bottom: 1px solid #ddd; }
+      th { background: #f5f5f5; font-weight: 700; }
+      .stat { display: inline-block; padding: 10px 14px; margin: 0 6px 6px 0; background: #fafafa; border-left: 3px solid #d4a24c; }
+      .stat-label { font-size: 9px; color: #888; text-transform: uppercase; letter-spacing: 0.08em; }
+      .stat-value { font-size: 18px; font-weight: 700; color: #222; font-family: monospace; }
+      .print-note { color: #999; font-size: 9px; margin-top: 30px; }
+      .empty { color: #aaa; font-style: italic; padding: 6px 0; }
+      @media print { .no-print { display: none; } }
+    </style></head><body>
+      <h1>Valuatio Portfolio Report</h1>
+      <div class="sub">Exported ${new Date().toLocaleString()} · ${portfolio.length} positions · ${txs.length} transactions</div>
+      <div class="no-print" style="background:#fffae6;padding:12px 16px;border-left:3px solid #d4a24c;font-size:12px;margin-bottom:24px">
+        Use your browser's <strong>Print → Save as PDF</strong> (Ctrl+P / ⌘P) to save this report as a PDF.
+      </div>
+
+      <h2>Portfolio Summary</h2>
+      <div class="stat"><div class="stat-label">Cash Position</div><div class="stat-value">$${cash.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</div></div>
+      <div class="stat"><div class="stat-label">Positions</div><div class="stat-value">${portfolio.length}</div></div>
+      <div class="stat"><div class="stat-label">Transactions</div><div class="stat-value">${txs.length}</div></div>
+      <div class="stat"><div class="stat-label">GoodGlobe Index</div><div class="stat-value">${gg.length}</div></div>
+
+      <h2>Positions</h2>
+      ${portfolio.length === 0 ? '<div class="empty">No positions</div>' : `
+      <table><thead><tr><th>Ticker</th><th>Position</th><th>Qty</th><th>Entry</th><th>Fees</th><th>Added</th></tr></thead><tbody>
+        ${portfolio.map(p => `<tr><td><strong>${p.ticker}</strong></td><td>${p.position||''}</td><td>${p.qty??'—'}</td><td>${p.costBasis?'$'+p.costBasis.toFixed(2):'—'}</td><td>${p.fees?'$'+p.fees.toFixed(2):'—'}</td><td>${(p.addedAt||'').slice(0,10)}</td></tr>`).join('')}
+      </tbody></table>`}
+
+      <h2>Transactions Ledger</h2>
+      ${txs.length === 0 ? '<div class="empty">No transactions</div>' : `
+      <table><thead><tr><th>Date</th><th>Type</th><th>Ticker</th><th>Qty</th><th>Price</th><th>Fee</th><th>Realized P/L</th></tr></thead><tbody>
+        ${txs.slice().reverse().map(t => `<tr><td>${(t.soldDate||t.entryDate||t.ts||'').slice(0,10)}</td><td>${(t.type||'').toUpperCase()}</td><td>${t.ticker||''}</td><td>${t.qty??''}</td><td>$${(t.price||0).toFixed(2)}</td><td>${t.fee?'$'+t.fee.toFixed(2):'—'}</td><td>${t.realizedPL!=null?'$'+t.realizedPL.toFixed(2):'—'}</td></tr>`).join('')}
+      </tbody></table>`}
+
+      <h2>GoodGlobe Index</h2>
+      ${gg.length === 0 ? '<div class="empty">No tickers in index</div>' : `
+      <table><thead><tr><th>Ticker</th><th>Asset Type</th><th>Flags</th><th>First</th><th>Last</th></tr></thead><tbody>
+        ${gg.map(e => `<tr><td><strong>${e.ticker}</strong></td><td>${e.assetType||'equity'}</td><td>${(e.flags||[]).join(', ')}</td><td>${(e.firstFlaggedAt||'').slice(0,10)}</td><td>${(e.lastFlaggedAt||'').slice(0,10)}</td></tr>`).join('')}
+      </tbody></table>`}
+
+      <h2>Notifications</h2>
+      ${notifs.length === 0 ? '<div class="empty">No notifications</div>' : `
+      <table><thead><tr><th>Status</th><th>Category</th><th>Title</th><th>Fires</th></tr></thead><tbody>
+        ${notifs.map(n => `<tr><td>${n.status}</td><td>${n.category}</td><td>${n.title}${n.detail?'<br><span style="color:#888;font-size:9px">'+n.detail+'</span>':''}</td><td>${(n.fireAt||'').slice(0,16).replace('T',' ')}</td></tr>`).join('')}
+      </tbody></table>`}
+
+      <div class="print-note">Generated by Valuatio · all data stored locally in your browser</div>
+    </body></html>
+  `;
+  const w = window.open('', '_blank');
+  if (!w) {
+    alert('Pop-up blocked. Please allow pop-ups for this site and try again.');
+    return;
+  }
+  w.document.write(html);
+  w.document.close();
+}
+
+// ============================================================
+//   WIRE EVERYTHING — DOMContentLoaded init
+// ============================================================
+document.addEventListener('DOMContentLoaded', () => {
+  // Apply saved prefs early so the UI doesn't flash with defaults
+  applyPrefs();
+
+  // Notif button → open drawer
+  document.getElementById('notif-btn')?.addEventListener('click', () => {
+    document.getElementById('notif-drawer').style.display = '';
+    document.getElementById('notif-drawer-backdrop').style.display = '';
+    renderNotificationsList();
+  });
+
+  // Home button → open drawer
+  document.getElementById('home-btn')?.addEventListener('click', () => {
+    document.getElementById('home-drawer').style.display = '';
+    document.getElementById('home-drawer-backdrop').style.display = '';
+    renderHomeStats();
+    renderStorageStats();
+    // Sync active prefs to the controls
+    const p = loadPrefs();
+    document.querySelectorAll('#pref-theme-seg .seg-btn').forEach(b => b.classList.toggle('active', b.dataset.val === (p.theme || 'dark')));
+    document.querySelectorAll('#pref-density-seg .seg-btn').forEach(b => b.classList.toggle('active', b.dataset.val === (p.density || 'comfortable')));
+    document.querySelectorAll('#pref-tape-seg .seg-btn').forEach(b => b.classList.toggle('active', b.dataset.val === (p.hideTape ? 'off' : 'on')));
+    document.querySelectorAll('#pref-accent-swatches .color-swatch').forEach(s => s.classList.toggle('active', s.dataset.color === (p.accentColor || '#d4a24c')));
+  });
+
+  // ---- Notification "Add" form wiring ----
+  document.querySelectorAll('#notif-when-seg .seg-btn').forEach(b => {
+    b.addEventListener('click', () => {
+      document.querySelectorAll('#notif-when-seg .seg-btn').forEach(x => x.classList.remove('active'));
+      b.classList.add('active');
+      const customInput = document.getElementById('notif-new-custom');
+      customInput.style.display = b.dataset.val === 'custom' ? '' : 'none';
+    });
+  });
+  document.getElementById('notif-add-btn')?.addEventListener('click', () => {
+    const title = document.getElementById('notif-new-title').value;
+    const detail = document.getElementById('notif-new-detail').value;
+    const category = document.getElementById('notif-new-category').value;
+    const when = document.querySelector('#notif-when-seg .seg-btn.active')?.dataset.val || 'now';
+    let fireAt = new Date();
+    if (when === '1h') fireAt = new Date(Date.now() + 3600000);
+    else if (when === '1d') fireAt = new Date(Date.now() + 86400000);
+    else if (when === '1w') fireAt = new Date(Date.now() + 7 * 86400000);
+    else if (when === 'custom') {
+      const v = document.getElementById('notif-new-custom').value;
+      if (!v) { alert('Pick a custom date/time first'); return; }
+      fireAt = new Date(v);
+    }
+    if (!title.trim()) { alert('Title is required'); return; }
+    addNotification({
+      title, detail, category, fireAt: fireAt.toISOString(), source: 'manual',
+    });
+    document.getElementById('notif-new-title').value = '';
+    document.getElementById('notif-new-detail').value = '';
+    renderNotificationsList();
+  });
+
+  // ---- Clear-dismissed button ----
+  document.getElementById('notif-clear-dismissed-btn')?.addEventListener('click', () => {
+    const arr = loadNotifications().filter(n => n.status !== 'dismissed');
+    saveNotifications(arr);
+    updateNotifBadge();
+    renderNotificationsList();
+  });
+
+  // ---- Home → Preferences ----
+  document.querySelectorAll('#pref-theme-seg .seg-btn').forEach(b => {
+    b.addEventListener('click', () => {
+      document.querySelectorAll('#pref-theme-seg .seg-btn').forEach(x => x.classList.remove('active'));
+      b.classList.add('active');
+      const p = loadPrefs();
+      p.theme = b.dataset.val;
+      savePrefs(p);
+      applyPrefs();
+    });
+  });
+  document.querySelectorAll('#pref-density-seg .seg-btn').forEach(b => {
+    b.addEventListener('click', () => {
+      document.querySelectorAll('#pref-density-seg .seg-btn').forEach(x => x.classList.remove('active'));
+      b.classList.add('active');
+      const p = loadPrefs();
+      p.density = b.dataset.val;
+      savePrefs(p);
+      applyPrefs();
+    });
+  });
+  document.querySelectorAll('#pref-tape-seg .seg-btn').forEach(b => {
+    b.addEventListener('click', () => {
+      document.querySelectorAll('#pref-tape-seg .seg-btn').forEach(x => x.classList.remove('active'));
+      b.classList.add('active');
+      const p = loadPrefs();
+      p.hideTape = b.dataset.val === 'off';
+      savePrefs(p);
+      const tape = document.getElementById('ticker-tape');
+      if (tape) tape.style.display = p.hideTape ? 'none' : '';
+    });
+  });
+  document.querySelectorAll('#pref-accent-swatches .color-swatch').forEach(s => {
+    s.addEventListener('click', () => {
+      document.querySelectorAll('#pref-accent-swatches .color-swatch').forEach(x => x.classList.remove('active'));
+      s.classList.add('active');
+      const p = loadPrefs();
+      p.accentColor = s.dataset.color;
+      savePrefs(p);
+      applyPrefs();
+    });
+  });
+
+  // ---- Home → Import file ----
+  const importInput = document.getElementById('home-import-file');
+  const importZone = document.getElementById('home-import-zone');
+  const importLog = document.getElementById('home-import-log');
+  importInput?.addEventListener('change', async (e) => {
+    const files = Array.from(e.target.files || []);
+    for (const f of files) await handleHomeImportFile(f, importLog);
+    importInput.value = '';
+    renderHomeStats();
+    renderStorageStats();
+  });
+  // Drag-drop
+  if (importZone) {
+    importZone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      importZone.classList.add('dragover');
+    });
+    importZone.addEventListener('dragleave', () => importZone.classList.remove('dragover'));
+    importZone.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      importZone.classList.remove('dragover');
+      const files = Array.from(e.dataTransfer?.files || []);
+      for (const f of files) await handleHomeImportFile(f, importLog);
+      renderHomeStats();
+      renderStorageStats();
+    });
+  }
+
+  // ---- Home → Export buttons ----
+  document.getElementById('home-export-json-btn')?.addEventListener('click', () => {
+    const snap = exportFullSnapshot();
+    const sizeKb = (JSON.stringify(snap).length / 1024).toFixed(1);
+    downloadJsonBlob(snap, `valuatio-snapshot-${new Date().toISOString().slice(0,10)}.json`);
+    if (typeof flashStatus === 'function') flashStatus(`Snapshot exported (${sizeKb}KB)`, 'success');
+  });
+  document.getElementById('home-export-pdf-btn')?.addEventListener('click', () => {
+    exportPdfReport();
+  });
+  document.getElementById('home-export-csv-btn')?.addEventListener('click', () => {
+    const txs = (typeof loadTransactions === 'function') ? loadTransactions() : [];
+    const header = 'timestamp,type,ticker,qty,price,fee,cost,proceeds,realized_pl,entry_date,entry_price,notes\n';
+    const csvEscape = (v) => v == null ? '' : (typeof v === 'string' && /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : String(v));
+    const rows = txs.map(t => [
+      t.ts || t.soldDate || t.entryDate || '',
+      t.type, t.ticker, t.qty, t.price, t.fee, t.cost, t.proceeds, t.realizedPL,
+      t.entryDate, t.entryPrice, t.notes,
+    ].map(csvEscape).join(',')).join('\n');
+    const blob = new Blob([header + rows], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `valuatio-transactions-${new Date().toISOString().slice(0,10)}.csv`;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  });
+
+  // ---- Home → Cache clearing ----
+  document.getElementById('home-clear-news-btn')?.addEventListener('click', () => {
+    if (!confirm('Clear cached news articles? Article read-states will be preserved.')) return;
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith('valuatio.news.cache')) localStorage.removeItem(k);
+    }
+    renderStorageStats();
+    if (typeof flashStatus === 'function') flashStatus('News cache cleared', 'success');
+  });
+  document.getElementById('home-clear-prices-btn')?.addEventListener('click', () => {
+    if (!confirm('Clear price history cache? Will re-fetch on next load (may be slow on first refresh).')) return;
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (k && (k.startsWith('valuatio.priceHistory') || k.startsWith('valuatio.priceHistCache'))) {
+        localStorage.removeItem(k);
+      }
+    }
+    renderStorageStats();
+    if (typeof flashStatus === 'function') flashStatus('Price history cache cleared', 'success');
+  });
+  document.getElementById('home-clear-all-btn')?.addEventListener('click', () => {
+    if (!confirm('⚠️  CLEAR ALL local data?\n\nThis wipes:\n• Portfolio + transactions\n• GoodGlobe Index\n• Notifications\n• Preferences\n• All caches\n\nA backup will be downloaded first. Continue?')) return;
+    try {
+      const backup = exportFullSnapshot();
+      downloadJsonBlob(backup, `valuatio-backup-before-wipe-${Date.now()}.json`);
+    } catch (e) { console.warn('Pre-wipe backup failed:', e); }
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith('valuatio.')) localStorage.removeItem(k);
+    }
+    alert('All local data cleared. Reloading page…');
+    location.reload();
+  });
+
+  // ---- Initial badge state + processing loop ----
+  updateNotifBadge();
+  processNotificationQueue();
+  setInterval(processNotificationQueue, 60_000);    // every minute
+});
+
+
+// ============================================================
+//   GLOBAL TRADE TAB
+//
+//   Architecture choice: this tab is data-honest by design. Trade data is
+//   fundamentally lagged (customs filings publish 1-2 months after the
+//   trade), and there's no free real-time global trade API I can plug into.
+//
+//   What we do have:
+//   • LIVE: tradeable proxies — BDRY (dry bulk shipping), IYT (US transports),
+//     XTN (transportation), JETS (airlines), USO (crude oil ETF as pipeline
+//     proxy), CCJ/URA (uranium / nuclear fuel), CPER (copper as global
+//     industrial barometer). These move with logistics activity in real time.
+//   • MONTHLY: FRED Census Bureau trade series for US partners (BOPGSTB, etc.)
+//   • QUARTERLY: World Bank/IMF/OECD national accounts data
+//   • ANNUAL: USGS commodity production rankings, World Bank GDP composition
+//
+//   What we DON'T have (and the user should know):
+//   • Real-time container shipping rates (Baltic Index paywalls these)
+//   • Real-time truck tonnage (ATA members-only)
+//   • Real-time rail carloads (AAR releases weekly with 1-week lag)
+//   • Bilateral trade flows beyond US (UN Comtrade requires API key + heavy
+//     rate limits; IMF DOTS needs a paid subscription for the live data)
+//
+//   The Data Sources tab is explicit about all of this so the user knows
+//   exactly what's behind every number.
+// ============================================================
+
+// Static country reference. Population, ISO, flag emoji, and the main
+// tradeable-equity ETF available to US investors that tracks the country's
+// equity market (so the user knows where to look for actionable exposure).
+// GDP is a placeholder — when we get the actual API integration, this can
+// be replaced with the latest published number.
+const GT_COUNTRIES = [
+  { code: 'us', iso: 'USA', name: 'United States',   flag: '🇺🇸', gdpRank: 1,  countryEtf: 'SPY',  gdpUsdT: 28.78, gdpYear: 2024 },
+  { code: 'cn', iso: 'CHN', name: 'China',           flag: '🇨🇳', gdpRank: 2,  countryEtf: 'MCHI', gdpUsdT: 18.53, gdpYear: 2024 },
+  { code: 'de', iso: 'DEU', name: 'Germany',         flag: '🇩🇪', gdpRank: 3,  countryEtf: 'EWG',  gdpUsdT: 4.59,  gdpYear: 2024 },
+  { code: 'jp', iso: 'JPN', name: 'Japan',           flag: '🇯🇵', gdpRank: 4,  countryEtf: 'EWJ',  gdpUsdT: 4.11,  gdpYear: 2024 },
+  { code: 'in', iso: 'IND', name: 'India',           flag: '🇮🇳', gdpRank: 5,  countryEtf: 'INDA', gdpUsdT: 3.94,  gdpYear: 2024 },
+  { code: 'gb', iso: 'GBR', name: 'United Kingdom',  flag: '🇬🇧', gdpRank: 6,  countryEtf: 'EWU',  gdpUsdT: 3.50,  gdpYear: 2024 },
+  { code: 'fr', iso: 'FRA', name: 'France',          flag: '🇫🇷', gdpRank: 7,  countryEtf: 'EWQ',  gdpUsdT: 3.13,  gdpYear: 2024 },
+  { code: 'br', iso: 'BRA', name: 'Brazil',          flag: '🇧🇷', gdpRank: 8,  countryEtf: 'EWZ',  gdpUsdT: 2.33,  gdpYear: 2024 },
+  { code: 'it', iso: 'ITA', name: 'Italy',           flag: '🇮🇹', gdpRank: 9,  countryEtf: 'EWI',  gdpUsdT: 2.30,  gdpYear: 2024 },
+  { code: 'ca', iso: 'CAN', name: 'Canada',          flag: '🇨🇦', gdpRank: 10, countryEtf: 'EWC',  gdpUsdT: 2.24,  gdpYear: 2024 },
+  { code: 'kr', iso: 'KOR', name: 'South Korea',     flag: '🇰🇷', gdpRank: 11, countryEtf: 'EWY',  gdpUsdT: 1.87,  gdpYear: 2024 },
+  { code: 'mx', iso: 'MEX', name: 'Mexico',          flag: '🇲🇽', gdpRank: 12, countryEtf: 'EWW',  gdpUsdT: 1.85,  gdpYear: 2024 },
+];
+
+// Top trade partners of the US (FY 2023 totals, in $B). When the FRED pipeline
+// integration lands, these will be replaced with live numbers.
+// Source: U.S. Census Bureau · Foreign Trade Division.
+const GT_US_PARTNERS = [
+  { code: 'cn', name: 'China',          exports: 147.8, imports: 426.9, balance: -279.1, year: 2023 },
+  { code: 'mx', name: 'Mexico',         exports: 322.7, imports: 475.6, balance: -152.9, year: 2023 },
+  { code: 'ca', name: 'Canada',         exports: 354.4, imports: 418.6, balance: -64.2,  year: 2023 },
+  { code: 'de', name: 'Germany',        exports: 76.4,  imports: 163.0, balance: -86.6,  year: 2023 },
+  { code: 'jp', name: 'Japan',          exports: 75.7,  imports: 147.4, balance: -71.7,  year: 2023 },
+  { code: 'kr', name: 'South Korea',    exports: 65.1,  imports: 116.2, balance: -51.1,  year: 2023 },
+  { code: 'gb', name: 'United Kingdom', exports: 74.3,  imports: 64.2,  balance: 10.1,   year: 2023 },
+  { code: 'tw', name: 'Taiwan',         exports: 40.0,  imports: 87.8,  balance: -47.8,  year: 2023 },
+  { code: 'vn', name: 'Vietnam',        exports: 9.8,   imports: 114.4, balance: -104.6, year: 2023 },
+  { code: 'in', name: 'India',          exports: 40.1,  imports: 83.8,  balance: -43.7,  year: 2023 },
+];
+const GT_PARTNER_FLAGS = { cn:'🇨🇳', mx:'🇲🇽', ca:'🇨🇦', de:'🇩🇪', jp:'🇯🇵', kr:'🇰🇷', gb:'🇬🇧', tw:'🇹🇼', vn:'🇻🇳', in:'🇮🇳', us:'🇺🇸', fr:'🇫🇷', it:'🇮🇹', br:'🇧🇷' };
+
+// Top global commodities + tradeable proxies. Production share is from USGS/
+// World Bank annual data — annual cadence so it's STALE most of the year.
+const GT_PRODUCTS = [
+  { name: 'Crude Oil',       proxy: 'USO',  unit: 'barrel',  topProducers: [['USA',13.4], ['Saudi Arabia',9.7], ['Russia',9.5]], dataYear: 2023 },
+  { name: 'Natural Gas',     proxy: 'UNG',  unit: 'BCF',     topProducers: [['USA',1035], ['Russia',583], ['Iran',259]], dataYear: 2023 },
+  { name: 'Copper',          proxy: 'CPER', unit: 'tonne',   topProducers: [['Chile',5.0], ['Peru',2.6], ['DR Congo',2.5]], dataYear: 2023 },
+  { name: 'Gold',            proxy: 'GLD',  unit: 'tonne',   topProducers: [['China',370], ['Russia',310], ['Australia',290]], dataYear: 2023 },
+  { name: 'Iron Ore',        proxy: 'PICK', unit: 'Mt',      topProducers: [['Australia',870], ['Brazil',440], ['China',280]], dataYear: 2023 },
+  { name: 'Wheat',           proxy: 'WEAT', unit: 'Mt',      topProducers: [['China',136], ['India',107], ['Russia',92]], dataYear: 2023 },
+  { name: 'Soybeans',        proxy: 'SOYB', unit: 'Mt',      topProducers: [['Brazil',153], ['USA',113], ['Argentina',48]], dataYear: 2023 },
+  { name: 'Semiconductors',  proxy: 'SOXX', unit: '$B sales', topProducers: [['Taiwan TSMC',95], ['South Korea Samsung',45], ['USA Intel',40]], dataYear: 2023 },
+  { name: 'Lithium',         proxy: 'LIT',  unit: 'kt',      topProducers: [['Australia',86], ['Chile',44], ['China',33]], dataYear: 2023 },
+  { name: 'Rare Earths',     proxy: 'REMX', unit: 'kt',      topProducers: [['China',240], ['USA',43], ['Myanmar',38]], dataYear: 2023 },
+];
+
+// Logistics proxies — these are LIVE, refreshed every time the user opens
+// the tab from existing stockbook data. Each card maps an ETF/index to a
+// logistics mode, with the move-direction giving a directional read.
+const GT_LOGISTICS = [
+  { mode: 'Shipping · Dry Bulk',   icon: '🚢', ticker: 'BDRY', desc: 'Tracks Baltic Dry Index futures — bulk freight rates for iron ore, grain, coal' },
+  { mode: 'Shipping · Tankers',    icon: '🛢️',  ticker: 'BWET', desc: 'Wet tanker freight futures — crude oil shipping rates' },
+  { mode: 'US Transports',         icon: '🚆', ticker: 'IYT',  desc: 'iShares U.S. Transportation ETF — rail, trucking, parcel, airlines combined' },
+  { mode: 'Trucking',              icon: '🚛', ticker: 'XTN',  desc: 'SPDR S&P Transportation ETF — heavy weight on trucking + rail' },
+  { mode: 'Air Cargo · Airlines',  icon: '✈️',  ticker: 'JETS', desc: 'U.S. Global Jets ETF — passenger + cargo airline composite' },
+  { mode: 'Pipeline · Oil & Gas',  icon: '🛤',  ticker: 'AMLP', desc: 'Alerian MLP ETF — midstream pipelines (oil, gas throughput proxy)' },
+  { mode: 'Container · Rail',      icon: '🚂', ticker: 'UNP',  desc: 'Union Pacific — rail carload volume is one of the cleanest US freight reads' },
+  { mode: 'Global Industrial',     icon: '🏭', ticker: 'CPER', desc: 'United States Copper Index Fund — copper is the canonical global industrial demand barometer' },
+];
+
+function _gtGetRow(ticker) {
+  const rows = state.stockbook?.rows || [];
+  return rows.find(r => r.ticker === ticker);
+}
+function _gtSessionPct(ticker) {
+  const r = _gtGetRow(ticker);
+  if (!r) return null;
+  if (isFinite(r.changePct))  return r.changePct;
+  if (isFinite(r.sessionPct)) return r.sessionPct;
+  if (isFinite(r.price) && isFinite(r.priorClose) && r.priorClose > 0) {
+    return ((r.price - r.priorClose) / r.priorClose) * 100;
+  }
+  return null;
+}
+
+function renderGlobalTradeLogistics() {
+  const grid = document.getElementById('gt-logistics-grid');
+  if (!grid) return;
+  const cards = GT_LOGISTICS.map(l => {
+    const row = _gtGetRow(l.ticker);
+    const pct = _gtSessionPct(l.ticker);
+    const px = row?.price;
+    let tone = 'flat';
+    let signal = 'no data';
+    if (pct != null) {
+      tone = pct > 0.5 ? 'bull' : pct < -0.5 ? 'bear' : 'flat';
+      signal = pct > 1.5  ? 'strong tailwind'
+             : pct > 0.5  ? 'tailwind'
+             : pct < -1.5 ? 'strong headwind'
+             : pct < -0.5 ? 'headwind'
+             : 'flat';
+    }
+    return { ...l, row, pct, px, tone, signal };
+  });
+  grid.innerHTML = cards.map(c => `
+    <div class="gt-logistics-card tone-${c.tone}">
+      <div class="gt-logistics-mode">
+        <span><span class="gt-logistics-icon">${c.icon}</span>${escapeHtml(c.mode)}</span>
+        <span class="tier-pill tier-live" style="margin:0;font-size:7px;padding:1px 5px">LIVE</span>
+      </div>
+      <div class="gt-logistics-title">${escapeHtml(c.ticker)}${c.row?.name ? ` · ${escapeHtml(c.row.name)}` : ''}</div>
+      <div class="gt-logistics-value">${c.px != null ? '$' + c.px.toFixed(2) : '—'}${c.pct != null ? ` <span style="font-size:13px;color:${c.tone==='bull'?'#5b8a72':c.tone==='bear'?'#a5645a':'var(--ink-faint)'}">${c.pct >= 0 ? '+' : ''}${c.pct.toFixed(2)}%</span>` : ''}</div>
+      <div class="gt-logistics-sub">${escapeHtml(c.signal)}</div>
+      <div class="gt-logistics-proxy">${escapeHtml(c.desc)}</div>
+    </div>
+  `).join('');
+}
+
+function renderGlobalTradePulse() {
+  const wrap = document.getElementById('gt-pulse-summary');
+  if (!wrap) return;
+  const moves = GT_LOGISTICS.map(l => _gtSessionPct(l.ticker)).filter(v => v != null);
+  if (moves.length === 0) {
+    wrap.innerHTML = `
+      <div class="gt-pulse-headline">No live data yet</div>
+      <div style="color:var(--ink-dim)">Load the stockbook (Refresh All in Stock Book tab) to populate logistics proxies. Once the prices come in, this summary will read the tape and tell you whether global trade is accelerating, decelerating, or mixed.</div>
+    `;
+    return;
+  }
+  const avg = moves.reduce((s, x) => s + x, 0) / moves.length;
+  const bullCount = moves.filter(m => m > 0.5).length;
+  const bearCount = moves.filter(m => m < -0.5).length;
+  let headline, tone, context;
+  if (bullCount >= 5) {
+    headline = 'Global trade accelerating';
+    tone = '#5b8a72';
+    context = `${bullCount}/${moves.length} logistics proxies are positive today. Average move: ${avg >= 0 ? '+' : ''}${avg.toFixed(2)}%. The tape is saying ships, planes, and pipelines are moving more goods than yesterday — typically a risk-on signal for emerging markets + industrials + freight equities.`;
+  } else if (bearCount >= 5) {
+    headline = 'Global trade decelerating';
+    tone = '#a5645a';
+    context = `${bearCount}/${moves.length} logistics proxies are red today. Average move: ${avg >= 0 ? '+' : ''}${avg.toFixed(2)}%. This is the kind of broad-based logistics weakness that often precedes (or accompanies) PMI contractions. Watch for confirmation in next week's BDI prints + rail carload data.`;
+  } else if (bullCount > bearCount) {
+    headline = 'Mixed · leaning positive';
+    tone = '#c4965a';
+    context = `${bullCount} green vs ${bearCount} red across ${moves.length} proxies. Average: ${avg >= 0 ? '+' : ''}${avg.toFixed(2)}%. The signal isn't broad-based but the bias is positive. Often the more interesting setup — divergences between modes (e.g. tankers up but rail down) tell you what kind of trade is happening.`;
+  } else if (bearCount > bullCount) {
+    headline = 'Mixed · leaning negative';
+    tone = '#c4965a';
+    context = `${bearCount} red vs ${bullCount} green. Average: ${avg >= 0 ? '+' : ''}${avg.toFixed(2)}%. Selective weakness — check the cards above for which modes specifically. If shipping is weak but pipelines are flat, that's a goods-trade story, not an energy-trade story.`;
+  } else {
+    headline = 'Flat / no signal';
+    tone = 'var(--ink-dim)';
+    context = `Logistics tape is balanced today. No directional read worth acting on. Use the country dashboards below for the slower-cadence numbers (monthly trade, quarterly GDP) which often tell more in flat tapes than the daily proxies do.`;
+  }
+  wrap.innerHTML = `
+    <div class="gt-pulse-headline" style="color:${tone}">${escapeHtml(headline)}</div>
+    <div>${escapeHtml(context)}</div>
+    <div style="margin-top:8px;font-size:10px;color:var(--ink-faint);padding-top:8px;border-top:1px dashed var(--rule)">
+      <strong>Why this is directional, not predictive:</strong> ETF prices move with sentiment + flow as well as fundamentals. A BDRY rally could reflect actual freight demand OR could be traders front-running expected demand. The pulse tells you what the tape thinks; the monthly/quarterly numbers below tell you what actually happened.
+    </div>
+  `;
+}
+
+function renderGlobalTradePartners() {
+  const wrap = document.getElementById('gt-partners-table-wrap');
+  if (!wrap) return;
+  const totalTrade = GT_US_PARTNERS.reduce((s, p) => s + p.exports + p.imports, 0);
+  wrap.innerHTML = `
+    <table class="gt-partners-table">
+      <thead><tr>
+        <th>Partner</th>
+        <th>US Exports ($B)</th>
+        <th>US Imports ($B)</th>
+        <th>Net Balance ($B)</th>
+        <th>Total Trade ($B)</th>
+        <th>% of Top-10</th>
+      </tr></thead>
+      <tbody>
+        ${GT_US_PARTNERS.map(p => {
+          const total = p.exports + p.imports;
+          const pctOfTop10 = (total / totalTrade) * 100;
+          const balColor = p.balance >= 0 ? '#5b8a72' : '#a5645a';
+          return `<tr>
+            <td><span class="gt-partners-flag">${GT_PARTNER_FLAGS[p.code] || ''}</span><strong>${escapeHtml(p.name)}</strong></td>
+            <td>$${p.exports.toFixed(1)}</td>
+            <td>$${p.imports.toFixed(1)}</td>
+            <td style="color:${balColor};font-weight:600">${p.balance >= 0 ? '+' : ''}$${p.balance.toFixed(1)}</td>
+            <td>$${total.toFixed(1)}</td>
+            <td>${pctOfTop10.toFixed(1)}%</td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table>
+    <div style="margin-top:10px;font-family:var(--mono);font-size:10px;color:var(--ink-faint);line-height:1.6">
+      <strong style="color:var(--amber)">Data:</strong> U.S. Census Bureau Foreign Trade Division, FY2023 totals. <strong style="color:var(--amber)">Cadence:</strong> the pipeline upgrade should pull FRED's BOPGSTB (goods trade balance) and equivalent monthly series for live updates. <strong style="color:var(--amber)">Limit:</strong> this view is US-centric. For bilateral flows between non-US countries (e.g. Germany ↔ China), we'd need IMF DOTS integration — see the Data Sources tab.
+    </div>
+  `;
+}
+
+function renderGlobalTradeCountries() {
+  const grid = document.getElementById('gt-countries-grid');
+  if (!grid) return;
+  grid.innerHTML = GT_COUNTRIES.map(c => {
+    const etfRow = _gtGetRow(c.countryEtf);
+    const etfPx = etfRow?.price;
+    const etfPct = _gtSessionPct(c.countryEtf);
+    return `
+      <div class="gt-country-card" data-country="${c.code}">
+        <div class="gt-country-head">
+          <div><span class="gt-country-flag">${c.flag}</span><span class="gt-country-name">${escapeHtml(c.name)}</span></div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint)">#${c.gdpRank}</div>
+        </div>
+        <div class="gt-country-row"><span>GDP (${c.gdpYear})</span><strong>$${c.gdpUsdT.toFixed(2)}T <span class="tier-pill tier-quarterly" style="margin-left:4px;font-size:7px;padding:1px 4px">QUARTERLY</span></strong></div>
+        <div class="gt-country-row"><span>Country ETF</span><strong>${escapeHtml(c.countryEtf)} ${etfPx != null ? '· $' + etfPx.toFixed(2) : ''} ${etfPct != null ? `<span style="color:${etfPct>=0?'#5b8a72':'#a5645a'}">${etfPct>=0?'+':''}${etfPct.toFixed(2)}%</span>` : ''}</strong></div>
+        <div class="gt-country-actionables">
+          For US-listed exposure: <strong style="color:var(--amber)">${escapeHtml(c.countryEtf)}</strong> ETF tracks ${escapeHtml(c.name)} equity market. Click to add to your stockbook for ongoing tracking.
+        </div>
+      </div>
+    `;
+  }).join('');
+  grid.querySelectorAll('.gt-country-card').forEach(el => {
+    el.addEventListener('click', () => {
+      const code = el.dataset.country;
+      const c = GT_COUNTRIES.find(x => x.code === code);
+      if (c && typeof openAddPositionModal === 'function') {
+        openAddPositionModal('equity');
+        setTimeout(() => {
+          const inp = document.getElementById('port-add-tic');
+          if (inp) inp.value = c.countryEtf;
+        }, 100);
+      }
+    });
+  });
+}
+
+function renderGlobalTradeProducts() {
+  const grid = document.getElementById('gt-products-grid');
+  if (!grid) return;
+  grid.innerHTML = GT_PRODUCTS.map(p => {
+    const proxyRow = _gtGetRow(p.proxy);
+    const proxyPx = proxyRow?.price;
+    const proxyPct = _gtSessionPct(p.proxy);
+    const tone = proxyPct == null ? 'flat'
+               : proxyPct >  0.5  ? 'bull'
+               : proxyPct < -0.5  ? 'bear'
+               : 'flat';
+    return `
+      <div class="gt-product-card">
+        <div class="gt-product-head">
+          <span>${escapeHtml(p.name)}</span>
+          <span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint)">${escapeHtml(p.proxy)}</span>
+        </div>
+        <div style="font-family:var(--mono);font-size:11px;color:var(--ink-dim);margin-bottom:6px">
+          ${proxyPx != null ? `<span style="color:var(--ink);font-weight:600">$${proxyPx.toFixed(2)}</span>` : '—'}
+          ${proxyPct != null ? ` <span style="color:${tone==='bull'?'#5b8a72':tone==='bear'?'#a5645a':'var(--ink-faint)'}">${proxyPct>=0?'+':''}${proxyPct.toFixed(2)}%</span>` : ''}
+          <span class="tier-pill tier-live" style="margin-left:6px;font-size:7px;padding:1px 4px">LIVE</span>
+        </div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);line-height:1.6">
+          <strong style="color:var(--ink-faint)">Top producers (${p.dataYear})</strong>
+          <span class="tier-pill tier-stale" style="margin-left:4px;font-size:7px;padding:1px 4px">ANNUAL</span>
+          <br>
+          ${p.topProducers.map(([country, vol]) => `${escapeHtml(country)} <span style="color:var(--ink)">${vol}</span>`).join(' · ')}
+          <div style="color:var(--ink-faint);margin-top:3px">unit: ${escapeHtml(p.unit)}</div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function renderGlobalTradeBilateral() {
+  const fromSel = document.getElementById('gt-bilat-from');
+  const toSel = document.getElementById('gt-bilat-to');
+  const out = document.getElementById('gt-bilateral-output');
+  if (!fromSel || !toSel || !out) return;
+
+  const update = () => {
+    const f = fromSel.value;
+    const t = toSel.value;
+    if (f === t) {
+      out.innerHTML = `<div style="padding:20px;text-align:center;color:var(--ink-faint);font-family:var(--mono);font-size:11px">Pick two different countries</div>`;
+      return;
+    }
+    // We only have detailed bilateral data for US-anchored pairs in this static set.
+    // For non-US pairs, we explicitly say so rather than fabricating.
+    if (f !== 'us' && t !== 'us') {
+      const fromCountry = GT_COUNTRIES.find(c => c.code === f);
+      const toCountry   = GT_COUNTRIES.find(c => c.code === t);
+      out.innerHTML = `
+        <div style="padding:20px;background:var(--bg-card);border-left:3px solid #c4965a;font-family:var(--mono);font-size:12px;line-height:1.7">
+          <strong style="color:#c4965a">Bilateral data for ${escapeHtml(fromCountry?.name || f)} ↔ ${escapeHtml(toCountry?.name || t)} requires the IMF DOTS API integration.</strong><br><br>
+          The current static dataset only covers US-anchored bilateral flows. The pipeline upgrade needed to support non-US pairs is documented in the Data Sources tab.<br><br>
+          <strong>What you can do today:</strong> open the country ETFs side by side (${escapeHtml(fromCountry?.countryEtf || '?')} and ${escapeHtml(toCountry?.countryEtf || '?')}) to compare equity-market moves, which often correlate with bilateral trade health.
+        </div>
+      `;
+      return;
+    }
+    const usPartner = f === 'us' ? t : f;
+    const direction = f === 'us' ? 'us-to-partner' : 'partner-to-us';
+    const partner = GT_US_PARTNERS.find(p => p.code === usPartner);
+    if (!partner) {
+      out.innerHTML = `<div style="padding:20px;text-align:center;color:var(--ink-faint);font-family:var(--mono);font-size:11px">No bilateral data on file for this pair · only top-10 US partners covered</div>`;
+      return;
+    }
+    const fromName = direction === 'us-to-partner' ? 'United States' : partner.name;
+    const toName   = direction === 'us-to-partner' ? partner.name : 'United States';
+    const flow = direction === 'us-to-partner' ? partner.exports : partner.imports;
+    const counterFlow = direction === 'us-to-partner' ? partner.imports : partner.exports;
+    out.innerHTML = `
+      <div style="background:var(--bg-card);border:1px solid var(--rule);padding:18px;border-radius:3px">
+        <div style="font-family:var(--serif);font-size:18px;font-weight:700;color:var(--amber);margin-bottom:12px">
+          ${escapeHtml(fromName)} → ${escapeHtml(toName)}
+        </div>
+        <div style="font-family:var(--mono);font-size:14px;color:var(--ink);margin-bottom:6px">
+          $${flow.toFixed(1)}B <span style="color:var(--ink-faint);font-size:11px">${partner.year} · annual</span>
+        </div>
+        <div style="font-family:var(--mono);font-size:11px;color:var(--ink-dim);line-height:1.7">
+          Counter-flow (${escapeHtml(toName)} → ${escapeHtml(fromName)}): <strong style="color:var(--ink)">$${counterFlow.toFixed(1)}B</strong><br>
+          Net balance for US: <strong style="color:${partner.balance >= 0 ? '#5b8a72' : '#a5645a'}">${partner.balance >= 0 ? '+' : ''}$${partner.balance.toFixed(1)}B</strong>
+          ${partner.balance < 0 ? ' (US runs trade deficit)' : ' (US runs trade surplus)'}
+        </div>
+        <div style="margin-top:14px;padding-top:14px;border-top:1px dashed var(--rule);font-family:var(--mono);font-size:10px;color:var(--ink-faint);line-height:1.7">
+          <strong style="color:var(--amber)">Tradeable exposure:</strong>
+          For ${escapeHtml(partner.name)} equity exposure, the country ETF most US investors use is <strong style="color:var(--ink)">${escapeHtml((GT_COUNTRIES.find(c => c.code === usPartner) || {}).countryEtf || '—')}</strong>. Add to your Stock Book to track ongoing.
+        </div>
+      </div>
+    `;
+  };
+  fromSel.addEventListener('change', update);
+  toSel.addEventListener('change', update);
+  update();
+}
+
+function renderGlobalTradeDataSources() {
+  const wrap = document.getElementById('gt-sources-content');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <h3>What we have today</h3>
+    <div class="source-row have">
+      <strong style="color:#5b8a72">LIVE · Tradeable proxies</strong> · <span style="color:var(--ink-dim)">In place</span><br>
+      Pulled from your existing stockbook. Every logistics card here reads
+      <code>state.stockbook.rows</code> for these tickers: BDRY, BWET, IYT, XTN, JETS, AMLP, UNP, CPER plus the country ETFs (MCHI, EWG, EWJ, etc.).
+      No new pipeline work needed — these are already fetched by <code>fetch_data.py</code>.
+    </div>
+    <div class="source-row have">
+      <strong style="color:#5b8a72">STATIC · US Top-10 partners</strong> · <span style="color:var(--ink-dim)">FY2023 baseline embedded</span><br>
+      Hard-coded annual totals from US Census Bureau. Good as a baseline; the pipeline upgrade below replaces these with monthly live numbers.
+    </div>
+
+    <h3>Pipeline upgrades to add (Python side)</h3>
+    <div class="source-row partial">
+      <strong style="color:#c4965a">FRED · Monthly US trade balance</strong> · <span style="color:var(--ink-dim)">Easy add</span><br>
+      FRED has all US trade series free with API key. Relevant codes:
+      <code>BOPGSTB</code> (goods trade balance), <code>EXPGS</code> (exports), <code>IMPGS</code> (imports),
+      <code>BOPGEXP</code>, <code>BOPGIMP</code>. Add to <code>fetch_macro.py</code> with the rest of FRED pulls.
+      Writes monthly numbers to <code>data/macro_trade.json</code>, browser reads from there.
+      Cadence: <span class="tier-pill tier-monthly">MONTHLY</span>
+    </div>
+    <div class="source-row partial">
+      <strong style="color:#c4965a">World Bank · Annual GDP composition</strong> · <span style="color:var(--ink-dim)">Free API, no key</span><br>
+      <code>api.worldbank.org/v2/country/{ISO3}/indicator/NY.GDP.MKTP.CD?format=json</code>
+      gives annual GDP for every country. Plus <code>NE.EXP.GNFS.ZS</code> (exports % of GDP),
+      <code>NE.IMP.GNFS.ZS</code> (imports % of GDP). Add a new <code>fetch_worldbank.py</code> that
+      writes <code>data/worldbank_countries.json</code>. Cadence: <span class="tier-pill tier-quarterly">ANNUAL</span>
+    </div>
+    <div class="source-row partial">
+      <strong style="color:#c4965a">UN Comtrade · Product-level bilateral flows</strong> · <span style="color:var(--ink-dim)">Free API key, rate limited</span><br>
+      <code>comtradeapi.un.org</code> · 500 free calls/day with sign-up. Lets you query exactly
+      "country X exports of product Y to country Z in year/month N". Heavy quota — best
+      to pre-fetch the top 10 products × top 20 country pairs nightly. Writes to
+      <code>data/comtrade_flows.json</code>. Cadence: <span class="tier-pill tier-monthly">MONTHLY</span>
+    </div>
+    <div class="source-row todo">
+      <strong style="color:#a5645a">IMF DOTS · Bilateral trade matrix</strong> · <span style="color:var(--ink-dim)">Paid subscription</span><br>
+      Direction of Trade Statistics is the gold standard for non-US bilateral flows
+      (Germany ↔ China, India ↔ Brazil, etc.). The free API is severely rate-limited.
+      Recommendation: only invest in this integration if non-US bilateral coverage
+      becomes a high-priority feature. World Bank + UN Comtrade cover 80% of the use case.
+    </div>
+    <div class="source-row todo">
+      <strong style="color:#a5645a">Real-time logistics data</strong> · <span style="color:var(--ink-dim)">Mostly paywalled</span><br>
+      Baltic Exchange (Baltic Dry Index): paid. ATA Truck Tonnage: members-only.
+      AAR rail carloads: free but weekly with lag. Flightradar24 cargo movements:
+      paid API. <strong>The tradeable proxies in the logistics panel above are
+      genuinely the best free signal for these.</strong> If you want to upgrade
+      one, the cleanest first step is scraping AAR's weekly rail data (free public
+      PDF on aar.org) and adding rail-carload data to the pipeline.
+    </div>
+
+    <h3>What "live" really means in this tab</h3>
+    <p>
+      The logistics proxies are <span class="tier-pill tier-live">LIVE</span> in the sense that they're
+      tradeable instruments updating during market hours. But they're <em>indirect</em> measurements
+      of underlying logistics activity. BDRY moves with dry-bulk freight expectations, not with
+      actual dry-bulk freight volume in real time.
+    </p>
+    <p>
+      The actual flow data (FRED, Census, IMF, UN Comtrade) is necessarily lagged.
+      Even with the full pipeline upgrade, US monthly trade prints with a ~45-day delay.
+      Quarterly GDP prints with a ~60-day delay. Annual data is usually 6+ months delayed.
+    </p>
+    <p>
+      <strong style="color:var(--amber)">The pulse summary at the top of this tab is intentionally honest about this.</strong>
+      The tape tells you sentiment + flow; the slower numbers tell you fundamentals. Both matter,
+      neither replaces the other.
+    </p>
+
+    <h3>What you can do today without any pipeline work</h3>
+    <ul>
+      <li>Add country ETFs to your stockbook so you have direct exposure tracking (MCHI for China, EWG for Germany, EWJ for Japan, EWY for South Korea, INDA for India, EWZ for Brazil, EWC for Canada, EWW for Mexico, EWU for UK).</li>
+      <li>Add commodity ETFs for product exposure: CPER (copper), GLD (gold), USO (oil), UNG (gas), WEAT (wheat), SOYB (soybeans), LIT (lithium), REMX (rare earths).</li>
+      <li>Watch the divergences in the logistics panel. When BDRY is up but IYT is flat, that's a China/EM bulk story without US confirmation. When AMLP rallies but USO doesn't, that's pipeline-specific positioning.</li>
+      <li>Use the bilateral picker to think about trade-balance shifts. Right now the data is US-centric, but the framing is portable.</li>
+    </ul>
+  `;
+}
+
+function renderGlobalTradeTab() {
+  const viewMode = document.getElementById('gt-view-mode')?.value || 'overview';
+  document.querySelectorAll('.gt-view').forEach(v => {
+    v.style.display = v.dataset.view === viewMode ? '' : 'none';
+  });
+  if (viewMode === 'overview') {
+    renderGlobalTradeLogistics();
+    renderGlobalTradePulse();
+    renderGlobalTradePartners();
+  } else if (viewMode === 'countries') {
+    renderGlobalTradeCountries();
+  } else if (viewMode === 'products') {
+    renderGlobalTradeProducts();
+  } else if (viewMode === 'bilateral') {
+    renderGlobalTradeBilateral();
+  } else if (viewMode === 'datasources') {
+    renderGlobalTradeDataSources();
+  }
+}
+
+// Wire view-mode picker + initial render
+let _gtWired = false;
+function loadGlobalTradeTab() {
+  if (!_gtWired) {
+    document.getElementById('gt-view-mode')?.addEventListener('change', renderGlobalTradeTab);
+    _gtWired = true;
+  }
+  renderGlobalTradeTab();
+  // Refresh logistics every 60s while the tab is open
+  if (!window._gtRefreshTimer) {
+    window._gtRefreshTimer = setInterval(() => {
+      const panel = document.querySelector('[data-panel="globaltrade"]');
+      if (panel && panel.classList.contains('active')) {
+        renderGlobalTradeLogistics();
+        renderGlobalTradePulse();
+      }
+    }, 60_000);
+  }
+}

@@ -226,6 +226,46 @@
     font-weight: 300;
     color: var(--amber);
   }
+  /* Icon buttons in the masthead — home + notification bell */
+  .masthead-icon-btn {
+    position: relative;
+    background: transparent;
+    border: 1px solid var(--rule);
+    color: var(--ink);
+    width: 38px;
+    height: 38px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    cursor: pointer;
+    transition: all 0.14s;
+    flex-shrink: 0;
+  }
+  .masthead-icon-btn:hover {
+    background: var(--bg-elev);
+    border-color: var(--amber);
+    color: var(--amber);
+  }
+  .masthead-icon-btn:active { transform: scale(0.95); }
+  .notif-badge {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    background: #a5645a;
+    color: #fff;
+    font-family: var(--mono);
+    font-size: 9px;
+    font-weight: 700;
+    min-width: 16px;
+    height: 16px;
+    border-radius: 8px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 4px;
+    border: 1px solid var(--bg);
+  }
   .masthead-sub {
     font-family: var(--mono);
     font-size: 10px;
@@ -5618,6 +5658,673 @@
     color: #a5645a;
     border-color: #a5645a;
   }
+  /* ============================================================
+     SIDE DRAWER — used by Home panel + Notifications panel.
+     Slides in from the top-left, anchored just below the masthead.
+     Mobile collapses to full-width.
+     ============================================================ */
+  .side-drawer-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    z-index: 200;
+    backdrop-filter: blur(2px);
+  }
+  .side-drawer {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 420px;
+    max-width: calc(100vw - 32px);
+    background: var(--bg);
+    border-right: 1px solid var(--rule);
+    border-top: 4px solid var(--amber);
+    z-index: 201;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 4px 0 24px rgba(0, 0, 0, 0.6);
+    animation: slideInLeft 0.18s ease-out;
+  }
+  .side-drawer-wide { width: 540px; }
+  @keyframes slideInLeft {
+    from { transform: translateX(-100%); }
+    to   { transform: translateX(0); }
+  }
+  .side-drawer-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 22px;
+    border-bottom: 1px solid var(--rule);
+    background: var(--bg-card);
+    flex-shrink: 0;
+  }
+  .side-drawer-title {
+    font-family: var(--serif);
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--ink);
+  }
+  .side-drawer-close {
+    background: transparent;
+    border: 1px solid var(--rule);
+    color: var(--ink-dim);
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 18px;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .side-drawer-close:hover { color: var(--ink); border-color: var(--amber); }
+  .side-drawer-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0;
+  }
+
+  /* Notification-specific */
+  .notif-form-section, .notif-list-section {
+    padding: 18px 22px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .notif-list-section { border-bottom: none; }
+  .notif-list-section .modal-label {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .notif-clear-btn {
+    font-size: 9px !important;
+    padding: 3px 8px !important;
+  }
+  .notif-empty {
+    color: var(--ink-faint);
+    font-family: var(--mono);
+    font-size: 11px;
+    text-align: center;
+    padding: 28px 12px;
+    line-height: 1.5;
+  }
+  .notif-item {
+    background: var(--bg-card);
+    border-left: 3px solid var(--ink-faint);
+    padding: 12px 14px;
+    margin-bottom: 8px;
+    border-radius: 0 3px 3px 0;
+    position: relative;
+  }
+  .notif-item.cat-fix      { border-left-color: #a5645a; }
+  .notif-item.cat-pipeline { border-left-color: var(--amber); }
+  .notif-item.cat-target   { border-left-color: #5b8a72; }
+  .notif-item.cat-note     { border-left-color: #7faaca; }
+  .notif-item.unfired      { opacity: 0.55; }
+  .notif-item.dismissed    { opacity: 0.35; }
+  .notif-item-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 4px;
+  }
+  .notif-item-title {
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.4;
+    flex: 1;
+  }
+  .notif-item-cat {
+    font-family: var(--mono);
+    font-size: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--ink-faint);
+    padding: 1px 6px;
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    height: fit-content;
+    white-space: nowrap;
+  }
+  .notif-item-detail {
+    color: var(--ink-dim);
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 1.5;
+    margin-bottom: 6px;
+  }
+  .notif-item-meta {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    color: var(--ink-faint);
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.05em;
+  }
+  .notif-item-actions {
+    display: flex;
+    gap: 4px;
+  }
+  .notif-action-btn {
+    background: transparent;
+    border: 1px solid var(--rule);
+    color: var(--ink-dim);
+    font-family: var(--mono);
+    font-size: 9px;
+    padding: 2px 6px;
+    cursor: pointer;
+    border-radius: 2px;
+  }
+  .notif-action-btn:hover { color: var(--amber); border-color: var(--amber); }
+
+  /* Home panel sections */
+  .home-section {
+    padding: 18px 22px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .home-section:last-child { border-bottom: none; }
+  .home-section-title {
+    font-family: var(--mono);
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--ink-faint);
+    margin-bottom: 10px;
+  }
+  .home-section-sub {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--ink-faint);
+    line-height: 1.6;
+    margin-bottom: 12px;
+  }
+  .home-stats-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px;
+  }
+  .home-stat-card {
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    padding: 10px 12px;
+    border-radius: 2px;
+  }
+  .home-stat-card-label {
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--ink-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 4px;
+  }
+  .home-stat-card-value {
+    font-family: var(--mono);
+    font-size: 16px;
+    color: var(--ink);
+    font-weight: 700;
+  }
+  .home-import-zone {
+    border: 2px dashed var(--rule);
+    border-radius: 4px;
+    transition: all 0.15s;
+  }
+  .home-import-zone.dragover {
+    border-color: var(--amber);
+    background: rgba(212, 162, 76, 0.08);
+  }
+  .home-import-zone-inner {
+    padding: 26px 18px;
+    text-align: center;
+    color: var(--ink-dim);
+    font-family: var(--mono);
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .home-import-zone-inner:hover { color: var(--ink); }
+  .home-import-log {
+    margin-top: 10px;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--ink-dim);
+    line-height: 1.6;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+  .home-import-log-entry {
+    padding: 4px 8px;
+    background: var(--bg-card);
+    border-left: 2px solid var(--rule);
+    margin-bottom: 3px;
+  }
+  .home-import-log-entry.ok      { border-left-color: #5b8a72; }
+  .home-import-log-entry.warn    { border-left-color: #c4965a; }
+  .home-import-log-entry.error   { border-left-color: #a5645a; }
+  .home-export-buttons {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .home-export-buttons .btn { width: 100%; text-align: left; padding-left: 14px; }
+  .home-pref-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+    gap: 12px;
+  }
+  .home-pref-row:last-child { margin-bottom: 0; }
+  .home-pref-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--ink-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .home-color-swatches {
+    display: flex;
+    gap: 6px;
+  }
+  .color-swatch {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    border: 2px solid transparent;
+    cursor: pointer;
+    transition: all 0.14s;
+    box-shadow: 0 0 0 1px var(--rule);
+  }
+  .color-swatch:hover { transform: scale(1.1); }
+  .color-swatch.active {
+    border-color: var(--ink);
+    box-shadow: 0 0 0 2px var(--amber);
+  }
+  .home-storage-stats {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--ink-dim);
+    line-height: 1.7;
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    padding: 10px 12px;
+    border-radius: 2px;
+  }
+  .home-storage-stats .key  { color: var(--ink-faint); }
+  .home-storage-stats .val  { color: var(--ink); font-weight: 600; }
+  /* ============================================================
+     EPISTEMIC TIER PILLS — labels showing data provenance
+     LIVE = real-time observation
+     CACHED = from last pipeline run (could be hours stale)
+     HISTORICAL = base rate from past patterns, NOT a prediction
+     ============================================================ */
+  .tier-pill {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 8px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    padding: 2px 7px;
+    border-radius: 9px;
+    border: 1px solid;
+    vertical-align: 1px;
+    margin-left: 6px;
+    cursor: help;
+  }
+  .tier-pill.tier-live       { color: #5b8a72; border-color: #5b8a72; background: rgba(91,138,114,0.1); }
+  .tier-pill.tier-cached     { color: #c4965a; border-color: #c4965a; background: rgba(196,150,90,0.08); }
+  .tier-pill.tier-historical { color: #9180a8; border-color: #9180a8; background: rgba(145,128,168,0.1); }
+  .tier-pill.tier-monthly    { color: #7faaca; border-color: #7faaca; background: rgba(127,170,202,0.1); }
+  .tier-pill.tier-quarterly  { color: #b88aa8; border-color: #b88aa8; background: rgba(184,138,168,0.1); }
+  .tier-pill.tier-stale      { color: var(--ink-faint); border-color: var(--ink-faint); background: rgba(120,120,120,0.05); }
+
+  .regime-epistemic-note {
+    padding: 12px 18px;
+    margin: 0 0 16px;
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--amber);
+    border-radius: 0 3px 3px 0;
+  }
+  .epistemic-tier-key {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 8px;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--ink-dim);
+    line-height: 1.6;
+  }
+  .epistemic-tier-key .tier-pill {
+    margin-left: 0;
+  }
+
+  /* Live market pulse panel */
+  .regime-live-pulse {
+    margin: 16px 0 24px;
+  }
+  .live-pulse-banner {
+    margin: 8px 0 14px;
+    padding: 10px 14px;
+    background: rgba(168, 90, 58, 0.1);
+    border: 1px solid #a85a3a;
+    border-left: 3px solid #a85a3a;
+    border-radius: 0 3px 3px 0;
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  .live-pulse-banner.banner-info {
+    background: rgba(127, 170, 202, 0.08);
+    border-color: #7faaca;
+  }
+  .live-pulse-banner.banner-ok {
+    background: rgba(91, 138, 114, 0.08);
+    border-color: #5b8a72;
+  }
+  .live-pulse-banner-icon {
+    font-weight: 700;
+    margin-right: 6px;
+  }
+  .live-pulse-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 10px;
+  }
+  .live-pulse-card {
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--ink-faint);
+    padding: 12px 14px;
+    border-radius: 0 3px 3px 0;
+  }
+  .live-pulse-card.tone-bull { border-left-color: #5b8a72; }
+  .live-pulse-card.tone-bear { border-left-color: #a5645a; }
+  .live-pulse-card.tone-warn { border-left-color: #c4965a; }
+  .live-pulse-card.tone-flat { border-left-color: var(--ink-faint); }
+  .live-pulse-card-label {
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--ink-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 4px;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+  .live-pulse-card-value {
+    font-family: var(--mono);
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--ink);
+    line-height: 1.2;
+  }
+  .live-pulse-card-sub {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--ink-dim);
+    margin-top: 4px;
+    line-height: 1.5;
+  }
+
+  /* Forecast caveat — sits below the Markov bars */
+  .regime-forecast-caveat {
+    margin-top: 12px;
+    padding: 10px 12px;
+    background: rgba(145,128,168,0.08);
+    border-left: 2px solid #9180a8;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--ink-dim);
+    line-height: 1.6;
+    border-radius: 0 2px 2px 0;
+  }
+  .regime-forecast-caveat strong { color: #9180a8; }
+  /* ============================================================
+     GLOBAL TRADE TAB
+     ============================================================ */
+  .gt-tier-note {
+    padding: 14px 18px;
+    margin: 16px 0 20px;
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--amber);
+    border-radius: 0 3px 3px 0;
+  }
+  .gt-tier-disclaimer {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--ink-dim);
+    line-height: 1.7;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px dashed var(--rule);
+  }
+  .gt-tier-disclaimer strong { color: var(--amber); }
+  .gt-tier-disclaimer em { color: var(--ink); font-style: normal; font-weight: 600; }
+  .gt-section { margin-bottom: 28px; }
+  .gt-section-sub {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--ink-dim);
+    line-height: 1.7;
+    margin: 6px 0 14px;
+    max-width: 920px;
+  }
+  .gt-section-sub strong { color: var(--amber); }
+  .gt-section-sub em { color: var(--ink); font-style: normal; font-weight: 600; }
+  .gt-logistics-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px;
+  }
+  .gt-logistics-card {
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--ink-faint);
+    padding: 14px 16px;
+    border-radius: 0 3px 3px 0;
+  }
+  .gt-logistics-card.tone-bull { border-left-color: #5b8a72; }
+  .gt-logistics-card.tone-bear { border-left-color: #a5645a; }
+  .gt-logistics-card.tone-warn { border-left-color: #c4965a; }
+  .gt-logistics-card.tone-flat { border-left-color: var(--ink-faint); }
+  .gt-logistics-mode {
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--ink-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+  }
+  .gt-logistics-title {
+    font-family: var(--sans);
+    font-size: 13px;
+    color: var(--ink);
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  .gt-logistics-value {
+    font-family: var(--mono);
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--ink);
+  }
+  .gt-logistics-sub {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--ink-dim);
+    margin-top: 4px;
+    line-height: 1.5;
+  }
+  .gt-logistics-proxy {
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--ink-faint);
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px dashed var(--rule);
+  }
+  .gt-pulse-summary {
+    padding: 16px 20px;
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.7;
+    color: var(--ink);
+  }
+  .gt-pulse-headline {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--amber);
+    margin-bottom: 8px;
+    font-family: var(--serif);
+  }
+  .gt-partners-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+  .gt-partners-table th {
+    text-align: left;
+    padding: 8px 12px;
+    background: var(--bg-elev);
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink-dim);
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-weight: 600;
+  }
+  .gt-partners-table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink);
+  }
+  .gt-partners-table tr:hover { background: var(--bg-elev); }
+  .gt-partners-flag {
+    font-size: 16px;
+    margin-right: 6px;
+    vertical-align: -2px;
+  }
+  .gt-countries-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 14px;
+  }
+  .gt-country-card {
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 14px 16px;
+    cursor: pointer;
+    transition: all 0.14s;
+  }
+  .gt-country-card:hover {
+    border-color: var(--amber);
+    transform: translateY(-1px);
+  }
+  .gt-country-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+  .gt-country-name {
+    font-family: var(--serif);
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--ink);
+  }
+  .gt-country-flag { font-size: 22px; }
+  .gt-country-row {
+    display: flex;
+    justify-content: space-between;
+    font-family: var(--mono);
+    font-size: 11px;
+    margin: 4px 0;
+    color: var(--ink-dim);
+  }
+  .gt-country-row strong { color: var(--ink); font-weight: 600; }
+  .gt-country-actionables {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--ink-faint);
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--rule);
+  }
+  .gt-products-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 12px;
+  }
+  .gt-product-card {
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 12px 14px;
+  }
+  .gt-product-head {
+    font-family: var(--serif);
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--ink);
+    margin-bottom: 4px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .gt-bilateral-picker {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 18px;
+    flex-wrap: wrap;
+  }
+  #gt-sources-content h3 {
+    font-family: var(--serif);
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--amber);
+    margin: 18px 0 6px;
+  }
+  #gt-sources-content h3:first-child { margin-top: 0; }
+  #gt-sources-content p, #gt-sources-content li {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--ink);
+    line-height: 1.7;
+    margin: 4px 0;
+  }
+  #gt-sources-content code {
+    background: var(--bg-elev);
+    padding: 1px 5px;
+    border-radius: 2px;
+    font-size: 10px;
+    color: var(--amber);
+  }
+  #gt-sources-content .source-row {
+    background: var(--bg-card);
+    border-left: 3px solid var(--rule);
+    padding: 10px 14px;
+    margin-bottom: 8px;
+    border-radius: 0 3px 3px 0;
+  }
+  #gt-sources-content .source-row.have { border-left-color: #5b8a72; }
+  #gt-sources-content .source-row.partial { border-left-color: #c4965a; }
+  #gt-sources-content .source-row.todo { border-left-color: #a5645a; }
 </style>
 </head>
 <body>
@@ -5636,9 +6343,29 @@
 </div>
 
 <header class="masthead">
-  <div>
-    <div class="masthead-title">Valuat<em>io</em></div>
-    <div class="masthead-sub" id="masthead-sub">Intrinsic Value Engine · DCF · CAPM · Multiples · Monte Carlo</div>
+  <div style="display:flex;align-items:center;gap:14px">
+    <!-- Home / settings button — opens the home panel with notifications,
+         theme preferences, data import/export, cache management. Always
+         visible top-left so it's reachable from any tab. -->
+    <button class="masthead-icon-btn" id="home-btn" title="Home · Settings · Preferences · Import/Export Data" aria-label="Open home panel">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+        <polyline points="9 22 9 12 15 12 15 22"/>
+      </svg>
+    </button>
+    <!-- Notifications bell — badge shows unread count. Click to open the
+         notifications drawer with chronologically-sorted reminders. -->
+    <button class="masthead-icon-btn" id="notif-btn" title="Notifications · Reminders · Set new alerts" aria-label="Open notifications">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+        <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+      </svg>
+      <span class="notif-badge" id="notif-badge" style="display:none">0</span>
+    </button>
+    <div>
+      <div class="masthead-title">Valuat<em>io</em></div>
+      <div class="masthead-sub" id="masthead-sub">Intrinsic Value Engine · DCF · CAPM · Multiples · Monte Carlo</div>
+    </div>
   </div>
   <div class="masthead-meta">
     <button class="theme-toggle" id="refresh-all-btn" title="Refresh all data — news, stocks, macro, bonds" aria-label="Refresh all data" style="margin-right:4px">
@@ -5764,6 +6491,10 @@
     <span class="tab-num">08</span>
     <span class="tab-label">Supply Chains</span>
   </button>
+  <button class="tab-btn" data-tab="globaltrade" title="Country-level trade flows, production, consumption — with live logistics proxies (BDRY, IYT, JETS, USO)">
+    <span class="tab-num">09</span>
+    <span class="tab-label">Global Trade</span>
+  </button>
 </nav>
 
 <!-- ===== NEWS FEED ===== -->
@@ -5857,26 +6588,59 @@
     </div>
   </section>
 
+  <!-- ============================================================
+       EPISTEMIC NOTICE — surfaces upfront what the user is looking at.
+       The cached regime call is HISTORICAL-pattern-based. The live pulse
+       below is from intraday tape. The user should never confuse the two:
+       "history rhymes, but it never repeats" — Markov forecasts are base
+       rates derived from past transitions, not predictions of the future.
+       ============================================================ -->
+  <section class="regime-epistemic-note" id="regime-epistemic-note" style="display:none">
+    <div class="epistemic-tier-key">
+      <span class="tier-pill tier-live">LIVE</span>
+      <span>= observed right now, intraday tape</span>
+      <span class="tier-pill tier-cached">CACHED</span>
+      <span>= last pipeline run, model output</span>
+      <span class="tier-pill tier-historical">HISTORICAL</span>
+      <span>= base rate from past patterns, not a prediction</span>
+    </div>
+  </section>
+
+  <!-- ============================================================
+       LIVE MARKET PULSE — fresh intraday signals as a consistency check
+       on the cached regime. Each card is data observable RIGHT NOW. If
+       the cached regime claims "Risk-On" but VIX just spiked 8%, the
+       deviation banner fires.
+       ============================================================ -->
+  <section class="regime-live-pulse" id="regime-live-pulse" style="display:none">
+    <div class="regime-section-title">LIVE MARKET PULSE <small>· intraday signals · ${''/* updated by JS */}</small></div>
+    <div class="live-pulse-banner" id="live-pulse-banner" style="display:none"></div>
+    <div class="live-pulse-grid" id="live-pulse-grid"></div>
+  </section>
+
   <!-- Six signal score bars (-1 to +1) -->
   <section class="regime-scores-grid" id="regime-scores-grid" style="display:none">
-    <div class="regime-section-title">SIGNAL SCORES <small>−1 bearish ◀ ▶ +1 bullish</small></div>
+    <div class="regime-section-title">SIGNAL SCORES <span class="tier-pill tier-cached" title="From last pipeline run">CACHED</span> <small>−1 bearish ◀ ▶ +1 bullish</small></div>
     <div class="regime-score-list" id="regime-score-list"></div>
   </section>
 
   <!-- Regime probabilities (current snapshot) + Markov n-step forecasts -->
   <section class="regime-prob-grid" id="regime-prob-grid" style="display:none">
     <div class="regime-prob-now">
-      <div class="regime-section-title">CURRENT PROBABILITIES</div>
+      <div class="regime-section-title">CURRENT PROBABILITIES <span class="tier-pill tier-cached">CACHED</span></div>
       <div class="regime-prob-bars" id="regime-prob-bars"></div>
     </div>
     <div class="regime-prob-forecast">
-      <div class="regime-section-title">N-STEP FORECAST <small>via Markov chain</small></div>
+      <div class="regime-section-title">N-STEP FORECAST <span class="tier-pill tier-historical" title="Markov chain forecasts are derived from historical regime transitions. They tell you what would happen IF past patterns repeat — not what will happen.">HISTORICAL BASE RATE</span> <small>via Markov chain</small></div>
       <div class="regime-forecast-tabs" id="regime-forecast-tabs">
         <button class="regime-forecast-tab active" data-step="1_step">+1d</button>
         <button class="regime-forecast-tab" data-step="5_step">+5d</button>
         <button class="regime-forecast-tab" data-step="20_step">+20d</button>
       </div>
       <div class="regime-prob-bars" id="regime-forecast-bars"></div>
+      <div class="regime-forecast-caveat">
+        <strong>Important:</strong> these are base rates from historical regime transitions, not forecasts. Past patterns rhyme but don't repeat. Treat as "if nothing dramatic changes" and cross-check with the Live Pulse above.
+      </div>
       <div class="regime-stationary" id="regime-stationary"></div>
     </div>
   </section>
@@ -6817,6 +7581,144 @@
   </div>
 </div>
 
+<!-- ============================================================
+     09 — GLOBAL TRADE
+     Country-level macroeconomic + trade flow dashboard with explicit
+     epistemic tier labeling. Live logistics proxies (BDRY, IYT, etc.)
+     are tagged LIVE; FRED/World Bank/IMF data is tagged MONTHLY or
+     QUARTERLY depending on cadence; data >90 days old is tagged STALE.
+     ============================================================ -->
+<div class="tab-panel" data-panel="globaltrade">
+
+  <div class="news-header">
+    <div>
+      <h2 class="news-title">Global Trade Pulse</h2>
+      <p class="news-subtitle">Trade flows, domestic production, consumption · logistics signals (ships, trucks, rail, planes, pipelines) via tradeable proxies · country-level snapshots beyond US-only</p>
+    </div>
+    <div class="news-controls">
+      <select class="news-filter" id="gt-view-mode">
+        <option value="overview" selected>Overview · Logistics + Trade Pulse</option>
+        <option value="countries">By Country</option>
+        <option value="products">By Product / Commodity</option>
+        <option value="bilateral">Bilateral Flows</option>
+        <option value="datasources">Data Sources &amp; Roadmap</option>
+      </select>
+    </div>
+  </div>
+
+  <!-- Epistemic tier explainer — same pattern as Macro Quad. Different cadence
+       labels because trade data is much more lagged than market data. -->
+  <section class="gt-tier-note">
+    <div class="epistemic-tier-key">
+      <span class="tier-pill tier-live">LIVE</span>
+      <span>= tradeable proxy (ETF/index price right now)</span>
+      <span class="tier-pill tier-monthly">MONTHLY</span>
+      <span>= FRED/national statistics (1-2 month lag)</span>
+      <span class="tier-pill tier-quarterly">QUARTERLY</span>
+      <span>= IMF/World Bank/national accounts (3-6 month lag)</span>
+      <span class="tier-pill tier-stale">STALE</span>
+      <span>= older than 90 days, treat as last-known</span>
+    </div>
+    <div class="gt-tier-disclaimer">
+      <strong>Important:</strong> trade data is fundamentally lagged. Customs filings publish 1-2 months after the trade. National GDP publishes 1 quarter after. Live logistics proxies (Baltic Dry, transportation ETFs, oil/gas movers) help fill the gap with tradeable signals, but they're proxies — not direct measurements. Treat proxies as <em>directional</em>, not as a substitute for the actual numbers when they arrive.
+    </div>
+  </section>
+
+  <!-- ============= OVERVIEW VIEW ============= -->
+  <section class="gt-view" data-view="overview" id="gt-view-overview">
+
+    <!-- Live logistics proxies -->
+    <div class="gt-section">
+      <div class="regime-section-title">LIVE LOGISTICS PROXIES <span class="tier-pill tier-live" style="margin-left:6px">LIVE</span></div>
+      <div class="gt-section-sub">Tradeable instruments that move with the underlying logistics activity. These are <em>proxies</em> — when BDRY rallies, dry bulk shipping is busy; when IYT diverges from S&amp;P 500, the transport tape is telling you something different from the broad market.</div>
+      <div class="gt-logistics-grid" id="gt-logistics-grid">
+        <!-- Cards populated by renderGlobalTradeLogistics() — 1 card per logistics mode -->
+      </div>
+    </div>
+
+    <!-- Trade pulse snapshot -->
+    <div class="gt-section">
+      <div class="regime-section-title">TRADE PULSE SNAPSHOT</div>
+      <div class="gt-section-sub">Aggregated read of where global trade is right now, combining all live proxies. Direction signal, not a forecast.</div>
+      <div class="gt-pulse-summary" id="gt-pulse-summary"></div>
+    </div>
+
+    <!-- Top trading partners (US default) -->
+    <div class="gt-section">
+      <div class="regime-section-title">TOP TRADING PARTNERS · USA <span class="tier-pill tier-monthly" style="margin-left:6px">MONTHLY</span></div>
+      <div class="gt-section-sub">Exports + imports by partner country (full-year run-rate). Sourced from FRED's Census Bureau trade series. To extend coverage beyond the US, the pipeline needs IMF DOTS integration — see the Data Sources tab for the roadmap.</div>
+      <div class="gt-partners-table-wrap" id="gt-partners-table-wrap"></div>
+    </div>
+
+  </section>
+
+  <!-- ============= COUNTRIES VIEW ============= -->
+  <section class="gt-view" data-view="countries" id="gt-view-countries" style="display:none">
+    <div class="gt-section">
+      <div class="regime-section-title">COUNTRY DASHBOARDS</div>
+      <div class="gt-section-sub">Top 11 economies by GDP. Each card shows GDP (most-recent quarter), exports/imports (most-recent month), and tradeable proxies. Click any card to open the country detail with sector exposure suggestions.</div>
+      <div class="gt-countries-grid" id="gt-countries-grid"></div>
+    </div>
+  </section>
+
+  <!-- ============= PRODUCTS VIEW ============= -->
+  <section class="gt-view" data-view="products" id="gt-view-products" style="display:none">
+    <div class="gt-section">
+      <div class="regime-section-title">PRODUCT &amp; COMMODITY FLOWS</div>
+      <div class="gt-section-sub">Top traded commodities + manufactured goods. Live price + ETF proxy + country production share. <strong>Heads up:</strong> production share data is from World Bank/USGS and updates annually — clearly tagged.</div>
+      <div class="gt-products-grid" id="gt-products-grid"></div>
+    </div>
+  </section>
+
+  <!-- ============= BILATERAL VIEW ============= -->
+  <section class="gt-view" data-view="bilateral" id="gt-view-bilateral" style="display:none">
+    <div class="gt-section">
+      <div class="regime-section-title">BILATERAL TRADE FLOWS</div>
+      <div class="gt-section-sub">Pick two countries to see the trade balance between them, top products in each direction, and the tradeable equities most-exposed to that trade lane.</div>
+      <div class="gt-bilateral-picker">
+        <select class="modal-input" id="gt-bilat-from" style="max-width:200px">
+          <option value="us">United States</option>
+          <option value="cn">China</option>
+          <option value="de">Germany</option>
+          <option value="jp">Japan</option>
+          <option value="mx">Mexico</option>
+          <option value="ca">Canada</option>
+          <option value="kr">South Korea</option>
+          <option value="gb">United Kingdom</option>
+          <option value="in">India</option>
+          <option value="fr">France</option>
+          <option value="br">Brazil</option>
+        </select>
+        <span style="font-family:var(--mono);color:var(--ink-faint);padding:0 8px;align-self:center">↔</span>
+        <select class="modal-input" id="gt-bilat-to" style="max-width:200px">
+          <option value="cn">China</option>
+          <option value="us">United States</option>
+          <option value="de">Germany</option>
+          <option value="jp">Japan</option>
+          <option value="mx">Mexico</option>
+          <option value="ca">Canada</option>
+          <option value="kr">South Korea</option>
+          <option value="gb">United Kingdom</option>
+          <option value="in">India</option>
+          <option value="fr">France</option>
+          <option value="br">Brazil</option>
+        </select>
+      </div>
+      <div id="gt-bilateral-output"></div>
+    </div>
+  </section>
+
+  <!-- ============= DATA SOURCES + ROADMAP VIEW ============= -->
+  <section class="gt-view" data-view="datasources" id="gt-view-datasources" style="display:none">
+    <div class="gt-section">
+      <div class="regime-section-title">DATA SOURCES &amp; PIPELINE ROADMAP</div>
+      <div class="gt-section-sub">Honest accounting of what data we have, where it comes from, and what's still missing. This page is intentionally verbose — global trade data is harder to source than US equity data, and the user deserves to know exactly what's behind every number.</div>
+      <div id="gt-sources-content"></div>
+    </div>
+  </section>
+
+</div>
+
 <div id="sb-desc-tooltip" class="sb-desc-tooltip"></div>
 
 <!-- DATA SOURCES MODAL -->
@@ -6986,6 +7888,163 @@
      (equity, option, future, FX, crypto) or do a bulk-import .txt
      from anywhere in the app.
      ============================================================ -->
+<!-- ============================================================
+     NOTIFICATIONS DRAWER
+     Slides in from the top-left. Lists all active notifications with their
+     fire times (relative), and provides a form to add new ones.
+     ============================================================ -->
+<div class="side-drawer-backdrop" id="notif-drawer-backdrop" style="display:none" onclick="if(event.target.id==='notif-drawer-backdrop')document.getElementById('notif-drawer-backdrop').style.display='none'"></div>
+<aside class="side-drawer" id="notif-drawer" style="display:none">
+  <div class="side-drawer-head">
+    <div class="side-drawer-title">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:8px;vertical-align:-3px"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+      Notifications
+    </div>
+    <button class="side-drawer-close" onclick="document.getElementById('notif-drawer').style.display='none';document.getElementById('notif-drawer-backdrop').style.display='none'">×</button>
+  </div>
+  <div class="side-drawer-body">
+    <!-- New notification form -->
+    <div class="notif-form-section">
+      <div class="modal-label">New Reminder</div>
+      <input type="text" class="modal-input" id="notif-new-title" placeholder="What needs doing?" maxlength="120">
+      <textarea class="modal-input" id="notif-new-detail" placeholder="Optional details, ticker, context…" rows="2" style="margin-top:6px;resize:vertical;min-height:48px;font-family:var(--mono);font-size:11px"></textarea>
+      <div class="modal-label" style="margin-top:10px">Remind me…</div>
+      <div class="seg-control" id="notif-when-seg" style="margin-top:4px;flex-wrap:wrap">
+        <button type="button" data-val="now" class="seg-btn active">Right now</button>
+        <button type="button" data-val="1h" class="seg-btn">In 1 hour</button>
+        <button type="button" data-val="1d" class="seg-btn">Tomorrow</button>
+        <button type="button" data-val="1w" class="seg-btn">In a week</button>
+        <button type="button" data-val="custom" class="seg-btn">Custom date…</button>
+      </div>
+      <input type="datetime-local" class="modal-input" id="notif-new-custom" style="display:none;margin-top:6px">
+      <div class="modal-label" style="margin-top:10px">Category</div>
+      <select class="modal-input" id="notif-new-category">
+        <option value="todo">To-Do · General reminder</option>
+        <option value="fix">Fix · Code or data needs attention</option>
+        <option value="pipeline">Pipeline · Tickers to add to tickers.txt</option>
+        <option value="target">Price Target · Watch for level (future feature)</option>
+        <option value="note">Note · Informational only</option>
+      </select>
+      <button class="btn" id="notif-add-btn" style="margin-top:12px;width:100%">Add Reminder</button>
+    </div>
+    <!-- List of existing notifications -->
+    <div class="notif-list-section">
+      <div class="modal-label" style="margin-bottom:8px">
+        <span>Active</span>
+        <button class="btn btn-ghost notif-clear-btn" id="notif-clear-dismissed-btn" title="Permanently delete dismissed notifications">Clear dismissed</button>
+      </div>
+      <div id="notif-list">
+        <div class="notif-empty">No notifications yet. Add a reminder above, or the system will create them as it detects issues.</div>
+      </div>
+    </div>
+  </div>
+</aside>
+
+<!-- ============================================================
+     HOME / SETTINGS DRAWER
+     Slides in from the top-left. Home panel with theme/display
+     preferences, data import (PDF/JSON), data export (full snapshot),
+     and cache management.
+     ============================================================ -->
+<div class="side-drawer-backdrop" id="home-drawer-backdrop" style="display:none" onclick="if(event.target.id==='home-drawer-backdrop')document.getElementById('home-drawer-backdrop').style.display='none'"></div>
+<aside class="side-drawer side-drawer-wide" id="home-drawer" style="display:none">
+  <div class="side-drawer-head">
+    <div class="side-drawer-title">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:8px;vertical-align:-3px"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+      Home · Settings
+    </div>
+    <button class="side-drawer-close" onclick="document.getElementById('home-drawer').style.display='none';document.getElementById('home-drawer-backdrop').style.display='none'">×</button>
+  </div>
+  <div class="side-drawer-body">
+
+    <!-- Section: Quick stats -->
+    <div class="home-section">
+      <div class="home-section-title">At a Glance</div>
+      <div class="home-stats-grid" id="home-stats-grid">
+        <!-- populated by renderHomeStats() -->
+      </div>
+    </div>
+
+    <!-- Section: Data import -->
+    <div class="home-section">
+      <div class="home-section-title">Import Data</div>
+      <div class="home-section-sub">Drop any PDF or JSON file. The system analyzes the content and routes it to the right place — ticker reports, charts, project data, leadership PDFs (the existing export format), etc.</div>
+      <div class="home-import-zone" id="home-import-zone">
+        <input type="file" id="home-import-file" accept=".pdf,.json,.txt,.csv" style="display:none" multiple>
+        <div class="home-import-zone-inner" onclick="document.getElementById('home-import-file').click()">
+          <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.6">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+          <div style="margin-top:8px"><strong>Click to choose files</strong> or drop here</div>
+          <div style="font-size:10px;color:var(--ink-faint);margin-top:4px">PDF · JSON · TXT · CSV · multi-file supported</div>
+        </div>
+      </div>
+      <div id="home-import-log" class="home-import-log"></div>
+    </div>
+
+    <!-- Section: Data export -->
+    <div class="home-section">
+      <div class="home-section-title">Export Data</div>
+      <div class="home-section-sub">Full backup of every local-storage key + cached data. Restore from this same file later (Import above) to recover everything.</div>
+      <div class="home-export-buttons">
+        <button class="btn" id="home-export-json-btn" title="Download a complete JSON snapshot of all your data — portfolios, transactions, notifications, settings, caches, everything in localStorage">Export Full JSON Snapshot</button>
+        <button class="btn" id="home-export-pdf-btn" title="Generate a human-readable PDF report with portfolio summary, transactions, notifications, GoodGlobe Index, and all settings">Export PDF Report</button>
+        <button class="btn btn-ghost" id="home-export-csv-btn" title="Export transactions ledger as CSV">Export Transactions CSV</button>
+      </div>
+    </div>
+
+    <!-- Section: Theme + display -->
+    <div class="home-section">
+      <div class="home-section-title">Display Preferences</div>
+      <div class="home-pref-row">
+        <label class="home-pref-label">Theme</label>
+        <div class="seg-control" id="pref-theme-seg">
+          <button type="button" data-val="dark" class="seg-btn">Dark</button>
+          <button type="button" data-val="light" class="seg-btn">Light</button>
+        </div>
+      </div>
+      <div class="home-pref-row">
+        <label class="home-pref-label">Accent Color</label>
+        <div class="home-color-swatches" id="pref-accent-swatches">
+          <button class="color-swatch" data-color="#d4a24c" style="background:#d4a24c" title="Amber (default)"></button>
+          <button class="color-swatch" data-color="#7faaca" style="background:#7faaca" title="Slate Blue"></button>
+          <button class="color-swatch" data-color="#5b8a72" style="background:#5b8a72" title="Forest Green"></button>
+          <button class="color-swatch" data-color="#a85a3a" style="background:#a85a3a" title="Burnt Sienna"></button>
+          <button class="color-swatch" data-color="#9c7aaf" style="background:#9c7aaf" title="Muted Plum"></button>
+        </div>
+      </div>
+      <div class="home-pref-row">
+        <label class="home-pref-label">Density</label>
+        <div class="seg-control" id="pref-density-seg">
+          <button type="button" data-val="comfortable" class="seg-btn active">Comfortable</button>
+          <button type="button" data-val="compact" class="seg-btn">Compact</button>
+        </div>
+      </div>
+      <div class="home-pref-row">
+        <label class="home-pref-label">Ticker Tape</label>
+        <div class="seg-control" id="pref-tape-seg">
+          <button type="button" data-val="on" class="seg-btn active">On</button>
+          <button type="button" data-val="off" class="seg-btn">Hide</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Section: Cache management -->
+    <div class="home-section">
+      <div class="home-section-title">Storage</div>
+      <div id="home-storage-stats" class="home-storage-stats"></div>
+      <div class="home-export-buttons" style="margin-top:10px">
+        <button class="btn btn-ghost" id="home-clear-news-btn" title="Clear cached news articles only (won't affect portfolio or settings)">Clear News Cache</button>
+        <button class="btn btn-ghost" id="home-clear-prices-btn" title="Clear cached price history (will re-fetch on next load)">Clear Price History Cache</button>
+        <button class="btn btn-ghost" id="home-clear-all-btn" title="Nuclear option — clears EVERY local-storage key for this app" style="border-color:#a5645a;color:#a5645a">Clear All Local Data</button>
+      </div>
+    </div>
+
+  </div>
+</aside>
+
 <button class="global-add-fab" id="global-add-fab" title="Add position · option · future · FX · or import a ticker list">
   <span class="fab-icon">+</span>
   <span class="fab-label">ADD</span>
