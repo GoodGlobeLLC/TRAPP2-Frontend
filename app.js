@@ -2606,7 +2606,7 @@ const PRICE_HIST_CACHE_KEY = 'valuatio.priceHist.cache.v1';
 const PRICE_HIST_TTL_MS = 24 * 60 * 60 * 1000;
 // Browser localStorage is 5-10 MB. Each ticker's 5-year history is ~25-40 KB.
 // Cap to 100 most-recently-used to avoid silently busting quota.
-const PRICE_HIST_CACHE_MAX_TICKERS = 100;
+const PRICE_HIST_CACHE_MAX_TICKERS = 60;
 
 // In-memory cache for the FULL ticker set this session. localStorage holds only
 // the most-recently-used PRICE_HIST_CACHE_MAX_TICKERS so quota doesn't burst.
@@ -2623,13 +2623,32 @@ function loadPriceHistCache() {
   catch { return {}; }
 }
 function savePriceHistCache(c) {
-  for (const [k, v] of Object.entries(c)) _priceHistMemCache[k] = v;
-  const sorted = Object.entries(c).sort((a, b) => (b[1].t || 0) - (a[1].t || 0));
+  // Trim each history to the last ~260 points (≈1 trading year). The chart,
+  // correlations, and probability models don't need more than a year of daily
+  // data, and keeping full multi-year histories for 100+ tickers was what
+  // pushed price-history storage to ~9MB and started silently failing saves
+  // (which broke the portfolio chart — new entries couldn't persist).
+  const MAX_POINTS = 260;
+  const trimmed = {};
+  for (const [k, v] of Object.entries(c)) {
+    if (v && Array.isArray(v.data) && v.data.length > MAX_POINTS) {
+      trimmed[k] = { ...v, data: v.data.slice(-MAX_POINTS) };
+    } else {
+      trimmed[k] = v;
+    }
+    _priceHistMemCache[k] = trimmed[k];
+  }
+  const sorted = Object.entries(trimmed).sort((a, b) => (b[1].t || 0) - (a[1].t || 0));
   const top = Object.fromEntries(sorted.slice(0, PRICE_HIST_CACHE_MAX_TICKERS));
   try { localStorage.setItem(PRICE_HIST_CACHE_KEY, JSON.stringify(top)); }
   catch {
+    // Quota burst — halve and retry, then quarter if still failing
     const half = Object.fromEntries(sorted.slice(0, Math.floor(PRICE_HIST_CACHE_MAX_TICKERS / 2)));
-    try { localStorage.setItem(PRICE_HIST_CACHE_KEY, JSON.stringify(half)); } catch {}
+    try { localStorage.setItem(PRICE_HIST_CACHE_KEY, JSON.stringify(half)); }
+    catch {
+      const quarter = Object.fromEntries(sorted.slice(0, Math.floor(PRICE_HIST_CACHE_MAX_TICKERS / 4)));
+      try { localStorage.setItem(PRICE_HIST_CACHE_KEY, JSON.stringify(quarter)); } catch {}
+    }
   }
 }
 
@@ -8360,16 +8379,31 @@ document.getElementById('stockbook-refresh-btn')?.addEventListener('click', () =
 function openClearCachePrompt() {
   const choice = prompt(
     'Choose what to clear:\n' +
-    '  1 = Caches only (sectors, descriptions, taxonomy, macro, bonds, sheet cache)\n' +
+    '  0 = Price history ONLY (the biggest cache — frees the most space, re-fetches on demand)\n' +
+    '  1 = Caches only (sectors, descriptions, taxonomy, macro, bonds, sheet cache, price history)\n' +
     '  2 = Caches + personal book (manually-added tickers)\n' +
     '  3 = EVERYTHING (caches + personal book + portfolio + saved valuations + ' +
        'notes + overrides + probability theses + risk portfolio + API keys + sheet URLs)\n\n' +
-    'Type 1, 2, or 3:'
+    'Type 0, 1, 2, or 3:'
   );
   if (!choice) return;
   const c = choice.trim();
-  if (c === '1') {
+  if (c === '0') {
+    // Price history is usually the largest single cache (often 8-9MB with
+    // hundreds of tickers). Clearing just this frees the most space without
+    // touching portfolio, settings, or other caches. Re-fetches on demand.
+    localStorage.removeItem('valuatio.priceHist.cache.v1');
+    // Also clear the in-memory mirror so getHistoryForTicker doesn't serve stale data
+    if (typeof _priceHistMemCache === 'object') {
+      for (const k of Object.keys(_priceHistMemCache)) delete _priceHistMemCache[k];
+    }
+    if (typeof renderStorageStats === 'function') renderStorageStats();
+    flashStatus('Price history cleared — frees the most space', 'success');
+  } else if (c === '1') {
     purgeAllDataCaches();
+    if (typeof _priceHistMemCache === 'object') {
+      for (const k of Object.keys(_priceHistMemCache)) delete _priceHistMemCache[k];
+    }
     loadStockBook(true);
     flashStatus('Caches cleared', 'success');
   } else if (c === '2') {
@@ -8386,7 +8420,7 @@ function openClearCachePrompt() {
     flashStatus('All Valuatio data cleared · reloading…', 'success');
     setTimeout(() => location.reload(), 800);
   } else {
-    flashStatus('Cancelled — type 1, 2, or 3', '');
+    flashStatus('Cancelled — type 0, 1, 2, or 3', '');
   }
 }
 document.getElementById('stockbook-clear-cache-btn')?.addEventListener('click', openClearCachePrompt);
@@ -19074,23 +19108,44 @@ function renderPortfolioChart(enriched, range) {
     } else if (withCost.length === 0) {
       msg = `${enrichedActive.length} active position(s) but none have an entry/cost basis recorded.`;
     } else if (withHist.length === 0) {
-      msg = `${withCost.length} position(s) with cost basis, but no price history loaded yet. ${state._historyManifest?.baseUrl ? 'Priming from GitHub…' : 'Set up the GitHub data source so history can load.'}`;
+      msg = `${withCost.length} position(s) with cost basis — loading price history…`;
     } else {
       msg = 'No positions with entry price + history yet';
     }
     svg.innerHTML = `<text x="50%" y="42%" text-anchor="middle" fill="var(--ink-faint)" font-family="var(--mono)" font-size="11">${escapeHtml(msg)}</text>` +
-      (withCost.length > 0 && withHist.length === 0 && state._historyManifest?.baseUrl
-        ? `<text x="50%" y="56%" text-anchor="middle" fill="var(--ink-faint)" font-family="var(--mono)" font-size="9">chart will fill in once history loads — try the range buttons</text>`
+      (withCost.length > 0 && withHist.length === 0
+        ? `<text x="50%" y="56%" text-anchor="middle" fill="var(--ink-faint)" font-family="var(--mono)" font-size="9">trying GitHub, then Stooq / Twelve Data / FMP…</text>`
         : '');
     if (legend) legend.innerHTML = '';
-    // If we have cost but no history and a manifest exists, kick off a prime + re-render
-    if (withCost.length > 0 && withHist.length === 0 && state._historyManifest?.baseUrl && typeof primeHistoryForTickers === 'function') {
+    // Prime history using the FULL fallback chain (getPriceHistory tries
+    // sheet → cache → GitHub → Twelve Data → FMP → Stooq). This is more robust
+    // than the GitHub-only primeHistoryForTickers — it loads MSFT etc. even
+    // when the GitHub manifest isn't configured, and handles FX/index tickers
+    // that GitHub doesn't generate files for. Guard against infinite re-render
+    // with a per-render flag.
+    if (withCost.length > 0 && withHist.length === 0 && !renderPortfolioChart._priming) {
+      renderPortfolioChart._priming = true;
       const need = withCost.map(e => e.ticker);
-      primeHistoryForTickers(need).then(() => {
-        // Only re-render if still on the same view
-        const stillActive = document.getElementById('portfolio-chart-svg');
-        if (stillActive) renderPortfolioChart(enriched, range);
-      }).catch(() => {});
+      (async () => {
+        let loadedAny = false;
+        for (const t of need) {
+          try {
+            const h = await getPriceHistory(t).catch(() => null);
+            if (h && h.length >= 2) {
+              // Persist into the price-hist cache so getHist() (sync) finds it next render
+              const cache = loadPriceHistCache();
+              cache[t] = { t: Date.now(), data: h };
+              savePriceHistCache(cache);
+              loadedAny = true;
+            }
+          } catch {}
+        }
+        renderPortfolioChart._priming = false;
+        if (loadedAny) {
+          const stillActive = document.getElementById('portfolio-chart-svg');
+          if (stillActive) renderPortfolioChart(enriched, range);
+        }
+      })();
     }
     return;
   }
