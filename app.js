@@ -18605,6 +18605,17 @@ const ACTIVE_POSITIONS = ['Trading', 'Long', 'Short'];
 // Portfolio sub-tab state — persists across re-renders
 state.portfolioSubTab = state.portfolioSubTab || 'all';
 
+// Contract multiplier for a position. Options represent 100 shares per
+// contract, so their dollar value/P/L is 100× the quoted per-share premium.
+// Top-level so both renderStockBookPortfolio and the chart impl can use it.
+function positionMultiplier(entry) {
+  if (!entry) return 1;
+  if (entry.optionMeta?.multiplier) return entry.optionMeta.multiplier;
+  if (entry.assetType === 'option') return 100;
+  if (typeof classifyAsset === 'function' && classifyAsset(entry.ticker) === 'option') return 100;
+  return 1;
+}
+
 function renderStockBookPortfolio(content) {
   const portfolio = loadPortfolio();
   const sbRows = state.stockbook?.rows || [];
@@ -18633,15 +18644,9 @@ function renderStockBookPortfolio(content) {
   //   the user's spec didn't include multiplier metadata. When/if they
   //   add it we can plumb it through positionMultiplier the same way.
   // ============================================================
-  function positionMultiplier(entry) {
-    if (!entry) return 1;
-    // Explicit multiplier on the entry's option metadata wins
-    if (entry.optionMeta?.multiplier) return entry.optionMeta.multiplier;
-    // Fall back to classifyAsset / assetType detection
-    if (entry.assetType === 'option') return 100;
-    if (classifyAsset(entry.ticker) === 'option') return 100;
-    return 1;
-  }
+  // positionMultiplier is now a top-level function (defined above
+  // renderStockBookPortfolio) so the portfolio chart impl, which lives at
+  // top level, can also call it. Calls here resolve via the scope chain.
 
   // Compute P/L for a single entry. Returns { plPct, plDollar } or {plPct: null, plDollar: null}
   // Uses ENTRY PRICE (costBasis) — NOT sheet's "P/L since" column.
