@@ -4170,6 +4170,10 @@
     display: flex; align-items: center; justify-content: center;
     padding: 20px;
   }
+  /* The leadership add/edit modal can be opened from inside the F2 overlay
+     (z-index 300). It must stack ABOVE that overlay, otherwise it renders
+     behind it and the user has to close the F2 box first to reach it. */
+  #leadership-edit-modal { z-index: 400; }
   .modal-box {
     background: var(--bg-card);
     border: 1px solid var(--rule);
