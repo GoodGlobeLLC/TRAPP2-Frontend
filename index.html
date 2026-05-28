@@ -1618,8 +1618,20 @@
   }
   .cmd-key {
     padding: 2px 6px;
-    border: 1px solid #1a1815;
-    background: #0a0908;
+    border: 1px solid var(--rule);
+    background: var(--bg-elev);
+    color: var(--ink-dim);
+    border-radius: 2px;
+  }
+  /* Light mode: brighter, clearer hint pills with better contrast */
+  html[data-theme="light"] .cmd-key {
+    background: #ece6d8;
+    border-color: #c9bfa8;
+    color: #6b5d3f;
+  }
+  html[data-theme="light"] .cmd-key#cmd-cheat-toggle {
+    color: var(--amber);
+    border-color: var(--amber);
   }
 
   /* Suggestion dropdown */
@@ -3890,7 +3902,16 @@
     gap: 0;
     border-bottom: 1px solid var(--rule);
     margin: 16px 0 10px;
+    /* Categories overflow on narrow screens — allow horizontal scroll instead
+       of wrapping/clipping. Thin scrollbar, momentum scroll on touch. */
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+    white-space: nowrap;
   }
+  .portfolio-subtabs::-webkit-scrollbar { height: 6px; }
+  .portfolio-subtabs::-webkit-scrollbar-thumb { background: var(--rule); border-radius: 3px; }
   .portfolio-subtab {
     background: transparent;
     border: none;
@@ -3903,6 +3924,8 @@
     letter-spacing: 0.18em;
     cursor: pointer;
     transition: all 0.12s;
+    flex-shrink: 0;
+    white-space: nowrap;
   }
   .portfolio-subtab:hover { color: var(--ink); }
   .portfolio-subtab.active {
@@ -5118,6 +5141,26 @@
     grid-template-columns: 1fr 1fr 1fr;
     gap: 14px;
     margin-top: 12px;
+  }
+  /* On constrained widths (half-screen, tablets), switch the 3 tiers from a
+     squeezed grid to a horizontally-scrollable row so downstream products
+     stay fully readable instead of being clipped. Each tier keeps a usable
+     min width and the row scrolls. */
+  @media (max-width: 1200px) {
+    .sc-flow {
+      display: flex;
+      overflow-x: auto;
+      overflow-y: hidden;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: thin;
+      padding-bottom: 6px;
+    }
+    .sc-flow > .sc-tier {
+      flex: 0 0 300px;
+      min-width: 300px;
+    }
+    .sc-flow::-webkit-scrollbar { height: 7px; }
+    .sc-flow::-webkit-scrollbar-thumb { background: var(--rule); border-radius: 4px; }
   }
   .sc-tier {
     background: var(--bg-elev);
@@ -8193,7 +8236,13 @@
           <span>Refresh All Data</span>
         </button>
         <button class="home-action-btn" id="clear-cache-btn" title="Clear cookies + localStorage + news cache + history cache">
-          <span style="font-size:14px;width:14px;text-align:center">🍪</span>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0">
+            <path d="M12 2a10 10 0 1 0 10 10 4 4 0 0 1-5-5 4 4 0 0 1-5-5"/>
+            <circle cx="8.5" cy="8.5" r="1" fill="currentColor"/>
+            <circle cx="15" cy="15" r="1" fill="currentColor"/>
+            <circle cx="9" cy="15.5" r="1" fill="currentColor"/>
+            <circle cx="14" cy="9.5" r="0.8" fill="currentColor"/>
+          </svg>
           <span>Clear Caches</span>
         </button>
         <button class="home-action-btn" id="debug-log-toggle" title="Open debug log — shows data sources, fetches, errors">

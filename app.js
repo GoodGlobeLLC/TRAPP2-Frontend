@@ -39,11 +39,17 @@ const COUNTRY_RISK = {
 // ---------- UI: SET UP CLOCK ----------
 function tickClock() {
   const d = new Date();
-  document.getElementById('clock').textContent =
-    d.toISOString().slice(0,10) + ' · ' + d.toTimeString().slice(0,5);
+  // Local date + local time WITH seconds, ticking every second so the display
+  // never lags behind real time. Previously it showed only HH:MM and updated
+  // every 30s, so the minute could appear up to ~30-40s behind actual time.
+  const pad = (n) => String(n).padStart(2, '0');
+  const dateStr = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const timeStr = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  const el = document.getElementById('clock');
+  if (el) el.textContent = `${dateStr} · ${timeStr}`;
 }
 tickClock();
-setInterval(tickClock, 30000);
+setInterval(tickClock, 1000);
 
 // ---------- DATA FETCHING ----------
 // Strategy in 2026: Yahoo Finance's unofficial API now requires a session crumb
@@ -11555,12 +11561,41 @@ function renderLeadershipEditBody() {
     </div>
   `;
 
-  // Wire add-row buttons
+  // Harvest ALL current field values from the DOM into the working object.
+  // Must run before any re-render (add position/employer/remove) — otherwise
+  // the identity fields (name, QID, DOB, tickers, education) that only commit
+  // on Save get wiped back to their original values when the body re-renders.
+  // This was the "info erases when adding a new position/employer" bug.
+  function harvestEditFields() {
+    const g = (id) => document.getElementById(id)?.value;
+    if (g('le-name') != null)     w.name = g('le-name');
+    if (g('le-qid') != null)      w.qid = g('le-qid') || null;
+    if (g('le-dob') != null)      w.dateOfBirth = g('le-dob') || null;
+    if (g('le-bp') != null)       w.birthPlace = g('le-bp') || null;
+    if (g('le-tickers') != null)  w.assignedTickers = g('le-tickers').split(',').map(t => t.trim().toUpperCase()).filter(Boolean);
+    if (g('le-education') != null) w.education = g('le-education').split('\n').map(s => s.trim()).filter(Boolean);
+    // Position + employer rows already commit live via their input handlers,
+    // but harvest them too for safety in case a row was edited without blur.
+    document.querySelectorAll('[data-le-pos-field]').forEach(el => {
+      const idx = parseInt(el.dataset.lePosIdx, 10);
+      const field = el.dataset.lePosField;
+      if (w.positions[idx]) w.positions[idx][field] = el.value || (field === 'start' || field === 'end' ? null : '');
+    });
+    document.querySelectorAll('[data-le-emp-field]').forEach(el => {
+      const idx = parseInt(el.dataset.leEmpIdx, 10);
+      const field = el.dataset.leEmpField;
+      if (w.employers[idx]) w.employers[idx][field] = el.value || (field === 'start' || field === 'end' ? null : '');
+    });
+  }
+
+  // Wire add-row buttons — harvest first so nothing already typed is lost
   document.getElementById('le-add-position')?.addEventListener('click', () => {
+    harvestEditFields();
     w.positions.push({ title: '', company: '', start: null, end: null });
     renderLeadershipEditBody();
   });
   document.getElementById('le-add-employer')?.addEventListener('click', () => {
+    harvestEditFields();
     w.employers.push({ company: '', start: null, end: null });
     renderLeadershipEditBody();
   });
@@ -11575,6 +11610,7 @@ function renderLeadershipEditBody() {
   });
   document.querySelectorAll('[data-le-pos-remove]').forEach(el => {
     el.addEventListener('click', () => {
+      harvestEditFields();
       const idx = parseInt(el.dataset.lePosRemove, 10);
       w.positions.splice(idx, 1);
       renderLeadershipEditBody();
@@ -11589,6 +11625,7 @@ function renderLeadershipEditBody() {
   });
   document.querySelectorAll('[data-le-emp-remove]').forEach(el => {
     el.addEventListener('click', () => {
+      harvestEditFields();
       const idx = parseInt(el.dataset.leEmpRemove, 10);
       w.employers.splice(idx, 1);
       renderLeadershipEditBody();
