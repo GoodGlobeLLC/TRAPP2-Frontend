@@ -19036,19 +19036,12 @@ function renderStockBookPortfolio(content) {
         renderPortfolioChart(enriched, btn.dataset.range);
       });
     });
-    // First paint with whatever's in cache so user sees something fast
+    // Single paint. renderPortfolioChart handles its own history priming
+    // internally (full fallback chain: sheet → cache → GitHub → Twelve → FMP →
+    // Stooq) and re-renders itself when data arrives. No separate prime call
+    // here — the old GitHub-only primeHistoryForTickers path was removed
+    // because it silently no-op'd when the GitHub manifest wasn't configured.
     renderPortfolioChart(enriched, '3M');
-    // Prime history for any portfolio tickers that don't have it locally yet,
-    // then re-render so the chart fills in.
-    const portfolioTickers = enriched.map(e => e.ticker);
-    const missingHistory = portfolioTickers.filter(t => !getHistoryForTicker(t));
-    if (missingHistory.length > 0 && typeof primeHistoryForTickers === 'function') {
-      console.log(`Portfolio chart: priming ${missingHistory.length} missing history files…`);
-      primeHistoryForTickers(missingHistory).then(() => {
-        const activeRange = document.querySelector('.portfolio-range-btn.active')?.dataset.range || '3M';
-        renderPortfolioChart(enriched, activeRange);
-      }).catch(() => {});
-    }
   }
 
   wirePortfolioToolbar();
@@ -19062,6 +19055,24 @@ function renderStockBookPortfolio(content) {
 //   Watching / Tracking are excluded.
 // ============================================================
 function renderPortfolioChart(enriched, range) {
+  // Surface any exception inside the SVG instead of leaving a blank box.
+  // The user reported a completely blank chart with no diagnostic text, which
+  // means something was throwing mid-render and being swallowed. Now any error
+  // is visible right in the chart area so we can see what's wrong.
+  try {
+    return _renderPortfolioChartImpl(enriched, range);
+  } catch (e) {
+    console.error('[portfolio-chart] render threw:', e);
+    const svg = document.getElementById('portfolio-chart-svg');
+    if (svg) {
+      svg.innerHTML = `<text x="50%" y="45%" text-anchor="middle" fill="#a5645a" font-family="var(--mono)" font-size="11">Chart error: ${escapeHtml(String(e.message || e))}</text>` +
+        `<text x="50%" y="58%" text-anchor="middle" fill="var(--ink-faint)" font-family="var(--mono)" font-size="9">see console (Ctrl+Shift+I) for details</text>`;
+    }
+    renderPortfolioChart._priming = false;  // unlock so a retry can happen
+  }
+}
+
+function _renderPortfolioChartImpl(enriched, range) {
   const svg = document.getElementById('portfolio-chart-svg');
   const legend = document.getElementById('portfolio-chart-legend');
   if (!svg) return;
@@ -19124,6 +19135,10 @@ function renderPortfolioChart(enriched, range) {
     e.position !== 'Sold' && e.position !== 'Avoid' &&
     e.costBasis && getHist(e.ticker)
   );
+
+  // Diagnostic: log what the chart sees so a blank chart is debuggable.
+  console.log(`[portfolio-chart] range=${range} · enriched=${enriched.length} · candidates=${candidates.length}`,
+    candidates.map(c => ({ t: c.ticker, pos: c.position, qty: c.qty, cost: c.costBasis, histPts: getHist(c.ticker)?.length })));
 
   // ===== Historical positions from the transactions ledger =====
   // Every sell transaction represents a position that LIVED between entryDate
