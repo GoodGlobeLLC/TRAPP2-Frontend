@@ -1334,8 +1334,7 @@ function renderForecastBars() {
 const REGIME_LIVE_PULSE_TICKERS = ['^VIX', 'SPY', '^GSPC', 'XLP', 'XLU', 'XLY', 'XLK', '^TNX', '^FVX', 'UUP', 'XLE', 'XLF', 'XLB'];
 
 function _pulseGetRow(ticker) {
-  const rows = state.stockbook?.rows || [];
-  return rows.find(r => r.ticker === ticker);
+  return getStockbookRow(ticker);
 }
 
 // Pull session % change. Prefer the live "session %" if the pipeline gave us
@@ -1395,8 +1394,10 @@ function _pulseSessionPct(ticker) {
 //     source: which tickers feed this signal (so consumers can show provenance)
 // ============================================================
 function extractCrossAssetSignals() {
-  const sbRows = state.stockbook?.rows || [];
-  const findRow = (t) => sbRows.find(r => r.ticker === t);
+  // Use the O(1) index instead of repeated .find() — with 700+ tickers,
+  // the extractor was doing ~30 lookups × 700 rows = 21,000 string compares
+  // on every call. The index drops this to 30 hash hits.
+  const findRow = (t) => getStockbookRow(t);
   const sessionPct = (t) => {
     const r = findRow(t);
     if (!r) return null;
@@ -3798,7 +3799,7 @@ function renderSummary(s) {
 
   // Pull taxonomy from Stock Book if the live stock object is missing it.
   // Sheet is authoritative — the stockbook row already carries the user-curated values.
-  const sbRow = state.stockbook?.rows?.find(r => r.ticker === s.ticker);
+  const sbRow = getStockbookRow(s.ticker);
   if (sbRow) {
     if (!s.sector && sbRow.sector)             s.sector       = sbRow.sector;
     if (!s.subSector && sbRow.subSector)       s.subSector    = sbRow.subSector;
@@ -3901,7 +3902,7 @@ function renderSummary(s) {
   const sectorEl = document.getElementById('s-sector');
   if (sectorEl) {
     sectorEl.onclick = () => {
-      const sbRow = state.stockbook?.rows?.find(r => r.ticker === s.ticker);
+      const sbRow = getStockbookRow(s.ticker);
       if (sbRow) openOverrideModal(s.ticker);
       else alert('Load Stock Book first to enable overrides');
     };
@@ -4798,7 +4799,7 @@ function syncStockToStockbook(stock) {
 // Used by other tabs (TA, Portfolio) to read consistent values without re-fetching.
 function getCanonicalStockData(ticker) {
   if (!ticker || !state.stockbook?.rows) return null;
-  return state.stockbook.rows.find(r => r.ticker === ticker) || null;
+  return getStockbookRow(ticker) || null;
 }
 
 async function loadValuation(savedRecord = null) {
@@ -6904,7 +6905,7 @@ function renderSectorTable() {
   }
 
   const rows = SECTOR_ETFS.map(etf => {
-    const sbRow = state.stockbook?.rows?.find(r => r.ticker === etf.ticker);
+    const sbRow = getStockbookRow(etf.ticker);
     // Unified history accessor merges sheet + cache + in-memory GitHub manifest data
     const unifiedHist = getHistoryForTicker(etf.ticker);
     const sheetSeries = unifiedHist || sheetHistory?.[etf.ticker];
@@ -7110,7 +7111,7 @@ function renderSectorStocks() {
 
   // Look up sheet price for each ticker if available
   grid.innerHTML = stocks.map(t => {
-    const bookEntry = state.stockbook.rows.find(r => r.ticker === t);
+    const bookEntry = getStockbookRow(t);
     const price = bookEntry?.price;
     const priceLabel = price != null ? `${fmt$(price)}` : 'Value →';
     return `
@@ -7312,6 +7313,55 @@ state.stockbook = {
   sortBy: null,        // column key
   sortDir: 'asc',      // 'asc' or 'desc'
 };
+
+// ============================================================
+//   STOCKBOOK ROW INDEX — O(1) ticker lookup
+//
+//   With 700+ tickers in the stockbook, doing `rows.find(r => r.ticker === t)`
+//   on every render path was the dominant perf cost. A single render that
+//   touches 50 tickers does 50 × 700 = 35,000 string comparisons. Multiply
+//   by re-renders during a thesis create / scenario run / regime refresh
+//   and it explained the 4-minute thesis-add the user reported.
+//
+//   The fix: maintain a Map<ticker, row> alongside rows[], rebuilt whenever
+//   rows is reassigned. Every lookup-by-ticker code path can call
+//   `getStockbookRow(ticker)` which is O(1).
+//
+//   Index is rebuilt lazily on the next lookup after rows mutate, so
+//   one-off pushes don't pay the rebuild cost upfront.
+// ============================================================
+let _sbRowIndex = null;
+let _sbRowIndexBuiltFor = null;   // identity-checked against state.stockbook.rows
+
+function _rebuildStockbookIndex() {
+  const rows = state.stockbook?.rows || [];
+  _sbRowIndex = new Map();
+  for (const r of rows) {
+    if (r && r.ticker) _sbRowIndex.set(r.ticker.toUpperCase(), r);
+  }
+  _sbRowIndexBuiltFor = rows;
+}
+
+// Public: O(1) ticker → row lookup. Safe to call from anywhere — first call
+// after rows mutate rebuilds the index. All ticker lookups in renderers,
+// extractors, valuators should use this instead of .find().
+function getStockbookRow(ticker) {
+  if (!ticker) return null;
+  const rows = state.stockbook?.rows;
+  if (!rows || rows.length === 0) return null;
+  if (_sbRowIndex == null || _sbRowIndexBuiltFor !== rows) {
+    _rebuildStockbookIndex();
+  }
+  return _sbRowIndex.get(ticker.toUpperCase()) || null;
+}
+
+// Explicit invalidation for code that mutates rows in-place (push, splice)
+// without reassigning the array. Most code reassigns, but a few hot paths
+// like ingestNewTicker push directly.
+function invalidateStockbookIndex() {
+  _sbRowIndex = null;
+  _sbRowIndexBuiltFor = null;
+}
 
 async function loadStockBook(forceRefresh = false) {
   const setStatus = (m, c='') => {
@@ -8109,7 +8159,7 @@ async function enrichRow(ticker) {
   };
   setStatus('Enriching ' + ticker + '…');
 
-  const row = state.stockbook.rows.find(r => r.ticker === ticker);
+  const row = getStockbookRow(ticker);
   if (!row) return;
 
   try {
@@ -8913,7 +8963,7 @@ document.getElementById('fn-overlay-close').addEventListener('click', closeFnOve
 async function fnDES(ticker) {
   openFnOverlay('DES', ticker);
   // Use stockbook + sheet + enrichment to assemble a profile
-  let row = state.stockbook.rows.find(r => r.ticker === ticker);
+  let row = getStockbookRow(ticker);
   let enriched = null;
   try { enriched = await enrichTicker(ticker, row?.name); } catch {}
   const merged = { ...(row || {}), ...(enriched || {}) };
@@ -9024,7 +9074,7 @@ async function fnGP(ticker) {
 // --- RV: Relative valuation (peer comparison via stockbook + sector) ---
 async function fnRV(ticker) {
   openFnOverlay('RV', ticker);
-  const subjectRow = state.stockbook.rows.find(r => r.ticker === ticker);
+  const subjectRow = getStockbookRow(ticker);
   const subjectEnriched = await enrichTicker(ticker, subjectRow?.name).catch(() => null);
   const subjectSector = subjectRow?.sector || subjectEnriched?.sector;
 
@@ -9114,7 +9164,7 @@ async function fnRV(ticker) {
         // Filter to peers we actually have data for (in stockbook)
         const enrichedPeers = chainMatch.peers
           .map(p => {
-            const row = state.stockbook.rows.find(r => r.ticker === p.ticker);
+            const row = getStockbookRow(p.ticker);
             return row ? { ...p, row } : null;
           })
           .filter(Boolean);
@@ -9225,7 +9275,7 @@ async function fnWACC(ticker) {
 // --- HOLD: 52-week range visualization ---
 async function fnHOLD(ticker) {
   openFnOverlay('HOLD', ticker);
-  const row = state.stockbook.rows.find(r => r.ticker === ticker);
+  const row = getStockbookRow(ticker);
   const stock = state.stock?.ticker === ticker ? state.stock : null;
   const price = stock?.price ?? row?.price;
   const high52 = stock?.high52 ?? row?.high52;
@@ -9768,7 +9818,7 @@ function fnANR(ticker) {
 async function fnSPLC(ticker) {
   openFnOverlay('SPLC', ticker);
   // We can show peers from the stockbook as a proxy for "related companies"
-  const subjectRow = state.stockbook.rows.find(r => r.ticker === ticker);
+  const subjectRow = getStockbookRow(ticker);
   const sector = subjectRow?.sector;
   const peers = sector ? state.stockbook.rows.filter(r =>
     r.ticker !== ticker && r.sector === sector
@@ -9906,7 +9956,7 @@ async function fnGMM() {
 
   // Build full per-ETF row pulling from EVERY available source
   const sectorRows = SECTOR_ETFS.map(etf => {
-    const sbRow = state.stockbook?.rows?.find(r => r.ticker === etf.ticker);
+    const sbRow = getStockbookRow(etf.ticker);
     const unifiedHist = getHistoryForTicker(etf.ticker);
     const sheetSeries = unifiedHist || sheetHistory?.[etf.ticker];
     const stooqSeries = state.macro?.sectors?.[etf.ticker];
@@ -10045,7 +10095,7 @@ async function fnIMAP() {
 
   // Get pct change for any ticker — sheet's changepct → return day → price history → stooq
   function pctFor(ticker, fallbackHistory) {
-    const sbRow = state.stockbook?.rows?.find(r => r.ticker === ticker);
+    const sbRow = getStockbookRow(ticker);
     if (sbRow?.rawRow) {
       const fromCp = parsePctSheet(sbRow.rawRow['changepct']);
       if (fromCp != null) return fromCp;
@@ -10063,7 +10113,7 @@ async function fnIMAP() {
   }
 
   function priceFor(ticker, fallbackHistory) {
-    const sbRow = state.stockbook?.rows?.find(r => r.ticker === ticker);
+    const sbRow = getStockbookRow(ticker);
     if (sbRow?.price != null) return sbRow.price;
     if (sheetHistory?.[ticker]?.length) return sheetHistory[ticker][sheetHistory[ticker].length - 1].price;
     if (fallbackHistory?.length) return fallbackHistory[fallbackHistory.length - 1].close;
@@ -12621,13 +12671,13 @@ async function computeThesisProbability(thesis) {
 
   // Try multiple sources for current price + sector
   // 1. Stockbook row (sheet-derived)
-  let sbRow = state.stockbook?.rows?.find(r => r.ticker === ticker);
+  let sbRow = getStockbookRow(ticker);
 
   // 2. If stockbook empty, force a load
   if (!sbRow && (state.stockbook?.rows?.length ?? 0) === 0) {
     try {
       await loadStockBook(false);
-      sbRow = state.stockbook?.rows?.find(r => r.ticker === ticker);
+      sbRow = getStockbookRow(ticker);
     } catch {}
   }
 
@@ -12784,7 +12834,7 @@ async function renderProbabilityTab() {
     }
     // Also check the last-known price from stockbook as a final check
     if (resolution === 'no') {
-      const sbRow = state.stockbook?.rows?.find(r => r.ticker === t.ticker.toUpperCase());
+      const sbRow = getStockbookRow(t.ticker.toUpperCase());
       const finalPrice = sbRow?.price;
       if (finalPrice != null) {
         if (t.direction === 'above' && finalPrice >= t.strike) resolution = 'yes';
@@ -15561,7 +15611,7 @@ function renderTodayStrip(stock) {
   if (!stock || !stock.ticker) { strip.style.display = 'none'; return; }
 
   // Try to pull intraday data from the stockbook row (which has the raw sheet row)
-  const sbRow = state.stockbook?.rows?.find(r => r.ticker === stock.ticker);
+  const sbRow = getStockbookRow(stock.ticker);
   const raw = sbRow?.rawRow || {};
 
   // Helper to parse a numeric sheet cell. Returns just the number value.
@@ -16396,7 +16446,7 @@ const STATUS_OPTIONS = ['', 'Trading', 'Watching', 'Tracking', 'Avoid', 'ETF', '
 //   OVERRIDE MODAL — edit sector/sub-sector/industry/status per ticker
 // ============================================================
 function openOverrideModal(ticker) {
-  const row = state.stockbook?.rows?.find(r => r.ticker === ticker);
+  const row = getStockbookRow(ticker);
   if (!row) { alert('Ticker not in stock book'); return; }
 
   const tax = collectTaxonomyValues();
@@ -17178,7 +17228,7 @@ function extractTickerFromLeg(leg) {
   const m = String(leg.name).match(/^([A-Z][A-Z0-9.\-]{0,5})\b/);
   if (!m) return null;
   // Avoid false positives like "ETF" or "USD" — must be in stockbook to count
-  const sb = state.stockbook?.rows?.find(r => r.ticker === m[1]);
+  const sb = getStockbookRow(m[1]);
   return sb ? m[1] : null;
 }
 
@@ -17597,7 +17647,7 @@ function renderRiskLegsTable() {
         const m = val.match(/^([A-Z][A-Z0-9.\-]{0,5})(?:\s*[—\-]\s*(.+))?$/);
         if (m) {
           const tic = m[1];
-          const sbRow = state.stockbook?.rows?.find(r => r.ticker === tic);
+          const sbRow = getStockbookRow(tic);
           if (sbRow) {
             // Try to measure vol from actual price history first
             const hist = getHistoryForTicker(tic);
@@ -20544,6 +20594,9 @@ async function ingestNewTicker(ticker, opts = {}) {
       _optionMeta: opts.optionMeta || null,
       addedAt: new Date().toISOString(),
     });
+    // Invalidate the O(1) ticker lookup index so the next getStockbookRow()
+    // call rebuilds it with the new row included.
+    if (typeof invalidateStockbookIndex === 'function') invalidateStockbookIndex();
   }
 
   // Re-render Stock Book immediately so user sees the new row
@@ -20933,7 +20986,7 @@ async function taEnsureHistory(ticker) {
 
 async function taResolveName(ticker) {
   // Try stockbook row first (fastest)
-  const sbRow = state.stockbook?.rows?.find(r => r.ticker === ticker);
+  const sbRow = getStockbookRow(ticker);
   if (sbRow?.name) return sbRow.name;
   // Try Polygon if configured
   if (getPolygonKey()) {
@@ -20947,7 +21000,7 @@ async function taResolveName(ticker) {
 
 async function taSuggestPeerEtf(ticker) {
   // Look up the ticker's sector in the stockbook → map to sector ETF
-  const sbRow = state.stockbook?.rows?.find(r => r.ticker === ticker);
+  const sbRow = getStockbookRow(ticker);
   const sector = sbRow?.sector || sbRow?.subSector;
   if (sector && TA_SECTOR_TO_ETF[sector]) return TA_SECTOR_TO_ETF[sector];
   // If primary is already an ETF/index, suggest SPY as the broad benchmark
@@ -24136,7 +24189,7 @@ function resolveMarketCapTier(marketCap) {
   return MARKET_CAP_TIERS[MARKET_CAP_TIERS.length - 1];
 }
 function resolveTickerPriority(ticker) {
-  const row = state.stockbook?.rows?.find(r => r.ticker === ticker);
+  const row = getStockbookRow(ticker);
   const mcap = row?.marketCap || 0;
   const tier = resolveMarketCapTier(mcap);
   // Score for sort ordering: higher mcap = higher score
@@ -24758,7 +24811,7 @@ function _splitSentences(text) {
 // Build a ~12-sentence summary from the article's available text.
 function expandSummary(article, priority, marketCap) {
   const ticker = article.ticker;
-  const companyName = state.stockbook?.rows?.find(r => r.ticker === ticker)?.name || '';
+  const companyName = getStockbookRow(ticker)?.name || '';
   // Combine all text fields the source gave us
   const fullText = [article.headline, article.summary].filter(Boolean).join('. ');
   const sentences = _splitSentences(fullText);
@@ -25196,7 +25249,7 @@ function renderNewsFeed() {
                     : `${Math.round(hoursAgo / 24)}d ago`;
 
     // Pull current price/change from stockbook + history
-    const sbRow = state.stockbook?.rows?.find(r => r.ticker === article.ticker);
+    const sbRow = getStockbookRow(article.ticker);
     const currentPrice = sbRow?.price;
     const priceStr = currentPrice != null ? fmt$(currentPrice) : '—';
 
@@ -26469,7 +26522,7 @@ async function renderBondEtfTable() {
   }
 
   const rows = BOND_ETFS.map(etf => {
-    const sbRow = state.stockbook?.rows?.find(r => r.ticker === etf.ticker);
+    const sbRow = getStockbookRow(etf.ticker);
     const hist = getHistoryForTicker(etf.ticker) || sheetHistory?.[etf.ticker];
     let price = null, r1d = null, r1m = null, r3m = null, r1y = null, r3y = null;
 
@@ -27025,7 +27078,7 @@ function openNotesModal(ticker) {
     } catch { return ts; }
   };
 
-  const sbRow = state.stockbook?.rows?.find(r => r.ticker === ticker);
+  const sbRow = getStockbookRow(ticker);
   const company = sbRow?.name || ticker;
 
   const renderNotesList = () => {
@@ -30402,6 +30455,120 @@ document.addEventListener('DOMContentLoaded', () => {
     a.href = url; a.download = `valuatio-transactions-${new Date().toISOString().slice(0,10)}.csv`;
     document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
+  });
+
+  // ============================================================
+  //   TICKER UNIVERSE EXPORT
+  //
+  //   Walks every source that references a ticker in the app and outputs a
+  //   sheet-ready CSV. Each ticker gets one row showing every source it
+  //   appears in (so the user can see "this ticker is only used by one tab,
+  //   maybe I can drop it").
+  //
+  //   Sources walked:
+  //     - PRIMED_REFERENCE_TICKERS         (auto-loaded reference set)
+  //     - MAJOR_INDICES_TAPE / MAJOR_ETFS_TAPE / FED_WATCH_ETFS  (ticker tape)
+  //     - GT_LOGISTICS / GT_COUNTRIES / GT_PRODUCTS              (Global Trade)
+  //     - SUPPLY_CHAINS                     (all participants across all chains)
+  //     - state.stockbook.rows              (loaded from sheet)
+  //     - Portfolio personal book            (your positions)
+  //     - GoodGlobe Index                   (your flagged tickers)
+  // ============================================================
+  document.getElementById('home-export-tickers-btn')?.addEventListener('click', () => {
+    // ticker → { sources: Set, sectors: Set, names: Set, price, loaded: bool }
+    const universe = new Map();
+    const addRef = (ticker, source, opts = {}) => {
+      if (!ticker) return;
+      const T = String(ticker).toUpperCase().trim();
+      if (!T) return;
+      if (!universe.has(T)) {
+        universe.set(T, { ticker: T, sources: new Set(), sectors: new Set(), names: new Set(), price: null, loaded: false });
+      }
+      const entry = universe.get(T);
+      entry.sources.add(source);
+      if (opts.sector) entry.sectors.add(opts.sector);
+      if (opts.name)   entry.names.add(opts.name);
+      if (opts.price != null) entry.price = opts.price;
+      if (opts.loaded) entry.loaded = true;
+    };
+
+    // Walk every static reference array
+    try { (typeof PRIMED_REFERENCE_TICKERS !== 'undefined' ? PRIMED_REFERENCE_TICKERS : []).forEach(t => addRef(t, 'PRIMED_REFERENCE_TICKERS')); } catch {}
+    try { (typeof MAJOR_INDICES_TAPE       !== 'undefined' ? MAJOR_INDICES_TAPE       : []).forEach(t => addRef(t, 'MAJOR_INDICES_TAPE')); } catch {}
+    try { (typeof MAJOR_ETFS_TAPE          !== 'undefined' ? MAJOR_ETFS_TAPE          : []).forEach(t => addRef(t, 'MAJOR_ETFS_TAPE')); } catch {}
+    try { (typeof FED_WATCH_ETFS           !== 'undefined' ? FED_WATCH_ETFS           : []).forEach(t => addRef(t, 'FED_WATCH_ETFS')); } catch {}
+    try { (typeof GT_LOGISTICS !== 'undefined' ? GT_LOGISTICS : []).forEach(l => addRef(l.ticker, 'GlobalTrade:Logistics', { name: l.mode })); } catch {}
+    try { (typeof GT_COUNTRIES !== 'undefined' ? GT_COUNTRIES : []).forEach(c => addRef(c.countryEtf, 'GlobalTrade:Country', { name: c.name })); } catch {}
+    try { (typeof GT_PRODUCTS  !== 'undefined' ? GT_PRODUCTS  : []).forEach(p => addRef(p.proxy, 'GlobalTrade:Product', { name: p.name })); } catch {}
+
+    // Supply chains — walk every participant in every chain
+    try {
+      if (typeof SUPPLY_CHAINS !== 'undefined' && Array.isArray(SUPPLY_CHAINS)) {
+        for (const chain of SUPPLY_CHAINS) {
+          for (const stage of ['upstream', 'midstream', 'downstream']) {
+            const participants = chain[stage] || [];
+            for (const p of participants) {
+              if (p.ticker) addRef(p.ticker, `SupplyChain:${chain.name}:${stage}`, { name: p.name });
+              if (Array.isArray(p.alias)) p.alias.forEach(a => addRef(a, `SupplyChain:${chain.name}:${stage}:alias`, { name: p.name }));
+            }
+          }
+        }
+      }
+    } catch {}
+
+    // Stockbook rows (loaded from sheet)
+    try {
+      (state.stockbook?.rows || []).forEach(r => {
+        addRef(r.ticker, 'StockBook:Sheet', { name: r.name, sector: r.sector, price: r.price, loaded: r.price != null });
+      });
+    } catch {}
+
+    // Portfolio personal book
+    try {
+      const portfolio = (typeof loadPortfolio === 'function') ? loadPortfolio() : [];
+      portfolio.forEach(p => addRef(p.ticker, `Portfolio:${p.position}`));
+    } catch {}
+
+    // GoodGlobe Index
+    try {
+      const gg = (typeof getGoodGlobeIndexEntries === 'function') ? getGoodGlobeIndexEntries() : [];
+      gg.forEach(e => addRef(e.ticker, `GoodGlobeIndex:${(e.flags || []).join('+') || 'flagged'}`));
+    } catch {}
+
+    // Build CSV
+    const tickers = Array.from(universe.values()).sort((a, b) => a.ticker.localeCompare(b.ticker));
+    const csvEscape = (v) => v == null ? '' : (typeof v === 'string' && /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : String(v));
+    const header = 'ticker,sources,source_count,sectors,names,current_price,loaded,first_source\n';
+    const rows = tickers.map(t => [
+      t.ticker,
+      Array.from(t.sources).join(' | '),
+      t.sources.size,
+      Array.from(t.sectors).join(' | '),
+      Array.from(t.names).join(' | '),
+      t.price != null ? t.price.toFixed(4) : '',
+      t.loaded ? 'yes' : 'no',
+      Array.from(t.sources)[0] || '',
+    ].map(csvEscape).join(',')).join('\n');
+
+    const blob = new Blob([header + rows], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `valuatio-ticker-universe-${new Date().toISOString().slice(0,10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+
+    // System notification logging the export so the user has a record
+    if (typeof addNotification === 'function') {
+      addNotification({
+        title: `Ticker universe exported (${tickers.length} tickers)`,
+        detail: `CSV downloaded. Each row shows every source that references the ticker — sort by source_count to find single-use tickers you could prune.`,
+        category: 'note',
+        source: 'system',
+      });
+    }
   });
 
   // ---- Home → Cache clearing ----

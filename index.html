@@ -14,11 +14,16 @@
     --bg-elev: #14161a;
     --bg-card: #1a1d22;
     --ink: #f0e7d0;
-    --ink-dim: #9a9387;
-    --ink-faint: #5a564d;
+    --ink-dim: #b8b1a4;          /* bumped from #9a9387 for better contrast on dark — grey
+                                     letters were hard to read in ticker tape + function buttons */
+    --ink-faint: #6e6a5f;        /* bumped from #5a564d — still subdued but legible */
     --rule: #2d2d33;
     --amber: #e0b04c;
     --amber-bright: #ffc960;
+    /* Derived darker shade of the accent — used for the primary Fetch/Go button so
+       it reflects the user's accent color choice with a deeper tone. Uses CSS
+       color-mix() which is well-supported (Safari 16.4+, Chrome 111+, Firefox 113+). */
+    --amber-dark: color-mix(in srgb, var(--amber) 78%, #000);
     --green: #6cc28a;
     --red: #d97a6c;
     --serif: 'Fraunces', Georgia, serif;
@@ -40,6 +45,7 @@
     --rule: #c8c0a8;                /* warm tan rule lines */
     --amber: #b8721c;               /* darker amber for AA contrast on cream */
     --amber-bright: #d68e2f;
+    --amber-dark: color-mix(in srgb, var(--amber) 78%, #000);
     --green: #2d6e44;
     --red: #a8392b;
   }
@@ -492,7 +498,7 @@
   .ticker-input::placeholder { color: var(--ink-faint); }
 
   .btn {
-    background: var(--amber);
+    background: var(--amber-dark);
     color: var(--bg);
     border: none;
     font-family: var(--mono);
@@ -504,7 +510,7 @@
     cursor: pointer;
     transition: all 0.15s;
   }
-  .btn:hover { background: var(--amber-bright); transform: translateY(-1px); }
+  .btn:hover { background: var(--amber); transform: translateY(-1px); }
   .btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
   .btn-ghost {
     background: transparent;
@@ -5425,9 +5431,9 @@
     border-color: var(--amber);
   }
   .amp-btn.active {
-    background: var(--amber);
-    border-color: var(--amber);
-    color: #000;
+    background: var(--amber-dark);
+    border-color: var(--amber-dark);
+    color: #fff;
   }
   /* OCC ticker live display in option mode */
   .opt-built-ticker-section {
@@ -6508,6 +6514,37 @@
     color: var(--ink-faint);
     letter-spacing: 0.04em;
   }
+  /* Quick Actions section in Home drawer — grid of 4 action buttons that
+     replaced the masthead-meta buttons (Refresh, Clear Cache, Debug, Theme). */
+  .home-quick-actions-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  .home-action-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-align: left;
+    cursor: pointer;
+    border-radius: 3px;
+    transition: all 0.14s;
+  }
+  .home-action-btn:hover {
+    border-color: var(--amber);
+    color: var(--amber);
+    background: var(--bg-elev);
+  }
+  .home-action-btn:active { transform: scale(0.98); }
+  .home-action-btn svg { color: currentColor; }
 </style>
 </head>
 <body>
@@ -6551,23 +6588,6 @@
     </div>
   </div>
   <div class="masthead-meta">
-    <button class="theme-toggle" id="refresh-all-btn" title="Refresh all data — news, stocks, macro, bonds" aria-label="Refresh all data" style="margin-right:4px">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:block">
-        <path d="M21 12a9 9 0 0 1-9 9 9 9 0 0 1-6.7-3"/>
-        <path d="M3 12a9 9 0 0 1 9-9 9 9 0 0 1 6.7 3"/>
-        <polyline points="21 4 21 9 16 9"/>
-        <polyline points="3 20 3 15 8 15"/>
-      </svg>
-    </button>
-    <button class="theme-toggle" id="clear-cache-btn" title="Clear all caches (cookies, localStorage, news cache, history cache)" aria-label="Clear cache" style="margin-right:4px">
-      <span class="theme-toggle-icon" style="font-size:14px">🍪</span>
-    </button>
-    <button class="theme-toggle" id="debug-log-toggle" title="Open debug log — shows data sources, fetches, errors" aria-label="Debug log" style="margin-right:4px">
-      <span class="theme-toggle-icon" style="font-size:13px;font-family:var(--mono)">⚙</span>
-    </button>
-    <button class="theme-toggle" id="theme-toggle" title="Toggle light / dark theme" aria-label="Toggle theme">
-      <span class="theme-toggle-icon">◐</span>
-    </button>
     <div id="regime-badge" class="regime-badge" style="display:none"></div>
     <div class="live" id="data-source-badge">Alpha Vantage</div>
     <div id="clock" style="margin-top:4px"></div>
@@ -8153,6 +8173,36 @@
   </div>
   <div class="side-drawer-body">
 
+    <!-- Section: Quick Actions — buttons previously on the masthead.
+         Moved here so they don't crowd the header on narrow tabs and to
+         consolidate all settings/utilities in one place. -->
+    <div class="home-section home-quick-actions">
+      <div class="home-section-title">Quick Actions</div>
+      <div class="home-quick-actions-grid">
+        <button class="home-action-btn" id="refresh-all-btn" title="Refresh all data — news, stocks, macro, bonds">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0">
+            <path d="M21 12a9 9 0 0 1-9 9 9 9 0 0 1-6.7-3"/>
+            <path d="M3 12a9 9 0 0 1 9-9 9 9 0 0 1 6.7 3"/>
+            <polyline points="21 4 21 9 16 9"/>
+            <polyline points="3 20 3 15 8 15"/>
+          </svg>
+          <span>Refresh All Data</span>
+        </button>
+        <button class="home-action-btn" id="clear-cache-btn" title="Clear cookies + localStorage + news cache + history cache">
+          <span style="font-size:14px;width:14px;text-align:center">🍪</span>
+          <span>Clear Caches</span>
+        </button>
+        <button class="home-action-btn" id="debug-log-toggle" title="Open debug log — shows data sources, fetches, errors">
+          <span style="font-family:var(--mono);font-size:13px;width:14px;text-align:center">⚙</span>
+          <span>Debug Log</span>
+        </button>
+        <button class="home-action-btn" id="theme-toggle" title="Toggle light / dark theme">
+          <span style="font-size:14px;width:14px;text-align:center">◐</span>
+          <span>Toggle Theme</span>
+        </button>
+      </div>
+    </div>
+
     <!-- Section: Quick stats -->
     <div class="home-section">
       <div class="home-section-title">At a Glance</div>
@@ -8188,6 +8238,7 @@
         <button class="btn" id="home-export-json-btn" title="Download a complete JSON snapshot of all your data — portfolios, transactions, notifications, settings, caches, everything in localStorage">Export Full JSON Snapshot</button>
         <button class="btn" id="home-export-pdf-btn" title="Generate a human-readable PDF report with portfolio summary, transactions, notifications, GoodGlobe Index, and all settings">Export PDF Report</button>
         <button class="btn btn-ghost" id="home-export-csv-btn" title="Export transactions ledger as CSV">Export Transactions CSV</button>
+        <button class="btn btn-ghost" id="home-export-tickers-btn" title="Export every ticker referenced anywhere in the app (Macro Quad, Supply Chains, Bonds, Global Trade, your portfolio, GoodGlobe Index) as a sheet-ready CSV. Source column shows where each ticker comes from so you can prune what's not in use.">Export Ticker Universe (CSV)</button>
       </div>
     </div>
 
