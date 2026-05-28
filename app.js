@@ -405,6 +405,114 @@ function getGoodGlobeIndexEntries() {
   );
 }
 
+// ============================================================
+//   GOODGLOBE INDEX — TRADE P/L HISTORY
+//
+//   Records realized P/L per ticker so the index becomes a running trade
+//   journal, not just a flag list. Handles the three position types the
+//   user cares about:
+//
+//     • LONG equity:  P/L = (sell - buy) × qty - fees
+//     • SHORT equity: P/L = (entry - cover) × qty - fees   (profit when price falls)
+//     • OPTION:       P/L = (sell - buy) × qty × 100 - fees (premium × 100 multiplier)
+//
+//   Each closed trade appends a record to entry.trades[]. Aggregate
+//   realized P/L + win/loss counts are recomputed and stored on the entry
+//   so the GoodGlobe Index view can show lifetime performance per ticker.
+//
+//   This is called from the transaction-recording path whenever a closing
+//   trade (sell / cover / sell-to-close / buy-to-close) is logged.
+// ============================================================
+function _ggIsOption(ticker, txType) {
+  // OCC option tickers look like AAPL260116C00150000, or the tx type signals it
+  if (/^[A-Z]+\d{6}[CP]\d{8}$/.test(String(ticker || '').toUpperCase())) return true;
+  if (['buy-to-open', 'sell-to-open', 'buy-to-close', 'sell-to-close'].includes(txType)) return true;
+  return false;
+}
+
+function recordTradeInGoodGlobeIndex(tx) {
+  if (!tx || !tx.ticker) return;
+  const tic = String(tx.ticker).trim().toUpperCase();
+  const idx = loadGoodGlobeIndex();
+  const now = new Date().toISOString();
+
+  // Ensure an entry exists (create stub if this ticker was never flagged)
+  if (!idx[tic]) {
+    idx[tic] = {
+      ticker: tic,
+      assetType: typeof subClassifyAsset === 'function' ? subClassifyAsset(tic) : 'equity',
+      firstFlaggedAt: now,
+      lastFlaggedAt: now,
+      flags: [],
+      source: 'trade',
+      notes: null,
+    };
+  }
+  const entry = idx[tic];
+  if (!Array.isArray(entry.trades)) entry.trades = [];
+
+  // Determine multiplier + P/L direction
+  const isOption = _ggIsOption(tic, tx.type);
+  const multiplier = isOption ? 100 : 1;
+  const fee = parseFloat(tx.fee) || 0;
+  const qty = tx.qty || 0;
+
+  // Compute realized P/L based on transaction type
+  let realizedPL = null;
+  let tradeKind = tx.type;
+  if (tx.type === 'sell' && tx.entryPrice != null) {
+    // Long equity close
+    realizedPL = (tx.price - tx.entryPrice) * qty * multiplier - fee;
+    tradeKind = isOption ? 'option-close' : 'long-close';
+  } else if (tx.type === 'cover' && tx.entryPrice != null) {
+    // Short equity cover — profit when cover price < entry price
+    realizedPL = (tx.entryPrice - tx.price) * qty * multiplier - fee;
+    tradeKind = 'short-cover';
+  } else if (tx.type === 'sell-to-close' && tx.entryPrice != null) {
+    // Long option close (bought to open, sold to close)
+    realizedPL = (tx.price - tx.entryPrice) * qty * 100 - fee;
+    tradeKind = 'option-long-close';
+  } else if (tx.type === 'buy-to-close' && tx.entryPrice != null) {
+    // Short option close (sold to open, bought to close) — profit when buy-back < sale
+    realizedPL = (tx.entryPrice - tx.price) * qty * 100 - fee;
+    tradeKind = 'option-short-close';
+  } else if (tx.realizedPL != null) {
+    // Fall back to a pre-computed realized P/L if the tx already carries one
+    realizedPL = tx.realizedPL;
+    tradeKind = tx.type;
+  }
+
+  // Only record if this is a closing trade with a computable P/L
+  if (realizedPL == null) {
+    saveGoodGlobeIndex(idx);
+    return;
+  }
+
+  entry.trades.push({
+    at: tx.soldDate || tx.ts || now,
+    kind: tradeKind,
+    qty,
+    entryPrice: tx.entryPrice ?? null,
+    exitPrice: tx.price ?? null,
+    multiplier,
+    isOption,
+    fee,
+    realizedPL,
+  });
+
+  // Recompute aggregate stats so the index view can show lifetime performance
+  const trades = entry.trades;
+  entry.realizedPL = trades.reduce((s, t) => s + (t.realizedPL || 0), 0);
+  entry.tradeCount = trades.length;
+  entry.winCount = trades.filter(t => (t.realizedPL || 0) > 0).length;
+  entry.lossCount = trades.filter(t => (t.realizedPL || 0) < 0).length;
+  entry.winRate = entry.tradeCount > 0 ? entry.winCount / entry.tradeCount : null;
+  entry.lastFlaggedAt = now;
+  if (!entry.flags.includes('Traded')) entry.flags.push('Traded');
+
+  saveGoodGlobeIndex(idx);
+}
+
 // Export the index as a plain newline-delimited ticker list (the format
 // GitHub-side pipelines consume). Manual-only tickers are easy to fish out
 // since they're tagged with 'Manual' or had source: 'manual_import'.
@@ -18360,8 +18468,20 @@ function appendTransaction(tx) {
   // tx shape: { id, ts, type: 'sell'|'buy', ticker, qty, price, fee, proceeds, entryId }
   const arr = loadTransactions();
   const id = `tx-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-  arr.push({ id, ts: new Date().toISOString(), ...tx });
+  const record = { id, ts: new Date().toISOString(), ...tx };
+  arr.push(record);
   saveTransactions(arr);
+  // Mirror closing trades into the GoodGlobe Index trade journal so each
+  // ticker accumulates a lifetime realized-P/L history (handles shorts +
+  // options with the 100× premium multiplier). Only closing trades produce
+  // realized P/L; opens are skipped inside the recorder.
+  try {
+    if (typeof recordTradeInGoodGlobeIndex === 'function') {
+      recordTradeInGoodGlobeIndex(record);
+    }
+  } catch (e) {
+    console.warn('[goodglobe] trade record failed:', e.message);
+  }
   return id;
 }
 
@@ -18944,8 +19064,34 @@ function renderPortfolioChart(enriched, range) {
     }).filter(Boolean);
 
   if (candidates.length === 0 && soldHistoricals.length === 0) {
-    svg.innerHTML = `<text x="50%" y="50%" text-anchor="middle" fill="var(--ink-faint)" font-family="var(--mono)" font-size="11">No positions with entry price + history yet</text>`;
+    // Diagnose WHY there's nothing to chart so the user isn't staring at a blank box.
+    const enrichedActive = enriched.filter(e => e.position !== 'Sold' && e.position !== 'Avoid' && ACTIVE_POSITIONS.includes(e.position));
+    const withCost = enrichedActive.filter(e => e.costBasis);
+    const withHist = enrichedActive.filter(e => getHist(e.ticker));
+    let msg;
+    if (enrichedActive.length === 0) {
+      msg = 'No active positions (Trading/Long/Short) to chart. Watching/Tracking/Avoid are excluded.';
+    } else if (withCost.length === 0) {
+      msg = `${enrichedActive.length} active position(s) but none have an entry/cost basis recorded.`;
+    } else if (withHist.length === 0) {
+      msg = `${withCost.length} position(s) with cost basis, but no price history loaded yet. ${state._historyManifest?.baseUrl ? 'Priming from GitHub…' : 'Set up the GitHub data source so history can load.'}`;
+    } else {
+      msg = 'No positions with entry price + history yet';
+    }
+    svg.innerHTML = `<text x="50%" y="42%" text-anchor="middle" fill="var(--ink-faint)" font-family="var(--mono)" font-size="11">${escapeHtml(msg)}</text>` +
+      (withCost.length > 0 && withHist.length === 0 && state._historyManifest?.baseUrl
+        ? `<text x="50%" y="56%" text-anchor="middle" fill="var(--ink-faint)" font-family="var(--mono)" font-size="9">chart will fill in once history loads — try the range buttons</text>`
+        : '');
     if (legend) legend.innerHTML = '';
+    // If we have cost but no history and a manifest exists, kick off a prime + re-render
+    if (withCost.length > 0 && withHist.length === 0 && state._historyManifest?.baseUrl && typeof primeHistoryForTickers === 'function') {
+      const need = withCost.map(e => e.ticker);
+      primeHistoryForTickers(need).then(() => {
+        // Only re-render if still on the same view
+        const stillActive = document.getElementById('portfolio-chart-svg');
+        if (stillActive) renderPortfolioChart(enriched, range);
+      }).catch(() => {});
+    }
     return;
   }
 
@@ -19590,11 +19736,20 @@ function renderGoodGlobeIndexView(content, summary, subTabs) {
     }).join(' ');
     const firstDate = e.firstFlaggedAt ? new Date(e.firstFlaggedAt).toISOString().slice(0, 10) : '—';
     const lastDate  = e.lastFlaggedAt  ? new Date(e.lastFlaggedAt).toISOString().slice(0, 10)  : '—';
+    // Realized P/L cell — populated from the trade journal (shorts + options
+    // handled with correct sign + 100× multiplier inside recordTradeInGoodGlobeIndex)
+    const hasTradePL = e.realizedPL != null && e.tradeCount > 0;
+    const plColor = !hasTradePL ? 'var(--ink-faint)' : e.realizedPL >= 0 ? '#5b8a72' : '#a5645a';
+    const plCell = hasTradePL
+      ? `<span style="color:${plColor};font-weight:600">${e.realizedPL >= 0 ? '+' : ''}$${Math.abs(e.realizedPL) >= 1000 ? (e.realizedPL/1000).toFixed(1) + 'k' : e.realizedPL.toFixed(2)}</span>`
+        + `<br><span style="font-size:8px;color:var(--ink-faint)">${e.tradeCount} trade${e.tradeCount === 1 ? '' : 's'}${e.winRate != null ? ` · ${Math.round(e.winRate * 100)}% win` : ''}</span>`
+      : '<span style="color:var(--ink-faint)">—</span>';
     return `
       <tr>
         <td><strong style="color:var(--amber);font-family:var(--mono)">${escapeHtml(e.ticker)}</strong></td>
         <td><span class="gg-asset-pill">${escapeHtml(e.assetType || 'equity')}</span></td>
         <td>${flagsBadges || '<span style="color:var(--ink-faint)">—</span>'}</td>
+        <td style="font-family:var(--mono);font-size:10px">${plCell}</td>
         <td style="font-family:var(--mono);font-size:10px;color:var(--ink-dim)">${firstDate}</td>
         <td style="font-family:var(--mono);font-size:10px;color:var(--ink-dim)">${lastDate}</td>
         <td style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${escapeHtml(e.source || '—')}</td>
@@ -19616,8 +19771,15 @@ function renderGoodGlobeIndexView(content, summary, subTabs) {
     </div>
     <div class="gg-asset-filters">${assetTypeButtons}</div>
     <div class="gg-info-strip">
-      <div><strong style="color:var(--amber)">${totalCount}</strong> ticker${totalCount === 1 ? '' : 's'} tracked · <strong style="color:var(--amber)">${manualCount}</strong> from manual import · ${visible.length} visible after filters</div>
-      <div style="color:var(--ink-faint);font-family:var(--mono);font-size:10px">Auto-recorded whenever you add a position · Manual import only adds to this list (no portfolio impact)</div>
+      <div><strong style="color:var(--amber)">${totalCount}</strong> ticker${totalCount === 1 ? '' : 's'} tracked · <strong style="color:var(--amber)">${manualCount}</strong> from manual import · ${visible.length} visible after filters${(() => {
+        const traded = entries.filter(e => e.tradeCount > 0);
+        if (traded.length === 0) return '';
+        const totalPL = traded.reduce((s, e) => s + (e.realizedPL || 0), 0);
+        const totalTrades = traded.reduce((s, e) => s + (e.tradeCount || 0), 0);
+        const c = totalPL >= 0 ? '#5b8a72' : '#a5645a';
+        return ` · <strong style="color:${c}">${totalPL >= 0 ? '+' : ''}$${totalPL.toFixed(2)}</strong> realized across ${totalTrades} trade${totalTrades === 1 ? '' : 's'} on ${traded.length} ticker${traded.length === 1 ? '' : 's'}`;
+      })()}</div>
+      <div style="color:var(--ink-faint);font-family:var(--mono);font-size:10px">Auto-recorded whenever you add a position · trade P/L (incl. shorts + options ×100) tracked on close · Manual import only adds to this list (no portfolio impact)</div>
     </div>
     ${visible.length === 0
       ? `<div style="padding:40px;text-align:center;color:var(--ink-faint);font-family:var(--mono);font-size:12px">${entries.length === 0 ? 'No tickers in the GoodGlobe Index yet — add a position or use Import .txt from the ADD button to populate.' : 'No matches for current filters.'}</div>`
@@ -19628,6 +19790,7 @@ function renderGoodGlobeIndexView(content, summary, subTabs) {
                 <th>Ticker</th>
                 <th>Asset Type</th>
                 <th>Flags</th>
+                <th title="Lifetime realized P/L from closed trades — shorts and options (premium × 100) included">Realized P/L</th>
                 <th>First Flagged</th>
                 <th>Last Flagged</th>
                 <th>Source</th>
@@ -29955,6 +30118,7 @@ function renderStorageStats() {
   const wrap = document.getElementById('home-storage-stats');
   if (!wrap) return;
   const buckets = {};
+  const otherKeys = [];   // track individual keys that fall into "Other" so we can show them
   let total = 0;
   for (let i = 0; i < localStorage.length; i++) {
     const k = localStorage.key(i);
@@ -29962,29 +30126,52 @@ function renderStorageStats() {
     const v = localStorage.getItem(k) || '';
     const size = (k.length + v.length) * 2;  // rough UTF-16 bytes
     total += size;
-    // Bucket by prefix
-    const bucket = k.startsWith('valuatio.news')      ? 'News'
-                 : k.startsWith('valuatio.transactions') ? 'Transactions'
-                 : k.startsWith('valuatio.cashPosition') ? 'Cash'
-                 : k.startsWith('valuatio.personalBook') ? 'Portfolio'
-                 : k.startsWith('valuatio.probability')  ? 'Probability'
-                 : k.startsWith('valuatio.leadership')   ? 'Leadership'
-                 : k.startsWith('valuatio.cpi')          ? 'CPI'
-                 : k.startsWith('valuatio.goodglobe')    ? 'GoodGlobe Index'
-                 : k.startsWith('valuatio.notifications')? 'Notifications'
-                 : k.startsWith('valuatio.prefs')        ? 'Preferences'
-                 : k.startsWith('valuatio.overrides')    ? 'Overrides'
-                 : k.startsWith('valuatio.bonds')        ? 'Bonds'
-                 : k.startsWith('valuatio.priceHistory') ? 'Price History'
-                 : k.startsWith('valuatio.macro')        ? 'Macro'
-                 : 'Other';
+    // Bucket by prefix. Order matters — most specific first.
+    const bucket =
+        k.startsWith('valuatio.news')          ? 'News'
+      : k.startsWith('valuatio.transactions')  ? 'Transactions'
+      : k.startsWith('valuatio.cashPosition')  ? 'Cash'
+      : k.startsWith('valuatio.personalBook')  ? 'Portfolio'
+      : k.startsWith('valuatio.probability')   ? 'Probability'
+      : k.startsWith('valuatio.leadership')    ? 'Leadership'
+      : k.startsWith('valuatio.cpi')           ? 'CPI'
+      : k.startsWith('valuatio.goodglobe')     ? 'GoodGlobe Index'
+      : k.startsWith('valuatio.notifications') ? 'Notifications'
+      : k.startsWith('valuatio.prefs')         ? 'Preferences'
+      : k.startsWith('valuatio.overrides')     ? 'Overrides'
+      : k.startsWith('valuatio.bonds')         ? 'Bonds'
+      : k.startsWith('valuatio.macro')         ? 'Macro'
+      // ---- Previously-uncaught keys that were inflating "Other" ----
+      : k.startsWith('valuatio.priceHist')     ? 'Price History'   // actual key is priceHist.cache, not priceHistory
+      : k.startsWith('valuatio.sheet')         ? 'Sheet Cache'      // full Google Sheet snapshot — usually the biggest
+      : k.startsWith('valuatio.desc')          ? 'Descriptions'     // enrichment description cache
+      : k.startsWith('valuatio.taxonomy')      ? 'Taxonomy Cache'
+      : k.startsWith('valuatio.savedValuations') ? 'Saved Valuations'
+      : k.startsWith('valuatio.imported')      ? 'Imported Files'   // PDF/CSV/JSON imports
+      : k.startsWith('valuatio.sb.columns')    ? 'Column Settings'
+      : k.startsWith('valuatio.theme')         ? 'Preferences'
+      : k.startsWith('sb-col-widths')          ? 'Column Settings'
+      : 'Other';
     buckets[bucket] = (buckets[bucket] || 0) + size;
+    if (bucket === 'Other') otherKeys.push({ key: k, size });
   }
   const fmt = (b) => b < 1024 ? `${b}B` : b < 1024 * 1024 ? `${(b/1024).toFixed(1)}KB` : `${(b/1024/1024).toFixed(2)}MB`;
   const rows = Object.entries(buckets).sort((a, b) => b[1] - a[1])
     .map(([k, v]) => `<div><span class="key">${escapeHtml(k)}:</span> <span class="val">${fmt(v)}</span></div>`)
     .join('');
-  wrap.innerHTML = rows + `<div style="margin-top:6px;padding-top:6px;border-top:1px solid var(--rule)"><span class="key">Total used:</span> <span class="val">${fmt(total)}</span> <span class="key">· browsers typically allow ~5-10MB</span></div>`;
+  // If anything still lands in Other, list the exact keys so nothing is mysterious
+  let otherDetail = '';
+  if (otherKeys.length > 0) {
+    otherKeys.sort((a, b) => b.size - a.size);
+    otherDetail = `
+      <div style="margin-top:8px;padding-top:8px;border-top:1px dashed var(--rule)">
+        <div class="key" style="margin-bottom:4px">Other — exact keys:</div>
+        ${otherKeys.slice(0, 15).map(o => `<div style="padding-left:8px"><span class="key" style="font-size:9px">${escapeHtml(o.key)}</span> <span class="val">${fmt(o.size)}</span></div>`).join('')}
+        ${otherKeys.length > 15 ? `<div style="padding-left:8px" class="key">…and ${otherKeys.length - 15} more</div>` : ''}
+      </div>`;
+  }
+  wrap.innerHTML = rows + otherDetail +
+    `<div style="margin-top:6px;padding-top:6px;border-top:1px solid var(--rule)"><span class="key">Total used:</span> <span class="val">${fmt(total)}</span> <span class="key">· browsers typically allow ~5-10MB</span></div>`;
 }
 
 // ============================================================
