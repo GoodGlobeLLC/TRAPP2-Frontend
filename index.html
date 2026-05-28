@@ -218,7 +218,13 @@
     align-items: flex-end;
     justify-content: space-between;
     gap: 32px;
+    flex-wrap: nowrap;          /* never wrap — keeps meta locked on the right */
   }
+  /* The left group (home/bell icons + Valuatio title) can shrink if needed,
+     but the meta block (regime/confidence/source/clock) always stays pinned
+     to the right edge. margin-left:auto guarantees right placement even if
+     the flex row is ever forced to wrap on very narrow screens. */
+  .masthead > div:first-child { min-width: 0; flex-shrink: 1; }
   .masthead-title {
     font-family: var(--serif);
     font-weight: 900;
@@ -287,6 +293,9 @@
     letter-spacing: 0.2em;
     color: var(--ink-dim);
     text-align: right;
+    margin-left: auto;        /* always pin to the right edge */
+    flex-shrink: 0;           /* never collapse — keeps regime/clock readable */
+    white-space: nowrap;
   }
   .masthead-meta .live::before {
     content: '●';
@@ -303,13 +312,20 @@
     .masthead-sub { font-size: 9px; letter-spacing: 0.2em; }
   }
   @media (max-width: 1100px) {
-    .masthead { padding: 16px 16px 12px; gap: 12px; flex-wrap: wrap; }
-    .masthead-title { font-size: 32px; }
-    .masthead-sub { font-size: 9px; letter-spacing: 0.15em; }
-    .masthead-meta { font-size: 9px; }
+    .masthead { padding: 16px 16px 12px; gap: 12px; }
+    .masthead-title { font-size: 30px; }
+    .masthead-sub { font-size: 8px; letter-spacing: 0.12em; }
+    .masthead-meta { font-size: 8px; letter-spacing: 0.12em; }
+    .masthead-icon-btn { width: 32px; height: 32px; }
   }
   @media (max-width: 900px) {
     .masthead-title { font-size: 26px; }
+  }
+  @media (max-width: 760px) {
+    /* Only at phone widths do we allow the sub-line to hide so the title +
+       meta still fit on one row with the meta on the right. */
+    .masthead-sub { display: none; }
+    .masthead-title { font-size: 24px; }
   }
 
   /* Workspace + section padding scaling */
