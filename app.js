@@ -2661,12 +2661,28 @@ function savePriceHistCache(c) {
 async function getPriceHistory(ticker, opts = {}) {
   const TIC = ticker.toUpperCase();
 
+  // Helper: persist any successfully-resolved history into the shared
+  // priceHist cache so the SYNCHRONOUS getHistoryForTicker() (used by the
+  // portfolio chart, correlations, probability models) can find it later.
+  // Previously, sheet- and GitHub-sourced history returned early WITHOUT
+  // caching here, so valuation could render a chart for MSFT while the
+  // portfolio chart saw nothing — exactly the bug the user reported.
+  const persist = (data) => {
+    if (!data || data.length < 2) return data;
+    try {
+      const c = loadPriceHistCache();
+      c[TIC] = { t: Date.now(), data };
+      savePriceHistCache(c);
+    } catch {}
+    return data;
+  };
+
   // 1. Try sheet first
   if (!opts.skipSheet) {
     const sheet = await getSheetData(false).catch(() => null);
     if (sheet?.priceHistory?.[TIC]) {
       const h = sheet.priceHistory[TIC];
-      if (h.length >= 2) return h;
+      if (h.length >= 2) return persist(h);
     }
   }
 
@@ -2679,7 +2695,7 @@ async function getPriceHistory(ticker, opts = {}) {
   // 3. GitHub Actions pipeline (user's own data — preferred over third-party APIs)
   if (getGitHubDataBase()) {
     const gh = await fetchGitHubHistory(TIC).catch(() => null);
-    if (gh && gh.length >= 2) return gh;
+    if (gh && gh.length >= 2) return persist(gh);
   }
 
   // 4. Twelve Data
@@ -19056,6 +19072,48 @@ function renderPortfolioChart(enriched, range) {
   // Helper: get history via unified accessor (sheet → cache → in-memory GitHub manifest)
   function getHist(t) {
     return getHistoryForTicker(t);
+  }
+
+  // ===== Proactive history priming =====
+  // BEFORE filtering candidates, check if any active position with a cost
+  // basis is missing history. If so, prime it via the full getPriceHistory
+  // fallback chain and re-render. This runs even when SOME positions already
+  // have history — previously the chart would render with partial data and
+  // silently drop positions whose history wasn't cached yet (the MSFT-missing,
+  // MOH-present case the user hit). Valuation works because it calls the async
+  // getPriceHistory directly; this brings the portfolio chart to parity.
+  {
+    const activeWithCost = enriched.filter(e =>
+      e.position !== 'Sold' && e.position !== 'Avoid' &&
+      ACTIVE_POSITIONS.includes(e.position) && e.costBasis
+    );
+    const missingHist = activeWithCost.filter(e => !getHist(e.ticker)).map(e => e.ticker);
+    if (missingHist.length > 0 && !renderPortfolioChart._priming) {
+      renderPortfolioChart._priming = true;
+      console.log(`[portfolio-chart] priming history for ${missingHist.length} position(s): ${missingHist.join(', ')}`);
+      (async () => {
+        let loadedAny = false;
+        for (const t of missingHist) {
+          try {
+            const h = await getPriceHistory(t).catch(() => null);
+            if (h && h.length >= 2) {
+              const cache = loadPriceHistCache();
+              cache[t] = { t: Date.now(), data: h };
+              savePriceHistCache(cache);
+              loadedAny = true;
+              console.log(`[portfolio-chart] loaded ${h.length} points for ${t}`);
+            } else {
+              console.warn(`[portfolio-chart] no history available for ${t} from any source`);
+            }
+          } catch (e) { console.warn(`[portfolio-chart] prime failed for ${t}:`, e.message); }
+        }
+        renderPortfolioChart._priming = false;
+        if (loadedAny) {
+          const stillActive = document.getElementById('portfolio-chart-svg');
+          if (stillActive) renderPortfolioChart(enriched, range);
+        }
+      })();
+    }
   }
 
   // ===== Active candidates =====
