@@ -10714,6 +10714,34 @@ async function fetchLeadershipManifest() {
 }
 
 async function fetchPersonProfile(slug) {
+  // 1. Check the local override store FIRST. Manually-added people (e.g. a CEO
+  //    the user entered by hand) exist ONLY in localStorage — there's no
+  //    GitHub pipeline file for them, so a network-only lookup returned null
+  //    and showed "Could not load profile". Local data takes priority anyway
+  //    since it represents the user's own edits.
+  try {
+    const store = loadLeadershipOverrides();
+    const local = store?.people?.[slug];
+    if (local) {
+      // If there's also a pipeline file, merge it (pipeline as base, local on top)
+      // so manually-added career details aren't lost. Otherwise return local.
+      let merged = { ...local };
+      try {
+        const base = state._historyManifest?.baseUrl?.replace(/\/history\/?$/, '/')
+          || 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2/main/data/';
+        const r = await fetch(`${base}leadership/by_person/${slug}.json`, { cache: 'no-cache' });
+        if (r.ok) {
+          const pipeline = await r.json();
+          merged = { ...pipeline, ...local, _hasPipeline: true };
+        }
+      } catch {}
+      return merged;
+    }
+  } catch (e) {
+    console.warn('[leadership] local profile lookup failed:', e.message);
+  }
+
+  // 2. Fall back to the pipeline (GitHub) for people who only exist there.
   const candidates = [];
   const manifestBase = state._historyManifest?.baseUrl;
   if (manifestBase) {
@@ -24436,6 +24464,36 @@ let _companyWired = false;
 function onCompanyTabActive() {
   console.log('[company-tab] onCompanyTabActive fired', { stock: state.stock?.ticker, wired: _companyWired });
 
+  // ===== BULLETPROOF VISIBLE DIAGNOSTIC =====
+  // Render a diagnostic line directly into the overview body the instant this
+  // fires, BEFORE any other logic that could throw. If the user sees this
+  // banner, we know the click handler + element lookup both work and the
+  // problem is downstream. If they DON'T see it, the click handler isn't
+  // firing or the element is missing — completely different root cause.
+  const diagEl = document.getElementById('company-overview-body');
+  const inputVal = (document.getElementById('ticker')?.value || '').trim().toUpperCase();
+  console.log('[company-tab] DIAGNOSTIC', {
+    overviewBodyFound: !!diagEl,
+    stateStock: state.stock?.ticker || null,
+    inputValue: inputVal,
+    activeTab: state.company?.activeTab,
+    companyStateExists: !!state.company,
+  });
+  if (diagEl) {
+    diagEl.innerHTML = `<div style="padding:16px;background:var(--bg-elev);border:1px solid var(--amber);border-radius:4px;font-family:var(--mono);font-size:11px;color:var(--ink-dim);line-height:1.8">
+      <div style="color:var(--amber);font-weight:700;margin-bottom:6px">[diagnostic] Company tab activated</div>
+      state.stock: <strong style="color:var(--ink)">${state.stock?.ticker || 'NULL'}</strong><br>
+      ticker input: <strong style="color:var(--ink)">${escapeHtml(inputVal) || '(empty)'}</strong><br>
+      Loading data…
+    </div>`;
+  }
+
+  // Ensure state.company exists (guards a possible undefined-state crash)
+  if (!state.company) {
+    state.company = { activeTab: 'overview', ticker: null };
+    console.warn('[company-tab] state.company was undefined — initialized');
+  }
+
   // BULLETPROOF visibility fix — ensure the subpanel + the overview internal panel
   // are both visible regardless of any prior toggling. Some users hit a state where
   // the .company-ctab sections were left in display:none from a previous interaction.
@@ -24460,7 +24518,17 @@ function onCompanyTabActive() {
     wireCompanyTabs();
     _companyWired = true;
   }
-  renderCompanyTab();
+  // Wrap the render so any exception surfaces ON THE PAGE, not just console.
+  Promise.resolve().then(() => renderCompanyTab()).catch(e => {
+    console.error('[company-tab] renderCompanyTab threw:', e);
+    const el = document.getElementById('company-overview-body');
+    if (el) {
+      el.innerHTML = `<div style="padding:16px;background:rgba(217,122,108,0.1);border:1px solid #d97a6c;border-radius:4px;font-family:var(--mono);font-size:11px;color:#d97a6c;line-height:1.7">
+        <strong>renderCompanyTab error:</strong><br>${escapeHtml(e.message || String(e))}<br>
+        <span style="color:var(--ink-faint)">Full stack in console (Ctrl+Shift+I)</span>
+      </div>`;
+    }
+  });
 }
 
 
