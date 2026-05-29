@@ -536,23 +536,28 @@ function _fxRateToUSD(currency) {
   // 1502.38). So prefer history, fall back to the row price, and reject the
   // 1.00 placeholder for non-parity currencies.
   const priceOf = (t) => {
-    // 1. Price-history close (correct source — what the valuation screen reads)
+    // Read the FX pair's LIVE price. Prefer the row's live price (what the
+    // valuation header shows — most current), then fall back to the latest
+    // price-history close. Reject the 1.00 placeholder for non-parity
+    // currencies (the bare-form pairs mis-read as 1.00).
     let p = null;
-    try {
-      const hist = (typeof getHistoryForTicker === 'function') ? getHistoryForTicker(t) : null;
-      if (hist && hist.length) {
-        const lastClose = hist[hist.length - 1].price;
-        if (typeof lastClose === 'number' && isFinite(lastClose) && lastClose > 0) p = lastClose;
-      }
-    } catch {}
-    // 2. Fall back to the row's sheet price
+    const r = getRow(t);
+    const rp = r?.price;
+    if (typeof rp === 'number' && isFinite(rp) && rp > 0
+        && !(Math.abs(rp - 1) < 1e-6 && !NEAR_PARITY_CCY.has(currency))) {
+      p = rp;  // live row price, validated against the 1.00 placeholder
+    }
+    // Fall back to price-history close if the live price was missing/rejected
     if (p == null) {
-      const r = getRow(t);
-      const rp = r?.price;
-      if (typeof rp === 'number' && isFinite(rp) && rp > 0) p = rp;
+      try {
+        const hist = (typeof getHistoryForTicker === 'function') ? getHistoryForTicker(t) : null;
+        if (hist && hist.length) {
+          const lastClose = hist[hist.length - 1].price;
+          if (typeof lastClose === 'number' && isFinite(lastClose) && lastClose > 0) p = lastClose;
+        }
+      } catch {}
     }
     if (p == null) return null;
-    // Reject the placeholder 1.00 for currencies never ~1:1 with USD
     if (Math.abs(p - 1) < 1e-6 && !NEAR_PARITY_CCY.has(currency)) return null;
     return p;
   };
@@ -615,6 +620,22 @@ function ensureRowNormalized(row) {
     row._fxRate = norm.rate;
     row.price = norm.price;
     row.marketCap = norm.marketCap;
+    // Convert all monetary financial-statement fields too, so foreign company
+    // assets/liabilities/equity/revenue compare apples-to-apples with US names
+    // (and feed the reasoning chain in USD). These are absolute-currency
+    // amounts; ratios (P/E, margins, ROE) are unit-less and left untouched.
+    const MONETARY_FIELDS = [
+      'totalAssets', 'totalLiabilities', 'totalEquity', 'bookValue', 'cash',
+      'totalDebt', 'freeCashFlow', 'revenue', 'netIncome', 'ebitda', 'eps',
+      'priorClose', 'high52', 'low52', 'fmpHigh52', 'fmpLow52',
+    ];
+    if (!row._localFinancials) row._localFinancials = {};
+    for (const f of MONETARY_FIELDS) {
+      if (typeof row[f] === 'number' && isFinite(row[f])) {
+        row._localFinancials[f] = row[f];
+        row[f] = row[f] * norm.rate;
+      }
+    }
     row._usdNormalized = true;
     row._currencyUnconverted = false;
   } else {
@@ -9307,8 +9328,29 @@ function purgeAllDataCaches() {
     'valuatio.taxonomy.cache.v1',
     'valuatio.macroData.v1',
     'valuatio.bonds.v1',
+    'valuatio.news.v1',          // news article cache (can grow to several MB)
+    'valuatio.news.mynews.v1',   // per-ticker my-news cache
   ];
   dataCacheKeys.forEach(k => localStorage.removeItem(k));
+}
+
+// Clear ONLY the news caches. The news article cache is the most common
+// space hog (several MB of article bodies + summaries). This frees that
+// without touching price history, portfolio, or settings.
+function clearNewsCache() {
+  let freed = 0;
+  Object.keys(localStorage).forEach(k => {
+    if (k.startsWith('valuatio.news.')) {
+      try { freed += (localStorage.getItem(k) || '').length; } catch {}
+      localStorage.removeItem(k);
+    }
+  });
+  // Reset in-memory news state so the feed doesn't re-serve cleared articles
+  if (typeof state !== 'undefined' && state.news) {
+    state.news.items = [];
+    state.news.lastFetch = 0;
+  }
+  return freed;
 }
 
 // Refresh ALL data linked to stock book — sheets, prices, taxonomy, macro, bonds.
@@ -9341,15 +9383,23 @@ document.getElementById('stockbook-refresh-btn')?.addEventListener('click', () =
 function openClearCachePrompt() {
   const choice = prompt(
     'Choose what to clear:\n' +
+    '  N = NEWS cache ONLY (clears all stored articles — often several MB)\n' +
     '  0 = Price history ONLY (the biggest cache — frees the most space, re-fetches on demand)\n' +
-    '  1 = Caches only (sectors, descriptions, taxonomy, macro, bonds, sheet cache, price history)\n' +
+    '  1 = Caches only (sectors, descriptions, taxonomy, macro, bonds, sheet cache, price history, news)\n' +
     '  2 = Caches + personal book (manually-added tickers)\n' +
     '  3 = EVERYTHING (caches + personal book + portfolio + saved valuations + ' +
        'notes + overrides + probability theses + risk portfolio + API keys + sheet URLs)\n\n' +
-    'Type 0, 1, 2, or 3:'
+    'Type N, 0, 1, 2, or 3:'
   );
   if (!choice) return;
-  const c = choice.trim();
+  const c = choice.trim().toUpperCase();
+  if (c === 'N') {
+    const freed = clearNewsCache();
+    if (typeof renderStorageStats === 'function') renderStorageStats();
+    if (typeof renderNews === 'function') { try { renderNews(); } catch {} }
+    flashStatus(`News cache cleared — freed ~${(freed / 1024 / 1024).toFixed(1)}MB`, 'success');
+    return;
+  }
   if (c === '0') {
     // Price history is usually the largest single cache (often 8-9MB with
     // hundreds of tickers). Clearing just this frees the most space without
@@ -9729,8 +9779,25 @@ function renderPriceChart() {
   ctx.scale(dpr, dpr);
   ctx.clearRect(0, 0, W, H);
 
-  const data = getRangedHistory();
+  let data = getRangedHistory();
   if (data.length < 2) return;
+
+  // FX inversion: for a USD/<ccy> pair (e.g. USD/KRW = won per dollar), invert
+  // to <ccy>/USD (dollars per unit) so the chart reads as the foreign currency's
+  // VALUE against the dollar — it rises when the currency strengthens, the
+  // intuitive "performance against the dollar" view. Tiny decimals expected.
+  const _tk = (state.priceChart.ticker || state.stock?.ticker || '').toUpperCase();
+  const _isFx = /=X$/.test(_tk);
+  const _fxInverted = _isFx && state.priceChart.fxInvert !== false;  // default ON for FX
+  // Show the invert toggle only for FX pairs
+  const _invBtn = document.getElementById('fx-invert-toggle');
+  if (_invBtn) {
+    _invBtn.style.display = _isFx ? '' : 'none';
+    _invBtn.classList.toggle('active', _fxInverted);
+  }
+  if (_fxInverted) {
+    data = data.map(d => ({ ...d, price: (d.price && d.price > 0) ? 1 / d.price : d.price }));
+  }
 
   const padL = 60, padR = 20, padT = 16, padB = 36;
   const plotW = W - padL - padR;
@@ -9762,7 +9829,12 @@ function renderPriceChart() {
     ctx.moveTo(padL, py);
     ctx.lineTo(padL + plotW, py);
     ctx.stroke();
-    ctx.fillText(fmt$(yv), padL - 8, py + 3);
+    // Inverted FX values are tiny decimals (e.g. 0.000666 USD per won) — show
+    // enough significant figures instead of "$0.00".
+    const label = _fxInverted
+      ? yv.toPrecision(4)
+      : fmt$(yv);
+    ctx.fillText(label, padL - 8, py + 3);
   }
 
   // ----- Area fill under the line (TradingView-style) -----
@@ -9810,10 +9882,10 @@ function renderPriceChart() {
   }
 
   // ----- Stats below -----
-  renderPriceChartStats(data);
+  renderPriceChartStats(data, _fxInverted);
 }
 
-function renderPriceChartStats(data) {
+function renderPriceChartStats(data, fxInverted = false) {
   const wrap = document.getElementById('price-chart-stats');
   if (!wrap) return;
   const first = data[0].price, last = data[data.length - 1].price;
@@ -9822,13 +9894,17 @@ function renderPriceChartStats(data) {
   const high = Math.max(...data.map(d => d.price));
   const low = Math.min(...data.map(d => d.price));
   const dir = change >= 0 ? 'up' : 'down';
+  // For inverted FX (tiny decimals), use significant-figure formatting rather
+  // than fmt$ which would collapse to "$0.00".
+  const fv = (v) => fxInverted ? v.toPrecision(4) : fmt$(v);
   wrap.innerHTML = `
-    <div><div class="l">Last</div><div class="v">${fmt$(last)}</div></div>
-    <div><div class="l">Change</div><div class="v ${dir}">${change >= 0 ? '+' : ''}${fmt$(change)}</div></div>
+    <div><div class="l">Last</div><div class="v">${fv(last)}</div></div>
+    <div><div class="l">Change</div><div class="v ${dir}">${change >= 0 ? '+' : ''}${fv(change)}</div></div>
     <div><div class="l">% Change</div><div class="v ${dir}">${changePct >= 0 ? '+' : ''}${changePct.toFixed(2)}%</div></div>
-    <div><div class="l">Range High</div><div class="v">${fmt$(high)}</div></div>
-    <div><div class="l">Range Low</div><div class="v">${fmt$(low)}</div></div>
+    <div><div class="l">Range High</div><div class="v">${fv(high)}</div></div>
+    <div><div class="l">Range Low</div><div class="v">${fv(low)}</div></div>
     <div><div class="l">Data Points</div><div class="v">${data.length}</div></div>
+    ${fxInverted ? `<div><div class="l">View</div><div class="v" style="font-size:10px">$/unit (inverted)</div></div>` : ''}
   `;
 }
 
@@ -9840,6 +9916,16 @@ document.getElementById('price-range-control')?.addEventListener('click', e => {
   document.querySelectorAll('#price-range-control .seg-btn').forEach(b => {
     b.classList.toggle('active', b === btn);
   });
+  renderPriceChart();
+});
+
+// FX invert toggle — only relevant for =X pairs. Flips between the raw rate
+// (USD/KRW = won per dollar) and the inverted decimal (KRW/USD = dollar value
+// of one won), the latter being the "performance against the dollar" view.
+document.getElementById('fx-invert-toggle')?.addEventListener('click', () => {
+  state.priceChart.fxInvert = state.priceChart.fxInvert === false ? true : false;
+  const btn = document.getElementById('fx-invert-toggle');
+  if (btn) btn.classList.toggle('active', state.priceChart.fxInvert !== false);
   renderPriceChart();
 });
 
@@ -32795,20 +32881,29 @@ document.addEventListener('DOMContentLoaded', () => {
   // ---- Home → Cache clearing ----
   document.getElementById('home-clear-news-btn')?.addEventListener('click', () => {
     if (!confirm('Clear cached news articles? Article read-states will be preserved.')) return;
+    // Use the real keys (valuatio.news.v1, valuatio.news.mynews.v1). The old
+    // code looked for "valuatio.news.cache" which never existed, so nothing
+    // was cleared — this is the bug where 4.5MB of news wouldn't clear.
+    // Read-states (valuatio.news.state.v1) are intentionally preserved.
+    let freed = 0;
     for (let i = localStorage.length - 1; i >= 0; i--) {
       const k = localStorage.key(i);
-      if (k && k.startsWith('valuatio.news.cache')) localStorage.removeItem(k);
+      if (k && k.startsWith('valuatio.news.') && k !== ARTICLE_STATE_KEY) {
+        try { freed += (localStorage.getItem(k) || '').length; } catch {}
+        localStorage.removeItem(k);
+      }
     }
+    if (typeof state !== 'undefined' && state.news) { state.news.items = []; state.news.lastFetch = 0; }
     renderStorageStats();
-    if (typeof flashStatus === 'function') flashStatus('News cache cleared', 'success');
+    if (typeof renderNews === 'function') { try { renderNews(); } catch {} }
+    if (typeof flashStatus === 'function') flashStatus(`News cache cleared — freed ~${(freed / 1024 / 1024).toFixed(1)}MB`, 'success');
   });
   document.getElementById('home-clear-prices-btn')?.addEventListener('click', () => {
     if (!confirm('Clear price history cache? Will re-fetch on next load (may be slow on first refresh).')) return;
-    for (let i = localStorage.length - 1; i >= 0; i--) {
-      const k = localStorage.key(i);
-      if (k && (k.startsWith('valuatio.priceHistory') || k.startsWith('valuatio.priceHistCache'))) {
-        localStorage.removeItem(k);
-      }
+    // Real key is valuatio.priceHist.cache.v1 (the old prefixes never matched).
+    localStorage.removeItem('valuatio.priceHist.cache.v1');
+    if (typeof _priceHistMemCache === 'object') {
+      for (const k of Object.keys(_priceHistMemCache)) delete _priceHistMemCache[k];
     }
     renderStorageStats();
     if (typeof flashStatus === 'function') flashStatus('Price history cache cleared', 'success');
