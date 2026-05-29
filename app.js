@@ -385,14 +385,151 @@ function _tickerLocalCurrency(ticker) {
 // Look up how many USD one unit of `currency` is worth, using FX pairs loaded
 // in the stockbook. Yahoo FX convention: KRW=X is USD/KRW (Won per dollar), so
 // USD per Won = 1 / price. EURUSD=X is USD per Euro directly. We handle both.
-// Currencies that CAN legitimately trade near 1:1 with USD — for these, a
-// price of ~1.00 is plausible and shouldn't be rejected as a placeholder.
+// ============================================================
+//   FX RATES from data/fx/rates.json (the dedicated 24h pipeline)
+//
+//   The pipeline writes one clean entry per currency with usdPer (how many USD
+//   one unit is worth) — used DIRECTLY as the conversion multiplier. This is
+//   the source of truth, checked before the messy stockbook FX pairs that were
+//   reading $1.00 placeholders. Polled on a fast cadence since FX is 24h.
+// ============================================================
+const FX_RATES_CACHE_KEY = 'valuatio.fxRates.v1';
+const FX_RATES_TTL_MS = 20 * 60 * 1000;  // 20 min
+let _fxRatesMem = null;   // { rates: {KRW:{usdPer,perUsd,pair}, ...}, fetchedAt }
+
+function loadFxRatesCache() {
+  if (_fxRatesMem) return _fxRatesMem;
+  try {
+    const raw = localStorage.getItem(FX_RATES_CACHE_KEY);
+    if (raw) { _fxRatesMem = JSON.parse(raw); return _fxRatesMem; }
+  } catch {}
+  return null;
+}
+
+async function fetchFxRates(force = false) {
+  const cached = loadFxRatesCache();
+  if (!force && cached && (Date.now() - cached.fetchedAt) < FX_RATES_TTL_MS) {
+    return cached;
+  }
+  const base = getGitHubDataBase() || 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2/main/data/';
+  const url = base.replace(/\/$/, '') + '/fx/rates.json';
+  try {
+    const r = await fetch(url, { cache: 'no-cache' });
+    if (!r.ok) { console.warn(`[fx-rates] ${url} → HTTP ${r.status}`); return cached; }
+    const json = await r.json();
+    if (!json.rates || typeof json.rates !== 'object') { console.warn('[fx-rates] no rates object'); return cached; }
+    _fxRatesMem = { rates: json.rates, updatedAt: json.updatedAt, fetchedAt: Date.now() };
+    try { localStorage.setItem(FX_RATES_CACHE_KEY, JSON.stringify(_fxRatesMem)); } catch {}
+    const n = Object.keys(json.rates).length;
+    console.log(`[fx-rates] loaded ${n} currencies from rates.json (updated ${json.updatedAt})`);
+    // Re-run conversions now that fresh rates are in — clear normalized flags so
+    // rows re-convert with the new authoritative rates.
+    if (state.stockbook?.rows) {
+      for (const row of state.stockbook.rows) {
+        if (row._usdNormalized || row._currencyUnconverted) {
+          // restore local values before re-converting
+          if (row._localPrice != null) row.price = row._localPrice;
+          if (row._localMarketCap != null) row.marketCap = row._localMarketCap;
+          row._usdNormalized = false;
+          row._currencyUnconverted = false;
+        }
+      }
+      if (typeof renderStockBook === 'function' && state.stockbook.rows.length) {
+        try { renderStockBook(); } catch {}
+      }
+    }
+    return _fxRatesMem;
+  } catch (e) {
+    console.warn('[fx-rates] fetch failed:', e.message);
+    return cached;
+  }
+}
+
+// Look up usdPer (USD per 1 unit) for a currency from the pipeline file.
+function fxRatesUsdPer(currency) {
+  const c = loadFxRatesCache();
+  const entry = c?.rates?.[currency];
+  if (entry && typeof entry.usdPer === 'number' && isFinite(entry.usdPer) && entry.usdPer > 0) {
+    return entry.usdPer;
+  }
+  return null;
+}
+
+
 // Everything else (KRW ~1380, JPY ~159, INR ~96, etc.) reading exactly 1.00
 // is the placeholder bug and gets rejected.
 const NEAR_PARITY_CCY = new Set(['EUR', 'GBP', 'CHF', 'CAD', 'AUD', 'NZD', 'SGD', 'BND']);
 
+// ============================================================
+//   DEDICATED FX RATES FEED (data/fx/rates.json)
+//   Authoritative USD-anchored rates from the pipeline's fast workflow.
+//   `usdPer` = USD value of one unit of the currency. _fxRateToUSD checks this
+//   cache FIRST, bypassing the broken sheet FX rows (bare KRW=X reading 1.00).
+// ============================================================
+const FX_RATES_KEY = 'valuatio.fxRates.v1';
+let _fxRatesCache = null;
+let _fxRatesLoadedAt = 0;
+
+function loadFxRatesCache() {
+  if (_fxRatesCache) return _fxRatesCache;
+  try {
+    const raw = localStorage.getItem(FX_RATES_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      _fxRatesCache = parsed.rates || {};
+      _fxRatesLoadedAt = parsed.loadedAt || 0;
+      return _fxRatesCache;
+    }
+  } catch {}
+  return null;
+}
+
+async function fetchFxRatesFile() {
+  const base = getGitHubDataBase() || 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2/main/data/';
+  const url = base + 'fx/rates.json';
+  try {
+    const r = await fetch(url, { cache: 'no-cache' });
+    if (!r.ok) { console.warn('[fx-rates] not found at', url, '(status', r.status + ')'); return null; }
+    const json = await r.json();
+    const map = {};
+    for (const [ccy, rec] of Object.entries(json.rates || {})) {
+      if (rec && typeof rec.usdPer === 'number' && isFinite(rec.usdPer) && rec.usdPer > 0) {
+        map[ccy.toUpperCase()] = rec.usdPer;
+      }
+    }
+    _fxRatesCache = map;
+    _fxRatesLoadedAt = Date.now();
+    try { localStorage.setItem(FX_RATES_KEY, JSON.stringify({ rates: map, loadedAt: _fxRatesLoadedAt })); } catch {}
+    console.log(`[fx-rates] loaded ${Object.keys(map).length} rates from ${url}`, map);
+    // Re-run conversions now that authoritative rates are available
+    if (typeof state !== 'undefined' && state.stockbook?.rows) {
+      let reconverted = 0;
+      for (const row of state.stockbook.rows) {
+        if (row._currencyUnconverted || (!row._usdNormalized && _tickerLocalCurrency(row.ticker))) {
+          row._currencyUnconverted = false;
+          if (typeof ensureRowNormalized === 'function') { ensureRowNormalized(row); if (row._usdNormalized) reconverted++; }
+        }
+      }
+      if (reconverted > 0) {
+        console.log(`[fx-rates] re-converted ${reconverted} foreign tickers`);
+        if (typeof renderStockBook === 'function') try { renderStockBook(); } catch {}
+      }
+    }
+    return map;
+  } catch (e) {
+    console.warn('[fx-rates] fetch failed:', e.message);
+    return null;
+  }
+}
+
 function _fxRateToUSD(currency) {
   if (!currency || currency === 'USD') return 1;
+  // 0. AUTHORITATIVE: dedicated FX rates file (usdPer multiplier). This is the
+  //    clean source that bypasses the broken sheet FX pairs entirely.
+  const fxFile = loadFxRatesCache();
+  if (fxFile && typeof fxFile[currency] === 'number' && fxFile[currency] > 0) {
+    return fxFile[currency];
+  }
   const getRow = (t) => (typeof getStockbookRow === 'function') ? getStockbookRow(t) : null;
   // Read the FX pair's price. The sheet's price column is WRONG for bare-form
   // pairs (KRW=X shows 1.00) but the price-HISTORY close is correct (e.g.
@@ -2384,6 +2521,13 @@ setInterval(_refreshLivePulseIfVisible, 60_000);
 
 // Wire forecast step tabs + theme toggle on DOM ready
 document.addEventListener('DOMContentLoaded', () => {
+  // Load the dedicated FX rates file on startup, then refresh every 15 min
+  // (matches the pipeline workflow cadence). Foreign-ticker conversions use
+  // these authoritative rates; this re-converts rows when fresh rates arrive.
+  if (typeof fetchFxRatesFile === 'function') {
+    fetchFxRatesFile().catch(() => {});
+    setInterval(() => { fetchFxRatesFile().catch(() => {}); }, 15 * 60 * 1000);
+  }
   document.querySelectorAll('.regime-forecast-tab').forEach(btn => {
     btn.addEventListener('click', () => {
       _currentForecastStep = btn.dataset.step;
