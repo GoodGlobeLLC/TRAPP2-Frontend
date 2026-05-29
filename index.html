@@ -4044,7 +4044,16 @@
     padding: 0 32px;
     border-bottom: 1px solid var(--rule);
     background: var(--bg);
+    /* The section tabs (Portfolio/Equities/Derivatives/Crypto/Futures/Metals/
+       Currencies/Indices…) overflow on narrow / half-screen widths. Allow
+       horizontal scroll so every tab is reachable instead of being clipped. */
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
   }
+  .stockbook-tabs::-webkit-scrollbar { height: 6px; }
+  .stockbook-tabs::-webkit-scrollbar-thumb { background: var(--rule); border-radius: 3px; }
   .sb-tab-btn {
     background: transparent;
     border: none;
@@ -4056,6 +4065,8 @@
     text-transform: uppercase;
     letter-spacing: 0.15em;
     cursor: pointer;
+    flex-shrink: 0;
+    white-space: nowrap;
   }
   .sb-tab-btn:hover { color: var(--ink); }
   .sb-tab-btn.active {
@@ -7716,7 +7727,7 @@
       <button class="btn btn-ghost" id="fed-refresh-btn" title="Re-read seeded data">Reset to Public Data</button>
     </div>
   </div>
-  <div id="fed-body" style="padding:0 32px 60px"></div>
+  <div id="fed-body" style="padding:0 32px 60px;overflow-x:auto"></div>
 </div><!-- /fed panel -->
 
 <!-- ===== SCENARIOS PANEL =====
@@ -7837,6 +7848,7 @@
     <div class="modal-section">
       <div class="modal-label">Ticker</div>
       <input type="text" class="modal-input" id="thesis-ticker" placeholder="AAPL" maxlength="25" style="text-transform:uppercase">
+      <div id="thesis-ticker-price" style="font-family:var(--mono);font-size:11px;color:var(--ink-dim);margin-top:6px;min-height:16px"></div>
     </div>
 
     <div class="modal-section">

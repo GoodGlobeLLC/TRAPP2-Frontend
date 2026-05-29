@@ -6793,12 +6793,12 @@ function renderFedTab() {
         <input type="range" id="fed-blend-weight" min="0" max="100" value="${(f.blendWeight*100).toFixed(0)}" style="flex:1;max-width:220px">
         <span id="fed-blend-label" style="font-family:var(--mono);font-size:11px;color:var(--amber);font-weight:700">${(f.blendWeight*100).toFixed(0)}%</span>
       </div>
-      <table class="sb-table" style="width:100%">
+      <div style="overflow-x:auto"><table class="sb-table" style="width:100%;min-width:560px">
         <thead><tr>
           <th>Meeting</th><th>Market (c/h/k)</th><th>Your Prediction (c/h/k)</th><th>Blend → Engine</th>
         </tr></thead>
         <tbody>${meetingRows}</tbody>
-      </table>
+      </table></div>
       <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:8px">
         Tip: refresh market odds at the CME FedWatch Tool, then type the current values here to keep the engine current.
       </div>
@@ -6834,10 +6834,10 @@ function renderFedTab() {
       <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);margin-bottom:10px;line-height:1.6">
         The <strong>5-session market reaction</strong> (SPY + TLT) after each decision is computed from price history when available — a read on how the market received the decision. Shows "—" when history isn't loaded for that date.
       </div>
-      <table class="sb-table" style="width:100%">
+      <div style="overflow-x:auto"><table class="sb-table" style="width:100%;min-width:560px">
         <thead><tr><th>Date</th><th>Decision</th><th>New Range</th><th>5-Session Market Reaction</th><th>Note</th></tr></thead>
         <tbody>${histRows}</tbody>
-      </table>
+      </table></div>
     </div>`;
 
   // ---- How this feeds the engine ----
@@ -14174,6 +14174,58 @@ function renderThesisCard(thesis, result) {
       <div class="thesis-prob-bar">
         <div class="thesis-prob-bar-fill" style="width:${pct}%"></div>
       </div>
+      ${(() => {
+        // ---- Probability timeline ----
+        // Record a daily snapshot of the blended probability + price so the
+        // user can see the TREND over the thesis's life, not just creation vs
+        // now. We keep at most one snapshot per calendar day (latest wins) and
+        // cap the history at 120 points to bound storage.
+        if (!Array.isArray(thesis.probTimeline)) thesis.probTimeline = [];
+        const todayKey = new Date().toISOString().slice(0, 10);
+        const last = thesis.probTimeline[thesis.probTimeline.length - 1];
+        if (!last || last.date !== todayKey) {
+          thesis.probTimeline.push({ date: todayKey, prob: blended, price: currentPrice });
+        } else {
+          last.prob = blended; last.price = currentPrice;  // update today's point
+        }
+        if (thesis.probTimeline.length > 120) thesis.probTimeline = thesis.probTimeline.slice(-120);
+        // Persist (debounced via the existing save in callers, but save here too)
+        try { if (typeof saveTheses === 'function') saveTheses(state.probability.theses); } catch {}
+
+        const tl = thesis.probTimeline;
+        if (tl.length < 2) {
+          return `<div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:8px">Probability timeline starts building from today — revisit over the coming days to see the trend.</div>`;
+        }
+        // Build an SVG sparkline of probability over time
+        const W = 320, H = 48, pad = 4;
+        const probs = tl.map(p => p.prob);
+        const minP = Math.min(...probs), maxP = Math.max(...probs);
+        const range = (maxP - minP) || 0.01;
+        const n = tl.length;
+        const x = (i) => pad + (i / (n - 1)) * (W - 2 * pad);
+        const y = (p) => H - pad - ((p - minP) / range) * (H - 2 * pad);
+        const path = tl.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(p.prob).toFixed(1)}`).join(' ');
+        const first = tl[0], lastPt = tl[tl.length - 1];
+        const trend = lastPt.prob - first.prob;
+        const trendColor = trend > 0.005 ? '#5b8a72' : trend < -0.005 ? '#a5645a' : 'var(--ink-dim)';
+        const spanDays = Math.round((new Date(lastPt.date) - new Date(first.date)) / 86400000);
+        return `
+          <div style="margin-top:10px;padding-top:8px;border-top:1px dashed var(--rule)">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+              <span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.08em;text-transform:uppercase">Probability Trend · ${n} pts over ${spanDays}d</span>
+              <span style="font-family:var(--mono);font-size:10px;font-weight:700;color:${trendColor}">${trend >= 0 ? '↑' : '↓'} ${trend >= 0 ? '+' : ''}${(trend * 100).toFixed(1)} pts</span>
+            </div>
+            <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px;display:block">
+              <line x1="${pad}" y1="${y(0.5).toFixed(1)}" x2="${W - pad}" y2="${y(0.5).toFixed(1)}" stroke="var(--rule)" stroke-dasharray="2,3" stroke-width="0.5"/>
+              <path d="${path}" fill="none" stroke="${trendColor}" stroke-width="1.5"/>
+              <circle cx="${x(n - 1).toFixed(1)}" cy="${y(lastPt.prob).toFixed(1)}" r="2.5" fill="${trendColor}"/>
+            </svg>
+            <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:8px;color:var(--ink-faint);margin-top:2px">
+              <span>${first.date} · ${(first.prob * 100).toFixed(0)}%</span>
+              <span>${lastPt.date} · ${(lastPt.prob * 100).toFixed(0)}%</span>
+            </div>
+          </div>`;
+      })()}
 
       <div class="thesis-components">
         ${compCell('ai', 'AI Inference', components.ai, weights.ai,
@@ -14457,6 +14509,49 @@ if (targetDateInput) {
     updateHorizonSummary();
   });
 }
+
+// Show last/current price as the user types a ticker in the thesis modal —
+// a shortcut so they don't have to look it up elsewhere. Debounced; reads the
+// stockbook row first (instant), then falls back to a price fetch.
+let _thesisPriceTimer = null;
+document.getElementById('thesis-ticker')?.addEventListener('input', (e) => {
+  const el = document.getElementById('thesis-ticker-price');
+  if (!el) return;
+  const ticker = e.target.value.trim().toUpperCase();
+  if (!ticker) { el.textContent = ''; return; }
+  clearTimeout(_thesisPriceTimer);
+  el.textContent = '…';
+  el.style.color = 'var(--ink-faint)';
+  _thesisPriceTimer = setTimeout(async () => {
+    // 1. Instant: stockbook row
+    const row = (typeof getStockbookRow === 'function') ? getStockbookRow(ticker) : null;
+    const showPrice = (price, chg, src) => {
+      if (price == null) { el.textContent = `No price found for ${ticker}`; el.style.color = 'var(--ink-faint)'; return; }
+      const chgStr = (chg != null && isFinite(chg))
+        ? ` · <span style="color:${chg >= 0 ? '#5b8a72' : '#a5645a'}">${chg >= 0 ? '+' : ''}${(chg).toFixed(2)}% today</span>`
+        : '';
+      el.innerHTML = `Last price: <strong style="color:var(--amber)">$${price.toFixed(2)}</strong>${chgStr} <span style="color:var(--ink-faint);font-size:9px">(${src})</span>`;
+      el.style.color = 'var(--ink-dim)';
+    };
+    if (row && isFinite(row.price)) {
+      const chg = isFinite(row.changePct) ? row.changePct : isFinite(row.changesPercentage) ? row.changesPercentage : null;
+      showPrice(row.price, chg, row._usdNormalized ? 'stockbook · USD-normalized' : 'stockbook');
+      return;
+    }
+    // 2. Fallback: fetch price
+    if (e.target.value.trim().toUpperCase() !== ticker) return; // user kept typing
+    try {
+      const sd = (typeof getCanonicalStockData === 'function') ? getCanonicalStockData(ticker) : null;
+      if (sd && isFinite(sd.price)) { showPrice(sd.price, sd.changePct, 'canonical'); return; }
+      const hist = (typeof getHistoryForTicker === 'function') ? getHistoryForTicker(ticker) : null;
+      if (hist && hist.length) { showPrice(hist[hist.length - 1].price, null, 'last close (history)'); return; }
+      el.textContent = `No cached price for ${ticker} — fetch & value it first`;
+      el.style.color = 'var(--ink-faint)';
+    } catch {
+      el.textContent = '';
+    }
+  }, 350);
+});
 
 document.getElementById('thesis-create').addEventListener('click', () => {
   const ticker = document.getElementById('thesis-ticker').value.trim().toUpperCase();
@@ -30483,6 +30578,244 @@ const SUPPLY_CHAINS = [
       'Newzoo Global Games Market Report',
       'Sensor Tower mobile gaming data',
     ],
+  },
+
+
+  // ----- STEEL & INDUSTRIAL METALS -----
+  {
+    id: 'steel_metals',
+    name: 'Steel & Industrial Metals',
+    sector: 'Materials',
+    description: 'From iron ore and coking coal mining through blast-furnace and electric-arc steelmaking to construction, autos, and machinery end-users.',
+    upstream: [
+      { ticker: 'BHP', role: 'Iron ore + metallurgical coal (Australia)', confidence: 'verified' },
+      { ticker: 'RIO', role: 'Rio Tinto — iron ore major', confidence: 'verified' },
+      { ticker: 'VALE', role: 'Vale — world iron ore leader (Brazil)', confidence: 'verified' },
+      { ticker: 'FCX', role: 'Freeport — copper + molybdenum', confidence: 'verified' },
+      { ticker: 'SCCO', role: 'Southern Copper', confidence: 'verified' },
+    ],
+    midstream: [
+      { ticker: 'NUE', role: 'Nucor — largest US steelmaker (EAF)', confidence: 'verified' },
+      { ticker: 'STLD', role: 'Steel Dynamics — EAF', confidence: 'verified' },
+      { ticker: 'CLF', role: 'Cleveland-Cliffs — integrated + auto-grade', confidence: 'verified' },
+      { ticker: 'X', role: 'US Steel', confidence: 'verified' },
+      { ticker: 'MT', role: 'ArcelorMittal — global (Luxembourg)', confidence: 'verified' },
+      { ticker: 'PKX', role: 'POSCO — Korea steel major', confidence: 'verified' },
+      { ticker: 'AA', role: 'Alcoa — aluminum smelting', confidence: 'verified' },
+    ],
+    downstream: [
+      { ticker: 'CAT', role: 'Construction + mining machinery', confidence: 'verified' },
+      { ticker: 'DE', role: 'Deere — agricultural machinery', confidence: 'verified' },
+      { ticker: 'GM', role: 'Auto body steel consumption', confidence: 'verified' },
+      { ticker: 'F', role: 'Ford — auto steel + aluminum', confidence: 'verified' },
+      { ticker: 'PCAR', role: 'PACCAR — heavy trucks', confidence: 'verified' },
+      { name: 'Construction / infrastructure', role: 'Rebar + structural steel demand', confidence: 'disclosed' },
+    ],
+    relatedChains: ['auto_ice', 'real_estate'],
+    citations: ['Company 10-Ks — segment volumes', 'World Steel Association', 'USGS Mineral Commodity Summaries'],
+  },
+
+  // ----- GOLD & PRECIOUS METALS MINING -----
+  {
+    id: 'gold_mining',
+    name: 'Gold & Precious Metals Mining',
+    sector: 'Materials',
+    description: 'From exploration and mining through refining to central-bank, jewelry, and investment demand — plus the ETFs that vault physical metal.',
+    upstream: [
+      { ticker: 'NEM', role: 'Newmont — world largest gold miner', confidence: 'verified' },
+      { ticker: 'GOLD', role: 'Barrick Gold', confidence: 'verified' },
+      { ticker: 'AEM', role: 'Agnico Eagle', confidence: 'verified' },
+      { ticker: 'FNV', role: 'Franco-Nevada — royalty/streaming', confidence: 'verified' },
+      { ticker: 'WPM', role: 'Wheaton Precious Metals — streaming', confidence: 'verified' },
+      { ticker: 'KGC', role: 'Kinross Gold', confidence: 'verified' },
+    ],
+    midstream: [
+      { ticker: 'RGLD', role: 'Royal Gold — royalties', confidence: 'verified' },
+      { name: 'Refiners (Valcambi, PAMP)', role: 'Swiss refining (private)', confidence: 'verified' },
+    ],
+    downstream: [
+      { ticker: 'GLD', role: 'SPDR Gold — physical vault ETF', confidence: 'verified' },
+      { ticker: 'IAU', role: 'iShares Gold Trust', confidence: 'verified' },
+      { ticker: 'SLV', role: 'iShares Silver Trust', confidence: 'verified' },
+      { ticker: 'SIVR', role: 'abrdn Physical Silver', confidence: 'verified' },
+      { name: 'Central banks', role: 'Reserve accumulation (PBoC, etc.)', confidence: 'disclosed' },
+      { name: 'Jewelry demand (India/China)', role: 'Largest physical consumers', confidence: 'verified' },
+    ],
+    relatedChains: [],
+    citations: ['Miner 10-Ks — production + AISC', 'World Gold Council demand trends', 'ETF prospectuses'],
+  },
+
+  // ----- NATURAL GAS & LNG -----
+  {
+    id: 'natgas_lng',
+    name: 'Natural Gas & LNG',
+    sector: 'Energy',
+    description: 'From shale gas production through pipelines and liquefaction-export terminals to power generation, heating, and global LNG importers.',
+    upstream: [
+      { ticker: 'EQT', role: 'Largest US natgas producer (Appalachia)', confidence: 'verified' },
+      { ticker: 'EXE', role: 'Expand Energy (Chesapeake+Southwestern)', confidence: 'verified' },
+      { ticker: 'AR', role: 'Antero Resources', confidence: 'verified' },
+      { ticker: 'RRC', role: 'Range Resources', confidence: 'verified' },
+    ],
+    midstream: [
+      { ticker: 'LNG', role: 'Cheniere — largest US LNG exporter', confidence: 'verified' },
+      { ticker: 'WMB', role: 'Williams — Transco pipeline', confidence: 'verified' },
+      { ticker: 'KMI', role: 'Kinder Morgan — gas pipelines', confidence: 'verified' },
+      { ticker: 'ET', role: 'Energy Transfer — midstream', confidence: 'verified' },
+      { ticker: 'OKE', role: 'ONEOK — gathering/processing', confidence: 'verified' },
+      { ticker: 'SHEL', role: 'Shell — global LNG trading', confidence: 'verified' },
+    ],
+    downstream: [
+      { name: 'US utilities (gas-fired power)', role: 'Largest domestic consumer', confidence: 'verified' },
+      { ticker: 'UNG', role: 'US Natural Gas Fund (futures ETF)', confidence: 'verified' },
+      { name: 'JERA / KOGAS / CNOOC', role: 'Asian LNG importers (Japan/Korea/China)', confidence: 'verified' },
+      { name: 'European utilities', role: 'Post-Russia LNG demand', confidence: 'verified' },
+    ],
+    relatedChains: ['oil_gas', 'solar_renew'],
+    citations: ['Producer 10-Ks', 'EIA natural gas data', 'Cheniere export volumes'],
+  },
+
+  // ----- AIRLINES & TRAVEL -----
+  {
+    id: 'airlines_travel',
+    name: 'Airlines & Travel',
+    sector: 'Industrials',
+    description: 'From aircraft + engine makers through airlines to booking platforms, hotels, and the jet-fuel cost input that swings the whole chain.',
+    upstream: [
+      { ticker: 'BA', role: 'Boeing — airframes', confidence: 'verified' },
+      { ticker: 'AIR.PA', name: 'Airbus', alias: ['EADSY'], role: 'Airbus — airframes (France)', confidence: 'verified' },
+      { ticker: 'GE', role: 'GE Aerospace — engines', confidence: 'verified' },
+      { ticker: 'RTX', role: 'Pratt & Whitney engines', confidence: 'verified' },
+      { ticker: 'USO', role: 'Jet fuel cost proxy (crude ETF)', confidence: 'disclosed' },
+    ],
+    midstream: [
+      { ticker: 'DAL', role: 'Delta Air Lines', confidence: 'verified' },
+      { ticker: 'UAL', role: 'United Airlines', confidence: 'verified' },
+      { ticker: 'AAL', role: 'American Airlines', confidence: 'verified' },
+      { ticker: 'LUV', role: 'Southwest Airlines', confidence: 'verified' },
+      { ticker: 'RYAAY', role: 'Ryanair (Europe)', confidence: 'verified' },
+    ],
+    downstream: [
+      { ticker: 'BKNG', role: 'Booking Holdings — OTA', confidence: 'verified' },
+      { ticker: 'EXPE', role: 'Expedia', confidence: 'verified' },
+      { ticker: 'ABNB', role: 'Airbnb — lodging', confidence: 'verified' },
+      { ticker: 'MAR', role: 'Marriott', confidence: 'verified' },
+      { ticker: 'HLT', role: 'Hilton', confidence: 'verified' },
+      { ticker: 'JETS', role: 'US Global Jets ETF', confidence: 'verified' },
+    ],
+    relatedChains: ['oil_gas', 'defense_aero'],
+    citations: ['Airline 10-Ks — capacity + load factors', 'Boeing/Airbus order books', 'IATA traffic data'],
+  },
+
+  // ----- SHIPPING & MARITIME LOGISTICS -----
+  {
+    id: 'shipping_maritime',
+    name: 'Shipping & Maritime Logistics',
+    sector: 'Industrials',
+    description: 'From shipbuilders through container, dry-bulk, and tanker operators to ports and the freight-rate proxies that signal global trade health.',
+    upstream: [
+      { ticker: '009540.KS', name: 'HD Hyundai Heavy', role: 'Shipbuilding (Korea)', confidence: 'verified' },
+      { name: 'China State Shipbuilding', role: 'Largest shipbuilder (China)', confidence: 'verified' },
+    ],
+    midstream: [
+      { ticker: 'ZIM', role: 'ZIM — container liner', confidence: 'verified' },
+      { ticker: 'MAERSK-B.CO', name: 'Maersk', alias: ['AMKBY'], role: 'A.P. Moller-Maersk (Denmark)', confidence: 'verified' },
+      { ticker: 'GSL', role: 'Global Ship Lease — charter', confidence: 'verified' },
+      { ticker: 'SBLK', role: 'Star Bulk — dry bulk', confidence: 'verified' },
+      { ticker: 'GNK', role: 'Genco — dry bulk', confidence: 'verified' },
+      { ticker: 'FRO', role: 'Frontline — crude tankers', confidence: 'verified' },
+      { ticker: 'STNG', role: 'Scorpio Tankers — product tankers', confidence: 'verified' },
+    ],
+    downstream: [
+      { ticker: 'BDRY', role: 'Breakwave Dry Bulk Freight ETF', confidence: 'verified' },
+      { ticker: 'BWET', role: 'Breakwave Tanker Freight ETF', confidence: 'disclosed' },
+      { name: 'Retail / manufacturing importers', role: 'End cargo demand', confidence: 'disclosed' },
+    ],
+    relatedChains: ['oil_gas', 'consumer_elec'],
+    citations: ['Operator 10-Ks/20-Fs', 'Baltic Exchange dry/wet indices', 'Drewry container rate index'],
+  },
+
+  // ----- APPAREL & TEXTILES -----
+  {
+    id: 'apparel_textiles',
+    name: 'Apparel & Textiles',
+    sector: 'Consumer Discretionary',
+    description: 'From cotton + synthetic fiber through Asian contract manufacturing to global brands and retail/e-commerce distribution.',
+    upstream: [
+      { name: 'Cotton growers (US/India/Brazil)', role: 'Raw cotton', confidence: 'disclosed' },
+      { name: 'Synthetic fiber (polyester)', role: 'Petrochemical-derived fiber', confidence: 'disclosed' },
+    ],
+    midstream: [
+      { name: 'Shenzhou International', role: 'Knit garment OEM (HK: 2313.HK)', confidence: 'verified' },
+      { name: 'Pou Chen / Yue Yuen', role: 'Footwear OEM (Taiwan/HK)', confidence: 'verified' },
+      { name: 'Vietnamese / Bangladeshi factories', role: 'Cut-and-sew manufacturing', confidence: 'disclosed' },
+    ],
+    downstream: [
+      { ticker: 'NKE', role: 'Nike', confidence: 'verified' },
+      { ticker: 'ADDYY', role: 'Adidas (ADR)', confidence: 'verified' },
+      { ticker: 'LULU', role: 'Lululemon', confidence: 'verified' },
+      { ticker: 'VFC', role: 'VF Corp (Vans, North Face)', confidence: 'verified' },
+      { ticker: 'TPR', role: 'Tapestry (Coach)', confidence: 'verified' },
+      { ticker: 'GPS', role: 'Gap', confidence: 'verified' },
+      { ticker: '9983.T', name: 'Fast Retailing (Uniqlo)', alias: ['FRCOY'], role: 'Uniqlo parent (Japan)', confidence: 'verified' },
+      { name: 'Inditex (Zara)', role: 'Fast fashion (Spain: ITX.MC)', confidence: 'verified' },
+    ],
+    relatedChains: [],
+    citations: ['Brand 10-Ks — sourcing disclosures', 'OEM annual reports', 'Cotlook cotton index'],
+  },
+
+  // ----- LUXURY GOODS -----
+  {
+    id: 'luxury_goods',
+    name: 'Luxury Goods',
+    sector: 'Consumer Discretionary',
+    description: 'From leather, precious materials, and Swiss watch movements through maisons to global flagship retail — heavily exposed to Chinese demand.',
+    upstream: [
+      { name: 'Italian tanneries / leather', role: 'Premium hides', confidence: 'disclosed' },
+      { name: 'Swiss movement makers', role: 'Watch movements (ETA, etc.)', confidence: 'disclosed' },
+    ],
+    midstream: [
+      { ticker: 'MC.PA', name: 'LVMH', alias: ['LVMUY'], role: 'LVMH — largest luxury group (France)', confidence: 'verified' },
+      { ticker: 'RMS.PA', name: 'Hermès', alias: ['HESAY'], role: 'Hermès (France)', confidence: 'verified' },
+      { ticker: 'CFR.SW', name: 'Richemont', alias: ['CFRUY'], role: 'Cartier parent (Switzerland)', confidence: 'verified' },
+      { ticker: 'KER.PA', name: 'Kering', alias: ['PPRUY'], role: 'Gucci parent (France)', confidence: 'verified' },
+      { ticker: 'PRX.AS', name: 'Prada', role: 'Prada (listed HK: 1913.HK)', confidence: 'verified' },
+    ],
+    downstream: [
+      { name: 'Chinese consumers', role: 'Largest luxury demand pool', confidence: 'verified' },
+      { name: 'Global flagship retail', role: 'Direct-to-consumer boutiques', confidence: 'disclosed' },
+      { ticker: 'TPR', role: 'Tapestry — accessible luxury', confidence: 'verified' },
+      { ticker: 'CPRI', role: 'Capri (Versace, Jimmy Choo)', confidence: 'verified' },
+    ],
+    relatedChains: ['apparel_textiles'],
+    citations: ['Maison annual reports', 'Bain Luxury Goods Worldwide Market Study'],
+  },
+
+  // ----- WATER & UTILITIES INFRASTRUCTURE -----
+  {
+    id: 'water_utilities',
+    name: 'Water & Utilities Infrastructure',
+    sector: 'Utilities',
+    description: 'From water sourcing and treatment-equipment makers through regulated water + electric utilities to industrial, agricultural, and residential consumers.',
+    upstream: [
+      { ticker: 'XYL', role: 'Xylem — water pumps + treatment equipment', confidence: 'verified' },
+      { ticker: 'ECL', role: 'Ecolab — water treatment chemicals', confidence: 'verified' },
+      { ticker: 'PNR', role: 'Pentair — water systems', confidence: 'verified' },
+    ],
+    midstream: [
+      { ticker: 'AWK', role: 'American Water Works — largest US water utility', confidence: 'verified' },
+      { ticker: 'WTRG', role: 'Essential Utilities (Aqua)', confidence: 'verified' },
+      { ticker: 'NEE', role: 'NextEra — largest US utility + renewables', confidence: 'verified' },
+      { ticker: 'DUK', role: 'Duke Energy', confidence: 'verified' },
+      { ticker: 'SO', role: 'Southern Company', confidence: 'verified' },
+    ],
+    downstream: [
+      { ticker: 'PHO', role: 'Invesco Water Resources ETF', confidence: 'verified' },
+      { ticker: 'XLU', role: 'Utilities Select Sector ETF', confidence: 'verified' },
+      { name: 'Residential / industrial / agricultural', role: 'End consumption', confidence: 'disclosed' },
+    ],
+    relatedChains: ['solar_renew'],
+    citations: ['Utility 10-Ks — rate base', 'EPA infrastructure data', 'ETF holdings'],
   },
 
 ];
