@@ -385,24 +385,45 @@ function _tickerLocalCurrency(ticker) {
 // Look up how many USD one unit of `currency` is worth, using FX pairs loaded
 // in the stockbook. Yahoo FX convention: KRW=X is USD/KRW (Won per dollar), so
 // USD per Won = 1 / price. EURUSD=X is USD per Euro directly. We handle both.
+// Currencies that CAN legitimately trade near 1:1 with USD — for these, a
+// price of ~1.00 is plausible and shouldn't be rejected as a placeholder.
+// Everything else (KRW ~1380, JPY ~159, INR ~96, etc.) reading exactly 1.00
+// is the placeholder bug and gets rejected.
+const NEAR_PARITY_CCY = new Set(['EUR', 'GBP', 'CHF', 'CAD', 'AUD', 'NZD', 'SGD', 'BND']);
+
 function _fxRateToUSD(currency) {
   if (!currency || currency === 'USD') return 1;
   const getRow = (t) => (typeof getStockbookRow === 'function') ? getStockbookRow(t) : null;
   const priceOf = (t) => {
     const r = getRow(t);
-    const p = r?.price;
-    return (typeof p === 'number' && isFinite(p) && p > 0) ? p : null;
+    let p = r?.price;
+    // The bare-form pairs (KRW=X, JPY=X) in the user's sheet are reading a
+    // placeholder $1.00 instead of the real rate (the full-form USDKRW=X /
+    // USDJPY=X pairs have the correct value). So if a row reads exactly 1.00
+    // for a non-USD-pegged currency, treat it as missing, not a real rate.
+    if (typeof p === 'number' && isFinite(p) && p > 0) {
+      // Reject the placeholder 1.00 for currencies that are never ~1:1 with USD.
+      if (Math.abs(p - 1) < 1e-6 && !NEAR_PARITY_CCY.has(currency)) return null;
+      return p;
+    }
+    return null;
   };
-  // Try direct USD-quoted pair first (e.g. EURUSD=X = dollars per euro)
-  const directPair = `${currency}USD=X`;
-  const direct = priceOf(directPair);
-  if (direct != null) return direct;
-  // Try inverse pair (e.g. KRW=X / USDKRW=X = won per dollar → invert)
-  const inversePair1 = `${currency}=X`;      // Yahoo shorthand: USD/<ccy>
-  const inversePair2 = `USD${currency}=X`;
-  const inv = priceOf(inversePair1) ?? priceOf(inversePair2);
-  if (inv != null && inv > 0) return 1 / inv;
-  return null;  // no rate available — caller should NOT convert
+
+  // ORDER MATTERS. Prefer the FULL-FORM pairs because the bare-form ones
+  // (KRW=X etc.) are mis-reading as $1.00 in the current data feed.
+  //   1. USD{ccy}=X  → units of ccy per 1 USD  → USD-per-ccy = 1 / price
+  //   2. {ccy}USD=X  → USD per 1 unit of ccy   → USD-per-ccy = price (direct)
+  //   3. {ccy}=X     → Yahoo shorthand for USD/{ccy} → invert (last resort)
+  const fullInverse = priceOf(`USD${currency}=X`);
+  if (fullInverse != null && fullInverse > 0) return 1 / fullInverse;
+
+  const directPair = priceOf(`${currency}USD=X`);
+  if (directPair != null) return directPair;
+
+  const bareInverse = priceOf(`${currency}=X`);
+  if (bareInverse != null && bareInverse > 0) return 1 / bareInverse;
+
+  return null;  // no usable rate — caller should NOT convert, flag discrepancy
 }
 
 // Convert a foreign-listed row's price + market cap to USD. Returns
@@ -8441,8 +8462,8 @@ async function loadStockBook(forceRefresh = false) {
       console.log(`[fx-normalize] ${converted.length} foreign tickers converted to USD`,
         converted.slice(0, 10).map(r => `${r.ticker}: ${r._localCurrency} ×${r._fxRate?.toExponential?.(2)} → $${r.price?.toFixed(2)}`));
       if (unconverted.length) {
-        console.warn(`[fx-normalize] ${unconverted.length} foreign tickers NOT converted (no FX rate loaded — add the pair e.g. KRW=X):`,
-          unconverted.map(r => `${r.ticker} (${r._localCurrency})`));
+        console.warn(`[fx-normalize] ${unconverted.length} foreign tickers NOT converted — load the full-form FX pair (USD<ccy>=X) with a live price:`,
+          unconverted.map(r => `${r.ticker} needs USD${r._localCurrency}=X`));
       }
     }
   } catch {}
