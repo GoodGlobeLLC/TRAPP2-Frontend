@@ -484,8 +484,15 @@ function loadFxRatesCache() {
   return null;
 }
 
+// The FX/crypto/signals-consensus files live in TRAPP2-1 (the dynamic repo
+// that holds all non-US-equity vehicles). US equities are split across TRAPP2
+// and TRAPP2-2. This base targets the dynamic repo for those three feeds.
+const DYNAMIC_DATA_BASE = 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-1/main/data/';
+
 async function fetchFxRatesFile() {
-  const base = getGitHubDataBase() || 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2/main/data/';
+  // Always TRAPP2-1 — the FX file only exists there, regardless of which repo
+  // the general data base points at.
+  const base = DYNAMIC_DATA_BASE;
   const url = base + 'fx/rates.json';
   try {
     const r = await fetch(url, { cache: 'no-cache' });
@@ -518,6 +525,83 @@ async function fetchFxRatesFile() {
     return map;
   } catch (e) {
     console.warn('[fx-rates] fetch failed:', e.message);
+    return null;
+  }
+}
+
+// ============================================================
+//   CRYPTO PRICES (data/crypto/prices.json) — 24h market, fast refresh.
+//   Updates the stockbook rows for -USD crypto tickers with fresh prices.
+// ============================================================
+const CRYPTO_PRICES_KEY = 'valuatio.cryptoPrices.v1';
+let _cryptoPricesCache = null;
+
+async function fetchCryptoPricesFile() {
+  const base = DYNAMIC_DATA_BASE;  // always TRAPP2-1
+  const url = base + 'crypto/prices.json';
+  try {
+    const r = await fetch(url, { cache: 'no-cache' });
+    if (!r.ok) { console.warn('[crypto] not found at', url, '(status', r.status + ')'); return null; }
+    const json = await r.json();
+    _cryptoPricesCache = json.prices || {};
+    try { localStorage.setItem(CRYPTO_PRICES_KEY, JSON.stringify({ prices: _cryptoPricesCache, loadedAt: Date.now() })); } catch {}
+    // Update stockbook rows for crypto tickers with the fresh prices
+    let updated = 0;
+    if (typeof state !== 'undefined' && state.stockbook?.rows) {
+      for (const row of state.stockbook.rows) {
+        const rec = _cryptoPricesCache[row.ticker];
+        if (rec && typeof rec.price === 'number' && rec.price > 0) {
+          row.price = rec.price;
+          if (typeof rec.change24hPct === 'number') row.changesPercentage = rec.change24hPct;
+          if (typeof rec.marketCap === 'number' && rec.marketCap > 0) row.marketCap = rec.marketCap;
+          updated++;
+        }
+      }
+    }
+    console.log(`[crypto] loaded ${Object.keys(_cryptoPricesCache).length} prices, updated ${updated} rows`);
+    if (updated > 0 && typeof renderStockBook === 'function') { try { renderStockBook(); } catch {} }
+    return _cryptoPricesCache;
+  } catch (e) {
+    console.warn('[crypto] fetch failed:', e.message);
+    return null;
+  }
+}
+
+// ============================================================
+//   CONSENSUS SIGNALS (data/signals_consensus.json)
+//   Tickers are split across 3 repos; each runs compute_signals on its slice.
+//   merge_signals.py combines them into one consensus file. The app reads it
+//   here so cross-asset signals reflect ALL repos agreeing, not just one slice.
+// ============================================================
+const SIGNALS_CONSENSUS_KEY = 'valuatio.signalsConsensus.v1';
+let _signalsConsensus = null;
+
+function loadSignalsConsensus() {
+  if (_signalsConsensus) return _signalsConsensus;
+  try {
+    const raw = localStorage.getItem(SIGNALS_CONSENSUS_KEY);
+    if (raw) { _signalsConsensus = JSON.parse(raw); return _signalsConsensus; }
+  } catch {}
+  return null;
+}
+
+async function fetchSignalsConsensus() {
+  const base = DYNAMIC_DATA_BASE;  // always TRAPP2-1 — consensus is written there
+  const url = base + 'signals_consensus.json';
+  try {
+    const r = await fetch(url, { cache: 'no-cache' });
+    if (!r.ok) { console.warn('[signals] consensus not found at', url, '(status', r.status + ')'); return null; }
+    const json = await r.json();
+    _signalsConsensus = json;
+    try { localStorage.setItem(SIGNALS_CONSENSUS_KEY, JSON.stringify(json)); } catch {}
+    const sigCount = json.signals ? Object.keys(json.signals).length : 0;
+    const ticCount = json.tickerCount || (json.tickers ? Object.keys(json.tickers).length : 0);
+    console.log(`[signals] consensus loaded — ${sigCount} aggregate signals, ${ticCount} per-ticker, merged from ${(json._mergedFrom || []).join(', ')}`);
+    // Re-render regime/cross-asset views if present
+    if (typeof renderRegimeDashboard === 'function') { try { renderRegimeDashboard(); } catch {} }
+    return json;
+  } catch (e) {
+    console.warn('[signals] consensus fetch failed:', e.message);
     return null;
   }
 }
@@ -2548,6 +2632,15 @@ document.addEventListener('DOMContentLoaded', () => {
   if (typeof fetchFxRatesFile === 'function') {
     fetchFxRatesFile().catch(() => {});
     setInterval(() => { fetchFxRatesFile().catch(() => {}); }, 15 * 60 * 1000);
+  }
+  // Consensus signals merged across all repos — same cadence as FX.
+  if (typeof fetchSignalsConsensus === 'function') {
+    fetchSignalsConsensus().catch(() => {});
+    setInterval(() => { fetchSignalsConsensus().catch(() => {}); }, 15 * 60 * 1000);
+  }
+  if (typeof fetchCryptoPricesFile === 'function') {
+    fetchCryptoPricesFile().catch(() => {});
+    setInterval(() => { fetchCryptoPricesFile().catch(() => {}); }, 15 * 60 * 1000);
   }
   document.querySelectorAll('.regime-forecast-tab').forEach(btn => {
     btn.addEventListener('click', () => {
