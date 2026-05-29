@@ -183,14 +183,22 @@ function classifyAsset(raw) {
   if (t.endsWith('.PVT')) return 'private';
   // Options: OCC standard format ROOT + 6-digit date + C|P + 8-digit strike
   if (/^[A-Z]+\d{6}[CP]\d{8}$/.test(t)) return 'option';
-  // Indexes: ^XXX prefix, Yahoo foreign-exchange suffixes (.SS, .ME, etc.)
-  if (t.startsWith('^') || /\.(SS|ME|HK|SZ|KS|KQ|SI|AX|TA|JO)$/.test(t) || t === 'DX-Y.NYB' || t.includes('-STRD')) {
-    // Foreign indexes go to FX bucket per legacy spec, US indexes to index
+  // Indexes: ONLY ^XXX prefix symbols are true indices (e.g. ^KS11 = KOSPI,
+  // ^GSPC = S&P 500). A bare exchange suffix like 005380.KS or 7203.T is an
+  // individual FOREIGN EQUITY listed on that exchange (Hyundai, Toyota), NOT
+  // an index and NOT a currency. Previously these were misrouted to the FX/
+  // index bucket, which polluted the Indices tab and the heat map.
+  if (t.startsWith('^') || t === 'DX-Y.NYB' || t.includes('-STRD')) {
     return (US_INDEX_PATTERN.test(t) ? 'index' : 'fx');
   }
   // Mutual funds (5-char alpha ending in X)
   if (/^[A-Z]{5}X$/.test(t)) return 'mutual';
-  // ETFs
+  // ETFs — but NEVER match a foreign-exchange-suffixed ticker as an ETF.
+  // A symbol with a .KS/.HK/.T/etc. suffix is a foreign equity; the ETF
+  // pattern could otherwise false-positive on short roots.
+  if (/\.[A-Z]{1,3}$/.test(t) && /\.(SS|SZ|HK|KS|KQ|T|TW|TWO|SI|AX|TA|JO|L|PA|DE|MI|MC|AS|BR|VI|ST|HE|CO|OL|TO|V|NS|BO|SR|ME|JK|BK|KL)$/.test(t)) {
+    return 'equity';   // foreign-listed equity
+  }
   if (KNOWN_ETF_PATTERN.test(t)) return 'etf';
   return 'equity';
 }
@@ -231,12 +239,16 @@ function subClassifyAsset(raw) {
   // FX: =X suffix → currencies bucket
   if (t.endsWith('=X')) return 'currencies';
 
-  // Indices: ^prefix + foreign exchange index suffixes
-  // EXCEPT DX-Y.NYB which is the dollar currency index — that belongs in
-  // Currencies even though it's structured like an index symbol.
+  // Indices: ONLY ^prefix symbols are true indices (^KS11 = KOSPI, etc.).
+  // DX-Y.NYB is the dollar index → Currencies.
   if (t === 'DX-Y.NYB') return 'currencies';
-  if (t.startsWith('^') || /\.(SS|ME|HK|SZ|KS|KQ|SI|AX|TA|JO)$/.test(t)) {
+  if (t.startsWith('^')) {
     return 'indices';
+  }
+  // Foreign-listed equities (005380.KS = Hyundai, 7203.T = Toyota): the
+  // exchange suffix means it's a stock on that exchange, NOT an index.
+  if (/\.[A-Z]{1,3}$/.test(t) && /\.(SS|SZ|HK|KS|KQ|T|TW|TWO|SI|AX|TA|JO|L|PA|DE|MI|MC|AS|BR|VI|ST|HE|CO|OL|TO|V|NS|BO|SR|ME|JK|BK|KL)$/.test(t)) {
+    return 'equity';
   }
 
   // Private listings
@@ -250,6 +262,92 @@ function subClassifyAsset(raw) {
 
   return 'equity';
 }
+
+// ============================================================
+//   FOREIGN CURRENCY → USD NORMALIZATION
+//
+//   Foreign-listed equities are quoted in their LOCAL currency. Hyundai
+//   (005380.KS) trades around ₩200,000 — if we display that as "$200,000"
+//   and compute market cap from it, we get the nonsense the user saw
+//   ($2.34M/share, $180T market cap). The raw price was Korean Won shown as
+//   dollars.
+//
+//   Fix: map each exchange suffix to its trading currency, look up the live
+//   FX rate (from FX pairs already loaded in the stockbook, e.g. KRW=X), and
+//   convert price + market cap to USD. If we can't find a rate, we DON'T fake
+//   a conversion — we flag the row so the UI can mark it unconverted rather
+//   than show a wrong number.
+// ============================================================
+const EXCHANGE_SUFFIX_CURRENCY = {
+  KS: 'KRW', KQ: 'KRW',           // South Korea (Won)
+  T: 'JPY',                        // Tokyo (Yen)
+  HK: 'HKD',                       // Hong Kong (HK Dollar)
+  SS: 'CNY', SZ: 'CNY',           // Shanghai / Shenzhen (Yuan)
+  TW: 'TWD', TWO: 'TWD',          // Taiwan (NT Dollar)
+  L: 'GBP',                        // London (Pound) — note: often GBX pence, handled below
+  PA: 'EUR', DE: 'EUR', MI: 'EUR', MC: 'EUR', AS: 'EUR', BR: 'EUR', VI: 'EUR',
+  ST: 'SEK', HE: 'EUR', CO: 'DKK', OL: 'NOK',
+  TO: 'CAD', V: 'CAD',            // Toronto / TSX Venture (CAD)
+  AX: 'AUD',                       // Australia (AUD)
+  NS: 'INR', BO: 'INR',           // India (Rupee)
+  SI: 'SGD',                       // Singapore (SGD)
+  SR: 'SAR', SA: 'BRL',           // Saudi / Brazil
+  ME: 'RUB', JK: 'IDR', BK: 'THB', KL: 'MYR', JO: 'ZAR', TA: 'ILS',
+};
+
+// Get the exchange suffix currency for a ticker, or null if it's a US/plain ticker.
+function _tickerLocalCurrency(ticker) {
+  const m = String(ticker || '').toUpperCase().match(/\.([A-Z]{1,3})$/);
+  if (!m) return null;
+  return EXCHANGE_SUFFIX_CURRENCY[m[1]] || null;
+}
+
+// Look up how many USD one unit of `currency` is worth, using FX pairs loaded
+// in the stockbook. Yahoo FX convention: KRW=X is USD/KRW (Won per dollar), so
+// USD per Won = 1 / price. EURUSD=X is USD per Euro directly. We handle both.
+function _fxRateToUSD(currency) {
+  if (!currency || currency === 'USD') return 1;
+  const getRow = (t) => (typeof getStockbookRow === 'function') ? getStockbookRow(t) : null;
+  const priceOf = (t) => {
+    const r = getRow(t);
+    const p = r?.price;
+    return (typeof p === 'number' && isFinite(p) && p > 0) ? p : null;
+  };
+  // Try direct USD-quoted pair first (e.g. EURUSD=X = dollars per euro)
+  const directPair = `${currency}USD=X`;
+  const direct = priceOf(directPair);
+  if (direct != null) return direct;
+  // Try inverse pair (e.g. KRW=X / USDKRW=X = won per dollar → invert)
+  const inversePair1 = `${currency}=X`;      // Yahoo shorthand: USD/<ccy>
+  const inversePair2 = `USD${currency}=X`;
+  const inv = priceOf(inversePair1) ?? priceOf(inversePair2);
+  if (inv != null && inv > 0) return 1 / inv;
+  return null;  // no rate available — caller should NOT convert
+}
+
+// Convert a foreign-listed row's price + market cap to USD. Returns
+// { price, marketCap, converted, currency, rate } where `converted` is false
+// if no FX rate was available (values returned unchanged so we never fabricate).
+function normalizeRowToUSD(row) {
+  if (!row || !row.ticker) return { price: row?.price, marketCap: row?.marketCap, converted: false };
+  // Prefer the sheet's explicit currency field; fall back to suffix mapping.
+  let currency = (row.currency && row.currency !== 'USD') ? row.currency : _tickerLocalCurrency(row.ticker);
+  if (!currency || currency === 'USD') {
+    return { price: row.price, marketCap: row.marketCap, converted: false, currency: 'USD', rate: 1 };
+  }
+  // London quotes are often in GBX (pence) = 1/100 GBP. Detect via currency code.
+  let penceFactor = 1;
+  if (currency === 'GBX' || currency === 'GBp') { currency = 'GBP'; penceFactor = 0.01; }
+  const rate = _fxRateToUSD(currency);
+  if (rate == null) {
+    // No FX rate loaded — don't fake it. Flag so UI can mark "local ccy".
+    return { price: row.price, marketCap: row.marketCap, converted: false, currency, rate: null };
+  }
+  const price = (typeof row.price === 'number' && isFinite(row.price)) ? row.price * penceFactor * rate : row.price;
+  const marketCap = (typeof row.marketCap === 'number' && isFinite(row.marketCap)) ? row.marketCap * penceFactor * rate : row.marketCap;
+  return { price, marketCap, converted: true, currency, rate };
+}
+
 // from the row's existing sector field if set; otherwise infers from the
 // ticker pattern. Used by the Stock Book to show meaningful categories for
 // futures/FX/crypto/indices/private/options/mutual funds.
@@ -1512,14 +1610,32 @@ function extractCrossAssetSignals() {
   // the extractor was doing ~30 lookups × 700 rows = 21,000 string compares
   // on every call. The index drops this to 30 hash hits.
   const findRow = (t) => getStockbookRow(t);
+  // Track the freshest data tier we actually used, so signals can honestly
+  // label themselves LIVE / CACHED / HISTORICAL instead of always claiming LIVE.
+  let _usedCache = false;
+  let _usedHistory = false;
   const sessionPct = (t) => {
     const r = findRow(t);
-    if (!r) return null;
-    if (isFinite(r.changePct))  return r.changePct;
-    if (isFinite(r.sessionPct)) return r.sessionPct;
-    if (isFinite(r.price) && isFinite(r.priorClose) && r.priorClose > 0) {
-      return ((r.price - r.priorClose) / r.priorClose) * 100;
+    if (r) {
+      if (isFinite(r.changePct))  return r.changePct;
+      if (isFinite(r.sessionPct)) return r.sessionPct;
+      // The sheet/FMP loader stores the daily move as `changesPercentage`
+      // (already in percent, e.g. 1.23 = 1.23%). This was being ignored —
+      // the main reason cross-asset signals showed "not in stockbook" even
+      // though the ticker WAS loaded. Read it now.
+      if (isFinite(r.changesPercentage)) return r.changesPercentage;
+      if (isFinite(r.price) && isFinite(r.priorClose) && r.priorClose > 0) {
+        return ((r.price - r.priorClose) / r.priorClose) * 100;
+      }
     }
+    // FALLBACK: compute today's move from the price-history cache. This is the
+    // "if live data doesn't exist, pull from cache" behavior the user asked for.
+    // The cross-asset deck should never go blank just because the session
+    // field is missing — these tickers all have history loaded.
+    try {
+      const pct = _getTodayPctChange(t);
+      if (pct != null) { _usedCache = true; return pct * 100; }
+    } catch {}
     return null;
   };
   // Average session % across a list of tickers — only counts those with valid data.
@@ -1749,6 +1865,71 @@ function extractCrossAssetSignals() {
     raw: macroValue,
   };
 
+  // ----- Fed rate-path signal -----
+  // Surfaces the blended (market + user) Fed expectation as a cross-asset
+  // signal. Easing bias = bullish tone (tailwind for risk); tightening = bearish.
+  let fedSignal = { value: 0, tone: 'flat', tier: 'CACHED', sub: 'No Fed data', source: ['fed.v1'], raw: 0 };
+  try {
+    if (typeof fedRateExpectation === 'function') {
+      const fed = fedRateExpectation();
+      const v = Math.max(-1, Math.min(1, -fed.expectedBpsChange / 75));
+      fedSignal = {
+        value: v,
+        tone: fed.stance === 'easing' ? 'bull' : fed.stance === 'tightening' ? 'bear' : 'flat',
+        tier: 'CACHED',
+        sub: `${fed.stance.toUpperCase()} — expected year-end ${fed.expectedYearEndRate.toFixed(2)}% (${fed.expectedBpsChange >= 0 ? '+' : ''}${fed.expectedBpsChange.toFixed(0)}bps) · next ${fed.nextMeeting?.date || '—'}`,
+        source: ['fed.v1'],
+        raw: fed.expectedBpsChange,
+      };
+    }
+  } catch {}
+
+  // ----- Resolve each signal's data tier HONESTLY -----
+  // Instead of hardcoding tier:'LIVE', decide per-signal based on where its
+  // data actually came from. For each signal, inspect its source tickers:
+  //   • If any source row has a fresh session field (changePct / changesPercentage)
+  //     → LIVE
+  //   • Else if we have price-history cache for a source ticker → CACHED
+  //   • Else → HISTORICAL/STALE (no recent data at all)
+  // This is the "if live data doesn't exist, pull from cache" behavior, with
+  // the label reflecting reality so the user isn't told LIVE when it's cached.
+  const resolveTier = (sourceTickers) => {
+    let anyLive = false, anyCache = false;
+    for (const t of (sourceTickers || [])) {
+      const row = getStockbookRow(t);
+      if (row && (isFinite(row.changePct) || isFinite(row.sessionPct) || isFinite(row.changesPercentage)
+          || (isFinite(row.price) && isFinite(row.priorClose) && row.priorClose > 0))) {
+        anyLive = true;
+      } else {
+        try { if (_getTodayPctChange(t) != null) anyCache = true; } catch {}
+      }
+    }
+    if (anyLive) return 'LIVE';
+    if (anyCache) return 'CACHED';
+    return 'STALE';
+  };
+
+  for (const sig of [dollarSignals, safeHaven, industrial, energy, globalIndices, agriculture, logistics]) {
+    if (sig && sig.raw != null) {
+      sig.tier = resolveTier(sig.source);
+    } else if (sig) {
+      sig.tier = 'STALE';
+    }
+  }
+
+  // Diagnostic — log which signals resolved and at what tier, plus any missing
+  // tickers, so a blank cross-asset deck is debuggable from the console.
+  console.log('[cross-asset] signals resolved:', {
+    dollar: `${dollarSignals.tier} (${dollarSignals.raw?.toFixed?.(2) ?? 'null'})`,
+    safeHaven: `${safeHaven.tier} (${safeHaven.raw?.toFixed?.(2) ?? 'null'})`,
+    industrial: `${industrial.tier} (${industrial.raw?.toFixed?.(2) ?? 'null'})`,
+    energy: `${energy.tier} (${energy.raw?.toFixed?.(2) ?? 'null'})`,
+    globalIndices: `${globalIndices.tier} (${globalIndices.raw?.toFixed?.(2) ?? 'null'})`,
+    agriculture: `${agriculture.tier} (${agriculture.raw?.toFixed?.(2) ?? 'null'})`,
+    logistics: `${logistics.tier} (${logistics.raw?.toFixed?.(2) ?? 'null'})`,
+    missingTickers: [...new Set(missing)],
+  });
+
   return {
     computedAt: new Date().toISOString(),
     signals: {
@@ -1761,6 +1942,7 @@ function extractCrossAssetSignals() {
       logisticsMomentum: logistics,
       chainPerformance: chainPerformance,
       macroAlignment: macroAlignment,
+      fedRate: fedSignal,
     },
     missingTickers: [...new Set(missing)],
   };
@@ -1785,6 +1967,7 @@ function renderCrossAssetSignalCards(signals, keys, labels = {}) {
     logisticsMomentum: 'Logistics Momentum',
     chainPerformance:  'Your Chain Exposure',
     macroAlignment:    'Macro Regime',
+    fedRate:           'Fed Rate Path',
   };
   return keys.map(k => {
     const s = signals[k];
@@ -6359,6 +6542,389 @@ const FRED_SERIES = {
   fedFunds: 'DFF',
 };
 
+// ============================================================
+//   FED / FOMC RATE-EXPECTATION ENGINE
+//
+//   Models the federal funds rate path for the year and feeds rate-cut/hike
+//   expectations into the engine (regime, probability, bonds, scenarios).
+//
+//   Two inputs are blended:
+//     1. MARKET-IMPLIED odds (seeded from CME FedWatch fed-funds-futures
+//        pricing, refreshable). These are the "what the market is pricing in".
+//     2. USER prediction (the user sets their own expected path per meeting).
+//
+//   The blend (default 60% market / 40% user, user-adjustable) produces an
+//   expected year-end rate + a per-meeting cut/hike probability that the rest
+//   of the app consumes via fedRateExpectation().
+//
+//   Data is seeded from public sources (federalreserve.gov FOMC calendar +
+//   CME FedWatch) as of the knowledge snapshot, and is fully user-editable so
+//   it never goes stale silently — the user can update the latest decision and
+//   re-key the market odds whenever they check FedWatch.
+// ============================================================
+
+const FED_KEY = 'valuatio.fed.v1';
+
+// 2026 FOMC meeting calendar (confirmed, federalreserve.gov). SEP = meeting
+// includes Summary of Economic Projections + dot plot (higher impact).
+const FOMC_SCHEDULE_2026 = [
+  { date: '2026-01-28', sep: false },
+  { date: '2026-03-18', sep: true  },
+  { date: '2026-04-29', sep: false },
+  { date: '2026-06-17', sep: true  },
+  { date: '2026-07-29', sep: false },
+  { date: '2026-09-16', sep: true  },
+  { date: '2026-10-28', sep: false },
+  { date: '2026-12-09', sep: true  },
+];
+
+// Decision history — seeded from public record. effect fields are computed
+// from market data when available; left null when not yet measured.
+// move: 'cut' | 'hike' | 'hold', bps: basis points changed.
+const FED_DECISION_HISTORY_SEED = [
+  { date: '2024-09-18', move: 'cut',  bps: 50, rangeLow: 4.75, rangeHigh: 5.00, note: 'First cut of the cycle' },
+  { date: '2024-11-07', move: 'cut',  bps: 25, rangeLow: 4.50, rangeHigh: 4.75, note: '' },
+  { date: '2024-12-18', move: 'cut',  bps: 25, rangeLow: 4.25, rangeHigh: 4.50, note: 'Hawkish cut; signaled slower pace' },
+  { date: '2025-01-29', move: 'hold', bps: 0,  rangeLow: 4.25, rangeHigh: 4.50, note: 'Pause begins' },
+  { date: '2025-03-19', move: 'hold', bps: 0,  rangeLow: 4.25, rangeHigh: 4.50, note: '' },
+  { date: '2025-09-17', move: 'cut',  bps: 25, rangeLow: 4.00, rangeHigh: 4.25, note: 'Resumed easing' },
+  { date: '2025-10-29', move: 'cut',  bps: 25, rangeLow: 3.75, rangeHigh: 4.00, note: '' },
+  { date: '2025-12-10', move: 'cut',  bps: 25, rangeLow: 3.50, rangeHigh: 3.75, note: 'Latest cut' },
+  { date: '2026-01-28', move: 'hold', bps: 0,  rangeLow: 3.50, rangeHigh: 3.75, note: '' },
+  { date: '2026-03-18', move: 'hold', bps: 0,  rangeLow: 3.50, rangeHigh: 3.75, note: 'Held; greater-confidence language' },
+  { date: '2026-04-29', move: 'hold', bps: 0,  rangeLow: 3.50, rangeHigh: 3.75, note: '3 dissents preferred no easing bias; 1 preferred cut' },
+];
+
+// Market-implied odds per upcoming meeting, seeded from CME FedWatch snapshot.
+// {cut, hold, hike} sum to 1. User can refresh these from FedWatch.
+const FED_MARKET_ODDS_SEED = {
+  '2026-06-17': { cut: 0.06, hold: 0.94, hike: 0.00 },
+  '2026-07-29': { cut: 0.20, hold: 0.78, hike: 0.02 },
+  '2026-09-16': { cut: 0.42, hold: 0.56, hike: 0.02 },
+  '2026-10-28': { cut: 0.30, hold: 0.68, hike: 0.02 },
+  '2026-12-09': { cut: 0.35, hold: 0.63, hike: 0.02 },
+};
+
+const FED_CURRENT_RANGE_SEED = { low: 3.50, high: 3.75, asOf: '2026-04-29' };
+
+function loadFedState() {
+  try {
+    const raw = localStorage.getItem(FED_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {}
+  // First run — seed from public-record defaults
+  return {
+    currentRange: { ...FED_CURRENT_RANGE_SEED },
+    history: FED_DECISION_HISTORY_SEED.slice(),
+    marketOdds: { ...FED_MARKET_ODDS_SEED },
+    userOdds: {},            // user's per-meeting {cut,hold,hike} overrides
+    blendWeight: 0.6,        // 0..1 weight on MARKET vs user (0.6 = 60% market)
+    lastOddsUpdate: null,
+  };
+}
+
+function saveFedState(f) {
+  try { localStorage.setItem(FED_KEY, JSON.stringify(f)); } catch (e) {
+    console.warn('[fed] save failed:', e.message);
+  }
+}
+
+// The next scheduled FOMC meeting from today.
+function nextFomcMeeting(fromDate = new Date()) {
+  const today = fromDate.toISOString().slice(0, 10);
+  for (const m of FOMC_SCHEDULE_2026) {
+    if (m.date >= today) return m;
+  }
+  return null;
+}
+
+function lastFomcDecision(f) {
+  const hist = (f || loadFedState()).history;
+  if (!hist || !hist.length) return null;
+  return hist.slice().sort((a, b) => b.date.localeCompare(a.date))[0];
+}
+
+// Blend market + user odds for a meeting. Returns {cut,hold,hike,source}.
+function blendedOddsFor(meetingDate, f) {
+  f = f || loadFedState();
+  const market = f.marketOdds?.[meetingDate];
+  const user = f.userOdds?.[meetingDate];
+  const w = (typeof f.blendWeight === 'number') ? f.blendWeight : 0.6;
+  if (market && user) {
+    return {
+      cut: market.cut * w + user.cut * (1 - w),
+      hold: market.hold * w + user.hold * (1 - w),
+      hike: market.hike * w + user.hike * (1 - w),
+      source: 'blend',
+    };
+  }
+  if (market) return { ...market, source: 'market' };
+  if (user) return { ...user, source: 'user' };
+  return null;
+}
+
+// THE engine hook. Returns a structured rate expectation other modules use:
+//   {
+//     currentRange, nextMeeting, nextOdds,
+//     expectedYearEndRate, expectedBpsChange (negative = cuts),
+//     netCutProbability (0..1), netHikeProbability,
+//     stance: 'easing'|'tightening'|'on-hold',
+//   }
+function fedRateExpectation() {
+  const f = loadFedState();
+  const mid = (f.currentRange.low + f.currentRange.high) / 2;
+  const next = nextFomcMeeting();
+  const nextOdds = next ? blendedOddsFor(next.date, f) : null;
+
+  // Walk the remaining meetings this year, computing the EXPECTED rate path:
+  // each meeting's expected bps change = (cutProb × −25) + (hikeProb × +25)
+  // (assuming standard 25bp moves; the SEP-meeting tail allows 50bp but we
+  // keep the base model at 25 for the blended expectation).
+  const today = new Date().toISOString().slice(0, 10);
+  let expectedRate = mid;
+  let netCutProb = 0, netHikeProb = 0, meetingsAhead = 0;
+  for (const m of FOMC_SCHEDULE_2026) {
+    if (m.date < today) continue;
+    const odds = blendedOddsFor(m.date, f);
+    if (!odds) continue;
+    meetingsAhead++;
+    const expectedMove = (odds.cut * -25) + (odds.hike * 25);
+    expectedRate += expectedMove / 100;
+    netCutProb += odds.cut;
+    netHikeProb += odds.hike;
+  }
+  const expectedBpsChange = (expectedRate - mid) * 100;
+  const stance = expectedBpsChange < -10 ? 'easing'
+               : expectedBpsChange > 10 ? 'tightening'
+               : 'on-hold';
+
+  return {
+    currentRange: f.currentRange,
+    currentMid: mid,
+    nextMeeting: next,
+    nextOdds,
+    expectedYearEndRate: expectedRate,
+    expectedBpsChange,
+    meetingsAhead,
+    cumulativeCutProb: netCutProb,
+    cumulativeHikeProb: netHikeProb,
+    stance,
+    blendWeight: f.blendWeight,
+    lastDecision: lastFomcDecision(f),
+  };
+}
+
+// ============================================================
+//   FED TAB RENDERER
+// ============================================================
+function renderFedTab() {
+  const body = document.getElementById('fed-body');
+  if (!body) return;
+  const f = loadFedState();
+  const exp = fedRateExpectation();
+  const today = new Date().toISOString().slice(0, 10);
+
+  const moveColor = (m) => m === 'cut' ? '#5b8a72' : m === 'hike' ? '#a5645a' : 'var(--ink-dim)';
+  const moveLabel = (m) => m === 'cut' ? '▼ CUT' : m === 'hike' ? '▲ HIKE' : '— HOLD';
+  const stanceColor = exp.stance === 'easing' ? '#5b8a72' : exp.stance === 'tightening' ? '#a5645a' : 'var(--amber)';
+
+  // ---- Current state strip ----
+  const next = exp.nextMeeting;
+  const daysToNext = next ? Math.round((new Date(next.date) - new Date()) / 86400000) : null;
+  const headStrip = `
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:18px 0">
+      <div class="company-card" style="margin:0">
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Current Target Range</div>
+        <div style="font-family:var(--mono);font-size:24px;font-weight:700;color:var(--amber);margin-top:4px">${f.currentRange.low.toFixed(2)}–${f.currentRange.high.toFixed(2)}%</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">as of ${f.currentRange.asOf}</div>
+      </div>
+      <div class="company-card" style="margin:0">
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Next FOMC Meeting</div>
+        <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:var(--ink);margin-top:4px">${next ? next.date : '—'}</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">${daysToNext != null ? daysToNext + ' days' : ''}${next?.sep ? ' · SEP + dot plot' : ''}</div>
+      </div>
+      <div class="company-card" style="margin:0">
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Next-Meeting Odds</div>
+        <div style="font-family:var(--mono);font-size:13px;font-weight:700;margin-top:6px;line-height:1.5">
+          ${exp.nextOdds ? `
+            <span style="color:#5b8a72">Cut ${(exp.nextOdds.cut*100).toFixed(0)}%</span> ·
+            <span style="color:var(--ink-dim)">Hold ${(exp.nextOdds.hold*100).toFixed(0)}%</span> ·
+            <span style="color:#a5645a">Hike ${(exp.nextOdds.hike*100).toFixed(0)}%</span>
+          ` : '—'}
+        </div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">${exp.nextOdds ? exp.nextOdds.source : ''} blend</div>
+      </div>
+      <div class="company-card" style="margin:0;border-left:3px solid ${stanceColor}">
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Expected Year-End</div>
+        <div style="font-family:var(--mono);font-size:24px;font-weight:700;color:${stanceColor};margin-top:4px">${exp.expectedYearEndRate.toFixed(2)}%</div>
+        <div style="font-family:var(--mono);font-size:9px;color:${stanceColor};margin-top:2px;text-transform:uppercase">${exp.stance} · ${exp.expectedBpsChange >= 0 ? '+' : ''}${exp.expectedBpsChange.toFixed(0)}bps</div>
+      </div>
+    </div>`;
+
+  // ---- Per-meeting prediction table (market vs your prediction) ----
+  const upcoming = FOMC_SCHEDULE_2026.filter(m => m.date >= today);
+  const meetingRows = upcoming.map(m => {
+    const mk = f.marketOdds[m.date];
+    const us = f.userOdds[m.date];
+    const blend = blendedOddsFor(m.date, f);
+    const oddsCell = (o, editable) => o
+      ? `${(o.cut*100).toFixed(0)}/${(o.hold*100).toFixed(0)}/${(o.hike*100).toFixed(0)}`
+      : '—';
+    return `
+      <tr>
+        <td style="font-family:var(--mono);font-weight:700">${m.date}${m.sep ? ' <span style="color:var(--amber);font-size:9px">★SEP</span>' : ''}</td>
+        <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${oddsCell(mk)}</td>
+        <td style="font-family:var(--mono);font-size:11px">
+          <input type="text" class="fed-user-odds" data-meeting="${m.date}" value="${us ? `${(us.cut*100).toFixed(0)}/${(us.hold*100).toFixed(0)}/${(us.hike*100).toFixed(0)}` : ''}" placeholder="cut/hold/hike" style="width:90px;background:var(--bg-elev);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:11px;padding:3px 6px;border-radius:2px">
+        </td>
+        <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${blend ? (blend.cut > blend.hike ? '#5b8a72' : blend.hike > blend.cut ? '#a5645a' : 'var(--ink-dim)') : 'var(--ink-faint)'}">${oddsCell(blend)}</td>
+      </tr>`;
+  }).join('');
+
+  const predictionTable = `
+    <div class="company-card">
+      <h4>Rate Path · Market vs Your Prediction</h4>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);margin-bottom:10px;line-height:1.6">
+        Each cell is <strong>cut / hold / hike</strong> probability (%). Market odds are seeded from CME FedWatch.
+        Enter your own prediction as three numbers like <code>40/55/5</code>. The blend (weighted ${(f.blendWeight*100).toFixed(0)}% market / ${((1-f.blendWeight)*100).toFixed(0)}% you) is what feeds the engine.
+      </div>
+      <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px">
+        <label style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">Blend weight (market %):</label>
+        <input type="range" id="fed-blend-weight" min="0" max="100" value="${(f.blendWeight*100).toFixed(0)}" style="flex:1;max-width:220px">
+        <span id="fed-blend-label" style="font-family:var(--mono);font-size:11px;color:var(--amber);font-weight:700">${(f.blendWeight*100).toFixed(0)}%</span>
+      </div>
+      <table class="sb-table" style="width:100%">
+        <thead><tr>
+          <th>Meeting</th><th>Market (c/h/k)</th><th>Your Prediction (c/h/k)</th><th>Blend → Engine</th>
+        </tr></thead>
+        <tbody>${meetingRows}</tbody>
+      </table>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:8px">
+        Tip: refresh market odds at the CME FedWatch Tool, then type the current values here to keep the engine current.
+      </div>
+    </div>`;
+
+  // ---- Decision history + market effectiveness ----
+  const hist = f.history.slice().sort((a, b) => b.date.localeCompare(a.date));
+  const histRows = hist.map(d => {
+    // Effectiveness: measured from price history of SPY + TLT in the 5 sessions
+    // after the decision, if available. Honest: shows "—" when not computable.
+    let effect = '—';
+    try {
+      const spyAfter = _priceMoveAfter('SPY', d.date, 5);
+      const tltAfter = _priceMoveAfter('TLT', d.date, 5);
+      const parts = [];
+      if (spyAfter != null) parts.push(`SPY ${spyAfter >= 0 ? '+' : ''}${(spyAfter*100).toFixed(1)}%`);
+      if (tltAfter != null) parts.push(`TLT ${tltAfter >= 0 ? '+' : ''}${(tltAfter*100).toFixed(1)}%`);
+      if (parts.length) effect = parts.join(' · ');
+    } catch {}
+    return `
+      <tr>
+        <td style="font-family:var(--mono);font-weight:700">${d.date}</td>
+        <td style="font-family:var(--mono);font-weight:700;color:${moveColor(d.move)}">${moveLabel(d.move)}${d.bps ? ' ' + d.bps + 'bp' : ''}</td>
+        <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${d.rangeLow.toFixed(2)}–${d.rangeHigh.toFixed(2)}%</td>
+        <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${effect}</td>
+        <td style="font-size:11px;color:var(--ink-dim)">${escapeHtml(d.note || '')}</td>
+      </tr>`;
+  }).join('');
+
+  const historyTable = `
+    <div class="company-card">
+      <h4>Decision History · Market Effectiveness</h4>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);margin-bottom:10px;line-height:1.6">
+        The <strong>5-session market reaction</strong> (SPY + TLT) after each decision is computed from price history when available — a read on how the market received the decision. Shows "—" when history isn't loaded for that date.
+      </div>
+      <table class="sb-table" style="width:100%">
+        <thead><tr><th>Date</th><th>Decision</th><th>New Range</th><th>5-Session Market Reaction</th><th>Note</th></tr></thead>
+        <tbody>${histRows}</tbody>
+      </table>
+    </div>`;
+
+  // ---- How this feeds the engine ----
+  const engineNote = `
+    <div class="company-card" style="border-left:3px solid ${stanceColor}">
+      <h4>How This Feeds the Engine</h4>
+      <div style="font-size:13px;color:var(--ink);line-height:1.7">
+        The blended expectation — <strong style="color:${stanceColor}">${exp.stance}</strong>, expected year-end
+        <strong>${exp.expectedYearEndRate.toFixed(2)}%</strong> (${exp.expectedBpsChange >= 0 ? '+' : ''}${exp.expectedBpsChange.toFixed(0)}bps) —
+        is consumed by:
+        <ul style="margin:8px 0 0;padding-left:20px;color:var(--ink-dim);font-size:12px;line-height:1.7">
+          <li><strong>Regime:</strong> an easing bias tilts the regime toward expansion/risk-on; tightening toward risk-off.</li>
+          <li><strong>Probability:</strong> rate-sensitive theses (rate-cut beneficiaries, long-duration) get a tailwind/headwind from the cumulative cut probability (${(exp.cumulativeCutProb*100).toFixed(0)}% across ${exp.meetingsAhead} meetings).</li>
+          <li><strong>Bonds:</strong> the expected path shifts the modeled yield curve — cuts steepen the front end.</li>
+          <li><strong>Scenarios:</strong> "Fed cuts 50bps" becomes a quantified shock instead of a guess.</li>
+        </ul>
+      </div>
+    </div>`;
+
+  body.innerHTML = headStrip + predictionTable + engineNote + historyTable;
+
+  // ---- Wire interactions ----
+  body.querySelectorAll('.fed-user-odds').forEach(inp => {
+    inp.addEventListener('change', e => {
+      const meeting = inp.dataset.meeting;
+      const parts = inp.value.split('/').map(x => parseFloat(x.trim()));
+      if (parts.length === 3 && parts.every(x => isFinite(x))) {
+        const sum = parts[0] + parts[1] + parts[2];
+        if (sum > 0) {
+          const ff = loadFedState();
+          ff.userOdds[meeting] = { cut: parts[0]/sum, hold: parts[1]/sum, hike: parts[2]/sum };
+          saveFedState(ff);
+          renderFedTab();
+        }
+      } else if (inp.value.trim() === '') {
+        const ff = loadFedState();
+        delete ff.userOdds[meeting];
+        saveFedState(ff);
+        renderFedTab();
+      }
+    });
+  });
+  const blendSlider = document.getElementById('fed-blend-weight');
+  if (blendSlider) {
+    blendSlider.addEventListener('input', e => {
+      document.getElementById('fed-blend-label').textContent = e.target.value + '%';
+    });
+    blendSlider.addEventListener('change', e => {
+      const ff = loadFedState();
+      ff.blendWeight = parseInt(e.target.value, 10) / 100;
+      saveFedState(ff);
+      renderFedTab();
+    });
+  }
+  const resetBtn = document.getElementById('fed-refresh-btn');
+  if (resetBtn) {
+    resetBtn.addEventListener('click', () => {
+      if (confirm('Reset Fed data to seeded public values? This clears your predictions and odds edits.')) {
+        localStorage.removeItem(FED_KEY);
+        renderFedTab();
+      }
+    });
+  }
+}
+
+// Helper: % price move in the N sessions after a date, from price history cache.
+function _priceMoveAfter(ticker, dateStr, sessions) {
+  let history = null;
+  try {
+    const cached = JSON.parse(localStorage.getItem(SHEET_CACHE_KEY) || 'null');
+    history = cached?.data?.priceHistory?.[ticker];
+  } catch {}
+  if (!history?.length) {
+    try { history = loadPriceHistCache()[ticker]?.data; } catch {}
+  }
+  if (!history?.length) return null;
+  const sorted = [...history].sort((a, b) => a.date.localeCompare(b.date));
+  const startIdx = sorted.findIndex(p => p.date >= dateStr);
+  if (startIdx < 0 || startIdx + sessions >= sorted.length) return null;
+  const p0 = sorted[startIdx].price;
+  const p1 = sorted[startIdx + sessions].price;
+  if (!p0 || !p1) return null;
+  return (p1 - p0) / p0;
+}
+
+
+
 // Public CORS proxies for the FRED CSV endpoint. Tried in order, first success wins.
 // As of 2026: corsproxy.io is most reliable, allorigins works, cors.sh is a fallback.
 function buildProxiedFredUrl(seriesId, proxyIdx) {
@@ -7356,6 +7922,7 @@ function switchTab(tabName) {
       tabName === 'probability' ? 'Probability · binary thesis odds blended from priors' :
       tabName === 'risk' ? 'Risk Calculator · Ray Dalio Holy Grail · diversification math' :
       tabName === 'bonds' ? 'Bonds & Treasuries · yield curve · interest rates · public debt' :
+      tabName === 'fed' ? 'Federal Reserve · rate-cut/hike pricing · FOMC schedule · decision effectiveness' :
       tabName === 'news'  ? 'News Feed · sorted by market cap · search, "My News" preset, lead+closer summarization' :
       tabName === 'scenarios' ? 'Scenarios · shock-and-transmission engine · ranged estimates with epistemic tiers' :
       tabName === 'supplychain' ? 'Supply Chains · upstream / midstream / downstream linkages · cross-portfolio exposure discovery' :
@@ -7434,6 +8001,9 @@ function switchTab(tabName) {
       // Refresh just the bond ETF table from latest sheet
       renderBondEtfTable();
     }
+  }
+  if (tabName === 'fed') {
+    if (typeof renderFedTab === 'function') renderFedTab();
   }
 }
 
@@ -7597,12 +8167,26 @@ async function loadStockBook(forceRefresh = false) {
 
       // Combine sheet's function column with name detection
       const fnLc = (sheetFunction || '').toLowerCase();
+      // Derivative detection via the sheet's "function" field. Use WORD-BOUNDARY
+      // matching, not naive substring — otherwise an equity whose function/
+      // description contains "macroeconomic", "microservices", "future of X",
+      // "bullish", etc. gets falsely flagged as a derivative. NFLX was landing
+      // in the ETF/derivatives bucket for exactly this reason.
+      const hasWord = (str, words) => {
+        const s = ' ' + String(str || '').toLowerCase() + ' ';
+        return words.some(w => new RegExp(`\\b${w}\\b`).test(s));
+      };
+      // Also require that the ticker isn't a plain equity symbol. A real ETF/
+      // derivative ticker won't have a foreign-exchange suffix and classifyAsset
+      // should agree it's etf/index/option/future.
+      const coarseClass = classifyAsset(tic);
+      const fnSaysDerivative = hasWord(fnLc, [
+        'leveraged', 'derivative', 'etf', 'etn', 'inverse', 'leverage',
+      ]) || hasWord(fnLc, ['macro etf', 'micro etf']);
       const isDerivative =
-        fnLc.includes('leverag') || fnLc.includes('derivative') || fnLc.includes('etf') ||
-        fnLc.includes('macro') || fnLc.includes('micro') || fnLc.includes('crypto') ||
-        fnLc.includes('option') || fnLc.includes('future') || fnLc.includes('inverse') ||
-        fnLc.includes('bull') || fnLc.includes('bear') ||
-        nameIndicatesLeverage || nameIndicatesETF;
+        fnSaysDerivative ||
+        nameIndicatesLeverage || nameIndicatesETF ||
+        ['etf', 'index', 'option', 'future'].includes(coarseClass);
 
       // Specific instrument category (used for grouping)
       let instrumentType = 'equity';
@@ -7731,6 +8315,21 @@ async function loadStockBook(forceRefresh = false) {
     row.assetClass = classifyAsset(row.ticker);
     if (!row.name) row.name = displayNameForRow(row);
   });
+  // Diagnostic: report foreign-currency normalization results so the user can
+  // see which foreign tickers were converted to USD and which couldn't be
+  // (missing FX rate) — the latter explains any remaining odd market caps.
+  try {
+    const converted = state.stockbook.rows.filter(r => r._usdNormalized);
+    const unconverted = state.stockbook.rows.filter(r => r._currencyUnconverted);
+    if (converted.length || unconverted.length) {
+      console.log(`[fx-normalize] ${converted.length} foreign tickers converted to USD`,
+        converted.slice(0, 10).map(r => `${r.ticker}: ${r._localCurrency} ×${r._fxRate?.toExponential?.(2)} → $${r.price?.toFixed(2)}`));
+      if (unconverted.length) {
+        console.warn(`[fx-normalize] ${unconverted.length} foreign tickers NOT converted (no FX rate loaded — add the pair e.g. KRW=X):`,
+          unconverted.map(r => `${r.ticker} (${r._localCurrency})`));
+      }
+    }
+  } catch {}
   // Persist stable identity/taxonomy fields to long-lived cache for instant cold-start
   updateTaxonomyCache(state.stockbook.rows);
   setStatus(`${state.stockbook.rows.length} tickers loaded`, 'success');
@@ -12838,6 +13437,43 @@ function probCrossSignals(thesis, sbRow, currentPrice) {
     diag.tech = { error: e.message };
   }
 
+  // ---- 5. Fed rate-path tailwind/headwind ----
+  // Rate-sensitive sectors (real estate, utilities, regional banks, long-duration
+  // growth, homebuilders) move with the expected rate path. An easing bias is a
+  // tailwind for rate-cut beneficiaries; tightening is a headwind. Uses the
+  // blended market+user expectation from the Fed tab.
+  try {
+    if (typeof fedRateExpectation === 'function') {
+      const fed = fedRateExpectation();
+      // Net easing pressure in [-1, 1]: positive = cuts expected
+      const easingPressure = Math.max(-1, Math.min(1, -fed.expectedBpsChange / 75)); // -75bps → +1.0
+      // Sector sensitivity sign: +1 = benefits from cuts, -1 = hurt by cuts
+      const sector = (sbRow?.sector || sbRow?.subSector || '').toLowerCase();
+      let sensitivity = 0;
+      if (/real estate|reit|utilities|homebuild|residential|construction/.test(sector)) sensitivity = 1;
+      else if (/technology|software|growth|biotech|semiconductor/.test(sector)) sensitivity = 0.6; // long-duration growth
+      else if (/bank|financial|insurance/.test(sector)) sensitivity = -0.5; // banks' NIM can compress when cutting
+      else if (/energy|materials|staples/.test(sector)) sensitivity = 0.1;
+      if (sensitivity !== 0) {
+        // Combine: easing × positive-sensitivity → bullish push
+        const push = easingPressure * sensitivity;  // [-1, 1]
+        const pAbove = 1 / (1 + Math.exp(-(push / 0.4)));
+        subSignals.fed = direction === 'above' ? pAbove : 1 - pAbove;
+        diag.fed = {
+          stance: fed.stance,
+          expectedBpsChange: +fed.expectedBpsChange.toFixed(0),
+          sectorSensitivity: sensitivity,
+          push: +push.toFixed(2),
+          p: subSignals.fed,
+        };
+      } else {
+        diag.fed = { note: 'sector not rate-sensitive', stance: fed.stance };
+      }
+    }
+  } catch (e) {
+    diag.fed = { error: e.message };
+  }
+
   // ---- Blend the sub-signals ----
   // Equal weights inside the component. If a sub-signal is missing it drops
   // out and the remaining weights re-normalize (log-odds method matches
@@ -16147,11 +16783,24 @@ function renderTickerTape() {
     // Mark this article's key as the displayed one so when the user clicks
     // to read it, we can advance to the next unread article.
     const articleId = articleKey(n);
+    // Build the rolling text: headline + first sentences of the summary so the
+    // ticker tape conveys real article content instead of just the title.
+    // No market-cap-tier filler (the user explicitly didn't want that).
+    let rollingText = n.headline || '';
+    if (n.summary && n.summary.length > 20) {
+      const sentences = n.summary.replace(/\s+/g, ' ').trim().match(/[^.!?]+[.!?]+/g) || [n.summary];
+      const lead = sentences.slice(0, 2).join(' ').trim();
+      if (lead && lead !== n.headline) {
+        rollingText = `${n.headline} — ${lead}`;
+      }
+    }
+    // Cap at 280 chars so the tape stays scannable
+    if (rollingText.length > 280) rollingText = rollingText.slice(0, 277) + '…';
     return `
       <span class="ticker-tape-news" data-news-key="${escapeHtml(articleId)}" onclick="_tickerTapeOnNewsClick('${escapeHtml(articleId)}')" style="border-left:3px solid ${tierColor}">
         <span class="ticker-tape-news-badge" style="color:${tierColor}">${escapeHtml((n.priority || 'news').toUpperCase())}</span>
         <span class="ticker-tape-news-tic">${escapeHtml(n.ticker || '—')}</span>
-        <span class="ticker-tape-news-text">${escapeHtml((n.headline || '').slice(0, 140))}</span>
+        <span class="ticker-tape-news-text">${escapeHtml(rollingText)}</span>
       </span>
     `;
   };
@@ -16643,6 +17292,31 @@ function enrichRowClassification(row) {
 
   // Store the sub-classification on the row for the sector-tab filter
   row._subClass = sub;
+
+  // ----- Foreign currency → USD normalization -----
+  // Convert foreign-listed equities (priced in local currency) to USD so the
+  // Stock Book, heat map, and market-cap rankings aren't corrupted by raw
+  // Won/Yen/etc. figures (the Hyundai "$180T market cap" bug). We preserve the
+  // originals on _localPrice / _localMarketCap / _localCurrency so nothing is
+  // lost and the UI can show "₩200,000 local" on hover if desired.
+  const localCcy = (row.currency && row.currency !== 'USD') ? row.currency : _tickerLocalCurrency(row.ticker);
+  if (localCcy && localCcy !== 'USD' && !row._usdNormalized) {
+    const norm = normalizeRowToUSD(row);
+    if (norm.converted) {
+      row._localPrice = row.price;
+      row._localMarketCap = row.marketCap;
+      row._localCurrency = norm.currency;
+      row._fxRate = norm.rate;
+      row.price = norm.price;
+      row.marketCap = norm.marketCap;
+      row._usdNormalized = true;
+    } else {
+      // Couldn't convert — flag so the row can be visually marked as local-ccy
+      // rather than silently showing a wrong USD figure.
+      row._currencyUnconverted = true;
+      row._localCurrency = norm.currency || localCcy;
+    }
+  }
 }
 
 // Collect all unique sectors/sub-sectors/industries seen across the stockbook
@@ -22595,6 +23269,187 @@ function evaluateRisk(s) {
   return { score, verdict: gradeFromScore(score).label.toLowerCase(), reason: checks.join(' · ') };
 }
 
+
+// ============================================================
+//   MULTI-STEP FINANCIAL REASONING CHAIN
+//
+//   Walks an explicit analyst decision tree where each step's verdict informs
+//   how the next is read:
+//     1 Scale gate     — is market cap > $1B? (below = speculative path)
+//     2 Survival       — profitable / cash-generative?
+//     3 Balance sheet  — assets vs liabilities, equity, leverage, liquidity
+//     4 Valuation      — at this price, cheap/fair/expensive for THIS quality?
+//     5 Shareholder    — dividends/buybacks sustainable?
+//     6 Trajectory     — growing or shrinking into this?
+//   Produces a conviction score + human-readable reasoning trail ("show your
+//   work"), reused by company valuation, CEO assessment, and news scoring.
+// ============================================================
+function financialReasoningChain(s) {
+  if (!s) return null;
+  const steps = [];
+  const num = (v) => (typeof v === 'number' && isFinite(v)) ? v : null;
+  const pct = (v) => num(v) != null ? (v * 100).toFixed(1) + '%' : 'n/a';
+
+  const mcap = num(s.marketCap);
+  const eps = num(s.eps);
+  const netMargin = num(s.netMargin != null ? s.netMargin : s.profitMargin);
+  const fcf = num(s.freeCashFlow);
+  const roe = num(s.roe);
+  const de = num(s.debtToEquity);
+  const curr = num(s.currentRatio);
+  const cash = num(s.cash);
+  const debt = num(s.totalDebt);
+  const assets = num(s.totalAssets);
+  const liabilities = num(s.totalLiabilities);
+  const equity = num(s.totalEquity != null ? s.totalEquity : s.bookValue);
+  const pe = num(s.pe);
+  const pb = num(s.priceToBook);
+  const ps = num(s.priceToSales);
+  const divYield = num(s.dividendYield);
+  const payout = num(s.payoutRatio);
+  const revGrowth = num(s.revenueGrowth);
+  const epsGrowth = num(s.epsGrowth);
+
+  // STEP 1: Scale gate
+  let scaleTier, scalePoints;
+  if (mcap == null) { scaleTier = 'unknown'; scalePoints = null; }
+  else if (mcap >= 1e12) { scaleTier = 'mega'; scalePoints = 100; }
+  else if (mcap >= 200e9) { scaleTier = 'mega'; scalePoints = 92; }
+  else if (mcap >= 10e9) { scaleTier = 'large'; scalePoints = 80; }
+  else if (mcap >= 2e9) { scaleTier = 'mid'; scalePoints = 62; }
+  else if (mcap >= 1e9) { scaleTier = 'mid'; scalePoints = 52; }
+  else if (mcap >= 300e6) { scaleTier = 'small'; scalePoints = 38; }
+  else if (mcap >= 50e6) { scaleTier = 'micro'; scalePoints = 20; }
+  else { scaleTier = 'nano'; scalePoints = 10; }
+  const over1B = mcap != null && mcap >= 1e9;
+  steps.push({ step: 1, name: 'Scale gate', pass: over1B, points: scalePoints,
+    note: mcap == null
+      ? 'No market-cap data - scale unknown, treat downstream signals as low-confidence.'
+      : `Market cap ${fmt$(mcap)} -> ${scaleTier}-cap. ${over1B ? 'Above the $1B institutional threshold.' : 'Below $1B - speculative tier; demand a wider margin of safety.'}` });
+
+  // STEP 2: Survival / profitability
+  let profitPass = null, profitPoints = null;
+  const profitNotes = [];
+  if (eps != null) profitNotes.push(eps > 0 ? `EPS +${fmt$(eps)} (profitable)` : `EPS -$${Math.abs(eps).toFixed(2)} (loss-making)`);
+  if (netMargin != null) profitNotes.push(`net margin ${pct(netMargin)}`);
+  if (fcf != null) profitNotes.push(fcf > 0 ? `FCF positive ${fmt$(fcf)}` : `FCF negative ${fmt$(fcf)}`);
+  if (roe != null) profitNotes.push(`ROE ${pct(roe)}`);
+  if (eps != null || netMargin != null || fcf != null) {
+    const profitable = (eps != null && eps > 0) || (netMargin != null && netMargin > 0) || (fcf != null && fcf > 0);
+    profitPass = profitable;
+    profitPoints = profitable
+      ? Math.min(100, 55 + (netMargin != null ? Math.min(30, netMargin * 150) : 0) + (roe != null && roe > 0.15 ? 10 : 0))
+      : Math.max(0, 35 - (netMargin != null && netMargin < -0.1 ? 20 : 0));
+    profitNotes.unshift(profitable
+      ? 'PROFITABLE - judged as a going concern.'
+      : 'UNPROFITABLE - value on cash runway + path to profitability, not earnings.');
+  }
+  steps.push({ step: 2, name: 'Survival / profitability', pass: profitPass, points: profitPoints,
+    note: profitNotes.length ? profitNotes.join(' · ') : 'No profitability data.' });
+
+  // STEP 3: Balance sheet at this price
+  let bsPass = null, bsPoints = null;
+  const bsNotes = [];
+  if (assets != null && liabilities != null) {
+    bsNotes.push(`assets ${fmt$(assets)} - liabilities ${fmt$(liabilities)} = ${fmt$(assets - liabilities)} net worth`);
+    if (equity != null && mcap != null && equity > 0) bsNotes.push(`market values equity at ${(mcap / equity).toFixed(1)}x book`);
+  }
+  if (de != null) bsNotes.push(`D/E ${de.toFixed(2)} (${de < 0.5 ? 'low' : de < 1.5 ? 'moderate' : 'high'} leverage)`);
+  if (curr != null) bsNotes.push(`current ratio ${curr.toFixed(2)} (${curr > 1.5 ? 'strong' : curr > 1 ? 'adequate' : 'tight'} liquidity)`);
+  if (cash != null && debt != null) bsNotes.push(cash > debt ? `net cash (${fmt$(cash - debt)})` : `net debt (${fmt$(debt - cash)})`);
+  if (de != null || curr != null || (assets != null && liabilities != null)) {
+    let pts = 50;
+    if (de != null) pts += de < 0.5 ? 18 : de < 1 ? 8 : de < 2 ? -5 : -20;
+    if (curr != null) pts += curr > 2 ? 12 : curr > 1 ? 4 : -18;
+    if (cash != null && debt != null && cash > debt) pts += 12;
+    if (equity != null && equity < 0) { pts -= 25; bsNotes.push('NEGATIVE equity - liabilities exceed assets'); }
+    bsPoints = Math.max(0, Math.min(100, pts));
+    bsPass = bsPoints >= 50;
+  }
+  steps.push({ step: 3, name: 'Balance sheet at this price', pass: bsPass, points: bsPoints,
+    note: bsNotes.length ? bsNotes.join(' · ') : 'No balance-sheet data.' });
+
+  // STEP 4: Valuation at this price, given quality
+  let valPass = null, valPoints = null;
+  const valNotes = [];
+  if (pe != null || pb != null || ps != null) {
+    let pts = 50;
+    const qualityGrower = (roe != null && roe > 0.15) || (revGrowth != null && revGrowth > 0.15);
+    if (pe != null && pe > 0) {
+      const peFair = qualityGrower ? 35 : 20;
+      if (pe < peFair * 0.6) { pts += 18; valNotes.push(`P/E ${pe.toFixed(1)} cheap for this quality`); }
+      else if (pe < peFair) { pts += 6; valNotes.push(`P/E ${pe.toFixed(1)} reasonable`); }
+      else if (pe < peFair * 1.7) { pts -= 6; valNotes.push(`P/E ${pe.toFixed(1)} expensive`); }
+      else { pts -= 18; valNotes.push(`P/E ${pe.toFixed(1)} very expensive even for a grower`); }
+    } else if (pe != null && pe < 0) {
+      valNotes.push('P/E negative - loss-making, P/S is the meaningful gauge');
+    }
+    if (ps != null) {
+      if (ps < 2) { pts += 8; valNotes.push(`P/S ${ps.toFixed(1)} cheap`); }
+      else if (ps > 12) { pts -= 10; valNotes.push(`P/S ${ps.toFixed(1)} rich`); }
+    }
+    if (pb != null && pb < 1) { pts += 10; valNotes.push(`P/B ${pb.toFixed(2)} below book - potential value`); }
+    valPoints = Math.max(0, Math.min(100, pts));
+    valPass = valPoints >= 50;
+  }
+  steps.push({ step: 4, name: 'Valuation at this price', pass: valPass, points: valPoints,
+    note: valNotes.length ? valNotes.join(' · ') : 'No valuation multiples.' });
+
+  // STEP 5: Shareholder return sustainability
+  let incPass = null, incPoints = null;
+  const incNotes = [];
+  if (divYield != null && divYield > 0) {
+    incNotes.push(`dividend yield ${pct(divYield)}`);
+    let pts = 50 + Math.min(25, divYield * 500);
+    if (payout != null) {
+      incNotes.push(`payout ${pct(payout)}`);
+      if (payout > 0.9) { pts -= 20; incNotes.push('payout >90% - sustainability risk'); }
+      else if (payout < 0.6) { pts += 10; incNotes.push('well-covered'); }
+    }
+    incPoints = Math.max(0, Math.min(100, pts));
+    incPass = incPoints >= 50;
+  } else if (divYield === 0) {
+    incNotes.push('No dividend - return depends on price appreciation / buybacks');
+    incPoints = 50; incPass = null;
+  }
+  steps.push({ step: 5, name: 'Shareholder return', pass: incPass, points: incPoints,
+    note: incNotes.length ? incNotes.join(' · ') : 'No dividend data.' });
+
+  // STEP 6: Trajectory
+  let growthPass = null, growthPoints = null;
+  const grNotes = [];
+  if (revGrowth != null) {
+    grNotes.push(`revenue ${revGrowth >= 0 ? '+' : ''}${pct(revGrowth)} YoY`);
+    growthPoints = Math.max(0, Math.min(100, 50 + revGrowth * 150));
+    growthPass = revGrowth > 0;
+  }
+  if (epsGrowth != null) grNotes.push(`EPS ${epsGrowth >= 0 ? '+' : ''}${pct(epsGrowth)} YoY`);
+  steps.push({ step: 6, name: 'Trajectory', pass: growthPass, points: growthPoints,
+    note: grNotes.length ? grNotes.join(' · ') : 'No growth data.' });
+
+  // Aggregate conviction
+  const stepWeights = over1B
+    ? { 1: 0.12, 2: 0.22, 3: 0.20, 4: 0.22, 5: 0.10, 6: 0.14 }
+    : { 1: 0.10, 2: 0.24, 3: 0.28, 4: 0.18, 5: 0.04, 6: 0.16 };
+  let scoreSum = 0, weightSum = 0;
+  for (const st of steps) {
+    if (st.points != null) { scoreSum += st.points * stepWeights[st.step]; weightSum += stepWeights[st.step]; }
+  }
+  const conviction = weightSum > 0 ? scoreSum / weightSum : null;
+
+  let verdict;
+  if (conviction == null) verdict = 'Insufficient data for a conviction call.';
+  else if (conviction >= 75) verdict = over1B ? 'High-quality business at a defensible price.' : 'Strong small-cap fundamentals - speculative but well-built.';
+  else if (conviction >= 60) verdict = 'Solid fundamentals; watch the weakest step below.';
+  else if (conviction >= 45) verdict = 'Mixed - strengths offset by real weaknesses; price discipline matters.';
+  else verdict = over1B ? 'Weak fundamentals for an institutional-scale name - caution.' : 'Speculative with weak fundamentals - high risk of permanent loss.';
+
+  return {
+    conviction, grade: gradeFromScore(conviction), over1B, scaleTier, verdict, steps,
+    trail: steps.filter(st => st.points != null).map(st => `${st.step}. ${st.name}: ${st.note}`),
+  };
+}
+
 function computeCompanyHealth(s) {
   if (!s) return null;
   const dims = {
@@ -22618,12 +23473,28 @@ function computeCompanyHealth(s) {
   for (const [k, dim] of Object.entries(dims)) {
     if (dim.score != null) { totalScore += dim.score * weights[k]; totalWeight += weights[k]; }
   }
-  const composite = totalWeight > 0 ? totalScore / totalWeight : null;
+  const dimComposite = totalWeight > 0 ? totalScore / totalWeight : null;
+
+  // Blend in the multi-step reasoning chain. The chain applies sequential,
+  // context-aware logic (scale gate → survival → balance sheet → valuation
+  // at this price → income → trajectory) that the independent dimensions
+  // don't capture. Final composite = 60% dimensions + 40% chain conviction
+  // when both exist, so the score reflects the conditional reasoning the user
+  // asked for, not just averaged metrics.
+  const chain = financialReasoningChain(s);
+  let composite = dimComposite;
+  if (dimComposite != null && chain?.conviction != null) {
+    composite = dimComposite * 0.6 + chain.conviction * 0.4;
+  } else if (chain?.conviction != null) {
+    composite = chain.conviction;
+  }
+
   return {
     composite,
     grade: gradeFromScore(composite),
     stage: isGrowthCo ? 'growth' : isDividendCo ? 'dividend' : 'blend',
     dimensions: dims,
+    chain,   // expose the full reasoning trail for display + news scoring
   };
 }
 
@@ -22683,6 +23554,21 @@ async function renderCompanyHealthScore(s, wd) {
       <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(240px, 1fr));gap:10px">
         ${dimensionsHtml}
       </div>
+      ${health.chain ? `
+      <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--rule)">
+        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:8px">
+          Multi-step reasoning · conviction ${health.chain.conviction != null ? health.chain.conviction.toFixed(0) : '—'}/100
+        </div>
+        <div style="font-size:13px;color:var(--ink);line-height:1.6;margin-bottom:10px;font-style:italic">${escapeHtml(health.chain.verdict)}</div>
+        <ol style="margin:0;padding-left:20px;display:flex;flex-direction:column;gap:6px">
+          ${health.chain.steps.filter(st => st.points != null).map(st => {
+            const g = gradeFromScore(st.points);
+            return `<li style="font-family:var(--mono);font-size:11px;color:var(--ink-dim);line-height:1.5">
+              <span style="color:${g.color};font-weight:700">${st.name} (${st.points.toFixed(0)})</span> — ${escapeHtml(st.note)}
+            </li>`;
+          }).join('')}
+        </ol>
+      </div>` : ''}
     </div>
   `;
 }
@@ -24621,7 +25507,8 @@ state.news = {
   items: [],
   loadedAt: 0,
   filterPriority: 'all',
-  filterRange: 7,
+  filterRange: 1,               // default 24h — fast initial pull. Widen via the
+                                // range selector inside the News tab when needed.
   filterView: 'unread',         // 'unread' | 'read' | 'reported' | 'all'
   searchQuery: '',              // free-text search over headline + summary + ticker
   myNewsActive: false,          // when true, restrict to user-selected tickers
@@ -24696,6 +25583,22 @@ function setArticleState(article, status, opts = {}) {
     ticker: article.ticker,
     headline: article.headline?.slice(0, 200),
   };
+  saveArticleStates(states);
+}
+
+// Read the current state of an article (used by render to draw the
+// appropriate toggle: "Mark unread" if already read, "Unhide" if hidden, etc.)
+function getArticleState(article) {
+  const states = loadArticleStates();
+  const key = articleKey(article);
+  return states[key] || null;
+}
+
+// Clear an article's state — used by "Mark unread" / "Unhide" toggles.
+function clearArticleState(article) {
+  const states = loadArticleStates();
+  const key = articleKey(article);
+  delete states[key];
   saveArticleStates(states);
 }
 
@@ -24814,7 +25717,55 @@ document.addEventListener('DOMContentLoaded', () => {
     const banner = document.getElementById('breaking-banner');
     if (banner) banner.style.display = 'none';
   });
+
+  // Background news prime — gives the app a 24h head-start so when the user
+  // opens the News tab, articles are already loaded. Waits 4s for the
+  // stockbook to finish loading before kicking off, then only runs if the
+  // news cache is stale or empty. Doesn't block UI — fully background.
+  setTimeout(() => {
+    try {
+      const sbReady = (state.stockbook?.rows?.length || 0) > 0;
+      if (!sbReady) {
+        // Stockbook not ready yet — retry in 4s. Cap retries.
+        let retries = 0;
+        const tick = setInterval(() => {
+          retries++;
+          if ((state.stockbook?.rows?.length || 0) > 0) {
+            clearInterval(tick);
+            _startupNewsPrime();
+          } else if (retries > 6) {
+            clearInterval(tick);  // give up after ~30s
+          }
+        }, 4000);
+      } else {
+        _startupNewsPrime();
+      }
+    } catch (e) { console.warn('[news] startup prime failed:', e.message); }
+  }, 4000);
 });
+
+// Run the background news pull. Only fires if the cache is empty or older
+// than the TTL, so it doesn't hammer the API on every reload.
+function _startupNewsPrime() {
+  try {
+    const cached = loadNewsCache();
+    const ageMs = cached ? (Date.now() - cached.fetchedAt) : Infinity;
+    if (cached && ageMs < NEWS_CACHE_TTL_MS) {
+      // Cache is fresh — hydrate state from it and we're done
+      if (!state.news.items.length) {
+        state.news.items = cached.items;
+        state.news.loadedAt = cached.fetchedAt;
+      }
+      console.log(`[news] startup prime: cache fresh (${Math.round(ageMs/60000)}m old), ${cached.items.length} articles ready`);
+      return;
+    }
+    console.log('[news] startup prime: fetching 24h headlines in background…');
+    state.news.filterRange = 1;  // 24h default for fast head-start
+    loadPortfolioNews(false).catch(e => console.warn('[news] startup prime failed:', e.message));
+  } catch (e) {
+    console.warn('[news] startup prime error:', e.message);
+  }
+}
 
 
 // ============================================================
@@ -24892,10 +25843,39 @@ function extractEntities(text) {
     out.dollarAmounts.push({ raw: m[0], value: num * mult });
   }
 
-  // Percentages: +12.4%, -3.2%, 47%
+  // Percentages: +12.4%, -3.2%, 47% — WITH surrounding context so the UI can
+  // show "revenue +12%" instead of a bare "12%". We grab up to 4 words before
+  // and 3 words after, then pick the most meaningful noun-ish context phrase.
   const pctRE = /([+-]?\d+(?:\.\d+)?)\s?%/g;
   while ((m = pctRE.exec(t)) !== null) {
-    out.percentages.push({ raw: m[0], value: parseFloat(m[1]) });
+    const idx = m.index;
+    // Look back ~40 chars for the subject word(s) the % describes
+    const before = t.slice(Math.max(0, idx - 45), idx).trim();
+    const after = t.slice(idx + m[0].length, idx + m[0].length + 35).trim();
+    // Common financial subjects to prioritize as context
+    const subjectWords = ['revenue', 'sales', 'profit', 'earnings', 'eps', 'margin', 'growth',
+      'guidance', 'shares', 'stock', 'gain', 'loss', 'decline', 'drop', 'rise', 'surge', 'jump',
+      'fell', 'rose', 'gained', 'lost', 'up', 'down', 'increase', 'decrease', 'yield', 'dividend',
+      'market share', 'net income', 'operating', 'gross', 'free cash flow'];
+    let context = '';
+    const beforeLower = before.toLowerCase();
+    for (const w of subjectWords) {
+      if (beforeLower.includes(w)) { context = w; break; }
+    }
+    // If no known subject, take the last 2-3 words before the %
+    if (!context) {
+      const words = before.split(/\s+/).filter(Boolean);
+      context = words.slice(-3).join(' ').replace(/[^\w\s$.-]/g, '').trim();
+    }
+    // Or the phrase right after (e.g. "12% increase in revenue")
+    let afterContext = '';
+    const afterMatch = after.match(/^(increase|decrease|gain|drop|rise|jump|surge|decline|growth)\s+(?:in|on|to)?\s*([\w\s]{0,20})/i);
+    if (afterMatch) afterContext = `${afterMatch[1]} ${afterMatch[2] || ''}`.trim();
+    out.percentages.push({
+      raw: m[0],
+      value: parseFloat(m[1]),
+      context: (afterContext || context || '').slice(0, 40),
+    });
   }
 
   // Fiscal periods: Q1 2026, Q3'24, FY24, fiscal 2026
@@ -25277,41 +26257,53 @@ function expandSummary(article, priority, marketCap) {
 // source text is too thin. Each line adds genuine framing (mcap tier, recency,
 // category-specific note) without being filler.
 function _contextLines(article, priority, marketCap, alreadyHave) {
+  // Generate concise, article-specific context lines — NOT boilerplate about
+  // market-cap tiers or "click read full article". Each line should add real
+  // information the headline alone doesn't convey.
   const lines = [];
-  const fmtMcap = v => v >= 1e12 ? '$' + (v/1e12).toFixed(2) + ' trillion' : v >= 1e9 ? '$' + (v/1e9).toFixed(1) + ' billion' : v >= 1e6 ? '$' + (v/1e6).toFixed(0) + ' million' : fmt$(v, 0);
-  if (marketCap > 0) {
-    lines.push(`${article.ticker} carries a market capitalization of ${fmtMcap(marketCap)}, classifying it in the ${priority.label} tier of the priority system.`);
-  }
   const hoursAgo = Math.round((Date.now() - article.datetime) / 3600000);
+  // Recency context — only if it adds something the headline timestamp doesn't
   if (hoursAgo < 1) {
-    lines.push(`This story broke within the past hour, meaning active price discovery may still be underway and intraday volatility could be elevated.`);
+    lines.push(`Breaking within the past hour — active price discovery may still be underway.`);
   } else if (hoursAgo < 24) {
-    lines.push(`The report was published ${hoursAgo} hours ago, leaving the next trading session as the principal opportunity for the market to react to the disclosed information.`);
-  } else {
-    const days = Math.round(hoursAgo / 24);
-    lines.push(`The story is ${days} day${days === 1 ? '' : 's'} old, giving the market sufficient time to absorb its implications into current pricing.`);
+    lines.push(`Published ${hoursAgo}h ago; the next trading session is the principal reaction window.`);
   }
+  // Category-specific framing (only when category is known)
   if (article.category) {
     const cat = article.category.toLowerCase();
-    if (cat.includes('earnings')) lines.push('Earnings reports typically drive concentrated price moves in the 24 to 48 hours after release, particularly when results diverge materially from consensus expectations.');
-    else if (cat.includes('merger') || cat.includes('m&a') || cat.includes('acquisition')) lines.push('Mergers and acquisitions announcements frequently trigger arbitrage flows as the spread between the deal price and current trading levels compresses over time.');
-    else if (cat.includes('analyst') || cat.includes('upgrade') || cat.includes('downgrade') || cat.includes('rating')) lines.push('Analyst rating changes can shift institutional positioning materially, particularly for mid-cap names where sell-side coverage is thinner and a single firm holds more relative influence.');
-    else if (cat.includes('guidance') || cat.includes('outlook')) lines.push('Forward guidance updates often weigh more heavily on price than trailing results, as investors discount expected future cash flows rather than the historical period being reported.');
+    if (cat.includes('earnings')) lines.push('Earnings reports drive concentrated price moves in the 24-48h after release, especially on material consensus divergence.');
+    else if (cat.includes('merger') || cat.includes('m&a') || cat.includes('acquisition')) lines.push('M&A announcements trigger arbitrage flows as the deal-price spread compresses.');
+    else if (cat.includes('analyst') || cat.includes('upgrade') || cat.includes('downgrade') || cat.includes('rating')) lines.push('Rating changes shift institutional positioning, particularly for mid-caps with thinner sell-side coverage.');
+    else if (cat.includes('guidance') || cat.includes('outlook')) lines.push('Forward guidance often outweighs trailing results — markets discount expected future cash flows.');
   }
-  lines.push(`Source: ${article.source}. Click the link below for the full original reporting and supporting detail.`);
   return lines;
 }
 
 function synthesizeFromHeadline(article, priority, marketCap) {
-  const fmtMcap = v => fmt$(v);
+  // Use the article's actual content first — headline + the opening sentences
+  // of the provided summary. Fall back to source/recency framing only when no
+  // summary was provided. Previously this function generated boilerplate like
+  // "META has market cap of $X, placing it in Mega-cap tier" for every article,
+  // which the user (rightly) called slop.
   const hoursAgo = Math.round((Date.now() - article.datetime) / 3600000);
-  const recency = hoursAgo < 1 ? 'within the past hour' : hoursAgo < 24 ? `${hoursAgo} hours ago` : `${Math.round(hoursAgo/24)} days ago`;
-  return [
-    `${article.source} published an article on ${article.ticker} ${recency} with the headline: "${article.headline}".`,
-    `A detailed article summary was not provided by the data source for automated extraction.`,
-    marketCap > 0 ? `${article.ticker} has a market capitalization of ${fmtMcap(marketCap)}, placing it in the ${priority.label} tier.` : '',
-    `Click the "Read full article" link below to see the original story for full context, key statistics, and any tradeable details.`,
-  ].filter(Boolean).join(' ');
+  const recency = hoursAgo < 1 ? 'within the past hour'
+                : hoursAgo < 24 ? `${hoursAgo} hours ago`
+                : `${Math.round(hoursAgo/24)} days ago`;
+
+  // If the source supplied a summary, surface the first 2-3 sentences directly.
+  if (article.summary && article.summary.length > 30) {
+    const cleaned = article.summary.replace(/\s+/g, ' ').trim();
+    // Take up to 3 sentences or 280 chars, whichever comes first
+    const sentences = cleaned.match(/[^.!?]+[.!?]+/g) || [cleaned];
+    let out = sentences.slice(0, 3).join(' ').trim();
+    if (out.length > 320) out = out.slice(0, 317) + '…';
+    if (out && !/[.!?]$/.test(out)) out += '.';
+    return out;
+  }
+
+  // No summary — give the user the headline + source + recency only.
+  // No market-cap filler, no "click read full article" boilerplate.
+  return `${article.source} reported ${recency}: "${article.headline}".`;
 }
 
 // Main fetch — pulls news for every ticker in the stockbook, rate-limited.
@@ -25663,23 +26655,40 @@ function renderNewsFeed() {
     const dayChangeClass = dayChange == null ? '' : dayChange > 0 ? 'news-item-sentiment-positive' : dayChange < 0 ? 'news-item-sentiment-negative' : '';
     const dayChangeStr = dayChange != null ? (dayChange >= 0 ? '+' : '') + (dayChange * 100).toFixed(2) + '%' : '—';
 
-    // Price change since article published — only meaningful if article is at least 1 day old
+    // Price change since article published. Daily history can't capture
+    // intraday moves, so for very fresh articles (<1 trading day) we compare
+    // current price to the close on/before the publish date — it shows the
+    // move since the last close before the news, which is still informative.
     let sincePublishedStr = null;
     let sincePublishedClass = '';
-    if (hoursAgo >= 12 && currentPrice != null) {
+    let sincePublishedLabel = 'since published';
+    if (currentPrice != null) {
       const priceAtPub = _getPriceOnDate(article.ticker, article.datetime);
-      if (priceAtPub != null && priceAtPub > 0) {
+      if (priceAtPub != null && priceAtPub > 0 && Math.abs(priceAtPub - currentPrice) > 1e-9) {
         const change = (currentPrice - priceAtPub) / priceAtPub;
         sincePublishedStr = (change >= 0 ? '+' : '') + (change * 100).toFixed(2) + '%';
         sincePublishedClass = change > 0 ? 'news-item-sentiment-positive' : change < 0 ? 'news-item-sentiment-negative' : '';
+        // For sub-24h articles, clarify this is from the prior close
+        if (hoursAgo < 24) sincePublishedLabel = 'since prior close';
       }
     }
 
-    // Health badge
+    // Health badge — company financial-health composite, now backed by the
+    // multi-step reasoning chain. The badge shows the grade; the tooltip
+    // surfaces the chain verdict + conviction so news is data-driven: the
+    // reader sees WHY the underlying company is rated as it is, in the context
+    // of the article. NOT article sentiment — it's company fundamentals.
     const health = sbRow ? computeCompanyHealth(sbRow) : null;
-    const healthBadge = health && health.composite != null
-      ? `<span class="news-item-mcap" style="color:${health.grade.color};border-color:${health.grade.color};font-weight:700" title="Composite financial health score">${health.grade.icon} ${health.grade.label} ${health.composite.toFixed(0)}</span>`
-      : '';
+    let healthBadge = '';
+    if (health && health.composite != null) {
+      const chainVerdict = health.chain?.verdict || '';
+      const chainConv = health.chain?.conviction != null ? ` · conviction ${health.chain.conviction.toFixed(0)}/100` : '';
+      const chainTrail = health.chain?.trail?.length
+        ? '\n\nReasoning:\n' + health.chain.trail.join('\n')
+        : '';
+      const tip = `Company financial health (NOT article sentiment)${chainConv}. ${chainVerdict}${chainTrail}`;
+      healthBadge = `<span class="news-item-mcap" style="color:${health.grade.color};border-color:${health.grade.color};font-weight:700" title="${escapeHtml(tip)}">${health.grade.icon} CO. ${health.grade.label} ${health.composite.toFixed(0)}</span>`;
+    }
 
     // Breaking-event badge
     const breaking = detectBreaking(article);
@@ -25709,7 +26718,10 @@ function renderNewsFeed() {
       }
       if (entities.percentages.length > 0) {
         const top = entities.percentages.slice(0, 2);
-        top.forEach(p => entityChips.push(`<span style="font-family:var(--mono);font-size:10px;color:${p.value >= 0 ? '#5b8a72' : '#a5645a'}">${escapeHtml(p.raw)}</span>`));
+        top.forEach(p => {
+          const ctx = p.context ? ` <span style="color:var(--ink-faint)">${escapeHtml(p.context)}</span>` : '';
+          entityChips.push(`<span style="font-family:var(--mono);font-size:10px;color:${p.value >= 0 ? '#5b8a72' : '#a5645a'}">${escapeHtml(p.raw)}${ctx}</span>`);
+        });
       }
     }
     const entitiesRow = entityChips.length > 0
@@ -25763,9 +26775,23 @@ function renderNewsFeed() {
           <div class="news-item-stat" style="margin-left:auto;display:flex;gap:4px;flex-wrap:wrap">
             <a class="news-item-cta" href="${article.url}" target="_blank" rel="noopener" onclick="markArticleStateAndRender('${articleId}', 'read')">Read full →</a>
             <button class="news-item-cta" onclick="executeCommand('${article.ticker}')" style="background:transparent;cursor:pointer">Value ${article.ticker} →</button>
-            <button class="news-item-cta" onclick="markArticleStateAndRender('${articleId}', 'read')" style="background:transparent;cursor:pointer" title="Mark as read">✓ Read</button>
-            <button class="news-item-cta" onclick="markArticleStateAndRender('${articleId}', 'dismissed')" style="background:transparent;cursor:pointer" title="Hide from feed">✕ Hide</button>
-            <button class="news-item-cta" onclick="markArticleStateAndRender('${articleId}', 'reported')" style="background:transparent;cursor:pointer;color:#a5645a" title="Report as wrong / irrelevant">⚠ Report</button>
+            ${(() => {
+              // Toggle: if already read, show "Mark unread"; otherwise "Mark read"
+              const st = getArticleState(article);
+              if (st?.status === 'read') {
+                return `<button class="news-item-cta" onclick="markArticleStateAndRender('${articleId}', '__clear')" style="background:transparent;cursor:pointer;color:var(--ink-faint)" title="Mark as unread">↶ Unread</button>`;
+              }
+              return `<button class="news-item-cta" onclick="markArticleStateAndRender('${articleId}', 'read')" style="background:transparent;cursor:pointer" title="Mark as read">✓ Read</button>`;
+            })()}
+            ${(() => {
+              // Toggle: if hidden, show "Unhide"; otherwise "Hide"
+              const st = getArticleState(article);
+              if (st?.status === 'dismissed') {
+                return `<button class="news-item-cta" onclick="markArticleStateAndRender('${articleId}', '__clear')" style="background:transparent;cursor:pointer;color:var(--ink-faint)" title="Show in feed again">↶ Unhide</button>`;
+              }
+              return `<button class="news-item-cta" onclick="markArticleStateAndRender('${articleId}', 'dismissed')" style="background:transparent;cursor:pointer" title="Hide from feed">✕ Hide</button>`;
+            })()}
+            <button class="news-item-cta" onclick="reportAndRetryArticle('${articleId}')" style="background:transparent;cursor:pointer;color:#a5645a" title="Report as wrong / irrelevant and try fetching this article from another source">⚠ Report &amp; Retry</button>
           </div>
         </div>
       </article>
@@ -25784,10 +26810,58 @@ function renderNewsFeed() {
 window.markArticleStateAndRender = function(articleId, status) {
   const article = (state.news?.items || []).find(a => articleKey(a) === articleId);
   if (!article) return;
-  setArticleState(article, status);
+  if (status === '__clear') {
+    // Toggle off — used by "Mark unread" / "Unhide"
+    clearArticleState(article);
+  } else {
+    setArticleState(article, status);
+  }
   renderNewsFeed();
-  // Refresh the breaking banner since this article might have been driving it
   renderBreakingBanner();
+};
+
+// Report an article AND attempt to re-fetch it from another source. When a
+// user clicks "Report & Retry" we both: (1) mark the article as reported (so
+// the bad version is excluded from the feed), and (2) try the alternate news
+// fetcher (Marketaux if Finnhub was used, or vice versa) to pull a fresh copy
+// for the same ticker. The new article appears with a "retried" badge.
+window.reportAndRetryArticle = async function(articleId) {
+  const article = (state.news?.items || []).find(a => articleKey(a) === articleId);
+  if (!article) return;
+  setArticleState(article, 'reported', { reason: 'user reported, retrying' });
+  renderNewsFeed();
+  updateNewsStatus(`Retrying ${article.ticker} from alternate source…`);
+  try {
+    // Try the OTHER news source than what's currently configured
+    const hasFinnhub = !!localStorage.getItem('valuatio.finnhub.key');
+    const hasMarketaux = !!localStorage.getItem('valuatio.marketaux.key');
+    let fresh = null;
+    if (hasFinnhub && typeof fetchMarketauxNews === 'function') {
+      fresh = await fetchMarketauxNews(article.ticker, state.news.filterRange).catch(() => null);
+    } else if (hasMarketaux && typeof fetchFinnhubNews === 'function') {
+      fresh = await fetchFinnhubNews(article.ticker, state.news.filterRange).catch(() => null);
+    }
+    if (fresh && fresh.length > 0) {
+      // Merge fresh into the items list, marking them as retried so the UI can show a badge
+      const existingKeys = new Set(state.news.items.map(a => articleKey(a)));
+      let added = 0;
+      for (const a of fresh) {
+        a._retried = true;
+        if (!existingKeys.has(articleKey(a))) {
+          state.news.items.push(a);
+          added++;
+        }
+      }
+      saveNewsCache(state.news.items, state.news.loadedAt);
+      renderNewsFeed();
+      updateNewsStatus(`Report submitted · pulled ${added} alternate article(s) for ${article.ticker}`);
+    } else {
+      updateNewsStatus(`Report submitted · no alternate source available for ${article.ticker} (add a second news API key in Settings to enable retries)`);
+    }
+  } catch (e) {
+    console.error('[news] report-retry failed:', e);
+    updateNewsStatus(`Report submitted · retry failed (${e.message})`);
+  }
 };
 
 let _newsWired = false;
@@ -30644,12 +31718,19 @@ function downloadJsonBlob(obj, filename) {
 // GoodGlobe Index + notifications + storage stats. Uses jsPDF if loaded,
 // falls back to a printable HTML page in a new tab otherwise.
 async function exportPdfReport() {
+  // Optional user note — prepended to the report. Notifications are an internal
+  // reminder system and are intentionally NOT included in shared/exported PDFs.
+  const userNote = prompt('Add a note to the top of this report? (optional — leave blank to skip)') || '';
+
   // Aggregate the report content
   const portfolio = (typeof loadPortfolio === 'function') ? loadPortfolio() : [];
   const txs = (typeof loadTransactions === 'function') ? loadTransactions() : [];
   const gg = (typeof getGoodGlobeIndexEntries === 'function') ? getGoodGlobeIndexEntries() : [];
-  const notifs = loadNotifications();
   const cash = (typeof getCashPosition === 'function') ? getCashPosition() : 0;
+
+  const noteBlock = userNote.trim()
+    ? `<div style="background:#f0f4f8;padding:14px 18px;border-left:3px solid #5b7a99;margin-bottom:24px;font-size:13px;line-height:1.6"><strong style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#5b7a99;display:block;margin-bottom:4px">Note</strong>${escapeHtml(userNote).replace(/\n/g, '<br>')}</div>`
+    : '';
 
   const html = `
     <!DOCTYPE html><html><head><meta charset="utf-8"><title>Valuatio Report — ${new Date().toISOString().slice(0,10)}</title>
@@ -30673,6 +31754,7 @@ async function exportPdfReport() {
       <div class="no-print" style="background:#fffae6;padding:12px 16px;border-left:3px solid #d4a24c;font-size:12px;margin-bottom:24px">
         Use your browser's <strong>Print → Save as PDF</strong> (Ctrl+P / ⌘P) to save this report as a PDF.
       </div>
+      ${noteBlock}
 
       <h2>Portfolio Summary</h2>
       <div class="stat"><div class="stat-label">Cash Position</div><div class="stat-value">$${cash.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</div></div>
@@ -30694,14 +31776,8 @@ async function exportPdfReport() {
 
       <h2>GoodGlobe Index</h2>
       ${gg.length === 0 ? '<div class="empty">No tickers in index</div>' : `
-      <table><thead><tr><th>Ticker</th><th>Asset Type</th><th>Flags</th><th>First</th><th>Last</th></tr></thead><tbody>
-        ${gg.map(e => `<tr><td><strong>${e.ticker}</strong></td><td>${e.assetType||'equity'}</td><td>${(e.flags||[]).join(', ')}</td><td>${(e.firstFlaggedAt||'').slice(0,10)}</td><td>${(e.lastFlaggedAt||'').slice(0,10)}</td></tr>`).join('')}
-      </tbody></table>`}
-
-      <h2>Notifications</h2>
-      ${notifs.length === 0 ? '<div class="empty">No notifications</div>' : `
-      <table><thead><tr><th>Status</th><th>Category</th><th>Title</th><th>Fires</th></tr></thead><tbody>
-        ${notifs.map(n => `<tr><td>${n.status}</td><td>${n.category}</td><td>${n.title}${n.detail?'<br><span style="color:#888;font-size:9px">'+n.detail+'</span>':''}</td><td>${(n.fireAt||'').slice(0,16).replace('T',' ')}</td></tr>`).join('')}
+      <table><thead><tr><th>Ticker</th><th>Asset Type</th><th>Flags</th><th>Realized P/L</th><th>First</th><th>Last</th></tr></thead><tbody>
+        ${gg.map(e => `<tr><td><strong>${e.ticker}</strong></td><td>${e.assetType||'equity'}</td><td>${(e.flags||[]).join(', ')}</td><td>${e.realizedPL!=null?'$'+e.realizedPL.toFixed(2):'—'}</td><td>${(e.firstFlaggedAt||'').slice(0,10)}</td><td>${(e.lastFlaggedAt||'').slice(0,10)}</td></tr>`).join('')}
       </tbody></table>`}
 
       <div class="print-note">Generated by Valuatio · all data stored locally in your browser</div>

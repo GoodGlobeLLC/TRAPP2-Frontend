@@ -6749,6 +6749,10 @@
     <span class="tab-num">06</span>
     <span class="tab-label">Bonds &amp; Treasuries</span>
   </button>
+  <button class="tab-btn" data-tab="fed" title="Federal Reserve · rate-cut/hike pricing · FOMC schedule · decision history + market effectiveness">
+    <span class="tab-num">06b</span>
+    <span class="tab-label">Fed</span>
+  </button>
   <button class="tab-btn" data-tab="scenarios">
     <span class="tab-num">07</span>
     <span class="tab-label">Scenarios</span>
@@ -7693,6 +7697,27 @@
   </section>
 
 </div><!-- /bonds panel -->
+
+<!-- ===== FED PANEL =====
+     Federal Reserve rate-cut/hike pricing. Blends CME-FedWatch market-implied
+     odds with the user's own per-meeting predictions, feeds the resulting
+     rate path into the engine (regime/probability/bonds/scenarios). Shows the
+     latest decision, next meeting, full decision history, and a market-effect
+     measure per decision. -->
+<div class="tab-panel" data-panel="fed">
+  <div class="news-header">
+    <div>
+      <h1 style="font-family:var(--serif);font-size:34px;margin:0">Federal Reserve</h1>
+      <div style="color:var(--ink-dim);font-family:var(--mono);font-size:11px;letter-spacing:0.05em;margin-top:4px">
+        Rate-cut / hike pricing · market odds blended with your predictions · fed into the engine
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button class="btn btn-ghost" id="fed-refresh-btn" title="Re-read seeded data">Reset to Public Data</button>
+    </div>
+  </div>
+  <div id="fed-body" style="padding:0 32px 60px"></div>
+</div><!-- /fed panel -->
 
 <!-- ===== SCENARIOS PANEL =====
      Shock-and-transmission engine. The user enters one or more macro/commodity
