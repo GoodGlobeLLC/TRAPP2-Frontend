@@ -295,6 +295,86 @@ const EXCHANGE_SUFFIX_CURRENCY = {
   ME: 'RUB', JK: 'IDR', BK: 'THB', KL: 'MYR', JO: 'ZAR', TA: 'ILS',
 };
 
+// Exchange suffix → country (ISO-ish name + flag) for display + filtering.
+const EXCHANGE_SUFFIX_COUNTRY = {
+  KS: { country: 'South Korea', flag: '🇰🇷', code: 'KR' }, KQ: { country: 'South Korea', flag: '🇰🇷', code: 'KR' },
+  T:  { country: 'Japan', flag: '🇯🇵', code: 'JP' },
+  HK: { country: 'Hong Kong', flag: '🇭🇰', code: 'HK' },
+  SS: { country: 'China', flag: '🇨🇳', code: 'CN' }, SZ: { country: 'China', flag: '🇨🇳', code: 'CN' },
+  TW: { country: 'Taiwan', flag: '🇹🇼', code: 'TW' }, TWO: { country: 'Taiwan', flag: '🇹🇼', code: 'TW' },
+  L:  { country: 'United Kingdom', flag: '🇬🇧', code: 'GB' },
+  PA: { country: 'France', flag: '🇫🇷', code: 'FR' },
+  DE: { country: 'Germany', flag: '🇩🇪', code: 'DE' },
+  MI: { country: 'Italy', flag: '🇮🇹', code: 'IT' },
+  MC: { country: 'Spain', flag: '🇪🇸', code: 'ES' },
+  AS: { country: 'Netherlands', flag: '🇳🇱', code: 'NL' },
+  BR: { country: 'Belgium', flag: '🇧🇪', code: 'BE' },
+  VI: { country: 'Austria', flag: '🇦🇹', code: 'AT' },
+  ST: { country: 'Sweden', flag: '🇸🇪', code: 'SE' },
+  HE: { country: 'Finland', flag: '🇫🇮', code: 'FI' },
+  CO: { country: 'Denmark', flag: '🇩🇰', code: 'DK' },
+  OL: { country: 'Norway', flag: '🇳🇴', code: 'NO' },
+  TO: { country: 'Canada', flag: '🇨🇦', code: 'CA' }, V: { country: 'Canada', flag: '🇨🇦', code: 'CA' },
+  AX: { country: 'Australia', flag: '🇦🇺', code: 'AU' },
+  NS: { country: 'India', flag: '🇮🇳', code: 'IN' }, BO: { country: 'India', flag: '🇮🇳', code: 'IN' },
+  SI: { country: 'Singapore', flag: '🇸🇬', code: 'SG' },
+  SR: { country: 'Saudi Arabia', flag: '🇸🇦', code: 'SA' },
+  SA: { country: 'Brazil', flag: '🇧🇷', code: 'BR' },
+  ME: { country: 'Russia', flag: '🇷🇺', code: 'RU' },
+  JK: { country: 'Indonesia', flag: '🇮🇩', code: 'ID' },
+  BK: { country: 'Thailand', flag: '🇹🇭', code: 'TH' },
+  KL: { country: 'Malaysia', flag: '🇲🇾', code: 'MY' },
+  JO: { country: 'South Africa', flag: '🇿🇦', code: 'ZA' },
+  TA: { country: 'Israel', flag: '🇮🇱', code: 'IL' },
+};
+
+// Return {country, flag, code} for a ticker. US/plain tickers → United States.
+function tickerCountry(ticker) {
+  const m = String(ticker || '').toUpperCase().match(/\.([A-Z]{1,3})$/);
+  if (m && EXCHANGE_SUFFIX_COUNTRY[m[1]]) return EXCHANGE_SUFFIX_COUNTRY[m[1]];
+  // FX pairs / indices aren't a single country
+  if (/=X$|^\^|=F$|-USD$/.test(String(ticker || '').toUpperCase())) return { country: '—', flag: '', code: '' };
+  return { country: 'United States', flag: '🇺🇸', code: 'US' };
+}
+
+// True if the ticker is a US/NYSE/Nasdaq listing (no foreign exchange suffix).
+function isUSListing(ticker) {
+  return tickerCountry(ticker).code === 'US';
+}
+
+// Currency-code → country/flag for FX pair display.
+const CURRENCY_COUNTRY = {
+  USD: { c: 'United States', f: '🇺🇸' }, EUR: { c: 'Eurozone', f: '🇪🇺' },
+  JPY: { c: 'Japan', f: '🇯🇵' }, GBP: { c: 'United Kingdom', f: '🇬🇧' },
+  CHF: { c: 'Switzerland', f: '🇨🇭' }, CAD: { c: 'Canada', f: '🇨🇦' },
+  AUD: { c: 'Australia', f: '🇦🇺' }, NZD: { c: 'New Zealand', f: '🇳🇿' },
+  CNY: { c: 'China', f: '🇨🇳' }, HKD: { c: 'Hong Kong', f: '🇭🇰' },
+  KRW: { c: 'South Korea', f: '🇰🇷' }, INR: { c: 'India', f: '🇮🇳' },
+  SGD: { c: 'Singapore', f: '🇸🇬' }, TWD: { c: 'Taiwan', f: '🇹🇼' },
+  MXN: { c: 'Mexico', f: '🇲🇽' }, BRL: { c: 'Brazil', f: '🇧🇷' },
+  SEK: { c: 'Sweden', f: '🇸🇪' }, NOK: { c: 'Norway', f: '🇳🇴' },
+  DKK: { c: 'Denmark', f: '🇩🇰' }, ZAR: { c: 'South Africa', f: '🇿🇦' },
+  RUB: { c: 'Russia', f: '🇷🇺' }, TRY: { c: 'Turkey', f: '🇹🇷' },
+  THB: { c: 'Thailand', f: '🇹🇭' }, IDR: { c: 'Indonesia', f: '🇮🇩' },
+  MYR: { c: 'Malaysia', f: '🇲🇾' }, SAR: { c: 'Saudi Arabia', f: '🇸🇦' },
+  ILS: { c: 'Israel', f: '🇮🇱' }, PLN: { c: 'Poland', f: '🇵🇱' },
+};
+
+// For an FX-pair ticker (EURUSD=X, JPY=X, GBPUSD=X), return "Base → Quote"
+// with both countries. Yahoo's bare form (JPY=X) implies USD as the base.
+function fxPairCountries(ticker) {
+  const t = String(ticker || '').toUpperCase().replace('=X', '');
+  let base, quote;
+  if (t.length === 6) { base = t.slice(0, 3); quote = t.slice(3, 6); }
+  else if (t.length === 3) { base = 'USD'; quote = t; }  // Yahoo shorthand: USD/<ccy>
+  else return '—';
+  const b = CURRENCY_COUNTRY[base], q = CURRENCY_COUNTRY[quote];
+  if (!b && !q) return '—';
+  const bStr = b ? `${b.f} ${base}` : base;
+  const qStr = q ? `${q.f} ${quote}` : quote;
+  return `${bStr} → ${qStr}`;
+}
+
 // Get the exchange suffix currency for a ticker, or null if it's a US/plain ticker.
 function _tickerLocalCurrency(ticker) {
   const m = String(ticker || '').toUpperCase().match(/\.([A-Z]{1,3})$/);
@@ -348,9 +428,45 @@ function normalizeRowToUSD(row) {
   return { price, marketCap, converted: true, currency, rate };
 }
 
-// from the row's existing sector field if set; otherwise infers from the
-// ticker pattern. Used by the Stock Book to show meaningful categories for
-// futures/FX/crypto/indices/private/options/mutual funds.
+// On-demand: ensure a row is USD-normalized, RETRYING the FX lookup if a
+// previous attempt failed because the currency pair wasn't loaded yet. This
+// is the fix for foreign tickers (SK hynix etc.) still showing raw local
+// currency: enrichment may have run before the FX pairs were in the stockbook.
+// Any code that reads price/marketCap for display should call this first.
+// Returns the row (mutated in place when conversion now succeeds).
+function ensureRowNormalized(row) {
+  if (!row || !row.ticker) return row;
+  if (row._usdNormalized) return row;  // already done
+  const localCcy = (row.currency && row.currency !== 'USD') ? row.currency : _tickerLocalCurrency(row.ticker);
+  if (!localCcy || localCcy === 'USD') return row;  // US/plain — nothing to do
+  const norm = normalizeRowToUSD(row);
+  if (norm.converted) {
+    row._localPrice = row.price;
+    row._localMarketCap = row.marketCap;
+    row._localCurrency = norm.currency;
+    row._fxRate = norm.rate;
+    row.price = norm.price;
+    row.marketCap = norm.marketCap;
+    row._usdNormalized = true;
+    row._currencyUnconverted = false;
+  } else {
+    row._currencyUnconverted = true;
+    row._localCurrency = norm.currency || localCcy;
+  }
+  return row;
+}
+
+// USD market cap for a row, normalizing on demand. Returns
+// { value, converted, currency, discrepancy } — discrepancy=true means we
+// could NOT convert (no FX rate), so the raw local-currency figure is shown
+// and should be visually flagged rather than trusted.
+function rowMarketCapUSD(row) {
+  if (!row) return { value: null, converted: false, discrepancy: false };
+  ensureRowNormalized(row);
+  if (row._usdNormalized) return { value: row.marketCap, converted: true, currency: 'USD', discrepancy: false };
+  if (row._currencyUnconverted) return { value: row.marketCap, converted: false, currency: row._localCurrency, discrepancy: true };
+  return { value: row.marketCap, converted: false, currency: 'USD', discrepancy: false };  // already USD
+}
 // ============================================================
 //   OCC OPTION TICKER BUILDER + PARSER
 //
@@ -8478,6 +8594,7 @@ function renderStockBook() {
     { id: 'sector',      label: 'Sector',        defaultVisible: true,  applicableTo: ['equities', 'crypto', 'futures', 'metals', 'currencies', 'indices', 'commodities', 'options', 'universe'], sortable: true },
     { id: 'subSector',   label: 'Sub-Sector',    defaultVisible: true,  applicableTo: 'all', sortable: true },
     { id: 'industry',    label: 'Industry',      defaultVisible: true,  applicableTo: ['equities', 'crypto', 'futures', 'metals', 'currencies', 'indices', 'commodities', 'options', 'universe'], sortable: true },
+    { id: 'country',     label: 'Country',       defaultVisible: true,  applicableTo: ['equities', 'derivatives', 'crypto', 'currencies', 'indices', 'options', 'universe'], sortable: true },
     { id: 'coreSegments',label: 'Core Segments', defaultVisible: true,  applicableTo: ['derivatives'] },
     { id: 'description', label: 'Description',   defaultVisible: true,  applicableTo: 'all' },
     { id: 'status',      label: 'Status',        defaultVisible: true,  applicableTo: 'all', sortable: true },
@@ -8573,6 +8690,7 @@ function renderStockBook() {
             ${sb.section === 'derivatives'
               ? `${thIf('function', 'Function')}${thIf('subSector', 'Sub-Sector')}${thIf('coreSegments', 'Core Segments')}`
               : `${thIf('sector', 'Sector')}${thIf('subSector', 'Sub-Sector')}${thIf('industry', 'Industry')}`}
+            ${thIf('country', 'Country')}
             ${thIf('description', 'Description')}
             ${thIf('status', 'Status')}
             ${thIf('price', 'Price')}
@@ -8596,15 +8714,33 @@ function renderStockBook() {
               : `${tdIf('sector', `<td class="sb-sector">${r.sector || '—'}</td>`)}
                  ${tdIf('subSector', `<td class="sb-sector">${r.subSector || '—'}</td>`)}
                  ${tdIf('industry', `<td class="sb-sector">${r.industry || '—'}</td>`)}`;
+            // Country cell. For currencies, show BOTH countries of the FX pair.
+            const ctry = (typeof tickerCountry === 'function') ? tickerCountry(r.ticker) : { country: '—', flag: '' };
+            let countryCellContent;
+            if (sb.section === 'currencies') {
+              countryCellContent = (typeof fxPairCountries === 'function') ? fxPairCountries(r.ticker) : (ctry.country || '—');
+            } else {
+              countryCellContent = ctry.country !== '—' ? `${ctry.flag} ${ctry.country}` : '—';
+            }
+            const countryCell = tdIf('country', `<td class="sb-sector" style="white-space:nowrap">${countryCellContent}</td>`);
+            // Normalize foreign price/marketcap to USD on demand
+            if (typeof ensureRowNormalized === 'function') ensureRowNormalized(r);
+            const priceCell = r._currencyUnconverted
+              ? `<td title="No FX rate loaded for ${r._localCurrency} — showing local currency. Add ${r._localCurrency}=X to convert."><span style="color:#e0b04c">⚠ ${r.price != null ? fmt$H(r.price) : '—'}</span></td>`
+              : `<td>${r.price != null ? fmt$H(r.price) : '—'}</td>`;
+            const mcapCell = r._currencyUnconverted
+              ? `<td title="Unconverted ${r._localCurrency} market cap"><span style="color:#e0b04c">⚠ ${r.marketCap != null ? fmt$H(r.marketCap) : '—'}</span></td>`
+              : `<td>${r.marketCap != null ? fmt$H(r.marketCap) : '—'}</td>`;
             return `
             <tr data-tic="${r.ticker}" ${r.isDerivative ? 'data-derivative="1"' : ''}>
               ${tdIf('ticker', `<td class="sb-tic">${r.ticker}${r.isDerivative ? ' <span class="sb-deriv-marker">⚡</span>' : ''}</td>`)}
               ${tdIf('name', `<td class="sb-name">${r.name || '—'}</td>`)}
               ${taxonomyCells}
+              ${countryCell}
               ${tdIf('description', `<td class="sb-desc" data-full="${r.description ? escapeHtml(r.description) : ''}">${r.description ? escapeHtml(r.description) : '<span style="color:var(--ink-faint)">—</span>'}</td>`)}
               ${tdIf('status', `<td>${r.status ? `<span class="sb-status sb-status-${statusClass}">${escapeHtml(r.status)}</span>` : '—'}</td>`)}
-              ${tdIf('price', `<td>${r.price != null ? fmt$H(r.price) : '—'}</td>`)}
-              ${tdIf('marketCap', `<td>${r.marketCap != null ? fmt$H(r.marketCap) : '—'}</td>`)}
+              ${tdIf('price', priceCell)}
+              ${tdIf('marketCap', mcapCell)}
               ${hidePE ? '' : tdIf('pe', `<td>${r.pe != null ? r.pe.toFixed(2) : '—'}</td>`)}
               ${hideBeta ? '' : tdIf('beta', `<td>${r.beta != null ? r.beta.toFixed(2) : '—'}</td>`)}
               ${tdIf('source', `<td><span class="sb-source-tag ${r.source.includes('sheet') ? 'sheet' : r.source.includes('av') ? 'av' : 'manual'}">${r.source}</span></td>`)}
@@ -15981,8 +16117,9 @@ async function fnHEAT(arg) {
   }
 
   // State for filters — persisted on state.heat so re-renders keep the
-  // user's selection. Default: All Sectors, 1D timeframe.
-  state.heat = state.heat || { sectorFilter: 'ALL', timeframe: '1D', zoomedTicker: null };
+  // user's selection. Default: All Sectors, 1D timeframe, US-only region.
+  state.heat = state.heat || { sectorFilter: 'ALL', timeframe: '1D', zoomedTicker: null, region: 'US' };
+  if (!state.heat.region) state.heat.region = 'US';
 
   // Apply optional CLI arg like `HEAT XLK` to filter by ETF sector
   if (arg && typeof arg === 'string') {
@@ -15995,19 +16132,39 @@ async function fnHEAT(arg) {
   // Build the universe — equities only, must have market cap. Threshold is
   // intentionally low ($300M = small cap) since the user wants the WHOLE
   // stock book in one view with zoom. Treemap layout handles density.
+  //
+  // REGION FILTER: default US-only (NYSE/Nasdaq listings). Foreign tickers are
+  // included only when region === 'ALL'. This prevents mis-converted foreign
+  // market caps from dominating, and matches the user's "USA unless filtered to
+  // ALL" request. Every foreign row is USD-normalized on demand first.
   const MIN_MCAP = 3e8;
   const universe = rows
-    .filter(r => !r.isDerivative && r.marketCap != null && r.marketCap >= MIN_MCAP)
-    .map(r => ({
-      ticker: r.ticker,
-      name: r.name || r.ticker,
-      sector: r.sector || 'Unclassified',
-      industry: r.industry || '',
-      marketCap: r.marketCap,
-      price: r.price,
-      pctChange: pctChangeForRow(r),
-      etf: r.sector ? sectorNameToETF(r.sector) : null,
-    }));
+    .filter(r => {
+      if (r.isDerivative) return false;
+      // Region gate
+      if (state.heat.region === 'US' && !isUSListing(r.ticker)) return false;
+      // Normalize foreign market cap to USD on demand
+      const mc = rowMarketCapUSD(r);
+      return mc.value != null && mc.value >= MIN_MCAP;
+    })
+    .map(r => {
+      const mc = rowMarketCapUSD(r);
+      const ctry = tickerCountry(r.ticker);
+      return {
+        ticker: r.ticker,
+        name: r.name || r.ticker,
+        sector: r.sector || 'Unclassified',
+        industry: r.industry || '',
+        marketCap: mc.value,
+        marketCapDiscrepancy: mc.discrepancy,   // true = couldn't convert to USD
+        marketCapCurrency: mc.currency,
+        country: ctry.country,
+        countryFlag: ctry.flag,
+        price: r.price,
+        pctChange: pctChangeForRow(r),
+        etf: r.sector ? sectorNameToETF(r.sector) : null,
+      };
+    });
 
   if (universe.length === 0) {
     setFnOverlayBody(`
@@ -16238,7 +16395,12 @@ async function fnHEAT(arg) {
     const pctText = t.pctChange != null ? (t.pctChange >= 0 ? '+' : '') + (t.pctChange * 100).toFixed(2) + '%' : '—';
     const pctColor = t.pctChange > 0 ? '#9ee89e' : t.pctChange < 0 ? '#ff9b9b' : '#bbb';
     const priceText = t.price != null ? fmt$(t.price) : '';
-    const mcapText  = fmtMcap(t.marketCap);
+    // If the foreign market cap couldn't be converted to USD, flag it instead
+    // of silently showing a wrong number (SK hynix "1624T" problem).
+    const mcapText  = t.marketCapDiscrepancy
+      ? `⚠ ${fmtMcap(t.marketCap)} ${t.marketCapCurrency || 'local'}`
+      : fmtMcap(t.marketCap);
+    const mcapColor = t.marketCapDiscrepancy ? '#e0b04c' : '#aaa';
 
     // Vertical stacking: ticker | price | pct | mcap | name
     let cy = y + h / 2;
@@ -16246,11 +16408,13 @@ async function fnHEAT(arg) {
     if (showTicker) labels.push({ text: t.ticker, size: tickerSize, color: '#fff', weight: 700 });
     if (showPrice && priceText) labels.push({ text: priceText, size: priceSize, color: '#ddd', weight: 500 });
     if (showPct) labels.push({ text: pctText, size: pctSize, color: pctColor, weight: 700 });
-    if (showMcap && mcapText) labels.push({ text: mcapText, size: mcapSize, color: '#aaa', weight: 400 });
+    if (showMcap && mcapText) labels.push({ text: mcapText, size: mcapSize, color: mcapColor, weight: 400 });
     if (showName && t.name && t.name !== t.ticker) {
-      // Truncate long names to fit
+      // Truncate long names to fit. Prefix foreign tickers with their flag.
+      const flagPrefix = (t.countryFlag && t.country !== 'United States') ? t.countryFlag + ' ' : '';
+      const fullName = flagPrefix + t.name;
       const maxChars = Math.floor(w / (nameSize * 0.55));
-      const truncated = t.name.length > maxChars ? t.name.slice(0, maxChars - 1) + '…' : t.name;
+      const truncated = fullName.length > maxChars ? fullName.slice(0, maxChars - 1) + '…' : fullName;
       labels.push({ text: truncated, size: nameSize, color: '#888', weight: 400 });
     }
 
@@ -16294,7 +16458,16 @@ async function fnHEAT(arg) {
   }).join('');
 
   // ====== Filter UI + summary header ======
+  const regionToggle = `
+    <div style="display:inline-flex;border:1px solid var(--rule);border-radius:3px;overflow:hidden;margin-right:8px">
+      <button class="heat-region-btn ${state.heat.region === 'US' ? 'active' : ''}" data-region="US"
+        style="background:${state.heat.region === 'US' ? 'var(--amber-dark)' : 'transparent'};color:${state.heat.region === 'US' ? '#fff' : 'var(--ink-dim)'};border:none;padding:6px 12px;font-family:var(--mono);font-size:10px;cursor:pointer;letter-spacing:0.05em">🇺🇸 US ONLY</button>
+      <button class="heat-region-btn ${state.heat.region === 'ALL' ? 'active' : ''}" data-region="ALL"
+        style="background:${state.heat.region === 'ALL' ? 'var(--amber-dark)' : 'transparent'};color:${state.heat.region === 'ALL' ? '#fff' : 'var(--ink-dim)'};border:none;padding:6px 12px;font-family:var(--mono);font-size:10px;cursor:pointer;letter-spacing:0.05em">🌐 ALL (Intl+US)</button>
+    </div>
+  `;
   const filterDropdown = `
+    ${regionToggle}
     <select id="heat-sector-filter" class="heat-filter-select">
       ${dropdownOrder.map(k => {
         const label = k === 'ALL' ? 'All Sectors' : (sectorLabels[k] || k);
@@ -16376,6 +16549,15 @@ async function fnHEAT(arg) {
       fnHEAT();  // re-render with new filter
     });
   }
+
+  // Region toggle (US-only vs ALL international+US)
+  document.querySelectorAll('.heat-region-btn').forEach(el => {
+    el.addEventListener('click', () => {
+      state.heat.region = el.dataset.region;
+      state.heat.zoomedTicker = null;
+      fnHEAT();
+    });
+  });
 
   // Ribbon cells — clicking switches filter
   document.querySelectorAll('.heat-ribbon-cell').forEach(el => {
