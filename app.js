@@ -394,26 +394,36 @@ const NEAR_PARITY_CCY = new Set(['EUR', 'GBP', 'CHF', 'CAD', 'AUD', 'NZD', 'SGD'
 function _fxRateToUSD(currency) {
   if (!currency || currency === 'USD') return 1;
   const getRow = (t) => (typeof getStockbookRow === 'function') ? getStockbookRow(t) : null;
+  // Read the FX pair's price. The sheet's price column is WRONG for bare-form
+  // pairs (KRW=X shows 1.00) but the price-HISTORY close is correct (e.g.
+  // 1502.38). So prefer history, fall back to the row price, and reject the
+  // 1.00 placeholder for non-parity currencies.
   const priceOf = (t) => {
-    const r = getRow(t);
-    let p = r?.price;
-    // The bare-form pairs (KRW=X, JPY=X) in the user's sheet are reading a
-    // placeholder $1.00 instead of the real rate (the full-form USDKRW=X /
-    // USDJPY=X pairs have the correct value). So if a row reads exactly 1.00
-    // for a non-USD-pegged currency, treat it as missing, not a real rate.
-    if (typeof p === 'number' && isFinite(p) && p > 0) {
-      // Reject the placeholder 1.00 for currencies that are never ~1:1 with USD.
-      if (Math.abs(p - 1) < 1e-6 && !NEAR_PARITY_CCY.has(currency)) return null;
-      return p;
+    // 1. Price-history close (correct source — what the valuation screen reads)
+    let p = null;
+    try {
+      const hist = (typeof getHistoryForTicker === 'function') ? getHistoryForTicker(t) : null;
+      if (hist && hist.length) {
+        const lastClose = hist[hist.length - 1].price;
+        if (typeof lastClose === 'number' && isFinite(lastClose) && lastClose > 0) p = lastClose;
+      }
+    } catch {}
+    // 2. Fall back to the row's sheet price
+    if (p == null) {
+      const r = getRow(t);
+      const rp = r?.price;
+      if (typeof rp === 'number' && isFinite(rp) && rp > 0) p = rp;
     }
-    return null;
+    if (p == null) return null;
+    // Reject the placeholder 1.00 for currencies never ~1:1 with USD
+    if (Math.abs(p - 1) < 1e-6 && !NEAR_PARITY_CCY.has(currency)) return null;
+    return p;
   };
 
-  // ORDER MATTERS. Prefer the FULL-FORM pairs because the bare-form ones
-  // (KRW=X etc.) are mis-reading as $1.00 in the current data feed.
+  // ORDER MATTERS. Prefer full-form pairs (the bare-form sheet prices are bad):
   //   1. USD{ccy}=X  → units of ccy per 1 USD  → USD-per-ccy = 1 / price
   //   2. {ccy}USD=X  → USD per 1 unit of ccy   → USD-per-ccy = price (direct)
-  //   3. {ccy}=X     → Yahoo shorthand for USD/{ccy} → invert (last resort)
+  //   3. {ccy}=X     → Yahoo shorthand USD/{ccy} → invert (now history-backed)
   const fullInverse = priceOf(`USD${currency}=X`);
   if (fullInverse != null && fullInverse > 0) return 1 / fullInverse;
 
@@ -4118,11 +4128,22 @@ function renderSummary(s) {
   document.getElementById('s-tic').textContent = s.ticker;
   const priceEl = document.getElementById('s-price');
   const mcapEl = document.getElementById('s-mcap');
-  priceEl.textContent = fmt$(s.price);
+  // For FX pairs, the "price" is an exchange rate, not a USD share price.
+  // Label it correctly so KRW=X reads "1,502.68 KRW/USD" not "$1,502.68".
+  const _pInstClass = (typeof classifyAsset === 'function') ? classifyAsset(s.ticker) : 'equity';
+  if (_pInstClass === 'fx' && s.price != null) {
+    const t = String(s.ticker).toUpperCase().replace('=X', '');
+    let base, quote;
+    if (t.length === 6) { base = t.slice(0, 3); quote = t.slice(3); }
+    else { base = 'USD'; quote = t; }   // bare form = USD/<ccy>
+    priceEl.textContent = `${s.price.toLocaleString(undefined, { maximumFractionDigits: 4 })} ${quote}/${base}`;
+    priceEl.title = `1 ${base} = ${s.price.toLocaleString(undefined, { maximumFractionDigits: 4 })} ${quote}`;
+  } else {
+    priceEl.textContent = fmt$(s.price);
+    if (s.price != null && Math.abs(s.price) >= 1e6) priceEl.title = exactValue(s.price, true);
+    else priceEl.removeAttribute('title');
+  }
   mcapEl.textContent = fmt$(s.marketCap);
-  // Hover-exact title for compact-notation values (≥ $1M)
-  if (s.price != null && Math.abs(s.price) >= 1e6) priceEl.title = exactValue(s.price, true);
-  else priceEl.removeAttribute('title');
   if (s.marketCap != null) mcapEl.title = exactValue(s.marketCap, true);
   else mcapEl.removeAttribute('title');
 
@@ -4295,7 +4316,26 @@ function renderSummary(s) {
     if (parts.length) sectorDisplay = parts.join(' · ');
   }
   document.getElementById('s-sector').textContent = sectorDisplay;
-  document.getElementById('s-description').textContent = s.description || '';
+  // FX pairs, indices, and futures don't have a company description — and the
+  // sheet sometimes mis-assigns a random company blurb to them (e.g. a "US
+  // Airways" description on KRW=X). Suppress it for these instrument types and
+  // show a meaningful one-liner instead.
+  const _instClass = (typeof classifyAsset === 'function') ? classifyAsset(s.ticker) : 'equity';
+  const _descEl = document.getElementById('s-description');
+  if (['fx', 'index', 'future'].includes(_instClass)) {
+    if (_instClass === 'fx') {
+      const pair = (typeof fxPairCountries === 'function') ? fxPairCountries(s.ticker) : '';
+      _descEl.textContent = pair && pair !== '—'
+        ? `Foreign exchange rate: ${pair}. Price is the exchange rate (units of quote currency per unit of base), not a USD share price.`
+        : 'Foreign exchange rate. Price shown is the exchange rate, not a USD share price.';
+    } else if (_instClass === 'index') {
+      _descEl.textContent = 'Market index. Value shown is the index level, not a share price.';
+    } else {
+      _descEl.textContent = s.description && !/airline|airways|founded|incorporated|headquarter/i.test(s.description) ? s.description : 'Futures contract.';
+    }
+  } else {
+    _descEl.textContent = s.description || '';
+  }
 
   // ── REGIME CONTEXT for this ticker ──
   // Show how the current market regime relates to this stock's sector.
