@@ -26,6 +26,13 @@
     --amber-dark: color-mix(in srgb, var(--amber) 78%, #000);
     --green: #6cc28a;
     --red: #d97a6c;
+    /* Data-viz semantic colors — muted shades used across charts, tables,
+       P/L figures, and tiers. Kept distinct from the brighter --green/--red
+       so dense data displays stay calm. Theme-aware (see light mode below)
+       so they remain legible on the cream background. */
+    --pos: #5b8a72;          /* positive / up / gain */
+    --neg: #a5645a;          /* negative / down / loss */
+    --data-amber: #c4965a;   /* data highlight (distinct from brand --amber) */
     --serif: 'Fraunces', Georgia, serif;
     --mono: 'JetBrains Mono', ui-monospace, monospace;
     --sans: 'Inter', system-ui, sans-serif;
@@ -48,6 +55,10 @@
     --amber-dark: color-mix(in srgb, var(--amber) 78%, #000);
     --green: #2d6e44;
     --red: #a8392b;
+    /* Data-viz semantics — darkened for AA contrast on the cream background. */
+    --pos: #3d7a5a;
+    --neg: #9a4438;
+    --data-amber: #9c6b28;
   }
 
   /* Smooth theme transitions on body + cards */
@@ -109,10 +120,10 @@
   html[data-theme="light"] .tab-num { color: var(--amber); }
 
   /* Hard-coded greens/reds (price changes) */
-  html[data-theme="light"] [style*="color:#5b8a72"],
-  html[data-theme="light"] [style*="color: #5b8a72"] { color: var(--green) !important; }
-  html[data-theme="light"] [style*="color:#a5645a"],
-  html[data-theme="light"] [style*="color: #a5645a"] { color: var(--red) !important; }
+  html[data-theme="light"] [style*="color:var(--pos)"],
+  html[data-theme="light"] [style*="color: var(--pos)"] { color: var(--green) !important; }
+  html[data-theme="light"] [style*="color:var(--neg)"],
+  html[data-theme="light"] [style*="color: var(--neg)"] { color: var(--red) !important; }
   html[data-theme="light"] [style*="color:#6b9b6f"] { color: var(--green) !important; }
   html[data-theme="light"] [style*="color:#b56856"] { color: var(--red) !important; }
 
@@ -264,7 +275,7 @@
     position: absolute;
     top: -4px;
     right: -4px;
-    background: #a5645a;
+    background: var(--neg);
     color: #fff;
     font-family: var(--mono);
     font-size: 9px;
@@ -706,12 +717,12 @@
   }
   .vpb-card:hover {
     background: var(--bg-card);
-    border-left-color: #5b8a72;
+    border-left-color: var(--pos);
   }
   .vpb-card.passive { border-left-color: #7faaca; }
   .vpb-card.active  { border-left-color: var(--amber); }
-  .vpb-card.profit  { border-left-color: #5b8a72; }
-  .vpb-card.loss    { border-left-color: #a5645a; }
+  .vpb-card.profit  { border-left-color: var(--pos); }
+  .vpb-card.loss    { border-left-color: var(--neg); }
   .vpb-card-head {
     display: flex;
     justify-content: space-between;
@@ -743,8 +754,8 @@
     font-weight: 700;
     margin-top: 2px;
   }
-  .vpb-card-perf.pos { color: #5b8a72; }
-  .vpb-card-perf.neg { color: #a5645a; }
+  .vpb-card-perf.pos { color: var(--pos); }
+  .vpb-card-perf.neg { color: var(--neg); }
   .vpb-actions {
     display: flex;
     align-items: center;
@@ -1518,8 +1529,8 @@
     margin-top: 4px;
     color: var(--ink);
   }
-  .fn-kv-grid .v.up { color: #5b8a72; }
-  .fn-kv-grid .v.down { color: #a5645a; }
+  .fn-kv-grid .v.up { color: var(--pos); }
+  .fn-kv-grid .v.down { color: var(--neg); }
   .fn-table {
     width: 100%;
     border-collapse: collapse;
@@ -1545,8 +1556,8 @@
   }
   .fn-table td:first-child { text-align: left; color: var(--amber); font-weight: 700; }
   .fn-table tr:hover { background: rgba(245, 184, 0, 0.04); }
-  .fn-table td.pos { color: #5b8a72; }
-  .fn-table td.neg { color: #a5645a; }
+  .fn-table td.pos { color: var(--pos); }
+  .fn-table td.neg { color: var(--neg); }
   .fn-bar-cell {
     position: relative;
     height: 16px;
@@ -1883,8 +1894,8 @@
     color: var(--ink);
     font-variant-numeric: tabular-nums;
   }
-  .today-value.up { color: #5b8a72; }
-  .today-value.down { color: #a5645a; }
+  .today-value.up { color: var(--pos); }
+  .today-value.down { color: var(--neg); }
 
   /* TICKER TAPE — sticky at top of page */
   .ticker-tape {
@@ -1932,8 +1943,8 @@
   .ticker-tape-tic { color: var(--amber); font-weight: 700; }
   .ticker-tape-price { color: var(--ink); }
   .ticker-tape-pct { font-size: 10px; font-weight: 600; }
-  .ticker-tape-pct.up { color: #5b8a72; }
-  .ticker-tape-pct.down { color: #a5645a; }
+  .ticker-tape-pct.up { color: var(--pos); }
+  .ticker-tape-pct.down { color: var(--neg); }
   .ticker-tape-pct.flat { color: var(--ink-faint); }
   /* Visual tags so tapes look different — gainer/loser/portfolio */
   .ticker-tape-item.tag-gainer { background: rgba(91,138,114,0.04); }
@@ -2107,8 +2118,8 @@
     color: var(--ink-dim);
   }
   .bonds-table tr:hover td { background: rgba(212,162,76,0.04); }
-  .bonds-table .pos { color: #5b8a72; }
-  .bonds-table .neg { color: #a5645a; }
+  .bonds-table .pos { color: var(--pos); }
+  .bonds-table .neg { color: var(--neg); }
 
   .yc-spread-tile {
     display: inline-block;
@@ -2132,8 +2143,8 @@
     font-weight: 700;
     color: var(--ink);
   }
-  .yc-spread-value.inverted { color: #a5645a; }
-  .yc-spread-value.normal { color: #5b8a72; }
+  .yc-spread-value.inverted { color: var(--neg); }
+  .yc-spread-value.normal { color: var(--pos); }
   .yc-spread-sub {
     font-family: var(--mono);
     font-size: 9px;
@@ -2466,8 +2477,8 @@
     transition: all 0.12s;
   }
   .risk-leg-remove:hover {
-    color: #a5645a;
-    border-color: #a5645a;
+    color: var(--neg);
+    border-color: var(--neg);
   }
 
   /* Metrics grid */
@@ -2499,8 +2510,8 @@
     font-weight: 700;
     font-variant-numeric: tabular-nums;
   }
-  .risk-metric-value.up { color: #5b8a72; }
-  .risk-metric-value.down { color: #a5645a; }
+  .risk-metric-value.up { color: var(--pos); }
+  .risk-metric-value.down { color: var(--neg); }
   .risk-metric-sub {
     font-family: var(--mono);
     font-size: 10px;
@@ -2555,12 +2566,12 @@
     fill: none;
   }
   #holy-grail-svg .curve-portfolio {
-    stroke: #c4965a;
+    stroke: var(--data-amber);
     stroke-width: 2.5;
     fill: none;
   }
   #holy-grail-svg .portfolio-marker {
-    fill: #c4965a;
+    fill: var(--data-amber);
     stroke: #1a1a1a;
     stroke-width: 1;
   }
@@ -2744,9 +2755,9 @@
     gap: 40px;
     align-items: center;
   }
-  .quad-hero.q1 { border-left: 4px solid #5b8a72; }
-  .quad-hero.q2 { border-left: 4px solid #c4965a; }
-  .quad-hero.q3 { border-left: 4px solid #a5645a; }
+  .quad-hero.q1 { border-left: 4px solid var(--pos); }
+  .quad-hero.q2 { border-left: 4px solid var(--data-amber); }
+  .quad-hero.q3 { border-left: 4px solid var(--neg); }
   .quad-hero.q4 { border-left: 4px solid #6b7a8f; }
   .quad-hero-label {
     font-family: var(--mono);
@@ -2801,9 +2812,9 @@
     margin-top: 6px;
     color: var(--ink);
   }
-  .quad-stats .v.up { color: #5b8a72; }
+  .quad-stats .v.up { color: var(--pos); }
   .quad-stats .v.up::before { content: '▲ '; font-size: 12px; }
-  .quad-stats .v.down { color: #a5645a; }
+  .quad-stats .v.down { color: var(--neg); }
   .quad-stats .v.down::before { content: '▼ '; font-size: 12px; }
 
   /* ===== QUAD 2x2 GRID ===== */
@@ -2843,9 +2854,9 @@
     color: var(--ink-faint);
     line-height: 1;
   }
-  .quad-card.q1 .quad-card-num { color: #5b8a72; }
-  .quad-card.q2 .quad-card-num { color: #c4965a; }
-  .quad-card.q3 .quad-card-num { color: #a5645a; }
+  .quad-card.q1 .quad-card-num { color: var(--pos); }
+  .quad-card.q2 .quad-card-num { color: var(--data-amber); }
+  .quad-card.q3 .quad-card-num { color: var(--neg); }
   .quad-card.q4 .quad-card-num { color: #6b7a8f; }
   .quad-card h3 {
     font-family: var(--serif);
@@ -2887,8 +2898,8 @@
     margin: 2px 3px 2px 0;
     border: 1px solid var(--rule);
   }
-  .quad-card .quad-tag.over { color: #8aa890; border-color: #5b8a72; }
-  .quad-card .quad-tag.under { color: #b88578; border-color: #a5645a; }
+  .quad-card .quad-tag.over { color: #8aa890; border-color: var(--pos); }
+  .quad-card .quad-tag.under { color: #b88578; border-color: var(--neg); }
 
   /* ===== QUAD HISTORY CHART ===== */
   .quad-chart-wrap {
@@ -2949,8 +2960,8 @@
   }
   .sector-table td:nth-child(1), .sector-table td:nth-child(2) { text-align: left; }
   .sector-table td:nth-child(1) { color: var(--amber); font-weight: 700; }
-  .sector-table td.pos { color: #5b8a72; }
-  .sector-table td.neg { color: #a5645a; }
+  .sector-table td.pos { color: var(--pos); }
+  .sector-table td.neg { color: var(--neg); }
   .sector-table tbody tr:hover { background: rgba(212, 162, 76, 0.04); }
   .sector-row-good td { background: rgba(91, 138, 114, 0.05); }
   .sector-row-bad td { background: rgba(165, 100, 90, 0.05); }
@@ -2962,8 +2973,8 @@
     padding: 2px 6px;
     border: 1px solid;
   }
-  .sector-stance.over { color: #8aa890; border-color: #5b8a72; }
-  .sector-stance.under { color: #b88578; border-color: #a5645a; }
+  .sector-stance.over { color: #8aa890; border-color: var(--pos); }
+  .sector-stance.under { color: #b88578; border-color: var(--neg); }
   .sector-stance.neutral { color: var(--ink-dim); border-color: var(--ink-faint); }
 
   /* ===== SECTOR PICKER + STOCKS ===== */
@@ -2992,10 +3003,10 @@
     border-color: var(--amber);
     font-weight: 700;
   }
-  .sector-pill.tail { border-color: #5b8a72; color: #8aa890; }
-  .sector-pill.tail.active { background: #5b8a72; border-color: #5b8a72; color: var(--bg); }
-  .sector-pill.head { border-color: #a5645a; color: #b88578; }
-  .sector-pill.head.active { background: #a5645a; border-color: #a5645a; color: var(--bg); }
+  .sector-pill.tail { border-color: var(--pos); color: #8aa890; }
+  .sector-pill.tail.active { background: var(--pos); border-color: var(--pos); color: var(--bg); }
+  .sector-pill.head { border-color: var(--neg); color: #b88578; }
+  .sector-pill.head.active { background: var(--neg); border-color: var(--neg); color: var(--bg); }
 
   .sector-stocks-grid {
     display: grid;
@@ -3063,8 +3074,8 @@
     padding: 8px 10px;
     margin-top: 8px;
   }
-  .tie-in-card .tie-verdict.tail { background: rgba(91, 138, 114, 0.1); color: #8aa890; border-left: 3px solid #5b8a72; }
-  .tie-in-card .tie-verdict.head { background: rgba(165, 100, 90, 0.1); color: #b88578; border-left: 3px solid #a5645a; }
+  .tie-in-card .tie-verdict.tail { background: rgba(91, 138, 114, 0.1); color: #8aa890; border-left: 3px solid var(--pos); }
+  .tie-in-card .tie-verdict.head { background: rgba(165, 100, 90, 0.1); color: #b88578; border-left: 3px solid var(--neg); }
   .tie-in-card .tie-verdict.neutral { background: var(--bg-elev); color: var(--ink-dim); border-left: 3px solid var(--ink-faint); }
 
   .summary-description {
@@ -3107,7 +3118,7 @@
   .s-52w-fill {
     position: absolute;
     top: 0; left: 0; bottom: 0;
-    background: linear-gradient(to right, #a5645a 0%, var(--amber) 50%, #5b8a72 100%);
+    background: linear-gradient(to right, var(--neg) 0%, var(--amber) 50%, var(--pos) 100%);
     opacity: 0.3;
   }
   .s-52w-marker {
@@ -3192,8 +3203,8 @@
     gap: 14px;
     position: relative;
   }
-  .thesis-card.resolved-yes { border-left-color: #5b8a72; }
-  .thesis-card.resolved-no  { border-left-color: #a5645a; }
+  .thesis-card.resolved-yes { border-left-color: var(--pos); }
+  .thesis-card.resolved-no  { border-left-color: var(--neg); }
 
   .thesis-question {
     font-family: var(--serif);
@@ -3239,7 +3250,7 @@
   .thesis-prob-bar-fill {
     position: absolute;
     top: 0; bottom: 0; left: 0;
-    background: linear-gradient(to right, #a5645a 0%, var(--amber) 50%, #5b8a72 100%);
+    background: linear-gradient(to right, var(--neg) 0%, var(--amber) 50%, var(--pos) 100%);
   }
 
   /* Component breakdown */
@@ -3268,8 +3279,8 @@
     font-weight: 700;
     margin-top: 2px;
   }
-  .thesis-component .value.up { color: #5b8a72; }
-  .thesis-component .value.down { color: #a5645a; }
+  .thesis-component .value.up { color: var(--pos); }
+  .thesis-component .value.down { color: var(--neg); }
   .thesis-component .value.muted { color: var(--ink-faint); font-weight: 400; font-size: 11px; }
   .thesis-component .weight {
     margin-top: 6px;
@@ -3323,7 +3334,7 @@
     cursor: pointer;
   }
   .thesis-action-btn:hover { color: var(--amber); border-color: var(--amber); }
-  .thesis-action-btn.danger:hover { color: #a5645a; border-color: #a5645a; }
+  .thesis-action-btn.danger:hover { color: var(--neg); border-color: var(--neg); }
 
   /* ===== PROBABILITY TREND SPARKLINE =====
      Lives inside the .thesis-components grid as a special cell next to
@@ -3545,8 +3556,8 @@
     letter-spacing: 0.18em;
     margin-bottom: 8px;
   }
-  .prob-pick-label.up { color: #5b8a72; }
-  .prob-pick-label.down { color: #a5645a; }
+  .prob-pick-label.up { color: var(--pos); }
+  .prob-pick-label.down { color: var(--neg); }
   .prob-pick-thesis {
     font-family: var(--mono);
     font-size: 12px;
@@ -3748,8 +3759,8 @@
     font-size: 14px;
     margin-top: 4px;
   }
-  .price-chart-stats .v.up { color: #5b8a72; }
-  .price-chart-stats .v.down { color: #a5645a; }
+  .price-chart-stats .v.up { color: var(--pos); }
+  .price-chart-stats .v.down { color: var(--neg); }
 
   /* ===== QUAD CHART TOOLTIP ===== */
   .quad-chart-tooltip {
@@ -4003,8 +4014,8 @@
     line-height: 1;
   }
   .note-delete:hover {
-    color: #a5645a;
-    border-color: #a5645a;
+    color: var(--neg);
+    border-color: var(--neg);
   }
   .note-text {
     font-family: var(--serif);
@@ -4155,7 +4166,7 @@
     text-transform: uppercase;
     letter-spacing: 0.1em;
   }
-  .sb-source-tag.sheet { color: #8aa890; border-color: #5b8a72; }
+  .sb-source-tag.sheet { color: #8aa890; border-color: var(--pos); }
   .sb-source-tag.av { color: var(--amber); border-color: var(--amber); }
   .sb-source-tag.manual { color: var(--ink-dim); border-color: var(--ink-faint); }
   .sb-source-tag.valuation { color: var(--amber-bright); border-color: var(--amber); }
@@ -4169,9 +4180,9 @@
     letter-spacing: 0.1em;
     font-weight: 700;
   }
-  .sb-status-trading { background: #5b8a72; color: var(--bg); }
+  .sb-status-trading { background: var(--pos); color: var(--bg); }
   .sb-status-track { background: #6b7a8f; color: var(--bg); }
-  .sb-status-watch { background: #c4965a; color: var(--bg); }
+  .sb-status-watch { background: var(--data-amber); color: var(--bg); }
   .sb-status-hold { background: var(--rule); color: var(--ink-dim); }
 
   /* Function badges (Leveraged ETF, Crypto, etc.) */
@@ -4188,8 +4199,8 @@
   .sb-fn-leveraged_etf { color: #ff9858; border-color: #c46f3f; background: rgba(196,111,63,0.1); }
   .sb-fn-inverse_etf   { color: #ff7777; border-color: #b85555; background: rgba(184,85,85,0.1); }
   .sb-fn-macro_etf     { color: #5fa9d9; border-color: #4881a8; background: rgba(72,129,168,0.1); }
-  .sb-fn-micro_etf     { color: #7bc497; border-color: #5b8a72; background: rgba(91,138,114,0.1); }
-  .sb-fn-crypto        { color: #d4a24c; border-color: #c4965a; background: rgba(196,150,90,0.1); }
+  .sb-fn-micro_etf     { color: #7bc497; border-color: var(--pos); background: rgba(91,138,114,0.1); }
+  .sb-fn-crypto        { color: #d4a24c; border-color: var(--data-amber); background: rgba(196,150,90,0.1); }
   .sb-fn-option        { color: #c98ad4; border-color: #9c66a6; background: rgba(156,102,166,0.1); }
   .sb-fn-future        { color: #c98ad4; border-color: #9c66a6; background: rgba(156,102,166,0.1); }
   .sb-fn-etf           { color: #d4a24c; border-color: var(--amber); background: rgba(212,162,76,0.08); }
@@ -4245,6 +4256,31 @@
     padding: 0 6px;
   }
   .modal-close:hover { color: var(--amber); }
+  /* ===== EDITOR ===== */
+  .editor-section { padding: 4px 28px 12px; }
+  .editor-section h4 {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--amber); margin: 12px 0 8px;
+  }
+  .editor-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+  .editor-field {
+    background: var(--bg-elev); border: 1px solid var(--rule);
+    border-radius: 4px; padding: 8px 10px;
+  }
+  .editor-field-active { border-color: var(--amber); }
+  .editor-field-label {
+    font-family: var(--mono); font-size: 10px; color: var(--ink); font-weight: 600;
+    display: flex; justify-content: space-between; align-items: center; gap: 6px;
+  }
+  .editor-active-badge { color: var(--amber); font-size: 8px; font-weight: 700; white-space: nowrap; }
+  .editor-field-pulled { font-family: var(--mono); font-size: 9px; color: var(--ink-faint); margin: 3px 0 5px; }
+  .editor-input {
+    width: 100%; background: var(--bg-card); border: 1px solid var(--rule);
+    color: var(--ink); font-family: var(--mono); font-size: 11px;
+    padding: 5px 7px; border-radius: 3px; box-sizing: border-box;
+  }
+  .editor-input:focus { outline: none; border-color: var(--amber); }
+  textarea.editor-input { resize: vertical; }
   .modal-section {
     padding: 20px 28px;
     border-bottom: 1px solid var(--rule);
@@ -4406,8 +4442,8 @@
     color: var(--ink-faint);
   }
   .ta-tool-secondary:hover {
-    border-color: #a5645a;
-    color: #a5645a;
+    border-color: var(--neg);
+    color: var(--neg);
   }
   .ta-chart-section {
     background: var(--bg-card);
@@ -4820,7 +4856,7 @@
     width: 4px;
     border-radius: 0 2px 2px 0;
   }
-  .news-item-priority.critical { background: #d97a6c; }   /* mega-cap = red bar */
+  .news-item-priority.critical { background: var(--red); }   /* mega-cap = red bar */
   .news-item-priority.high     { background: #e0b04c; }   /* large-cap = amber */
   .news-item-priority.medium   { background: #7faaca; }   /* mid-cap = blue */
   .news-item-priority.low      { background: var(--ink-faint); }
@@ -4942,7 +4978,7 @@
     top: 0;
     z-index: 110;
     background: linear-gradient(90deg, #2a1410 0%, #1a0a08 100%);
-    border-bottom: 2px solid #d97a6c;
+    border-bottom: 2px solid var(--red);
     display: flex;
     align-items: center;
     gap: 16px;
@@ -4957,9 +4993,9 @@
     font-size: 10px;
     font-weight: 700;
     letter-spacing: 0.24em;
-    color: #d97a6c;
+    color: var(--red);
     padding: 4px 10px;
-    border: 1px solid #d97a6c;
+    border: 1px solid var(--red);
     border-radius: 2px;
     flex-shrink: 0;
     animation: breaking-pulse 1.8s ease-in-out infinite;
@@ -5101,8 +5137,8 @@
   .refresh-task-status { width: 14px; flex-shrink: 0; }
   .refresh-task-status.pending { color: var(--ink-faint); }
   .refresh-task-status.running { color: var(--amber); animation: refresh-pulse 1.4s ease-in-out infinite; }
-  .refresh-task-status.done    { color: #5b8a72; }
-  .refresh-task-status.failed  { color: #a5645a; }
+  .refresh-task-status.done    { color: var(--pos); }
+  .refresh-task-status.failed  { color: var(--neg); }
   .refresh-task-label  { color: var(--ink); flex: 1; }
   .refresh-task-detail { color: var(--ink-faint); font-size: 10px; }
   @keyframes refresh-pulse {
@@ -5245,9 +5281,9 @@
     color: var(--ink-faint);
     flex-shrink: 0;
   }
-  .sc-company-conf.verified  { color: #5b8a72; }
+  .sc-company-conf.verified  { color: var(--pos); }
   .sc-company-conf.disclosed { color: #7faaca; }
-  .sc-company-conf.inferred  { color: #c4965a; }
+  .sc-company-conf.inferred  { color: var(--data-amber); }
   .sc-arrow {
     position: absolute;
     right: -10px;
@@ -5318,8 +5354,8 @@
     font-weight: 700;
     color: var(--ink-dim);
   }
-  .sc-perf-val.pos { color: #5b8a72; }
-  .sc-perf-val.neg { color: #a5645a; }
+  .sc-perf-val.pos { color: var(--pos); }
+  .sc-perf-val.neg { color: var(--neg); }
   .sc-perf-val.null { color: var(--ink-faint); font-weight: 400; }
   .sc-perf-val.low-coverage { opacity: 0.55; }
   .sc-perf-cov {
@@ -5752,8 +5788,8 @@
     color: var(--ink-faint);
   }
   .gg-row-remove:hover {
-    color: #a5645a;
-    border-color: #a5645a;
+    color: var(--neg);
+    border-color: var(--neg);
   }
   /* ============================================================
      SIDE DRAWER — used by Home panel + Notifications panel.
@@ -5855,9 +5891,9 @@
     border-radius: 0 3px 3px 0;
     position: relative;
   }
-  .notif-item.cat-fix      { border-left-color: #a5645a; }
+  .notif-item.cat-fix      { border-left-color: var(--neg); }
   .notif-item.cat-pipeline { border-left-color: var(--amber); }
-  .notif-item.cat-target   { border-left-color: #5b8a72; }
+  .notif-item.cat-target   { border-left-color: var(--pos); }
   .notif-item.cat-note     { border-left-color: #7faaca; }
   .notif-item.unfired      { opacity: 0.55; }
   .notif-item.dismissed    { opacity: 0.35; }
@@ -5998,9 +6034,9 @@
     border-left: 2px solid var(--rule);
     margin-bottom: 3px;
   }
-  .home-import-log-entry.ok      { border-left-color: #5b8a72; }
-  .home-import-log-entry.warn    { border-left-color: #c4965a; }
-  .home-import-log-entry.error   { border-left-color: #a5645a; }
+  .home-import-log-entry.ok      { border-left-color: var(--pos); }
+  .home-import-log-entry.warn    { border-left-color: var(--data-amber); }
+  .home-import-log-entry.error   { border-left-color: var(--neg); }
   .home-export-buttons {
     display: flex;
     flex-direction: column;
@@ -6071,8 +6107,8 @@
     margin-left: 6px;
     cursor: help;
   }
-  .tier-pill.tier-live       { color: #5b8a72; border-color: #5b8a72; background: rgba(91,138,114,0.1); }
-  .tier-pill.tier-cached     { color: #c4965a; border-color: #c4965a; background: rgba(196,150,90,0.08); }
+  .tier-pill.tier-live       { color: var(--pos); border-color: var(--pos); background: rgba(91,138,114,0.1); }
+  .tier-pill.tier-cached     { color: var(--data-amber); border-color: var(--data-amber); background: rgba(196,150,90,0.08); }
   .tier-pill.tier-historical { color: #9180a8; border-color: #9180a8; background: rgba(145,128,168,0.1); }
   .tier-pill.tier-monthly    { color: #7faaca; border-color: #7faaca; background: rgba(127,170,202,0.1); }
   .tier-pill.tier-quarterly  { color: #b88aa8; border-color: #b88aa8; background: rgba(184,138,168,0.1); }
@@ -6122,7 +6158,7 @@
   }
   .live-pulse-banner.banner-ok {
     background: rgba(91, 138, 114, 0.08);
-    border-color: #5b8a72;
+    border-color: var(--pos);
   }
   .live-pulse-banner-icon {
     font-weight: 700;
@@ -6140,9 +6176,9 @@
     padding: 12px 14px;
     border-radius: 0 3px 3px 0;
   }
-  .live-pulse-card.tone-bull { border-left-color: #5b8a72; }
-  .live-pulse-card.tone-bear { border-left-color: #a5645a; }
-  .live-pulse-card.tone-warn { border-left-color: #c4965a; }
+  .live-pulse-card.tone-bull { border-left-color: var(--pos); }
+  .live-pulse-card.tone-bear { border-left-color: var(--neg); }
+  .live-pulse-card.tone-warn { border-left-color: var(--data-amber); }
   .live-pulse-card.tone-flat { border-left-color: var(--ink-faint); }
   .live-pulse-card-label {
     font-family: var(--mono);
@@ -6228,9 +6264,9 @@
     padding: 14px 16px;
     border-radius: 0 3px 3px 0;
   }
-  .gt-logistics-card.tone-bull { border-left-color: #5b8a72; }
-  .gt-logistics-card.tone-bear { border-left-color: #a5645a; }
-  .gt-logistics-card.tone-warn { border-left-color: #c4965a; }
+  .gt-logistics-card.tone-bull { border-left-color: var(--pos); }
+  .gt-logistics-card.tone-bear { border-left-color: var(--neg); }
+  .gt-logistics-card.tone-warn { border-left-color: var(--data-amber); }
   .gt-logistics-card.tone-flat { border-left-color: var(--ink-faint); }
   .gt-logistics-mode {
     font-family: var(--mono);
@@ -6419,9 +6455,9 @@
     margin-bottom: 8px;
     border-radius: 0 3px 3px 0;
   }
-  #gt-sources-content .source-row.have { border-left-color: #5b8a72; }
-  #gt-sources-content .source-row.partial { border-left-color: #c4965a; }
-  #gt-sources-content .source-row.todo { border-left-color: #a5645a; }
+  #gt-sources-content .source-row.have { border-left-color: var(--pos); }
+  #gt-sources-content .source-row.partial { border-left-color: var(--data-amber); }
+  #gt-sources-content .source-row.todo { border-left-color: var(--neg); }
   /* ============================================================
      STOCK BOOK COLUMN PICKER — per-tab show/hide controls
      ============================================================ */
@@ -6526,9 +6562,9 @@
     padding: 10px 12px;
     border-radius: 0 3px 3px 0;
   }
-  .cross-asset-card.tone-bull { border-left-color: #5b8a72; }
-  .cross-asset-card.tone-bear { border-left-color: #a5645a; }
-  .cross-asset-card.tone-warn { border-left-color: #c4965a; }
+  .cross-asset-card.tone-bull { border-left-color: var(--pos); }
+  .cross-asset-card.tone-bear { border-left-color: var(--neg); }
+  .cross-asset-card.tone-warn { border-left-color: var(--data-amber); }
   .cross-asset-card.tone-flat { border-left-color: var(--ink-faint); }
   .cross-asset-card-head {
     display: flex;
@@ -6731,6 +6767,18 @@
   <button class="tab-btn" data-tab="news">
     <span class="tab-num">★</span>
     <span class="tab-label">News</span>
+  </button>
+  <button class="tab-btn" data-tab="bets" title="Bot trading signals · paper portfolio · backtested performance vs you + SPY">
+    <span class="tab-num">🤖</span>
+    <span class="tab-label">Bets</span>
+  </button>
+  <button class="tab-btn" data-tab="research" title="Cross-stockbook statistical ranking · screen by any metric · letter grades · rank in every category">
+    <span class="tab-num">🔬</span>
+    <span class="tab-label">Research</span>
+  </button>
+  <button class="tab-btn" data-tab="review" title="Human-in-the-loop · confirm the model's guesses · retrain the sentiment lexicon · inspect what it learned">
+    <span class="tab-num">🧠</span>
+    <span class="tab-label">Review</span>
   </button>
   <button class="tab-btn" data-tab="regime">
     <span class="tab-num">00</span>
@@ -6951,8 +6999,11 @@
   <button class="btn" id="fetch-btn">Fetch & Value</button>
   <button class="btn btn-ghost" id="save-btn" disabled>Save Valuation</button>
   <button class="btn btn-ghost" id="sources-btn">Data Sources</button>
+  <button class="btn btn-ghost" id="editor-btn" title="Open the Editor — set authoritative overrides for this company's fields (last-resort source of truth)">✎ Editor</button>
   <div class="status" id="status">Ready</div>
 </div>
+
+<div id="todays-bets-banner" style="display:none;padding:8px 32px 0"></div>
 
 <section class="summary" id="summary">
   <div class="summary-header">
@@ -7251,11 +7302,14 @@
         <button class="ta-tool" data-tool="bb" title="Bollinger Bands (20, 2σ)">
           <span class="ta-tool-icon">⫷</span><span class="ta-tool-name">BBands</span>
         </button>
-        <button class="ta-tool" data-tool="rsi" title="RSI overlay (coming soon)" disabled>
+        <button class="ta-tool" data-tool="rsi" title="Relative Strength Index (14) — momentum oscillator in a sub-panel">
           <span class="ta-tool-icon">⊢</span><span class="ta-tool-name">RSI</span>
         </button>
-        <button class="ta-tool" data-tool="volume" title="Volume bars (coming soon)" disabled>
+        <button class="ta-tool" data-tool="volume" title="Volume bars in a sub-panel below price">
           <span class="ta-tool-icon">▮</span><span class="ta-tool-name">Volume</span>
+        </button>
+        <button class="ta-tool" data-tool="pe" title="Live Price/Earnings — shows current P/E and marks the EPS-implied price band on the chart">
+          <span class="ta-tool-icon">⊙</span><span class="ta-tool-name">P/E</span>
         </button>
         <div style="margin-left:auto;display:flex;gap:6px">
           <button class="ta-tool ta-tool-secondary" id="ta-clear-drawings" title="Clear all drawings">
@@ -7429,9 +7483,9 @@
         <canvas id="quad-history-canvas" width="1200" height="400"></canvas>
         <div id="quad-chart-tooltip" class="quad-chart-tooltip"></div>
         <div class="quad-chart-legend">
-          <span><span class="dot" style="background:#5b8a72"></span>Quad 1</span>
-          <span><span class="dot" style="background:#c4965a"></span>Quad 2</span>
-          <span><span class="dot" style="background:#a5645a"></span>Quad 3</span>
+          <span><span class="dot" style="background:var(--pos)"></span>Quad 1</span>
+          <span><span class="dot" style="background:var(--data-amber)"></span>Quad 2</span>
+          <span><span class="dot" style="background:var(--neg)"></span>Quad 3</span>
           <span><span class="dot" style="background:#6b7a8f"></span>Quad 4</span>
         </div>
       </div>
@@ -7501,6 +7555,22 @@
     <button class="btn btn-ghost" id="prob-recalc-btn">Recalculate All</button>
     <button class="btn btn-ghost" id="prob-clear-btn">Clear All</button>
     <div class="status" id="prob-status">—</div>
+  </div>
+
+  <!-- Import a call from X (paste URL/text) or a screenshot/CSV/PDF, and turn
+       it into a probability thesis via the Calls parser brain. -->
+  <div class="company-card" style="margin:0 0 14px">
+    <h4>Import a Call → Thesis <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· paste an X post or text · or drop a screenshot/CSV/PDF</span></h4>
+    <textarea id="prob-import-text" rows="2" placeholder='Paste an X post or text — e.g. "NVDA will be $500 by 2027" or "$TSLA below 200 by Q3"' style="width:100%;background:var(--bg-card);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:12px;padding:8px;border-radius:3px;box-sizing:border-box;resize:vertical"></textarea>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
+      <input id="prob-import-date" type="date" title="When was it posted? Past date uses the historical price as the starting reference." style="background:var(--bg-elev);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:11px;padding:5px 8px;border-radius:3px">
+      <button class="btn" id="prob-import-parse">Parse → Thesis</button>
+      <label class="btn btn-ghost" style="cursor:pointer" title="CSV/PDF of calls, or a screenshot (screenshot OCR needs a vision API)">
+        Drop file<input type="file" id="prob-import-file" accept=".csv,.pdf,image/*" style="display:none">
+      </label>
+      <span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint)">extracts ticker · target (= strike) · date · direction</span>
+    </div>
+    <div id="prob-import-preview"></div>
   </div>
 
   <div class="prob-intro">
@@ -7731,6 +7801,60 @@
   <div id="fed-body" style="padding:0 32px 60px;overflow-x:auto"></div>
 </div><!-- /fed panel -->
 
+<!-- ===== BETS PANEL =====
+     The trading bot's paper portfolio. $1,000 bankroll, 3-4 conviction-sized
+     bets/day (long/short/leverage/hedge), every bet permanent once placed.
+     Shows today's bets, the full track record, per-ticker filtering, and
+     performance vs SPY + the user's own portfolio. -->
+<div class="tab-panel" data-panel="bets">
+  <div class="news-header">
+    <div>
+      <h1 style="font-family:var(--serif);font-size:34px;margin:0">Bot Bets 🤖</h1>
+      <div style="color:var(--ink-dim);font-family:var(--mono);font-size:11px;letter-spacing:0.05em;margin-top:4px">
+        $1,000 paper portfolio · conviction-sized signals · 6-month challenge vs you
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <input id="bets-filter" placeholder="filter by ticker" style="background:var(--bg-elev);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:11px;padding:6px 10px;border-radius:3px;width:140px">
+      <button class="btn btn-ghost" id="bets-run-btn" title="Run today's signal scan now">Run Scan</button>
+    </div>
+  </div>
+  <div id="bets-body" style="padding:0 32px 60px;overflow-x:auto"></div>
+</div><!-- /bets panel -->
+
+<!-- ===== RESEARCH PANEL =====
+     Cross-stockbook statistical ranking. Screen the top/bottom 100 on any
+     financial metric, or view composite letter grades with each company's
+     rank in every category. Rankings computed over the WHOLE stockbook;
+     companies excluded from metrics they don't report (shown n/a · not ranked). -->
+<div class="tab-panel" data-panel="research">
+  <div class="news-header">
+    <div>
+      <h1 style="font-family:var(--serif);font-size:34px;margin:0">Research 🔬</h1>
+      <div style="color:var(--ink-dim);font-family:var(--mono);font-size:11px;letter-spacing:0.05em;margin-top:4px">
+        Rank every holding by any statistic · letter grades · dig for names to watch
+      </div>
+    </div>
+  </div>
+  <div id="research-body" style="padding:0 32px 60px;overflow-x:auto"></div>
+</div><!-- /research panel -->
+
+<!-- ===== REVIEW PANEL (human-in-the-loop) =====
+     Surfaces low-confidence model guesses for confirmation. Every confirm/
+     correct retrains the lexicon so new phrasing gets recognized. Also hosts
+     the lexicon inspector (see/prune what was learned) and other feedback areas. -->
+<div class="tab-panel" data-panel="review">
+  <div class="news-header">
+    <div>
+      <h1 style="font-family:var(--serif);font-size:34px;margin:0">Review 🧠</h1>
+      <div style="color:var(--ink-dim);font-family:var(--mono);font-size:11px;letter-spacing:0.05em;margin-top:4px">
+        Confirm the system's thinking · retrain the model · the human loop
+      </div>
+    </div>
+  </div>
+  <div id="review-body" style="padding:0 32px 60px;overflow-x:auto"></div>
+</div><!-- /review panel -->
+
 <!-- ===== SCENARIOS PANEL =====
      Shock-and-transmission engine. The user enters one or more macro/commodity
      shocks. The engine walks the causal transmission graph and produces ranged
@@ -7953,6 +8077,13 @@
       </div>
     </div>
 
+    <!-- Live US trade balance (FRED) -->
+    <div class="gt-section">
+      <div class="regime-section-title">US TRADE BALANCE <span class="tier-pill tier-monthly" style="margin-left:6px">MONTHLY · FRED</span></div>
+      <div class="gt-section-sub">Live monthly goods trade balance, exports, and imports from FRED. Populates when the pipeline (<code>fetch_macro_trade.py</code>) has run; otherwise hidden.</div>
+      <div id="gt-trade-balance-card" style="display:none"></div>
+    </div>
+
     <!-- Trade pulse snapshot -->
     <div class="gt-section">
       <div class="regime-section-title">TRADE PULSE SNAPSHOT</div>
@@ -8161,7 +8292,7 @@
       <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)" id="leadership-edit-status"></div>
       <div style="display:flex;gap:8px">
         <button class="btn" id="leadership-edit-verify-btn" title="Search Wikidata for this person and pull authoritative data">Verify via Wikidata</button>
-        <button class="btn" id="leadership-edit-delete-btn" style="color:#a5645a">Delete</button>
+        <button class="btn" id="leadership-edit-delete-btn" style="color:var(--neg)">Delete</button>
         <button class="btn" id="leadership-edit-save-btn" style="background:var(--amber);color:#000;font-weight:700">Save</button>
       </div>
     </div>
@@ -8364,7 +8495,7 @@
         <div class="home-color-swatches" id="pref-accent-swatches">
           <button class="color-swatch" data-color="#d4a24c" style="background:#d4a24c" title="Amber (default)"></button>
           <button class="color-swatch" data-color="#7faaca" style="background:#7faaca" title="Slate Blue"></button>
-          <button class="color-swatch" data-color="#5b8a72" style="background:#5b8a72" title="Forest Green"></button>
+          <button class="color-swatch" data-color="var(--pos)" style="background:var(--pos)" title="Forest Green"></button>
           <button class="color-swatch" data-color="#a85a3a" style="background:#a85a3a" title="Burnt Sienna"></button>
           <button class="color-swatch" data-color="#9c7aaf" style="background:#9c7aaf" title="Muted Plum"></button>
         </div>
@@ -8392,7 +8523,7 @@
       <div class="home-export-buttons" style="margin-top:10px">
         <button class="btn btn-ghost" id="home-clear-news-btn" title="Clear cached news articles only (won't affect portfolio or settings)">Clear News Cache</button>
         <button class="btn btn-ghost" id="home-clear-prices-btn" title="Clear cached price history (will re-fetch on next load)">Clear Price History Cache</button>
-        <button class="btn btn-ghost" id="home-clear-all-btn" title="Nuclear option — clears EVERY local-storage key for this app" style="border-color:#a5645a;color:#a5645a">Clear All Local Data</button>
+        <button class="btn btn-ghost" id="home-clear-all-btn" title="Nuclear option — clears EVERY local-storage key for this app" style="border-color:var(--neg);color:var(--neg)">Clear All Local Data</button>
       </div>
     </div>
 
@@ -8411,6 +8542,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260516"></script>
+<script src="app.js?v=20260530b"></script>
 </body>
 </html>
