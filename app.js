@@ -466,54 +466,36 @@ const NEAR_PARITY_CCY = new Set(['EUR', 'GBP', 'CHF', 'CAD', 'AUD', 'NZD', 'SGD'
 //   `usdPer` = USD value of one unit of the currency. _fxRateToUSD checks this
 //   cache FIRST, bypassing the broken sheet FX rows (bare KRW=X reading 1.00).
 // ============================================================
-const FX_RATES_KEY = 'valuatio.fxRates.v1';
-let _fxRatesCache = null;
-let _fxRatesLoadedAt = 0;
-
-function loadFxRatesCache() {
-  if (_fxRatesCache) return _fxRatesCache;
-  try {
-    const raw = localStorage.getItem(FX_RATES_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      _fxRatesCache = parsed.rates || {};
-      _fxRatesLoadedAt = parsed.loadedAt || 0;
-      return _fxRatesCache;
-    }
-  } catch {}
-  return null;
-}
-
 // The FX/crypto/signals-consensus files live in TRAPP2-1 (the dynamic repo
 // that holds all non-US-equity vehicles). US equities are split across TRAPP2
 // and TRAPP2-2. This base targets the dynamic repo for those three feeds.
 const DYNAMIC_DATA_BASE = 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-1/main/data/';
 
+// Fetch the dedicated FX rates file from TRAPP2-1 and store it in the SAME
+// cache the rest of the app reads (_fxRatesMem / FX_RATES_CACHE_KEY, with the
+// nested {usdPer,perUsd,pair} shape that fetch_fx.py writes). This supersedes
+// the generic fetchFxRates() above by always targeting TRAPP2-1 and by
+// re-running conversions when fresh rates land.
 async function fetchFxRatesFile() {
-  // Always TRAPP2-1 — the FX file only exists there, regardless of which repo
-  // the general data base points at.
-  const base = DYNAMIC_DATA_BASE;
-  const url = base + 'fx/rates.json';
+  const url = DYNAMIC_DATA_BASE + 'fx/rates.json';
   try {
     const r = await fetch(url, { cache: 'no-cache' });
     if (!r.ok) { console.warn('[fx-rates] not found at', url, '(status', r.status + ')'); return null; }
     const json = await r.json();
-    const map = {};
-    for (const [ccy, rec] of Object.entries(json.rates || {})) {
-      if (rec && typeof rec.usdPer === 'number' && isFinite(rec.usdPer) && rec.usdPer > 0) {
-        map[ccy.toUpperCase()] = rec.usdPer;
-      }
-    }
-    _fxRatesCache = map;
-    _fxRatesLoadedAt = Date.now();
-    try { localStorage.setItem(FX_RATES_KEY, JSON.stringify({ rates: map, loadedAt: _fxRatesLoadedAt })); } catch {}
-    console.log(`[fx-rates] loaded ${Object.keys(map).length} rates from ${url}`, map);
+    if (!json.rates || typeof json.rates !== 'object') { console.warn('[fx-rates] no rates object'); return null; }
+    // Store in the canonical cache structure (nested objects with usdPer).
+    _fxRatesMem = { rates: json.rates, updatedAt: json.updatedAt, fetchedAt: Date.now() };
+    try { localStorage.setItem(FX_RATES_CACHE_KEY, JSON.stringify(_fxRatesMem)); } catch {}
+    console.log(`[fx-rates] loaded ${Object.keys(json.rates).length} rates from ${url} (updated ${json.updatedAt})`);
     // Re-run conversions now that authoritative rates are available
     if (typeof state !== 'undefined' && state.stockbook?.rows) {
       let reconverted = 0;
       for (const row of state.stockbook.rows) {
         if (row._currencyUnconverted || (!row._usdNormalized && _tickerLocalCurrency(row.ticker))) {
+          if (row._localPrice != null) row.price = row._localPrice;
+          if (row._localMarketCap != null) row.marketCap = row._localMarketCap;
           row._currencyUnconverted = false;
+          row._usdNormalized = false;
           if (typeof ensureRowNormalized === 'function') { ensureRowNormalized(row); if (row._usdNormalized) reconverted++; }
         }
       }
@@ -522,7 +504,7 @@ async function fetchFxRatesFile() {
         if (typeof renderStockBook === 'function') try { renderStockBook(); } catch {}
       }
     }
-    return map;
+    return _fxRatesMem;
   } catch (e) {
     console.warn('[fx-rates] fetch failed:', e.message);
     return null;
@@ -609,11 +591,10 @@ async function fetchSignalsConsensus() {
 function _fxRateToUSD(currency) {
   if (!currency || currency === 'USD') return 1;
   // 0. AUTHORITATIVE: dedicated FX rates file (usdPer multiplier). This is the
-  //    clean source that bypasses the broken sheet FX pairs entirely.
-  const fxFile = loadFxRatesCache();
-  if (fxFile && typeof fxFile[currency] === 'number' && fxFile[currency] > 0) {
-    return fxFile[currency];
-  }
+  //    clean source that bypasses the broken sheet FX pairs entirely. Reads the
+  //    nested {usdPer} structure that fetch_fx.py writes via fxRatesUsdPer().
+  const filePer = (typeof fxRatesUsdPer === 'function') ? fxRatesUsdPer(currency) : null;
+  if (filePer != null && filePer > 0) return filePer;
   const getRow = (t) => (typeof getStockbookRow === 'function') ? getStockbookRow(t) : null;
   // Read the FX pair's price. The sheet's price column is WRONG for bare-form
   // pairs (KRW=X shows 1.00) but the price-HISTORY close is correct (e.g.
@@ -740,9 +721,98 @@ function rowMarketCapUSD(row) {
   if (row._currencyUnconverted) return { value: row.marketCap, converted: false, currency: row._localCurrency, discrepancy: true };
   return { value: row.marketCap, converted: false, currency: 'USD', discrepancy: false };  // already USD
 }
+
+// ============================================================
+//   DERIVATIVE / VEHICLE RELATIONSHIP DETECTION
+//   Parses a vehicle's description to find what it tracks/inverts (MSFD = -1x
+//   MSFT, TSLL = 2x TSLA). Lets the app mark it as a DERIVATIVE not a company,
+//   show "inversely related to MSFT" in the Function field, and offer a jump
+//   to the underlying. Returns {isRelated, relationship, multiplier, underlying,
+//   label} or null. relationship: 'inverse'|'leveraged'|'tracking'.
+// ============================================================
+const KNOWN_VEHICLE_UNDERLYING = {
+  MSFD: { underlying: 'MSFT', multiplier: -1 },
+  MSFU: { underlying: 'MSFT', multiplier: 2 },
+  TSLL: { underlying: 'TSLA', multiplier: 2 },
+  TSLQ: { underlying: 'TSLA', multiplier: -1 },
+  TSLS: { underlying: 'TSLA', multiplier: -1 },
+  NVDL: { underlying: 'NVDA', multiplier: 2 },
+  NVD:  { underlying: 'NVDA', multiplier: -1 },
+  AMZU: { underlying: 'AMZN', multiplier: 2 },
+  AMZD: { underlying: 'AMZN', multiplier: -1 },
+  GGLL: { underlying: 'GOOGL', multiplier: 2 },
+  AAPU: { underlying: 'AAPL', multiplier: 2 },
+  AAPD: { underlying: 'AAPL', multiplier: -1 },
+};
+
+function detectDerivativeRelationship(tickerOrRow) {
+  const row = (typeof tickerOrRow === 'string')
+    ? (typeof getStockbookRow === 'function' ? getStockbookRow(tickerOrRow) : null)
+    : tickerOrRow;
+  const ticker = (typeof tickerOrRow === 'string' ? tickerOrRow : row?.ticker || '').toUpperCase();
+  if (!ticker) return null;
+
+  const desc = String(row?.description || '').toLowerCase();
+  const fn   = String(row?.function || '').toLowerCase();
+  const name = String(row?.name || '').toLowerCase();
+  const hay  = `${desc} ${fn} ${name}`;
+
+  let relationship = null, multiplier = null, underlying = null;
+
+  if (KNOWN_VEHICLE_UNDERLYING[ticker]) {
+    underlying = KNOWN_VEHICLE_UNDERLYING[ticker].underlying;
+    multiplier = KNOWN_VEHICLE_UNDERLYING[ticker].multiplier;
+    relationship = multiplier < 0 ? 'inverse' : 'leveraged';
+  }
+
+  if (!relationship) {
+    const multMatch = hay.match(/(-?\d+(?:\.\d+)?)\s*x\b/);
+    if (multMatch) {
+      multiplier = parseFloat(multMatch[1]);
+      if (/\binverse\b|\bshort\b|\bbear\b/.test(hay) && multiplier > 0) multiplier = -multiplier;
+      relationship = multiplier < 0 ? 'inverse' : 'leveraged';
+    } else if (/\binverse\b|\b-1x\b|\bshort\b|\bbear\b/.test(hay)) {
+      relationship = 'inverse'; multiplier = -1;
+    } else if (/\bleveraged\b|\bbull\b/.test(hay)) {
+      relationship = 'leveraged';
+    } else if (/\btracks?\b|\btracking\b|\bindex fund\b|\breplicat/.test(hay)) {
+      relationship = 'tracking';
+    }
+  }
+
+  if (relationship && !underlying) {
+    const ticMatch = (row?.description || '').match(/\b(?:of|on|to|track(?:s|ing)?|underlying)\s+\(?([A-Z]{1,5})\)?\b/)
+                  || (row?.description || '').match(/\(([A-Z]{1,5})\)/);
+    if (ticMatch && ticMatch[1] !== ticker) underlying = ticMatch[1];
+    if (!underlying) {
+      const nameToTicker = {
+        microsoft: 'MSFT', tesla: 'TSLA', nvidia: 'NVDA', apple: 'AAPL',
+        amazon: 'AMZN', google: 'GOOGL', alphabet: 'GOOGL', meta: 'META',
+        netflix: 'NFLX', 'advanced micro': 'AMD',
+      };
+      for (const [nm, tk] of Object.entries(nameToTicker)) {
+        if (hay.includes(nm) && tk !== ticker) { underlying = tk; break; }
+      }
+    }
+  }
+
+  if (!relationship) return null;
+
+  let label;
+  const multStr = multiplier != null ? `${multiplier > 0 ? '+' : ''}${multiplier}x ` : '';
+  if (relationship === 'inverse') {
+    label = underlying ? `Inversely related to ${underlying} (${multStr || '-1x '}daily)` : `Inverse daily vehicle ${multStr}`.trim();
+  } else if (relationship === 'leveraged') {
+    label = underlying ? `${multStr}leveraged to ${underlying} (daily)` : `Leveraged daily vehicle ${multStr}`.trim();
+  } else {
+    label = underlying ? `Tracks ${underlying}` : 'Tracking vehicle';
+  }
+
+  return { isRelated: true, relationship, multiplier, underlying, label };
+}
+
 // ============================================================
 //   OCC OPTION TICKER BUILDER + PARSER
-//
 //   The user's existing sheets formula constructs OCC-format option tickers
 //   matching what Yahoo Finance recognizes:
 //
@@ -1712,10 +1782,10 @@ const REGIME_SECTOR_BIAS = {
 };
 
 const REGIME_LABELS = {
-  expansion:       { label: 'Expansion',         color: '#5b8a72', mood: 'Risk-on, broad bullish' },
+  expansion:       { label: 'Expansion',         color: 'var(--pos)', mood: 'Risk-on, broad bullish' },
   risk_on_melt_up: { label: 'Risk-On Melt Up',   color: '#a8c97f', mood: 'Extreme positive momentum' },
-  inflation_shock: { label: 'Inflation Shock',   color: '#c4965a', mood: 'Macro stress, vol elevated' },
-  recession_fear:  { label: 'Recession Fear',    color: '#a5645a', mood: 'Risk-off, growth concerns' },
+  inflation_shock: { label: 'Inflation Shock',   color: 'var(--data-amber)', mood: 'Macro stress, vol elevated' },
+  recession_fear:  { label: 'Recession Fear',    color: 'var(--neg)', mood: 'Risk-off, growth concerns' },
   risk_off:        { label: 'Risk-Off',          color: '#9180a8', mood: 'Defensive posture warranted' },
   neutral:         { label: 'Neutral / Mixed',   color: '#857da0', mood: 'No dominant signal' },
 };
@@ -1811,7 +1881,7 @@ function renderRegimeDashboard() {
       const conf = r.signal_confidences?.[name];
       const pct = Math.min(50, Math.abs(val) * 50);
       const isPos = val >= 0;
-      const color = val > 0.15 ? '#5b8a72' : val < -0.15 ? '#a5645a' : 'var(--ink-dim)';
+      const color = val > 0.15 ? 'var(--pos)' : val < -0.15 ? 'var(--neg)' : 'var(--ink-dim)';
       const barStyle = isPos
         ? `left:50%; width:${pct}%; background:${color};`
         : `right:50%; width:${pct}%; background:${color};`;
@@ -1839,7 +1909,7 @@ function renderRegimeDashboard() {
       const sorted = Object.entries(r.stationary).sort((a, b) => b[1] - a[1]);
       const persist = r.expected_persistence_days ? ` · Expected persistence: <strong>${r.expected_persistence_days} days</strong>` : '';
       const obsCount = r.transition_observation_count || 0;
-      const warning = r.transition_warning ? `<br><span style="color:#c4965a">⚠ ${r.transition_warning}</span>` : '';
+      const warning = r.transition_warning ? `<br><span style="color:var(--data-amber)">⚠ ${r.transition_warning}</span>` : '';
       stat.innerHTML = `<strong>Stationary distribution:</strong> ${sorted.map(([n,p]) => `${n} ${(p*100).toFixed(1)}%`).join(' · ')}${persist}<br>${obsCount} observed transitions${warning}`;
     }
   } else if (probGrid) {
@@ -1851,7 +1921,7 @@ function renderRegimeDashboard() {
     drivers.style.display = '';
     const list = document.getElementById('regime-driver-list');
     list.innerHTML = r.drivers.map(d => {
-      const dirColor = d.direction === 'bullish' ? '#5b8a72' : d.direction === 'bearish' ? '#a5645a' : 'var(--ink-dim)';
+      const dirColor = d.direction === 'bullish' ? 'var(--pos)' : d.direction === 'bearish' ? 'var(--neg)' : 'var(--ink-dim)';
       return `<div class="regime-driver-row" style="border-left-color:${dirColor}">
         <span class="regime-driver-name">${d.signal}</span>
         <span class="regime-driver-score" style="color:${dirColor}">${d.score >= 0 ? '+' : ''}${d.score.toFixed(3)}</span>
@@ -2633,6 +2703,8 @@ document.addEventListener('DOMContentLoaded', () => {
     fetchFxRatesFile().catch(() => {});
     setInterval(() => { fetchFxRatesFile().catch(() => {}); }, 15 * 60 * 1000);
   }
+  // Prune any overrides whose expiry has passed, so the app pulls normally again.
+  if (typeof pruneExpiredOverrides === 'function') pruneExpiredOverrides();
   // Consensus signals merged across all repos — same cadence as FX.
   if (typeof fetchSignalsConsensus === 'function') {
     fetchSignalsConsensus().catch(() => {});
@@ -2642,6 +2714,37 @@ document.addEventListener('DOMContentLoaded', () => {
     fetchCryptoPricesFile().catch(() => {});
     setInterval(() => { fetchCryptoPricesFile().catch(() => {}); }, 15 * 60 * 1000);
   }
+
+  // Bets tab buttons
+  document.getElementById('bets-run-btn')?.addEventListener('click', async () => {
+    const btn = document.getElementById('bets-run-btn');
+    if (btn) { btn.textContent = 'Scanning…'; btn.disabled = true; }
+    try {
+      if (typeof botDailyRun === 'function') await botDailyRun(true);
+    } catch (e) { console.warn('[bot] run failed', e); }
+    if (btn) { btn.textContent = 'Run Scan'; btn.disabled = false; }
+    if (typeof renderBetsTab === 'function') renderBetsTab();
+    if (typeof renderTodaysBetsBanner === 'function') renderTodaysBetsBanner();
+  });
+  let _betsFilterTimer = null;
+  document.getElementById('bets-filter')?.addEventListener('input', () => {
+    clearTimeout(_betsFilterTimer);
+    _betsFilterTimer = setTimeout(() => { if (typeof renderBetsTab === 'function') renderBetsTab(); }, 300);
+  });
+  // Warm the 13F institutional cache early so the bot's institutional signal
+  // (and the Company tab's holders section) have data to read.
+  if (typeof load13fByCusip === 'function') load13fByCusip().catch(() => {});
+  if (typeof loadSecFilings === 'function') loadSecFilings().catch(() => {});
+  // Warm the XTRAPP lexicon + posts so the Calls/Review brain reflects prior training.
+  if (typeof fetchXtrappData === 'function') fetchXtrappData().catch(() => {});
+  // Auto-run the bot's daily scan once per day on startup (after stockbook loads)
+  setTimeout(() => {
+    if (typeof botDailyRun === 'function' && typeof state !== 'undefined' && state.stockbook?.rows?.length) {
+      botDailyRun(false).then(() => {
+        if (typeof renderTodaysBetsBanner === 'function') renderTodaysBetsBanner();
+      }).catch(() => {});
+    }
+  }, 8000);
   document.querySelectorAll('.regime-forecast-tab').forEach(btn => {
     btn.addEventListener('click', () => {
       _currentForecastStep = btn.dataset.step;
@@ -2705,7 +2808,7 @@ function openRegimeDetailModal() {
   const scoreBar = (label, val, conf) => {
     if (val == null) return `<tr><td>${label}</td><td colspan="2" style="color:var(--ink-faint)">—</td></tr>`;
     const w = Math.abs(val) * 50; // 0..50 px each side
-    const color = val > 0.15 ? '#5b8a72' : val < -0.15 ? '#a5645a' : 'var(--ink-dim)';
+    const color = val > 0.15 ? 'var(--pos)' : val < -0.15 ? 'var(--neg)' : 'var(--ink-dim)';
     const bar = val >= 0
       ? `<div style="margin-left:50px;width:${w}px;height:8px;background:${color};border-radius:2px"></div>`
       : `<div style="margin-left:${50 - w}px;width:${w}px;height:8px;background:${color};border-radius:2px"></div>`;
@@ -2738,7 +2841,7 @@ function openRegimeDetailModal() {
   const driverList = (r.drivers || []).map(d => `
     <div style="display:flex;justify-content:space-between;padding:4px 0;font-family:var(--mono);font-size:11px">
       <span style="color:var(--ink-dim)">${d.signal}</span>
-      <span style="color:${d.direction === 'bullish' ? '#5b8a72' : d.direction === 'bearish' ? '#a5645a' : 'var(--ink-dim)'}">
+      <span style="color:${d.direction === 'bullish' ? 'var(--pos)' : d.direction === 'bearish' ? 'var(--neg)' : 'var(--ink-dim)'}">
         ${d.score >= 0 ? '+' : ''}${d.score.toFixed(3)} · ${d.direction}
       </span>
     </div>
@@ -3552,6 +3655,11 @@ function normalizeStock(envelope) {
   const ocf = avNum(cf.operatingCashflow);
   const capex = Math.abs(avNum(cf.capitalExpenditures) || 0);
   const fcfFromAV = ocf != null ? ocf - capex : null;
+  // Stock-based compensation — a non-cash expense added back into operating
+  // cash flow, which inflates reported OCF/FCF relative to the true economic
+  // cost (the company really did pay employees, just in equity). We capture it
+  // so the app can show SBC intensity and an SBC-adjusted FCF.
+  const sbcAV = avNum(cf.stockBasedCompensation) || avNum(cf.shareBasedCompensation) || null;
 
   const opInc = avNum(inc.operatingIncome);
   const da = avNum(inc.depreciationAndAmortization) || avNum(cf.depreciationDepletionAndAmortization) || 0;
@@ -3695,6 +3803,7 @@ function normalizeStock(envelope) {
     netIncome: avNum(inc.netIncome),
     capex,
     depreciation: da,
+    stockBasedComp: sbcAV,
     operatingCashFlow: ocf,
     freeCashFlow: pick(sheetFcf, fcfFromAV),
     totalDebt: pick(sheetDebt, totalDebtAV),
@@ -4387,15 +4496,13 @@ function renderSummary(s) {
   const priceEl = document.getElementById('s-price');
   const mcapEl = document.getElementById('s-mcap');
   // For FX pairs, the "price" is an exchange rate, not a USD share price.
-  // Label it correctly so KRW=X reads "1,502.68 KRW/USD" not "$1,502.68".
+  // The display MIRRORS the chart's invert state so price and chart agree:
+  //   • Inverted (default): show the decimal dollar value of one foreign unit,
+  //     e.g. USD/KRW 1,502.68 → 0.0006655 USD/KRW (dollars per won).
+  //   • Not inverted: show the raw rate, e.g. "1,502.68 KRW/USD" (won per dollar).
   const _pInstClass = (typeof classifyAsset === 'function') ? classifyAsset(s.ticker) : 'equity';
   if (_pInstClass === 'fx' && s.price != null) {
-    const t = String(s.ticker).toUpperCase().replace('=X', '');
-    let base, quote;
-    if (t.length === 6) { base = t.slice(0, 3); quote = t.slice(3); }
-    else { base = 'USD'; quote = t; }   // bare form = USD/<ccy>
-    priceEl.textContent = `${s.price.toLocaleString(undefined, { maximumFractionDigits: 4 })} ${quote}/${base}`;
-    priceEl.title = `1 ${base} = ${s.price.toLocaleString(undefined, { maximumFractionDigits: 4 })} ${quote}`;
+    updateFxPriceDisplay(s);   // shared with the invert toggle; honors chart state
   } else {
     priceEl.textContent = fmt$(s.price);
     if (s.price != null && Math.abs(s.price) >= 1e6) priceEl.title = exactValue(s.price, true);
@@ -4559,11 +4666,22 @@ function renderSummary(s) {
     if (sbRow.instrumentType)                  s.instrumentType = sbRow.instrumentType;
   }
 
+  // Detect if this ticker is a derivative/vehicle that tracks or inverts an
+  // underlying (MSFD = -1x MSFT). Used to mark it as a derivative, show the
+  // relationship in the Function field, and offer a jump to the underlying.
+  const _instClass = (typeof classifyAsset === 'function') ? classifyAsset(s.ticker) : 'equity';
+  const _rel = (typeof detectDerivativeRelationship === 'function') ? detectDerivativeRelationship(s) : null;
+  const _isDeriv = s.isDerivative || !!_rel || ['etf', 'index', 'future', 'option', 'fx'].includes(_instClass);
+
   // Build sector display string. For derivatives, show function · sub-sector.
   // For equities, show sector · sub-sector · industry (whichever are set).
   let sectorDisplay = '—';
-  if (s.isDerivative && s.function) {
-    const parts = [s.function];
+  if ((s.isDerivative || _rel) && (s.function || _rel)) {
+    const parts = [];
+    // Prefer the detected relationship label as the Function (e.g. "Inversely
+    // related to MSFT") — it's more informative than a generic function string.
+    if (_rel) parts.push(_rel.label);
+    else if (s.function) parts.push(s.function);
     if (s.subSector) parts.push(s.subSector);
     sectorDisplay = parts.join(' · ');
   } else {
@@ -4578,9 +4696,16 @@ function renderSummary(s) {
   // sheet sometimes mis-assigns a random company blurb to them (e.g. a "US
   // Airways" description on KRW=X). Suppress it for these instrument types and
   // show a meaningful one-liner instead.
-  const _instClass = (typeof classifyAsset === 'function') ? classifyAsset(s.ticker) : 'equity';
   const _descEl = document.getElementById('s-description');
-  if (['fx', 'index', 'future'].includes(_instClass)) {
+  if (_rel) {
+    // Derivative with a detected relationship — explain it clearly and offer a
+    // jump to the underlying it tracks.
+    const relWord = _rel.relationship === 'inverse' ? 'moves inversely to' : _rel.relationship === 'leveraged' ? 'is a leveraged play on' : 'tracks';
+    const jumpBtn = _rel.underlying
+      ? ` <a href="#" onclick="event.preventDefault(); document.getElementById('ticker').value='${_rel.underlying}'; document.getElementById('fetch-btn').click();" style="color:var(--amber);text-decoration:underline;font-weight:700">→ Go to ${_rel.underlying}</a>`
+      : '';
+    _descEl.innerHTML = `<strong style="color:#e0b04c">⚡ DERIVATIVE</strong> — this is a trading vehicle, not a company. It ${relWord}${_rel.underlying ? ' ' + _rel.underlying : ' its underlying'}${_rel.multiplier != null ? ` at ${_rel.multiplier > 0 ? '+' : ''}${_rel.multiplier}x daily` : ''}.${jumpBtn}`;
+  } else if (['fx', 'index', 'future'].includes(_instClass)) {
     if (_instClass === 'fx') {
       const pair = (typeof fxPairCountries === 'function') ? fxPairCountries(s.ticker) : '';
       _descEl.textContent = pair && pair !== '—'
@@ -4621,10 +4746,10 @@ function renderSummary(s) {
     let verdict, color;
     if (bias.favor.includes(sector)) {
       verdict = 'Tailwind';
-      color = '#5b8a72';
+      color = 'var(--pos)';
     } else if (bias.disfavor.includes(sector)) {
       verdict = 'Headwind';
-      color = '#a5645a';
+      color = 'var(--neg)';
     } else {
       verdict = 'Neutral';
       color = 'var(--ink-dim)';
@@ -5396,7 +5521,7 @@ const _debugLog = {
     // Only render if panel is open (avoid wasted DOM work)
     const panel = document.getElementById('debug-log-panel');
     if (!panel || panel.style.display === 'none') return;
-    const colorFor = lvl => lvl === 'error' ? '#d97a6c' : lvl === 'warn' ? '#e0b04c' : lvl === 'info' ? '#7faaca' : 'var(--ink-dim)';
+    const colorFor = lvl => lvl === 'error' ? 'var(--red)' : lvl === 'warn' ? '#e0b04c' : lvl === 'info' ? '#7faaca' : 'var(--ink-dim)';
     body.innerHTML = this.entries.slice().reverse().map(e => {
       const time = e.ts.toLocaleTimeString(undefined, { hour12: false }) + '.' + String(e.ts.getMilliseconds()).padStart(3, '0');
       const dataStr = e.data ? ` <span style="color:var(--ink-faint)">${escapeHtml(typeof e.data === 'string' ? e.data : JSON.stringify(e.data).slice(0, 200))}</span>` : '';
@@ -5721,6 +5846,9 @@ function closeSourcesModal() {
 }
 
 document.getElementById('sources-btn').addEventListener('click', openSourcesModal);
+document.getElementById('editor-btn')?.addEventListener('click', () => {
+  if (typeof openEditor === 'function') openEditor(state.stock?.ticker);
+});
 document.getElementById('sources-close').addEventListener('click', closeSourcesModal);
 document.getElementById('sources-modal').addEventListener('click', e => {
   if (e.target.id === 'sources-modal') closeSourcesModal();
@@ -6766,7 +6894,7 @@ const QUADS = {
     name: 'Goldilocks',
     axes: 'Growth ↑ · Inflation ↓',
     desc: 'Strong real growth with cooling price pressures. Historically the most bullish for broad risk assets — high-beta, momentum, and growth styles tend to lead.',
-    color: '#5b8a72',
+    color: 'var(--pos)',
     overweights: ['XLK (Tech)', 'XLY (Discretionary)', 'XLI (Industrials)', 'XLC (Comm)'],
     underweights: ['XLU (Utilities)', 'XLP (Staples)', 'XLE (Energy)'],
     style: 'Growth, Momentum, High-Beta',
@@ -6776,7 +6904,7 @@ const QUADS = {
     name: 'Reflation',
     axes: 'Growth ↑ · Inflation ↑',
     desc: 'Booming growth alongside rising prices — the post-stimulus or commodity-boom regime. Still pro-risk but more cyclical in character.',
-    color: '#c4965a',
+    color: 'var(--data-amber)',
     overweights: ['XLK (Tech)', 'XLI (Industrials)', 'XLF (Financials)', 'XLE (Energy)', 'XLY (Discretionary)'],
     underweights: ['XLU (Utilities)', 'XLP (Staples)', 'TLT (Long bonds)'],
     style: 'Cyclicals, Value, Commodities',
@@ -6786,7 +6914,7 @@ const QUADS = {
     name: 'Stagflation',
     axes: 'Growth ↓ · Inflation ↑',
     desc: 'Slowing growth with rising prices — the squeeze. Defensive yield and inflation-protected positioning have historically led.',
-    color: '#a5645a',
+    color: 'var(--neg)',
     overweights: ['XLK (Tech)', 'XLU (Utilities)', 'XLRE (REITs)', 'XLE (Energy)', 'GLD (Gold)'],
     underweights: ['XLY (Discretionary)', 'XLF (Financials)', 'XLI (Industrials)'],
     style: 'Quality, Yield, Hard Assets',
@@ -7159,9 +7287,9 @@ function renderFedTab() {
   const exp = fedRateExpectation();
   const today = new Date().toISOString().slice(0, 10);
 
-  const moveColor = (m) => m === 'cut' ? '#5b8a72' : m === 'hike' ? '#a5645a' : 'var(--ink-dim)';
+  const moveColor = (m) => m === 'cut' ? 'var(--pos)' : m === 'hike' ? 'var(--neg)' : 'var(--ink-dim)';
   const moveLabel = (m) => m === 'cut' ? '▼ CUT' : m === 'hike' ? '▲ HIKE' : '— HOLD';
-  const stanceColor = exp.stance === 'easing' ? '#5b8a72' : exp.stance === 'tightening' ? '#a5645a' : 'var(--amber)';
+  const stanceColor = exp.stance === 'easing' ? 'var(--pos)' : exp.stance === 'tightening' ? 'var(--neg)' : 'var(--amber)';
 
   // ---- Current state strip ----
   const next = exp.nextMeeting;
@@ -7182,9 +7310,9 @@ function renderFedTab() {
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Next-Meeting Odds</div>
         <div style="font-family:var(--mono);font-size:13px;font-weight:700;margin-top:6px;line-height:1.5">
           ${exp.nextOdds ? `
-            <span style="color:#5b8a72">Cut ${(exp.nextOdds.cut*100).toFixed(0)}%</span> ·
+            <span style="color:var(--pos)">Cut ${(exp.nextOdds.cut*100).toFixed(0)}%</span> ·
             <span style="color:var(--ink-dim)">Hold ${(exp.nextOdds.hold*100).toFixed(0)}%</span> ·
-            <span style="color:#a5645a">Hike ${(exp.nextOdds.hike*100).toFixed(0)}%</span>
+            <span style="color:var(--neg)">Hike ${(exp.nextOdds.hike*100).toFixed(0)}%</span>
           ` : '—'}
         </div>
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">${exp.nextOdds ? exp.nextOdds.source : ''} blend</div>
@@ -7212,7 +7340,7 @@ function renderFedTab() {
         <td style="font-family:var(--mono);font-size:11px">
           <input type="text" class="fed-user-odds" data-meeting="${m.date}" value="${us ? `${(us.cut*100).toFixed(0)}/${(us.hold*100).toFixed(0)}/${(us.hike*100).toFixed(0)}` : ''}" placeholder="cut/hold/hike" style="width:90px;background:var(--bg-elev);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:11px;padding:3px 6px;border-radius:2px">
         </td>
-        <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${blend ? (blend.cut > blend.hike ? '#5b8a72' : blend.hike > blend.cut ? '#a5645a' : 'var(--ink-dim)') : 'var(--ink-faint)'}">${oddsCell(blend)}</td>
+        <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${blend ? (blend.cut > blend.hike ? 'var(--pos)' : blend.hike > blend.cut ? 'var(--neg)' : 'var(--ink-dim)') : 'var(--ink-faint)'}">${oddsCell(blend)}</td>
       </tr>`;
   }).join('');
 
@@ -7792,7 +7920,7 @@ function renderQuadHero() {
       const expected = quadToRegimes[m.current.quad] || [];
       const agrees = expected.includes(r.regime);
       const verdict = agrees ? 'AGREE' : 'DIVERGE';
-      const verdictColor = agrees ? '#5b8a72' : '#c4965a';
+      const verdictColor = agrees ? 'var(--pos)' : 'var(--data-amber)';
       xrefHost.style.borderLeftColor = info.color;
       xrefHost.innerHTML = `
         <span style="color:var(--ink-dim);font-size:10px;letter-spacing:0.15em">REGIME ENGINE</span>
@@ -7838,6 +7966,23 @@ function renderQuadGrid() {
       </div>
     `;
   }).join('');
+}
+
+// Resolve a CSS custom property (e.g. '--neg') to its computed color string.
+// Needed for <canvas> fillStyle/strokeStyle, which — unlike SVG/DOM — cannot
+// resolve var() references themselves. Cached per value; recomputed if theme
+// changes (the cache key includes the current theme).
+let _cssVarCache = {};
+let _cssVarTheme = null;
+function cssVar(name, fallback) {
+  const theme = document.documentElement.getAttribute('data-theme') || 'dark';
+  if (theme !== _cssVarTheme) { _cssVarCache = {}; _cssVarTheme = theme; }
+  if (_cssVarCache[name]) return _cssVarCache[name];
+  let v = '';
+  try { v = getComputedStyle(document.documentElement).getPropertyValue(name).trim(); } catch {}
+  const resolved = v || fallback || '#888';
+  _cssVarCache[name] = resolved;
+  return resolved;
 }
 
 function renderQuadHistory() {
@@ -7914,7 +8059,7 @@ function renderQuadHistory() {
   ctx.stroke();
 
   // Inflation RoC line (red-brown)
-  ctx.strokeStyle = '#a5645a';
+  ctx.strokeStyle = cssVar('--neg', '#a5645a');
   ctx.lineWidth = 2;
   ctx.beginPath();
   data.forEach((d, i) => {
@@ -7949,7 +8094,7 @@ function renderQuadHistory() {
   ctx.textAlign = 'left';
   ctx.fillStyle = '#d4a24c';
   ctx.fillText('— Growth RoC', padL + 8, padT + 14);
-  ctx.fillStyle = '#a5645a';
+  ctx.fillStyle = cssVar('--neg', '#a5645a');
   ctx.fillText('— Inflation RoC', padL + 110, padT + 14);
 }
 
@@ -7999,7 +8144,7 @@ function attachQuadChartHover() {
     // Dots
     ctx.fillStyle = '#d4a24c';
     ctx.beginPath(); ctx.arc(px, geom.y(d.growthRoC), 4, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#a5645a';
+    ctx.fillStyle = cssVar('--neg', '#a5645a');
     ctx.beginPath(); ctx.arc(px, geom.y(d.inflationRoC), 4, 0, Math.PI * 2); ctx.fill();
 
     // Position tooltip
@@ -8010,7 +8155,7 @@ function attachQuadChartHover() {
       <div class="qct-row"><span>GDP YoY</span><span>${(d.growthYoY * 100).toFixed(2)}%</span></div>
       <div class="qct-row"><span>CPI YoY</span><span>${(d.inflationYoY * 100).toFixed(2)}%</span></div>
       <div class="qct-row"><span>Growth Δ</span><span style="color:#d4a24c">${(d.growthRoC * 100 >= 0 ? '+' : '') + (d.growthRoC * 100).toFixed(2)}pp</span></div>
-      <div class="qct-row"><span>Inflation Δ</span><span style="color:#a5645a">${(d.inflationRoC * 100 >= 0 ? '+' : '') + (d.inflationRoC * 100).toFixed(2)}pp</span></div>
+      <div class="qct-row"><span>Inflation Δ</span><span style="color:var(--neg)">${(d.inflationRoC * 100 >= 0 ? '+' : '') + (d.inflationRoC * 100).toFixed(2)}pp</span></div>
     `;
     tip.style.display = 'block';
     const tipW = 200;
@@ -8179,7 +8324,7 @@ function populateSectorStocksList(etfTicker) {
     const name = sb?.name || tic;
     const price = sb?.price;
     const chg = sb?.rawRow ? parsePct(sb.rawRow['changepct']) : null;
-    const chgColor = chg == null ? 'var(--ink-faint)' : chg > 0 ? '#5b8a72' : '#a5645a';
+    const chgColor = chg == null ? 'var(--ink-faint)' : chg > 0 ? 'var(--pos)' : 'var(--neg)';
     const chgText = chg == null ? '' : (chg >= 0 ? '+' : '') + (chg * 100).toFixed(2) + '%';
     return `
       <button class="sector-stock-pill" data-sector-stock="${tic}" title="Click to run valuation"
@@ -8358,6 +8503,9 @@ function switchTab(tabName) {
       tabName === 'risk' ? 'Risk Calculator · Ray Dalio Holy Grail · diversification math' :
       tabName === 'bonds' ? 'Bonds & Treasuries · yield curve · interest rates · public debt' :
       tabName === 'fed' ? 'Federal Reserve · rate-cut/hike pricing · FOMC schedule · decision effectiveness' :
+      tabName === 'bets' ? 'Bot Bets · $1,000 paper portfolio · conviction signals · 6-month challenge' :
+      tabName === 'research' ? 'Research · cross-stockbook ranking · screen by any metric · letter grades' :
+      tabName === 'review' ? 'Review · human-in-the-loop · confirm guesses · retrain the model' :
       tabName === 'news'  ? 'News Feed · sorted by market cap · search, "My News" preset, lead+closer summarization' :
       tabName === 'scenarios' ? 'Scenarios · shock-and-transmission engine · ranged estimates with epistemic tiers' :
       tabName === 'supplychain' ? 'Supply Chains · upstream / midstream / downstream linkages · cross-portfolio exposure discovery' :
@@ -8439,6 +8587,15 @@ function switchTab(tabName) {
   }
   if (tabName === 'fed') {
     if (typeof renderFedTab === 'function') renderFedTab();
+  }
+  if (tabName === 'bets') {
+    if (typeof renderBetsTab === 'function') renderBetsTab();
+  }
+  if (tabName === 'research') {
+    if (typeof renderResearchTab === 'function') renderResearchTab();
+  }
+  if (tabName === 'review') {
+    if (typeof renderReviewHub === 'function') renderReviewHub();
   }
 }
 
@@ -9023,7 +9180,13 @@ function renderStockBook() {
         <tbody>
           ${rows.map(r => {
             const statusClass = r.status ? r.status.toLowerCase().trim() : '';
-            const functionBadge = r.function
+            // Detect tracking/inverse relationship for the Function column —
+            // shows "Inversely related to MSFT" even when the function field
+            // is blank, by parsing the description.
+            const _rowRel = (typeof detectDerivativeRelationship === 'function') ? detectDerivativeRelationship(r) : null;
+            const functionBadge = _rowRel
+              ? `<span class="sb-function-badge sb-fn-${r.instrumentType || _rowRel.relationship}" title="${escapeHtml(_rowRel.label)}">${escapeHtml(_rowRel.label)}</span>`
+              : r.function
               ? `<span class="sb-function-badge sb-fn-${r.instrumentType}">${escapeHtml(r.function)}</span>`
               : '—';
             const taxonomyCells = sb.section === 'derivatives'
@@ -9626,7 +9789,7 @@ async function openSheetDiagnostics() {
         </div>
         <div class="modal-section">
           <div class="modal-label">Price history extracted from CSV/sheet parser: ${tickersWithHistory.length} tickers</div>
-          <div style="font-family:var(--mono);font-size:11px;color:${tickersWithHistory.length > 0 ? '#5b8a72' : 'var(--ink-faint)'}">
+          <div style="font-family:var(--mono);font-size:11px;color:${tickersWithHistory.length > 0 ? 'var(--pos)' : 'var(--ink-faint)'}">
             ${tickersWithHistory.length === 0
               ? 'None — sheet/CSV parser found no embedded date/price pairs. This is normal when using GitHub manifest source (history comes via per-ticker files instead).'
               : tickersWithHistory.join(', ')}
@@ -9646,7 +9809,7 @@ async function openSheetDiagnostics() {
             <div class="modal-section" style="background:var(--bg-elev);padding:14px;border-left:2px solid var(--amber)">
               <div class="modal-label">GitHub History Cache <small style="color:var(--ink-faint);text-transform:none;letter-spacing:0">(used by Portfolio chart, correlations, valuation)</small></div>
               <div style="font-family:var(--mono);font-size:11px;color:var(--ink);line-height:1.7">
-                <strong style="color:#5b8a72">${cachedTickers.length} tickers cached</strong> · manifest registered for <strong>${manifestN}</strong> tickers<br>
+                <strong style="color:var(--pos)">${cachedTickers.length} tickers cached</strong> · manifest registered for <strong>${manifestN}</strong> tickers<br>
                 <span style="color:var(--ink-dim)">base URL: ${manifest?.baseUrl || '—'}</span>
               </div>
               ${sample && sampleData ? `
@@ -9934,7 +10097,7 @@ function renderPriceChart() {
   const firstPrice = data[0].price;
   const lastPrice = data[data.length - 1].price;
   const isUp = lastPrice >= firstPrice;
-  const lineColor = isUp ? '#5b8a72' : '#a5645a';
+  const lineColor = isUp ? 'var(--pos)' : 'var(--neg)';
   const fillColor = isUp ? 'rgba(91, 138, 114, 0.15)' : 'rgba(165, 100, 90, 0.15)';
 
   ctx.beginPath();
@@ -9973,6 +10136,44 @@ function renderPriceChart() {
     const label = dt.toLocaleDateString('en-US', { month: 'short', year: '2-digit' });
     ctx.fillText(label, x(idx), padT + plotH + 16);
   }
+
+  // ----- POST / CALL MARKERS overlay -----
+  // Plot each tracked post for this ticker at its timestamp: up-triangle for
+  // bullish, down for bearish, colored, with a hover title. Connects the Calls
+  // tab to the price chart (Phase 2).
+  try {
+    const tk = (state.priceChart.ticker || state.stock?.ticker || '').toUpperCase();
+    if (tk && typeof postsForTicker === 'function') {
+      const posts = postsForTicker(tk);
+      if (posts.length && data.length) {
+        const t0 = new Date(data[0].date).getTime();
+        const t1 = new Date(data[data.length - 1].date).getTime();
+        const span = (t1 - t0) || 1;
+        for (const p of posts) {
+          const pt = new Date(p.postedAt).getTime();
+          if (pt < t0 || pt > t1) continue;  // outside visible range
+          const frac = (pt - t0) / span;
+          const mx = padL + frac * plotW;
+          const bull = p.sentiment === 'bullish';
+          const bear = p.sentiment === 'bearish';
+          const col = bull ? cssVar('--pos', '#5b8a72') : bear ? cssVar('--neg', '#a5645a') : '#8a8275';
+          const my = bull ? padT + plotH - 6 : padT + 6;  // bull near bottom, bear near top
+          ctx.fillStyle = col;
+          ctx.beginPath();
+          if (bull) { ctx.moveTo(mx, my - 8); ctx.lineTo(mx - 5, my); ctx.lineTo(mx + 5, my); }
+          else { ctx.moveTo(mx, my + 8); ctx.lineTo(mx - 5, my); ctx.lineTo(mx + 5, my); }
+          ctx.closePath();
+          ctx.fill();
+          // thin vertical guide
+          ctx.strokeStyle = col + '55';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([2, 3]);
+          ctx.beginPath(); ctx.moveTo(mx, padT); ctx.lineTo(mx, padT + plotH); ctx.stroke();
+          ctx.setLineDash([]);
+        }
+      }
+    }
+  } catch {}
 
   // ----- Stats below -----
   renderPriceChartStats(data, _fxInverted);
@@ -10020,7 +10221,33 @@ document.getElementById('fx-invert-toggle')?.addEventListener('click', () => {
   const btn = document.getElementById('fx-invert-toggle');
   if (btn) btn.classList.toggle('active', state.priceChart.fxInvert !== false);
   renderPriceChart();
+  // Keep the headline price in sync with the chart's invert state: flip between
+  // the inverted decimal (dollars per unit) and the raw won-per-dollar rate.
+  if (typeof updateFxPriceDisplay === 'function' && state.stock) updateFxPriceDisplay(state.stock);
 });
+
+// Update the headline price element for an FX pair according to the chart's
+// current invert state. Shared by renderSummary and the invert toggle so they
+// never disagree.
+function updateFxPriceDisplay(s) {
+  const priceEl = document.getElementById('s-price');
+  if (!priceEl || !s || s.price == null) return;
+  const cls = (typeof classifyAsset === 'function') ? classifyAsset(s.ticker) : 'equity';
+  if (cls !== 'fx') return;
+  const t = String(s.ticker).toUpperCase().replace('=X', '');
+  let base, quote;
+  if (t.length === 6) { base = t.slice(0, 3); quote = t.slice(3); }
+  else { base = 'USD'; quote = t; }
+  const inverted = !state.priceChart || state.priceChart.fxInvert !== false;
+  if (inverted && s.price > 0) {
+    const dpu = 1 / s.price;
+    priceEl.textContent = `${dpu.toPrecision(5)} ${base}/${quote}`;
+    priceEl.title = `1 ${quote} = ${dpu.toPrecision(6)} ${base} (inverse of ${s.price.toLocaleString(undefined,{maximumFractionDigits:4})} ${quote}/${base})`;
+  } else {
+    priceEl.textContent = `${s.price.toLocaleString(undefined, { maximumFractionDigits: 4 })} ${quote}/${base}`;
+    priceEl.title = `1 ${base} = ${s.price.toLocaleString(undefined, { maximumFractionDigits: 4 })} ${quote}`;
+  }
+}
 
 // Hover tooltip
 function attachPriceChartHover() {
@@ -10076,7 +10303,7 @@ function attachPriceChartHover() {
     const firstDate = geom.data[0].date;
     const fromStart = ((d.price - first) / first) * 100;
     const dir = fromStart >= 0 ? 'up' : 'down';
-    const dirColor = dir === 'up' ? '#5b8a72' : '#a5645a';
+    const dirColor = dir === 'up' ? 'var(--pos)' : 'var(--neg)';
     const dt = new Date(d.date);
     const dateLabel = dt.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
     const startDt = new Date(firstDate);
@@ -10136,11 +10363,13 @@ const TERMINAL_FUNCTIONS = {
   HOLD:   { name: 'Holdings (52W)',       desc: '52-week range + current position',      scope: 'ticker', handler: fnHOLD },
   CRPR:   { name: 'Credit Profile',       desc: 'Synthetic rating & default spread',     scope: 'ticker', handler: fnCRPR },
   CEO:    { name: 'CEO / Leadership',     desc: 'Per-ticker leadership + career history', scope: 'ticker', handler: fnCEO },
+  THF:    { name: '13F Holdings',         desc: 'Institutional holdings + Q/Q changes',  scope: 'global', handler: fn13F },
 
   // === Market & macro ===
   GMM:    { name: 'Global Market Monitor', desc: 'Sector ETFs & macro snapshot',         scope: 'global', handler: fnGMM },
   IMAP:   { name: 'Intraday Market Map',   desc: 'Sector heat map by performance',       scope: 'global', handler: fnIMAP },
   HEAT:   { name: 'Heat Map by Sector',    desc: 'All your stocks grouped by sector',    scope: 'global', handler: fnHEAT },
+  WEB:    { name: 'Relationship Web (3D)',  desc: '3D supply-chain connection graph',    scope: 'global', handler: fnWEB },
   SOVM:   { name: 'Sovereign Monitor',     desc: 'Treasury yields & Fed Funds',          scope: 'global', handler: fnSOVM },
   QUAD:   { name: 'GIP Quad',              desc: 'Current macro regime',                 scope: 'global', handler: () => switchTab('macro') },
   MGMT:   { name: 'Leadership Tracker',    desc: 'Cross-portfolio management database',  scope: 'global', handler: fnMGMT },
@@ -10154,8 +10383,8 @@ const TERMINAL_FUNCTIONS = {
 };
 
 const TERMINAL_GROUPS = [
-  { label: 'Company', mnemonics: ['DES', 'GP', 'RV', 'EE', 'ANR', 'WACC', 'FA', 'SPLC', 'HOLD', 'CRPR', 'CEO'] },
-  { label: 'Market',  mnemonics: ['GMM', 'IMAP', 'HEAT', 'SOVM', 'QUAD', 'MGMT'] },
+  { label: 'Company', mnemonics: ['DES', 'GP', 'RV', 'EE', 'ANR', 'WACC', 'FA', 'SPLC', 'HOLD', 'CRPR', 'CEO', 'THF'] },
+  { label: 'Market',  mnemonics: ['GMM', 'IMAP', 'HEAT', 'WEB', 'SOVM', 'QUAD', 'MGMT'] },
   { label: 'Navigate', mnemonics: ['HELP', 'TOP', 'BOOK', 'EQS', 'PORT'] },
 ];
 
@@ -10320,7 +10549,7 @@ async function fnDES(ticker) {
         <div><div class="l">Last Price</div><div class="v">${merged.price != null ? fmt$(merged.price) : '—'}</div></div>
         <div><div class="l">Market Cap</div><div class="v">${merged.marketCap != null ? formatHumanNumber(merged.marketCap) : '—'}</div></div>
         ${merged.fmpMarketCap && merged.fmpMarketCap !== merged.marketCap ?
-          `<div><div class="l">FMP Market Cap</div><div class="v" style="color:#c4965a">${formatHumanNumber(merged.fmpMarketCap)}</div></div>` : ''}
+          `<div><div class="l">FMP Market Cap</div><div class="v" style="color:var(--data-amber)">${formatHumanNumber(merged.fmpMarketCap)}</div></div>` : ''}
         <div><div class="l">P/E</div><div class="v">${merged.pe != null ? merged.pe.toFixed(2) : '—'}</div></div>
         <div><div class="l">EPS</div><div class="v">${merged.eps != null ? fmt$(merged.eps) : '—'}</div></div>
         <div><div class="l">Beta</div><div class="v">${merged.beta != null ? merged.beta.toFixed(2) : '—'}</div></div>
@@ -10479,7 +10708,7 @@ async function fnRV(ticker) {
                     <td>${p.row.pe != null ? p.row.pe.toFixed(2) : '—'}</td>
                     <td>${p.row.beta != null ? p.row.beta.toFixed(2) : '—'}</td>
                     <td>${p.row.marketCap != null ? formatHumanNumber(p.row.marketCap) : '—'}</td>
-                    <td style="color:${p.row.plPct >= 0 ? '#5b8a72' : '#a5645a'}">${p.row.plPct != null ? (p.row.plPct >= 0 ? '+' : '') + p.row.plPct.toFixed(1) + '%' : '—'}</td>
+                    <td style="color:${p.row.plPct >= 0 ? 'var(--pos)' : 'var(--neg)'}">${p.row.plPct != null ? (p.row.plPct >= 0 ? '+' : '') + p.row.plPct.toFixed(1) + '%' : '—'}</td>
                   </tr>
                 `).join('')}
               </tbody>
@@ -10583,7 +10812,7 @@ async function fnHOLD(ticker) {
         <span style="color:var(--amber);font-weight:700">${(pctOfRange * 100).toFixed(1)}% of range</span>
         <span>${fmt$(high52)}</span>
       </div>
-      <div style="position:relative;height:40px;background:linear-gradient(to right,#a5645a,var(--amber),#5b8a72);opacity:0.4;border:1px solid var(--rule)">
+      <div style="position:relative;height:40px;background:linear-gradient(to right,var(--neg),var(--amber),var(--pos));opacity:0.4;border:1px solid var(--rule)">
         <div style="position:absolute;top:-4px;width:3px;height:48px;background:var(--amber);left:${pctOfRange * 100}%;box-shadow:0 0 8px var(--amber)"></div>
       </div>
     </div>
@@ -10909,7 +11138,7 @@ function renderFinancialGrade(s, fmpData) {
   const totalWeight = scores.reduce((s, x) => s + x.weight, 0);
   const overall = scores.reduce((s, x) => s + x.score * x.weight, 0) / totalWeight;
   const letter = overallToLetter(overall);
-  const gradeColor = overall >= 85 ? '#5b8a72' : overall >= 70 ? '#7aa085' : overall >= 55 ? '#c4965a' : overall >= 40 ? '#b88578' : '#a5645a';
+  const gradeColor = overall >= 85 ? 'var(--pos)' : overall >= 70 ? '#7aa085' : overall >= 55 ? 'var(--data-amber)' : overall >= 40 ? '#b88578' : 'var(--neg)';
 
   return `
     <div class="fn-section">
@@ -10922,7 +11151,7 @@ function renderFinancialGrade(s, fmpData) {
         </div>
         <div>
           ${scores.map(s => {
-            const c = s.score >= 85 ? '#5b8a72' : s.score >= 70 ? '#7aa085' : s.score >= 55 ? '#c4965a' : s.score >= 40 ? '#b88578' : '#a5645a';
+            const c = s.score >= 85 ? 'var(--pos)' : s.score >= 70 ? '#7aa085' : s.score >= 55 ? 'var(--data-amber)' : s.score >= 40 ? '#b88578' : 'var(--neg)';
             const barW = Math.max(2, Math.min(100, s.score));
             return `
               <div style="margin-bottom:14px">
@@ -11543,7 +11772,7 @@ async function fnSOVM() {
     <div class="fn-section">
       <h3>Curve Status</h3>
       <div class="fn-kv-grid">
-        <div><div class="l">Yield Curve (10Y - FF)</div><div class="v" style="color:${spread > 0 ? '#5b8a72' : '#a5645a'}">${spread != null ? (spread >= 0 ? '+' : '') + spread.toFixed(2) + 'pp' : '—'}</div></div>
+        <div><div class="l">Yield Curve (10Y - FF)</div><div class="v" style="color:${spread > 0 ? 'var(--pos)' : 'var(--neg)'}">${spread != null ? (spread >= 0 ? '+' : '') + spread.toFixed(2) + 'pp' : '—'}</div></div>
         <div><div class="l">Curve State</div><div class="v">${spread > 1 ? 'Steep' : spread > 0 ? 'Normal' : spread > -0.5 ? 'Flat' : 'Inverted'}</div></div>
         <div><div class="l">10Y · 1Y Range</div><div class="v">${tsy1y != null ? Math.min(tsy, tsy1y).toFixed(2) + '–' + Math.max(tsy, tsy1y).toFixed(2) + '%' : '—'}</div></div>
         <div><div class="l">Data Source</div><div class="v">FRED</div></div>
@@ -11755,7 +11984,7 @@ async function fnCEO(ticker) {
               <div style="font-family:var(--mono);font-size:11px;color:var(--amber);margin-top:2px">${escapeHtml(p.role || '')}${velocityHtml}</div>
               ${educationHtml}
               ${p._manualEntry ? `<div style="margin-top:4px"><span style="padding:1px 6px;background:rgba(212,162,76,0.12);color:var(--amber);border:1px solid var(--amber);border-radius:2px;font-family:var(--mono);font-size:8px;font-weight:700;letter-spacing:0.06em">MANUAL ENTRY</span></div>` : ''}
-              ${p._verificationStatus === 'verified' && p._hasOverride ? `<div style="margin-top:4px"><span style="padding:1px 6px;background:rgba(91,138,114,0.12);color:#5b8a72;border:1px solid #5b8a72;border-radius:2px;font-family:var(--mono);font-size:8px;font-weight:700;letter-spacing:0.06em">✓ VERIFIED</span></div>` : ''}
+              ${p._verificationStatus === 'verified' && p._hasOverride ? `<div style="margin-top:4px"><span style="padding:1px 6px;background:rgba(91,138,114,0.12);color:var(--pos);border:1px solid var(--pos);border-radius:2px;font-family:var(--mono);font-size:8px;font-weight:700;letter-spacing:0.06em">✓ VERIFIED</span></div>` : ''}
             </div>
             <div style="display:flex;align-items:center;gap:6px">
               ${career?.qid ? `<a href="https://www.wikidata.org/wiki/${career.qid}" target="_blank" rel="noopener" style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);text-decoration:none">${career.qid} ↗</a>` : ''}
@@ -12609,9 +12838,9 @@ function renderLeadershipEditBody() {
   const body = document.getElementById('leadership-edit-body');
 
   const statusBadge = w.verificationStatus === 'verified'
-    ? `<span style="padding:2px 8px;background:rgba(91,138,114,0.15);color:#5b8a72;border:1px solid #5b8a72;border-radius:2px;font-family:var(--mono);font-size:9px;font-weight:700">VERIFIED · ${escapeHtml(w.qid || '')}</span>`
+    ? `<span style="padding:2px 8px;background:rgba(91,138,114,0.15);color:var(--pos);border:1px solid var(--pos);border-radius:2px;font-family:var(--mono);font-size:9px;font-weight:700">VERIFIED · ${escapeHtml(w.qid || '')}</span>`
     : w.verificationStatus === 'no-match'
-    ? `<span style="padding:2px 8px;background:rgba(196,150,90,0.12);color:#c4965a;border:1px solid #c4965a;border-radius:2px;font-family:var(--mono);font-size:9px;font-weight:700">UNVERIFIED</span>`
+    ? `<span style="padding:2px 8px;background:rgba(196,150,90,0.12);color:var(--data-amber);border:1px solid var(--data-amber);border-radius:2px;font-family:var(--mono);font-size:9px;font-weight:700">UNVERIFIED</span>`
     : w.manualEntry
     ? `<span style="padding:2px 8px;background:rgba(212,162,76,0.12);color:var(--amber);border:1px solid var(--amber);border-radius:2px;font-family:var(--mono);font-size:9px;font-weight:700">MANUAL ENTRY</span>`
     : '';
@@ -12761,7 +12990,7 @@ function renderPositionsEditor(positions) {
         <input type="text" placeholder="Company" data-le-pos-field="company" data-le-pos-idx="${idx}" value="${escapeHtml(pos.company || '')}" style="padding:5px 7px;background:var(--bg);color:var(--ink);font-family:var(--mono);font-size:11px;border:1px solid var(--rule);border-radius:2px;outline:none">
         <input type="text" placeholder="Start YYYY" data-le-pos-field="start" data-le-pos-idx="${idx}" value="${escapeHtml((pos.start || '').slice(0, 10))}" style="padding:5px 7px;background:var(--bg);color:var(--ink);font-family:var(--mono);font-size:11px;border:1px solid var(--rule);border-radius:2px;outline:none">
         <input type="text" placeholder="End YYYY" data-le-pos-field="end" data-le-pos-idx="${idx}" value="${escapeHtml((pos.end || '').slice(0, 10))}" style="padding:5px 7px;background:var(--bg);color:var(--ink);font-family:var(--mono);font-size:11px;border:1px solid var(--rule);border-radius:2px;outline:none">
-        <button class="btn" data-le-pos-remove="${idx}" style="font-size:14px;padding:2px 8px;color:#a5645a;line-height:1" title="Remove">×</button>
+        <button class="btn" data-le-pos-remove="${idx}" style="font-size:14px;padding:2px 8px;color:var(--neg);line-height:1" title="Remove">×</button>
       </div>
     </div>
   `).join('');
@@ -12775,7 +13004,7 @@ function renderEmployersEditor(employers) {
         <input type="text" placeholder="Company" data-le-emp-field="company" data-le-emp-idx="${idx}" value="${escapeHtml(emp.company || '')}" style="padding:5px 7px;background:var(--bg);color:var(--ink);font-family:var(--mono);font-size:11px;border:1px solid var(--rule);border-radius:2px;outline:none">
         <input type="text" placeholder="Start YYYY" data-le-emp-field="start" data-le-emp-idx="${idx}" value="${escapeHtml((emp.start || '').slice(0, 10))}" style="padding:5px 7px;background:var(--bg);color:var(--ink);font-family:var(--mono);font-size:11px;border:1px solid var(--rule);border-radius:2px;outline:none">
         <input type="text" placeholder="End YYYY" data-le-emp-field="end" data-le-emp-idx="${idx}" value="${escapeHtml((emp.end || '').slice(0, 10))}" style="padding:5px 7px;background:var(--bg);color:var(--ink);font-family:var(--mono);font-size:11px;border:1px solid var(--rule);border-radius:2px;outline:none">
-        <button class="btn" data-le-emp-remove="${idx}" style="font-size:14px;padding:2px 8px;color:#a5645a;line-height:1" title="Remove">×</button>
+        <button class="btn" data-le-emp-remove="${idx}" style="font-size:14px;padding:2px 8px;color:var(--neg);line-height:1" title="Remove">×</button>
       </div>
     </div>
   `).join('');
@@ -12904,9 +13133,9 @@ document.addEventListener('DOMContentLoaded', () => {
           state.leadership.editing = applied.person;
           renderLeadershipEditBody();
           if (applied.conflicts.length > 0) {
-            statusEl.innerHTML = `Verified — <span style="color:#c4965a">${applied.conflicts.length} field conflict(s); your values kept. Edit manually to override.</span>`;
+            statusEl.innerHTML = `Verified — <span style="color:var(--data-amber)">${applied.conflicts.length} field conflict(s); your values kept. Edit manually to override.</span>`;
           } else {
-            statusEl.innerHTML = `<span style="color:#5b8a72">✓ Verified — manual flag removed</span>`;
+            statusEl.innerHTML = `<span style="color:var(--pos)">✓ Verified — manual flag removed</span>`;
           }
         } catch (e) {
           statusEl.textContent = `Apply failed: ${e.message}`;
@@ -12952,12 +13181,12 @@ function triggerLeadershipImport(onComplete) {
       <div style="font-family:var(--mono);font-size:11px;color:var(--ink);line-height:1.8">
         <div style="margin-bottom:14px">Imported from <strong>${escapeHtml(file.name)}</strong></div>
         <div style="background:var(--bg-elev);border:1px solid var(--rule);border-radius:3px;padding:10px 14px;margin-bottom:14px">
-          <div><span style="color:#5b8a72">+</span> ${additions.length} new people</div>
-          <div><span style="color:#c4965a">~</span> ${modifications.length} modified people</div>
-          <div><span style="color:#a5645a">−</span> ${removals.length} removed people <span style="color:var(--ink-faint)">(present locally but not in import)</span></div>
+          <div><span style="color:var(--pos)">+</span> ${additions.length} new people</div>
+          <div><span style="color:var(--data-amber)">~</span> ${modifications.length} modified people</div>
+          <div><span style="color:var(--neg)">−</span> ${removals.length} removed people <span style="color:var(--ink-faint)">(present locally but not in import)</span></div>
         </div>
         ${removals.length > 0 ? `
-          <div style="background:rgba(165,100,90,0.08);border:1px solid #a5645a;border-radius:3px;padding:10px 14px;font-size:10px;color:#a5645a;margin-bottom:10px">
+          <div style="background:rgba(165,100,90,0.08);border:1px solid var(--neg);border-radius:3px;padding:10px 14px;font-size:10px;color:var(--neg);margin-bottom:10px">
             Importing will REPLACE your current overrides with the imported set.
             ${removals.length} person/people you have locally but not in the import file will be removed.
           </div>
@@ -13321,7 +13550,7 @@ function fnPORT() {
     <div class="fn-section">
       <h3>Portfolio Summary · ${saved.length} saved valuations</h3>
       <div class="fn-kv-grid">
-        <div><div class="l">Avg Margin of Safety</div><div class="v" style="color:${totalUpside > 0 ? '#5b8a72' : '#a5645a'}">${(totalUpside * 100).toFixed(1)}%</div></div>
+        <div><div class="l">Avg Margin of Safety</div><div class="v" style="color:${totalUpside > 0 ? 'var(--pos)' : 'var(--neg)'}">${(totalUpside * 100).toFixed(1)}%</div></div>
         <div><div class="l">Undervalued</div><div class="v up">${saved.filter(v => v.fairValue > v.price * 1.1).length}</div></div>
         <div><div class="l">Fair</div><div class="v">${saved.filter(v => v.fairValue && Math.abs(v.fairValue - v.price) <= v.price * 0.1).length}</div></div>
         <div><div class="l">Overvalued</div><div class="v down">${saved.filter(v => v.fairValue < v.price * 0.9).length}</div></div>
@@ -14174,6 +14403,47 @@ async function computeThesisProbability(thesis) {
 }
 
 // ---------- RENDER ----------
+// ============================================================
+//   IMPORT CALL → PROBABILITY THESIS
+//   Reuses the Calls parser brain to turn an X post / pasted text into a binary
+//   thesis (ticker · target=strike · date · direction). A thesis needs a strike
+//   and a direction, so a post must have a price target to convert; vague posts
+//   without a number are flagged (the user can add a strike manually).
+// ============================================================
+function thesisFromParsedPost(parsed) {
+  if (!parsed || !parsed.primaryTicker) return { ok: false, reason: 'No ticker detected.' };
+  if (parsed.priceTarget == null) return { ok: false, reason: 'No price target — a thesis needs a strike (e.g. "$500"). Add one or use + New Thesis.' };
+  // Direction from sentiment: bullish → "above", bearish → "below".
+  const direction = parsed.sentiment.label === 'bearish' ? 'below' : 'above';
+  const targetDate = parsed.horizon?.targetDate
+    ? new Date(parsed.horizon.targetDate).toISOString()
+    : new Date(Date.now() + 90 * 86400000).toISOString();   // default 90d if vague
+  const days = Math.max(1, Math.ceil((new Date(targetDate) - Date.now()) / 86400000));
+  return {
+    ok: true,
+    thesis: {
+      id: 't' + Date.now(),
+      ticker: parsed.primaryTicker,
+      strike: parsed.priceTarget,
+      direction,
+      initialDays: days,
+      createdAt: new Date().toISOString(),
+      targetDate,
+      manualPrior: 0.5,
+      weights: { ai: 0.35, hist: 0.18, val: 0.18, macro: 0.09, cross: 0.10, manual: 0.10 },
+      createdProb: null,
+      createdPrice: parsed.entryPrice ?? null,
+      status: 'active',
+      snapshots: [],
+      // Provenance — this thesis came from an imported call.
+      source: 'import',
+      sourceText: parsed.text,
+      sourceAuthor: parsed.author || 'me',
+      sourcePostedAt: parsed.postedAt,
+    },
+  };
+}
+
 async function renderProbabilityTab() {
   const grid = document.getElementById('prob-grid');
   const empty = document.getElementById('prob-empty');
@@ -14392,7 +14662,7 @@ function renderProbabilitySummary(computed) {
         </div>
         <div class="prob-summary-avg">
           <div class="prob-summary-avg-label">Average Probability</div>
-          <div class="prob-summary-avg-pct" style="color:${avgProb > 0.5 ? '#5b8a72' : '#a5645a'}">
+          <div class="prob-summary-avg-pct" style="color:${avgProb > 0.5 ? 'var(--pos)' : 'var(--neg)'}">
             ${(avgProb * 100).toFixed(1)}%
           </div>
         </div>
@@ -14401,11 +14671,11 @@ function renderProbabilitySummary(computed) {
       <!-- Probability distribution histogram (5 buckets) -->
       <div class="prob-summary-buckets">
         ${[
-          { key: 'veryLikely', label: 'Very Likely', sub: '≥70%', color: '#5b8a72' },
+          { key: 'veryLikely', label: 'Very Likely', sub: '≥70%', color: 'var(--pos)' },
           { key: 'likely', label: 'Likely', sub: '55–70%', color: '#7aa085' },
-          { key: 'coinflip', label: 'Coin Flip', sub: '45–55%', color: '#c4965a' },
+          { key: 'coinflip', label: 'Coin Flip', sub: '45–55%', color: 'var(--data-amber)' },
           { key: 'unlikely', label: 'Unlikely', sub: '30–45%', color: '#b88578' },
-          { key: 'veryUnlikely', label: 'Very Unlikely', sub: '<30%', color: '#a5645a' },
+          { key: 'veryUnlikely', label: 'Very Unlikely', sub: '<30%', color: 'var(--neg)' },
         ].map(b => `
           <div class="prob-bucket" style="border-top:3px solid ${b.color}">
             <div class="prob-bucket-count">${buckets[b.key].length}</div>
@@ -14423,7 +14693,7 @@ function renderProbabilitySummary(computed) {
             <span class="tic">${topThesis.thesis.ticker}</span>
             ${topThesis.thesis.direction} ${fmt$(topThesis.thesis.strike)} in ${thesisRemainingDays(topThesis.thesis)}d
           </div>
-          <div class="prob-pick-pct" style="color:#5b8a72">${(topThesis.result.blended * 100).toFixed(1)}%</div>
+          <div class="prob-pick-pct" style="color:var(--pos)">${(topThesis.result.blended * 100).toFixed(1)}%</div>
         </div>
         <div class="prob-pick">
           <div class="prob-pick-label down">▼ Lowest probability</div>
@@ -14431,7 +14701,7 @@ function renderProbabilitySummary(computed) {
             <span class="tic">${bottomThesis.thesis.ticker}</span>
             ${bottomThesis.thesis.direction} ${fmt$(bottomThesis.thesis.strike)} in ${thesisRemainingDays(bottomThesis.thesis)}d
           </div>
-          <div class="prob-pick-pct" style="color:#a5645a">${(bottomThesis.result.blended * 100).toFixed(1)}%</div>
+          <div class="prob-pick-pct" style="color:var(--neg)">${(bottomThesis.result.blended * 100).toFixed(1)}%</div>
         </div>
       </div>
 
@@ -14447,8 +14717,8 @@ function renderProbabilitySummary(computed) {
                 <tr>
                   <td>${s.sector}</td>
                   <td>${s.count}</td>
-                  <td style="color:${s.avgProb > 0.5 ? '#5b8a72' : '#a5645a'}">${(s.avgProb * 100).toFixed(1)}%</td>
-                  <td><div class="prob-summary-bar"><div style="width:${w}%;background:${s.avgProb > 0.5 ? '#5b8a72' : '#a5645a'}"></div></div></td>
+                  <td style="color:${s.avgProb > 0.5 ? 'var(--pos)' : 'var(--neg)'}">${(s.avgProb * 100).toFixed(1)}%</td>
+                  <td><div class="prob-summary-bar"><div style="width:${w}%;background:${s.avgProb > 0.5 ? 'var(--pos)' : 'var(--neg)'}"></div></div></td>
                 </tr>
               `;
             }).join('')}
@@ -14507,8 +14777,8 @@ function renderProbabilitySparkline(thesis, opts = {}) {
   // Line color: trend-aware
   const first = snapshots[0].p ?? 0.5;
   const last  = snapshots[snapshots.length - 1].p ?? 0.5;
-  const trendColor = last > first + 0.005 ? '#5b8a72'
-                   : last < first - 0.005 ? '#a5645a'
+  const trendColor = last > first + 0.005 ? 'var(--pos)'
+                   : last < first - 0.005 ? 'var(--neg)'
                    : 'var(--amber)';
 
   // Build polyline string
@@ -14563,7 +14833,7 @@ function renderArchivedThesesSection(archived) {
   );
   const cards = sorted.map(t => {
     const isWin = t.resolution === 'yes';
-    const winColor = isWin ? '#5b8a72' : '#a5645a';
+    const winColor = isWin ? 'var(--pos)' : 'var(--neg)';
     const winLabel = isWin ? 'YES — TARGET HIT' : 'NO — DID NOT HIT';
     const targetDate = new Date(t.targetDate).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
     const resolvedDate = t.resolvedAt ? new Date(t.resolvedAt).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }) : '—';
@@ -14606,7 +14876,7 @@ function renderArchivedThesesSection(archived) {
               const wins = archived.filter(t => t.resolution === 'yes').length;
               const losses = archived.filter(t => t.resolution === 'no').length;
               const winRate = (wins + losses) > 0 ? Math.round(wins / (wins + losses) * 100) : null;
-              return `<span style="color:#5b8a72">${wins} won</span> · <span style="color:#a5645a">${losses} lost</span>${winRate != null ? ` · ${winRate}% hit rate` : ''}`;
+              return `<span style="color:var(--pos)">${wins} won</span> · <span style="color:var(--neg)">${losses} lost</span>${winRate != null ? ` · ${winRate}% hit rate` : ''}`;
             })()}
           </span>
         </summary>
@@ -14679,9 +14949,9 @@ function renderThesisCard(thesis, result) {
           ${thesis.createdProb != null ? (() => {
             const createdPct = (thesis.createdProb * 100).toFixed(1);
             const delta = (blended - thesis.createdProb) * 100;
-            const deltaColor = delta > 0.5 ? '#5b8a72' : delta < -0.5 ? '#a5645a' : 'var(--ink-dim)';
+            const deltaColor = delta > 0.5 ? 'var(--pos)' : delta < -0.5 ? 'var(--neg)' : 'var(--ink-dim)';
             const priceDelta = thesis.createdPrice ? ((currentPrice - thesis.createdPrice) / thesis.createdPrice * 100) : null;
-            const priceColor = priceDelta == null ? 'var(--ink-dim)' : priceDelta > 0 ? '#5b8a72' : '#a5645a';
+            const priceColor = priceDelta == null ? 'var(--ink-dim)' : priceDelta > 0 ? 'var(--pos)' : 'var(--neg)';
             return `<div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-top:6px;padding-top:6px;border-top:1px dashed var(--rule)">
               At creation: <strong style="color:var(--ink-dim)">${createdPct}%</strong>
               ${thesis.createdPrice != null ? ` @ <strong style="color:var(--ink-dim)">${fmt$(thesis.createdPrice)}</strong>` : ''}
@@ -14727,7 +14997,7 @@ function renderThesisCard(thesis, result) {
         const path = tl.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(p.prob).toFixed(1)}`).join(' ');
         const first = tl[0], lastPt = tl[tl.length - 1];
         const trend = lastPt.prob - first.prob;
-        const trendColor = trend > 0.005 ? '#5b8a72' : trend < -0.005 ? '#a5645a' : 'var(--ink-dim)';
+        const trendColor = trend > 0.005 ? 'var(--pos)' : trend < -0.005 ? 'var(--neg)' : 'var(--ink-dim)';
         const spanDays = Math.round((new Date(lastPt.date) - new Date(first.date)) / 86400000);
         return `
           <div style="margin-top:10px;padding-top:8px;border-top:1px dashed var(--rule)">
@@ -14780,7 +15050,7 @@ function renderThesisCard(thesis, result) {
           const hintParts = inputs.map(k => {
             const v = subs[k];
             const pct = (v * 100).toFixed(0);
-            const color = v > 0.55 ? '#5b8a72' : v < 0.45 ? '#a5645a' : 'var(--ink-faint)';
+            const color = v > 0.55 ? 'var(--pos)' : v < 0.45 ? 'var(--neg)' : 'var(--ink-faint)';
             return `<span style="color:${color}">${labelByKey[k] || k} ${pct}%</span>`;
           });
           const hint = `${cd.inputCount}/4 inputs: ${hintParts.join(' · ')}`;
@@ -14982,7 +15252,7 @@ function updateHorizonSummary() {
     const target = new Date(customDate);
     const daysOut = Math.ceil((target - new Date()) / 86400000);
     if (daysOut <= 0) {
-      summaryEl.innerHTML = `<span style="color:#a5645a">Target date must be in the future.</span>`;
+      summaryEl.innerHTML = `<span style="color:var(--neg)">Target date must be in the future.</span>`;
       return;
     }
     summaryEl.innerHTML = `Custom target · <strong style="color:var(--amber)">${daysOut}</strong> day${daysOut === 1 ? '' : 's'} from today → ${target.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}`;
@@ -15048,7 +15318,7 @@ document.getElementById('thesis-ticker')?.addEventListener('input', (e) => {
     const showPrice = (price, chg, src) => {
       if (price == null) { el.textContent = `No price found for ${ticker}`; el.style.color = 'var(--ink-faint)'; return; }
       const chgStr = (chg != null && isFinite(chg))
-        ? ` · <span style="color:${chg >= 0 ? '#5b8a72' : '#a5645a'}">${chg >= 0 ? '+' : ''}${(chg).toFixed(2)}% today</span>`
+        ? ` · <span style="color:${chg >= 0 ? 'var(--pos)' : 'var(--neg)'}">${chg >= 0 ? '+' : ''}${(chg).toFixed(2)}% today</span>`
         : '';
       el.innerHTML = `Last price: <strong style="color:var(--amber)">$${price.toFixed(2)}</strong>${chgStr} <span style="color:var(--ink-faint);font-size:9px">(${src})</span>`;
       el.style.color = 'var(--ink-dim)';
@@ -15129,6 +15399,120 @@ document.getElementById('prob-clear-btn').addEventListener('click', () => {
   state.probability.theses = [];
   saveTheses([]);
   renderProbabilityTab();
+});
+
+// --- Import-call-to-thesis wiring (Probability tab) ---
+let _probImportPending = null;
+document.getElementById('prob-import-parse')?.addEventListener('click', async () => {
+  const raw = (document.getElementById('prob-import-text')?.value || '').trim();
+  if (!raw) return;
+  // Strip an X URL if pasted alone (we can't fetch the post body without an API,
+  // so if it's just a URL, ask for the text). If text accompanies a URL, parse the text.
+  const isJustUrl = /^https?:\/\/\S+$/.test(raw) && !/\s/.test(raw);
+  const prev = document.getElementById('prob-import-preview');
+  if (isJustUrl) {
+    if (prev) prev.innerHTML = `<div style="font-family:var(--mono);font-size:10px;color:var(--data-amber);margin-top:10px;line-height:1.6">⚠ That's just a link. Pulling an X post's text needs the X API (wire a key in settings). For now, paste the post's <strong>text</strong> here and Parse — the brain reads the words, not the URL.</div>`;
+    return;
+  }
+  const dateVal = document.getElementById('prob-import-date')?.value;
+  const postedAt = dateVal ? new Date(dateVal).toISOString() : new Date().toISOString();
+  const btn = document.getElementById('prob-import-parse');
+  if (btn) { btn.textContent = 'Reading…'; btn.disabled = true; }
+  const parsed = await parsePost(raw, { author: 'imported', postedAt });
+  if (btn) { btn.textContent = 'Parse → Thesis'; btn.disabled = false; }
+  _probImportPending = parsed;
+  const conv = thesisFromParsedPost(parsed);
+  if (!prev) return;
+  if (!conv.ok) {
+    prev.innerHTML = `<div style="margin-top:10px;padding:10px;background:var(--bg-elev);border:1px solid var(--data-amber);border-radius:4px;font-family:var(--mono);font-size:11px;color:var(--ink-dim)">Can't build a thesis: ${escapeHtml(conv.reason)}</div>`;
+    return;
+  }
+  const th = conv.thesis;
+  prev.innerHTML = `
+    <div style="margin-top:12px;padding:12px;background:var(--bg-elev);border:1px solid var(--amber);border-radius:4px">
+      <div style="font-family:var(--mono);font-size:11px;line-height:1.8">
+        <strong style="color:var(--amber)">Thesis preview:</strong><br>
+        <strong>${escapeHtml(th.ticker)} ${th.direction} $${th.strike}</strong> by <strong>${th.targetDate.slice(0,10)}</strong> (${th.initialDays}d)<br>
+        ${th.createdPrice!=null?`reference price ${parsed.isBackdated?'on '+parsed.entryDate:'today'}: $${th.createdPrice.toFixed(2)}<br>`:''}
+        direction from sentiment: <strong style="color:${th.direction==='above'?'var(--pos)':'var(--neg)'}">${parsed.sentiment.label}</strong>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
+        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-dim)">Direction:</span>
+        <select id="prob-import-dir" class="heat-filter-select">
+          <option value="above" ${th.direction==='above'?'selected':''}>Above (bullish)</option>
+          <option value="below" ${th.direction==='below'?'selected':''}>Below (bearish)</option>
+        </select>
+        <button class="btn" id="prob-import-add">Add Thesis</button>
+        <button class="btn btn-ghost" id="prob-import-review" title="Add and send to the Review hub to confirm/correct the ticker & direction">Add + Review</button>
+      </div>
+    </div>`;
+  document.getElementById('prob-import-add')?.addEventListener('click', () => {
+    const dir = document.getElementById('prob-import-dir')?.value;
+    if (dir) th.direction = dir;
+    state.probability.theses.push(th);
+    saveTheses(state.probability.theses);
+    // Feed the human-in-the-loop: if the brain's sentiment read was low
+    // confidence OR multiple tickers were detected, queue this thesis for
+    // Review so the ticker/direction can be confirmed or corrected in-app.
+    const conf = parsed?.sentiment?.confidence ?? 1;
+    const ambiguous = (parsed?.tickers?.length || 0) > 1;
+    if ((conf < 0.5 || ambiguous) && typeof queueThesisForReview === 'function') {
+      queueThesisForReview(th, parsed);
+    }
+    _probImportPending = null;
+    document.getElementById('prob-import-text').value = '';
+    document.getElementById('prob-import-preview').innerHTML = '';
+    renderProbabilityTab();
+    const flagged = (conf < 0.5 || ambiguous);
+    if (typeof flashStatus === 'function') flashStatus(`Thesis added: ${th.ticker} ${th.direction} $${th.strike}${flagged ? ' · sent to Review (low confidence)' : ''}`, 'success');
+  });
+  document.getElementById('prob-import-review')?.addEventListener('click', () => {
+    const dir = document.getElementById('prob-import-dir')?.value;
+    if (dir) th.direction = dir;
+    state.probability.theses.push(th);
+    saveTheses(state.probability.theses);
+    if (typeof queueThesisForReview === 'function') queueThesisForReview(th, parsed);
+    _probImportPending = null;
+    document.getElementById('prob-import-text').value = '';
+    document.getElementById('prob-import-preview').innerHTML = '';
+    renderProbabilityTab();
+    if (typeof flashStatus === 'function') flashStatus(`Thesis added + sent to Review for confirmation`, 'success');
+  });
+});
+
+document.getElementById('prob-import-file')?.addEventListener('change', async (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  const prev = document.getElementById('prob-import-preview');
+  const name = file.name.toLowerCase();
+  if (name.endsWith('.csv')) {
+    // CSV of calls → parse each row, convert any with a target to theses.
+    const text = await file.text();
+    if (typeof parseImportCsv === 'function') {
+      const rows = parseImportCsv(text);
+      let added = 0;
+      for (const r of rows) {
+        if (!r.ticker) continue;
+        // Build a synthetic post string the brain understands, then convert.
+        const tgt = r.priceTarget || r.target || r.strike;
+        if (tgt == null) continue;
+        const parsed = await parsePost(`${r.ticker} to ${tgt}`, { author: 'csv-import' });
+        const conv = thesisFromParsedPost(parsed);
+        if (conv.ok) {
+          state.probability.theses.push(conv.thesis);
+          // Bulk CSV imports are unconfirmed — queue each for ticker/direction review.
+          if (typeof queueThesisForReview === 'function') queueThesisForReview(conv.thesis, parsed);
+          added++;
+        }
+      }
+      saveTheses(state.probability.theses);
+      renderProbabilityTab();
+      if (prev) prev.innerHTML = `<div style="font-family:var(--mono);font-size:10px;color:var(--pos);margin-top:10px">Added ${added} thesis(es) from CSV. Rows without a price target were skipped.</div>`;
+    }
+  } else {
+    // PDF / image → needs OCR / a vision model. Honest message.
+    if (prev) prev.innerHTML = `<div style="font-family:var(--mono);font-size:10px;color:var(--data-amber);margin-top:10px;line-height:1.6">⚠ Reading ${name.endsWith('.pdf')?'a PDF':'a screenshot'} needs a vision/OCR model — the parser + thesis builder are ready, wire a vision API key in settings to enable extraction. For now, paste the call text above, or drop a CSV with columns like Ticker, Target.</div>`;
+  }
 });
 
 // Quick-add a "PROB" mnemonic to the terminal command bar so users can do "AAPL PROB"
@@ -15484,6 +15868,25 @@ function computeFinancialRatios(income, balance, cashflow, currentPrice, marketC
     format: v => v == null ? null : (v * 100).toFixed(1) + '%',
     gradeFn: v => v == null ? null : v > 0.20 ? 'strong' : v > 0.12 ? 'good' : v > 0.06 ? 'neutral' : v > 0 ? 'weak' : 'poor',
   };
+  metrics.rotce = {
+    label: 'Return on Tangible Common Equity',
+    group: 'Profitability',
+    formula: 'Net Income / (Equity − Goodwill − Intangibles)',
+    description: 'Return on the hard capital actually in the business, stripping out acquisition goodwill and intangibles. More demanding than ROE — the gold standard for capital-allocation quality, especially for banks and acquisitive companies. Above 20% sustained signals a durable advantage.',
+    value: (() => {
+      const eq = safe(bc.totalStockholdersEquity);
+      const ni = safe(ic.netIncome);
+      if (eq == null || ni == null) return null;
+      const tangible = eq - (safe(bc.goodwill) || 0) - (safe(bc.intangibleAssets) || 0);
+      return tangible > 0 ? ni / tangible : null;
+    })(),
+    history: series(p => {
+      const tangible = (p.totalStockholdersEquity || 0) - (p.goodwill || 0) - (p.intangibleAssets || 0);
+      return tangible > 0 ? ratio(p.netIncome, tangible) : null;
+    }),
+    format: v => v == null ? null : (v * 100).toFixed(1) + '%',
+    gradeFn: v => v == null ? null : v > 0.20 ? 'strong' : v > 0.12 ? 'good' : v > 0.06 ? 'neutral' : v > 0 ? 'weak' : 'poor',
+  };
   metrics.roic = {
     label: 'Return on Invested Capital',
     group: 'Profitability',
@@ -15556,6 +15959,35 @@ function computeFinancialRatios(income, balance, cashflow, currentPrice, marketC
     history: [],  // requires historical mcap which we don't track
     format: v => v == null ? null : (v * 100).toFixed(2) + '%',
     gradeFn: v => v == null ? null : v > 0.08 ? 'strong' : v > 0.05 ? 'good' : v > 0.02 ? 'neutral' : v > 0 ? 'weak' : 'poor',
+  };
+
+  metrics.sbcIntensity = {
+    label: 'Stock-Based Comp % of Revenue',
+    group: 'Cash Flow',
+    formula: 'Stock-Based Compensation / Revenue',
+    description: 'SBC is a REAL cost paid to employees/board in equity — it dilutes shareholders, yet it is added back to operating cash flow (inflating OCF/FCF) and is usually EXCLUDED from "adjusted" EBITDA and non-GAAP EPS. Above ~5% of revenue is high, above 10% severe. When this is large, treat any "adjusted" profitability figure with skepticism — GAAP net income includes SBC; the adjusted version hides it.',
+    value: ratio(safe(cc.stockBasedCompensation), safe(ic.revenue)),
+    history: series(p => ratio(p.stockBasedCompensation, p.revenue)),
+    format: v => v == null ? null : (v * 100).toFixed(1) + '%',
+    // Higher SBC is WORSE, so the grade scale is inverted vs. a normal metric.
+    gradeFn: v => v == null ? null : v < 0.02 ? 'strong' : v < 0.05 ? 'good' : v < 0.08 ? 'neutral' : v < 0.12 ? 'weak' : 'poor',
+  };
+  metrics.sbcAdjFcf = {
+    label: 'SBC-Adjusted FCF Margin',
+    group: 'Cash Flow',
+    formula: '(Free Cash Flow − Stock-Based Comp) / Revenue',
+    description: 'Free cash flow with SBC subtracted back out — the more honest owner-cash figure, since the standard FCF add-back treats equity comp as free. The gap between this and the headline FCF margin is exactly how much SBC is flattering the cash numbers.',
+    value: (() => {
+      const fcf = safe(cc.freeCashFlow) ?? (safe(cc.operatingCashFlow) - Math.abs(safe(cc.capitalExpenditure) ?? 0));
+      const sbc = safe(cc.stockBasedCompensation) ?? 0;
+      return ratio(fcf - sbc, safe(ic.revenue));
+    })(),
+    history: series(p => {
+      const fcf = p.freeCashFlow ?? ((p.operatingCashFlow || 0) - Math.abs(p.capitalExpenditure || 0));
+      return ratio(fcf - (p.stockBasedCompensation || 0), p.revenue);
+    }),
+    format: v => v == null ? null : (v * 100).toFixed(1) + '%',
+    gradeFn: v => v == null ? null : v > 0.20 ? 'strong' : v > 0.10 ? 'good' : v > 0.05 ? 'neutral' : v > 0 ? 'weak' : 'poor',
   };
 
   // ---- VALUATION ----
@@ -15709,7 +16141,7 @@ function renderSparkline(data, gradeColor) {
   const firstVal = values[0];
   const direction = lastVal > firstVal ? 'up' : lastVal < firstVal ? 'down' : 'flat';
   const trendArrow = direction === 'up' ? '↗' : direction === 'down' ? '↘' : '→';
-  const trendColor = direction === 'up' ? '#5b8a72' : direction === 'down' ? '#a5645a' : 'var(--ink-faint)';
+  const trendColor = direction === 'up' ? 'var(--pos)' : direction === 'down' ? 'var(--neg)' : 'var(--ink-faint)';
   return `
     <div style="display:flex;align-items:center;gap:6px;height:30px">
       <svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" style="flex:1;height:100%;overflow:visible">
@@ -15938,7 +16370,7 @@ function renderFinancialsOverview(el, data, stock) {
   ];
   const topLineHtml = topLineCards.map(c => {
     const v = c.value;
-    const valColor = v == null ? 'var(--ink-faint)' : v < 0 ? '#a5645a' : 'var(--ink)';
+    const valColor = v == null ? 'var(--ink-faint)' : v < 0 ? 'var(--neg)' : 'var(--ink)';
     const tipHtml = `<div class="ttip-title">${escapeHtml(c.label)}</div><div class="ttip-desc">${escapeHtml(c.tooltip)}</div>`;
     return `
       <div class="top-line-card" data-tip-full="${escapeHtml(tipHtml)}">
@@ -15960,14 +16392,14 @@ function renderFinancialsOverview(el, data, stock) {
   //   and the legend notes the net loss separately so the visual still works.
   // ============================================================
   const pieColors = {
-    cash: '#5b8a72', receivables: '#7faaca', inventory: '#c4965a',
+    cash: 'var(--pos)', receivables: '#7faaca', inventory: 'var(--data-amber)',
     invShortTerm: '#9bc7d6', ppe: '#a89e6c', intangibles: '#a07b8f',
     goodwill: '#8b7baa', other: '#5e5754',
-    shortDebt: '#d97757', longDebt: '#a5645a', payables: '#c4965a',
-    deferred: '#7faaca', otherLiab: '#5e5754', equity: '#5b8a72',
-    cogs: '#a5645a', opex: '#d97757', randd: '#c4965a',
+    shortDebt: '#d97757', longDebt: 'var(--neg)', payables: 'var(--data-amber)',
+    deferred: '#7faaca', otherLiab: '#5e5754', equity: 'var(--pos)',
+    cogs: 'var(--neg)', opex: '#d97757', randd: 'var(--data-amber)',
     sga: '#a89e6c', interest: '#8b7baa', taxes: '#5e5754',
-    netIncome: '#5b8a72',
+    netIncome: 'var(--pos)',
   };
 
   // ----- ASSET COMPOSITION -----
@@ -16034,7 +16466,7 @@ function renderFinancialsOverview(el, data, stock) {
     incomeSlices.push({ label: 'Other / Non-Op', value: unaccounted, color: pieColors.other });
   }
   const lossNote = (topLine.netIncome != null && topLine.netIncome < 0)
-    ? `<div style="margin-top:8px;padding:6px 10px;background:rgba(165,100,90,0.1);border-left:3px solid #a5645a;border-radius:2px;font-family:var(--mono);font-size:10px;color:#a5645a">Net loss of ${formatLargeCurrency(Math.abs(topLine.netIncome))} — slice not shown (pies require positive values).</div>`
+    ? `<div style="margin-top:8px;padding:6px 10px;background:rgba(165,100,90,0.1);border-left:3px solid var(--neg);border-radius:2px;font-family:var(--mono);font-size:10px;color:var(--neg)">Net loss of ${formatLargeCurrency(Math.abs(topLine.netIncome))} — slice not shown (pies require positive values).</div>`
     : '';
   const incomePieHtml = renderPieChart(incomeSlices, {
     size: 200,
@@ -16071,12 +16503,12 @@ function renderFinancialsOverview(el, data, stock) {
     const items = [];
     if (topLine.revenueGrowth != null) {
       const g = topLine.revenueGrowth;
-      const col = g > 0.10 ? '#5b8a72' : g > 0 ? 'var(--amber)' : '#a5645a';
+      const col = g > 0.10 ? 'var(--pos)' : g > 0 ? 'var(--amber)' : 'var(--neg)';
       items.push(`<span style="color:${col};font-family:var(--mono);font-size:11px">Revenue YoY: <strong>${(g >= 0 ? '+' : '') + (g * 100).toFixed(1)}%</strong></span>`);
     }
     if (topLine.earningsGrowth != null) {
       const g = topLine.earningsGrowth;
-      const col = g > 0.10 ? '#5b8a72' : g > 0 ? 'var(--amber)' : '#a5645a';
+      const col = g > 0.10 ? 'var(--pos)' : g > 0 ? 'var(--amber)' : 'var(--neg)';
       items.push(`<span style="color:${col};font-family:var(--mono);font-size:11px">EPS YoY: <strong>${(g >= 0 ? '+' : '') + (g * 100).toFixed(1)}%</strong></span>`);
     }
     return items.join(' · ');
@@ -17078,7 +17510,7 @@ function showHeatDetailPopup(g, evt) {
     return '$' + v.toFixed(0);
   }
   const pctText  = pct != null ? (pct >= 0 ? '+' : '') + (pct * 100).toFixed(2) + '%' : '—';
-  const pctColor = pct > 0 ? '#5b8a72' : pct < 0 ? '#a5645a' : 'var(--ink-faint)';
+  const pctColor = pct > 0 ? 'var(--pos)' : pct < 0 ? 'var(--neg)' : 'var(--ink-faint)';
   const priceText = price != null ? '$' + price.toFixed(2) : '—';
 
   popup.innerHTML = `
@@ -17438,7 +17870,7 @@ function renderTickerTape() {
   };
 
   const newsHtml = (n) => {
-    const tierColor = n.priority === 'critical' ? '#d97a6c'
+    const tierColor = n.priority === 'critical' ? 'var(--red)'
                     : n.priority === 'high'     ? '#e0b04c'
                     : '#7faaca';
     // Mark this article's key as the displayed one so when the user clicks
@@ -17851,6 +18283,76 @@ function interpretAIFeatures(f, direction) {
 // ============================================================
 const OVERRIDES_STORAGE = 'valuatio.overrides.v1';
 
+// ============================================================
+//   OVERRIDE MODEL (v2) — time-boxed, any-field, "final" precedence
+//
+//   The override store is the EDITOR's data layer. An override marks a value
+//   as the user's authoritative ("final") answer for a field, optionally with
+//   an expiry after which the app reverts to normally-pulled data.
+//
+//   Storage shape (backward-compatible with the old flat string form):
+//     { TICKER: { field: <legacy string>  OR  { value, setAt, expiresAt, source } } }
+//
+//   - Legacy flat strings (sector/industry/etc.) keep working untouched.
+//   - New rich overrides carry { value, setAt (ms), expiresAt (ms|null), source }.
+//   - expiresAt null = forever. When now > expiresAt, the override is ignored
+//     (and lazily pruned) so the app pulls data as normal again.
+//
+//   This same store is what the Editor serializes to data/overrides.json for
+//   the backend workflows to merge (see exportOverridesForBackend()).
+// ============================================================
+
+// Major fields the editor can override, grouped for the UI. Prices are
+// intentionally excluded EXCEPT currency (per user). Everything else about a
+// company is editable here as a last-resort authoritative source.
+const OVERRIDABLE_FIELDS = {
+  'Identity': [
+    { key: 'name', label: 'Company Name', type: 'text' },
+    { key: 'description', label: 'Description', type: 'textarea' },
+    { key: 'sector', label: 'Sector', type: 'text' },
+    { key: 'subSector', label: 'Sub-Sector', type: 'text' },
+    { key: 'industry', label: 'Industry', type: 'text' },
+    { key: 'function', label: 'Function (derivatives)', type: 'text' },
+    { key: 'status', label: 'Status', type: 'text' },
+    { key: 'country', label: 'Country', type: 'text' },
+  ],
+  'Financials': [
+    { key: 'revenue', label: 'Revenue', type: 'number' },
+    { key: 'netIncome', label: 'Net Income', type: 'number' },
+    { key: 'ebitda', label: 'EBITDA', type: 'number' },
+    { key: 'freeCashFlow', label: 'Free Cash Flow', type: 'number' },
+    { key: 'totalAssets', label: 'Total Assets', type: 'number' },
+    { key: 'totalLiabilities', label: 'Total Liabilities', type: 'number' },
+    { key: 'totalEquity', label: 'Total Equity', type: 'number' },
+    { key: 'totalDebt', label: 'Total Debt', type: 'number' },
+    { key: 'cash', label: 'Cash', type: 'number' },
+    { key: 'eps', label: 'EPS', type: 'number' },
+  ],
+  'Ratios': [
+    { key: 'pe', label: 'P/E', type: 'number' },
+    { key: 'priceToBook', label: 'Price / Book', type: 'number' },
+    { key: 'returnOnEquity', label: 'ROE (decimal)', type: 'number' },
+    { key: 'returnOnAssets', label: 'ROA (decimal)', type: 'number' },
+    { key: 'grossMargin', label: 'Gross Margin (decimal)', type: 'number' },
+    { key: 'operatingMargin', label: 'Operating Margin (decimal)', type: 'number' },
+    { key: 'profitMargin', label: 'Net Margin (decimal)', type: 'number' },
+    { key: 'dividendYield', label: 'Dividend Yield (decimal)', type: 'number' },
+    { key: 'beta', label: 'Beta', type: 'number' },
+  ],
+  // Currency rate override is allowed (per user) — useful when an FX feed lags.
+  'Currency': [
+    { key: '_fxRateOverride', label: 'USD-per-unit FX rate', type: 'number' },
+  ],
+};
+
+// Expiry presets (label → ms duration, null = forever)
+const OVERRIDE_DURATIONS = [
+  { label: '1 week', ms: 7 * 86400000 },
+  { label: '1 month', ms: 30 * 86400000 },
+  { label: '3 months', ms: 90 * 86400000 },
+  { label: 'Forever', ms: null },
+];
+
 function loadOverrides() {
   try { return JSON.parse(localStorage.getItem(OVERRIDES_STORAGE) || '{}'); }
   catch { return {}; }
@@ -17858,37 +18360,526 @@ function loadOverrides() {
 function saveOverrides(o) {
   localStorage.setItem(OVERRIDES_STORAGE, JSON.stringify(o));
 }
-function setOverride(ticker, field, value) {
+
+// Normalize an override entry to { value, setAt, expiresAt, source }, accepting
+// the legacy flat-string form transparently.
+function _normalizeOverride(entry) {
+  if (entry == null) return null;
+  if (typeof entry === 'object' && 'value' in entry) return entry;
+  return { value: entry, setAt: 0, expiresAt: null, source: 'legacy' };
+}
+
+// Is an override currently active (exists and not expired)?
+function _overrideActive(entry) {
+  const n = _normalizeOverride(entry);
+  if (!n) return false;
+  if (n.expiresAt != null && Date.now() > n.expiresAt) return false;
+  return true;
+}
+
+function setOverride(ticker, field, value, opts = {}) {
   const all = loadOverrides();
   if (!all[ticker]) all[ticker] = {};
-  if (value == null || value === '') delete all[ticker][field];
-  else all[ticker][field] = value;
+  if (value == null || value === '') {
+    delete all[ticker][field];
+  } else {
+    const durationMs = opts.durationMs;  // undefined = forever
+    all[ticker][field] = {
+      value,
+      setAt: Date.now(),
+      expiresAt: (durationMs == null) ? null : Date.now() + durationMs,
+      source: opts.source || 'editor',
+    };
+  }
   if (Object.keys(all[ticker]).length === 0) delete all[ticker];
   saveOverrides(all);
 }
+
 function getOverride(ticker, field) {
   const all = loadOverrides();
-  return all[ticker]?.[field] ?? null;
+  const entry = all[ticker]?.[field];
+  if (!_overrideActive(entry)) return null;
+  return _normalizeOverride(entry).value;
 }
 function clearOverrides(ticker) {
   const all = loadOverrides();
   delete all[ticker];
   saveOverrides(all);
 }
+function clearOverrideField(ticker, field) {
+  const all = loadOverrides();
+  if (all[ticker]) { delete all[ticker][field]; if (!Object.keys(all[ticker]).length) delete all[ticker]; saveOverrides(all); }
+}
+
+// Prune expired overrides across the whole store. Called on load.
+function pruneExpiredOverrides() {
+  const all = loadOverrides();
+  let changed = false;
+  for (const tic of Object.keys(all)) {
+    for (const field of Object.keys(all[tic])) {
+      if (!_overrideActive(all[tic][field])) { delete all[tic][field]; changed = true; }
+    }
+    if (!Object.keys(all[tic]).length) delete all[tic];
+  }
+  if (changed) saveOverrides(all);
+  return changed;
+}
+
+// Serialize active overrides into the backend contract (data/overrides.json).
+// Workflows in the repos read this and apply each as the FINAL value for its
+// field, respecting expiry. Only active, non-expired overrides are emitted.
+function exportOverridesForBackend() {
+  const all = loadOverrides();
+  const out = {};
+  for (const tic of Object.keys(all)) {
+    for (const field of Object.keys(all[tic])) {
+      const entry = all[tic][field];
+      if (!_overrideActive(entry)) continue;
+      const n = _normalizeOverride(entry);
+      if (!out[tic]) out[tic] = {};
+      out[tic][field] = {
+        value: n.value,
+        setAt: n.setAt || Date.now(),
+        expiresAt: n.expiresAt,
+        source: n.source || 'editor',
+      };
+    }
+  }
+  return {
+    _schema: 'valuatio-overrides-v1',
+    _description: 'User-authoritative field overrides. Each is the FINAL value '
+      + 'for that ticker+field until expiresAt (null = forever). Backend '
+      + 'workflows merge this LAST so it wins over pulled data.',
+    updatedAt: new Date().toISOString(),
+    overrides: out,
+  };
+}
+
+// ============================================================
+//   EDITOR — authoritative field override surface
+//
+//   Opens for a ticker and lets the user set the "final" value for any major
+//   company field, with an expiry (1wk / 1mo / 3mo / forever). Edits are stored
+//   in the override model and applied to the live row immediately. The whole
+//   override set serializes to data/overrides.json for the backend to merge.
+//
+//   Prices are excluded except the currency FX-rate override (per user). This
+//   is positioned as the LAST-RESORT authoritative editor: use it to solidify a
+//   value when pulled data is wrong or when resolving an import discrepancy.
+// ============================================================
+
+function openEditor(ticker) {
+  const tic = (ticker || state.stock?.ticker || '').toUpperCase();
+  if (!tic) { alert('Open or select a ticker first.'); return; }
+  const row = (typeof getStockbookRow === 'function') ? getStockbookRow(tic) : null;
+  const stock = (state.stock?.ticker === tic) ? state.stock : row;
+
+  let modal = document.getElementById('editor-modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'editor-modal';
+    modal.className = 'modal-backdrop';
+    document.body.appendChild(modal);
+  }
+  modal.style.display = 'flex';
+  modal.innerHTML = renderEditorBody(tic, stock);
+  wireEditor(tic);
+}
+
+function renderEditorBody(tic, stock) {
+  const overrides = loadOverrides()[tic] || {};
+  const currentVal = (key) => {
+    // The pulled value is the pre-override original if overridden, else the live value
+    if (stock?._preOverride && key in stock._preOverride) return stock._preOverride[key];
+    return stock?.[key];
+  };
+  const fmtCurrent = (key, type) => {
+    const v = currentVal(key);
+    if (v == null || v === '') return '<span style="color:var(--ink-faint)">—</span>';
+    if (type === 'number' && Math.abs(v) >= 1e6) return _fmtBig ? _fmtBig(v) : v.toLocaleString();
+    if (type === 'number') return (typeof v === 'number') ? v.toLocaleString(undefined, {maximumFractionDigits: 4}) : v;
+    if (type === 'textarea') return escapeHtml(String(v).slice(0, 120)) + (String(v).length > 120 ? '…' : '');
+    return escapeHtml(String(v));
+  };
+
+  const sections = Object.entries(OVERRIDABLE_FIELDS).map(([group, fields]) => {
+    const rows = fields.map(f => {
+      const ovEntry = overrides[f.key];
+      const active = _overrideActive(ovEntry);
+      const ovVal = active ? _normalizeOverride(ovEntry).value : '';
+      const exp = active ? _normalizeOverride(ovEntry).expiresAt : null;
+      const expLabel = active ? (exp == null ? 'forever' : 'until ' + new Date(exp).toISOString().slice(0,10)) : '';
+      const inputEl = f.type === 'textarea'
+        ? `<textarea class="editor-input" data-field="${f.key}" rows="3" placeholder="(leave blank = use pulled)">${active ? escapeHtml(String(ovVal)) : ''}</textarea>`
+        : `<input class="editor-input" data-field="${f.key}" type="${f.type === 'number' ? 'number' : 'text'}" step="any" value="${active ? escapeHtml(String(ovVal)) : ''}" placeholder="(blank = pulled)">`;
+      return `
+        <div class="editor-field ${active ? 'editor-field-active' : ''}">
+          <div class="editor-field-label">${escapeHtml(f.label)}
+            ${active ? `<span class="editor-active-badge" title="Override active ${expLabel}">● ${expLabel}</span>` : ''}
+          </div>
+          <div class="editor-field-pulled">pulled: ${fmtCurrent(f.key, f.type)}</div>
+          ${inputEl}
+        </div>`;
+    }).join('');
+    return `<div class="editor-section"><h4>${group}</h4><div class="editor-grid">${rows}</div></div>`;
+  }).join('');
+
+  const durationOpts = OVERRIDE_DURATIONS.map((d, i) =>
+    `<option value="${d.ms == null ? 'forever' : d.ms}" ${i === OVERRIDE_DURATIONS.length-1 ? 'selected' : ''}>${d.label}</option>`).join('');
+
+  return `
+    <div class="modal-box" style="max-width:760px;max-height:88vh;overflow-y:auto">
+      <div class="modal-head">
+        <div>
+          <h2 style="margin:0;font-family:var(--serif)">Editor · ${escapeHtml(tic)}</h2>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);margin-top:3px">${escapeHtml(stock?.name || '')} · authoritative overrides · blank field = use pulled data</div>
+        </div>
+        <button class="modal-close" onclick="document.getElementById('editor-modal').style.display='none'">✕</button>
+      </div>
+
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:10px 0;border-bottom:1px solid var(--rule);margin-bottom:12px">
+        <span style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">New overrides good for:</span>
+        <select id="editor-duration" class="heat-filter-select">${durationOpts}</select>
+        <span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint)">after expiry, the app pulls data normally again</span>
+      </div>
+
+      ${sections}
+
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:18px;padding-top:14px;border-top:1px solid var(--rule)">
+        <button class="btn" id="editor-save">Save Overrides</button>
+        <button class="btn btn-ghost" id="editor-clear-all">Clear All for ${escapeHtml(tic)}</button>
+        <button class="btn btn-ghost" id="editor-export" title="Download data/overrides.json for the backend repos">Export for Backend</button>
+        <label class="btn btn-ghost" style="cursor:pointer" title="Drop a CSV of company data — it fills only the fields present and flags any conflicts to resolve">
+          Import CSV<input type="file" id="editor-import-file" accept=".csv,text/csv" style="display:none">
+        </label>
+        <span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-left:auto">edits apply instantly · also exportable to the repos</span>
+      </div>
+    </div>`;
+}
+
+function wireEditor(tic) {
+  document.getElementById('editor-save')?.addEventListener('click', () => {
+    const durSel = document.getElementById('editor-duration');
+    const durVal = durSel?.value;
+    const durationMs = (durVal === 'forever' || durVal == null) ? null : Number(durVal);
+    let count = 0;
+    document.querySelectorAll('#editor-modal .editor-input').forEach(inp => {
+      const field = inp.dataset.field;
+      const raw = inp.value.trim();
+      const fieldDef = Object.values(OVERRIDABLE_FIELDS).flat().find(f => f.key === field);
+      if (raw === '') {
+        // Blank = clear any existing override for this field
+        clearOverrideField(tic, field);
+      } else {
+        const value = fieldDef?.type === 'number' ? Number(raw) : raw;
+        if (fieldDef?.type === 'number' && !isFinite(value)) return;
+        setOverride(tic, field, value, { durationMs, source: 'editor' });
+        count++;
+      }
+    });
+    // Re-apply to the live row + re-render
+    const row = (typeof getStockbookRow === 'function') ? getStockbookRow(tic) : null;
+    if (row) { delete row._preOverride; applyOverridesToRow(row); }
+    if (state.stock?.ticker === tic) {
+      const sr = getStockbookRow(tic);
+      if (sr) { Object.assign(state.stock, sr); if (typeof renderSummary === 'function') renderSummary(state.stock); }
+    }
+    if (typeof renderStockBook === 'function') { try { renderStockBook(); } catch {} }
+    if (typeof flashStatus === 'function') flashStatus(`Saved ${count} override${count===1?'':'s'} for ${tic}`, 'success');
+    document.getElementById('editor-modal').style.display = 'none';
+  });
+
+  document.getElementById('editor-clear-all')?.addEventListener('click', () => {
+    if (!confirm(`Clear all overrides for ${tic}? It will pull data normally.`)) return;
+    clearOverrides(tic);
+    const row = (typeof getStockbookRow === 'function') ? getStockbookRow(tic) : null;
+    if (row) delete row._preOverride;
+    if (typeof flashStatus === 'function') flashStatus(`Cleared overrides for ${tic}`, 'success');
+    openEditor(tic);  // re-render the modal
+  });
+
+  document.getElementById('editor-export')?.addEventListener('click', () => {
+    exportOverridesFile();
+  });
+
+  document.getElementById('editor-import-file')?.addEventListener('change', (e) => {
+    const file = e.target.files?.[0];
+    if (file && typeof handleCompanyDataImport === 'function') {
+      document.getElementById('editor-modal').style.display = 'none';
+      handleCompanyDataImport(file);
+    }
+  });
+}
+
+// Download the full override set as data/overrides.json for the backend repos.
+function exportOverridesFile() {
+  const data = exportOverridesForBackend();
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'overrides.json';
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+  const n = Object.keys(data.overrides).length;
+  if (typeof flashStatus === 'function') flashStatus(`Exported overrides.json (${n} tickers) — commit to each repo's data/ folder`, 'success');
+}
+
+// ============================================================
+//   IMPORT & DISCREPANCY RESOLUTION
+//
+//   Drop a CSV/PDF of company data. We parse ONLY the fields present (never
+//   scan for every category), match them against the pulled data, and where
+//   they CONFLICT we surface a discrepancy the user resolves — picking the
+//   pulled value or the imported one. The chosen value becomes an Editor
+//   override (the "final" answer). Non-conflicting imported fields are offered
+//   as fills but don't auto-override.
+//
+//   This is the "compare, don't blindly override" behavior the user asked for.
+// ============================================================
+
+// Map common column header aliases → our canonical field keys. Only headers we
+// recognize are imported; everything else is ignored (no forced full-scan).
+const IMPORT_FIELD_ALIASES = {
+  'name': 'name', 'company': 'name', 'company name': 'name',
+  'description': 'description', 'desc': 'description', 'business': 'description',
+  'sector': 'sector', 'industry': 'industry', 'sub-sector': 'subSector', 'subsector': 'subSector',
+  'country': 'country',
+  'revenue': 'revenue', 'sales': 'revenue', 'total revenue': 'revenue',
+  'net income': 'netIncome', 'netincome': 'netIncome', 'earnings': 'netIncome',
+  'ebitda': 'ebitda',
+  'free cash flow': 'freeCashFlow', 'fcf': 'freeCashFlow',
+  'total assets': 'totalAssets', 'assets': 'totalAssets',
+  'total liabilities': 'totalLiabilities', 'liabilities': 'totalLiabilities',
+  'total equity': 'totalEquity', 'equity': 'totalEquity', 'shareholders equity': 'totalEquity',
+  'total debt': 'totalDebt', 'debt': 'totalDebt',
+  'cash': 'cash',
+  'eps': 'eps', 'earnings per share': 'eps',
+  'pe': 'pe', 'p/e': 'pe', 'pe ratio': 'pe',
+  'price to book': 'priceToBook', 'p/b': 'priceToBook', 'pb': 'priceToBook',
+  'roe': 'returnOnEquity', 'return on equity': 'returnOnEquity',
+  'roa': 'returnOnAssets', 'return on assets': 'returnOnAssets',
+  'gross margin': 'grossMargin', 'operating margin': 'operatingMargin',
+  'net margin': 'profitMargin', 'profit margin': 'profitMargin',
+  'dividend yield': 'dividendYield', 'div yield': 'dividendYield',
+  'beta': 'beta',
+  'ticker': 'ticker', 'symbol': 'ticker',
+};
+
+const NUMERIC_IMPORT_FIELDS = new Set(['revenue','netIncome','ebitda','freeCashFlow','totalAssets','totalLiabilities','totalEquity','totalDebt','cash','eps','pe','priceToBook','returnOnEquity','returnOnAssets','grossMargin','operatingMargin','profitMargin','dividendYield','beta']);
+
+// Parse a numeric value that may carry $, commas, %, B/M/K suffixes.
+function _parseImportNumber(raw) {
+  if (raw == null) return null;
+  let s = String(raw).trim().replace(/[$,\s]/g, '');
+  let mult = 1;
+  if (/%$/.test(s)) { mult = 0.01; s = s.replace(/%$/, ''); }
+  const suf = s.slice(-1).toUpperCase();
+  if (suf === 'B') { mult *= 1e9; s = s.slice(0, -1); }
+  else if (suf === 'M') { mult *= 1e6; s = s.slice(0, -1); }
+  else if (suf === 'K') { mult *= 1e3; s = s.slice(0, -1); }
+  else if (suf === 'T') { mult *= 1e12; s = s.slice(0, -1); }
+  const n = parseFloat(s);
+  return isFinite(n) ? n * mult : null;
+}
+
+// Parse CSV text → array of row objects keyed by canonical field. Only mapped
+// columns are kept. Assumes first row is headers.
+function parseImportCsv(text) {
+  const lines = text.split(/\r?\n/).filter(l => l.trim());
+  if (lines.length < 2) return [];
+  const splitRow = (l) => {
+    // simple CSV: handle quoted fields
+    const out = []; let cur = '', q = false;
+    for (let i = 0; i < l.length; i++) {
+      const c = l[i];
+      if (c === '"') q = !q;
+      else if (c === ',' && !q) { out.push(cur); cur = ''; }
+      else cur += c;
+    }
+    out.push(cur);
+    return out.map(s => s.trim().replace(/^"|"$/g, ''));
+  };
+  const headers = splitRow(lines[0]).map(h => h.toLowerCase().trim());
+  const fieldMap = headers.map(h => IMPORT_FIELD_ALIASES[h] || null);
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cells = splitRow(lines[i]);
+    const obj = {};
+    fieldMap.forEach((field, idx) => {
+      if (!field || cells[idx] == null || cells[idx] === '') return;
+      obj[field] = NUMERIC_IMPORT_FIELDS.has(field) ? _parseImportNumber(cells[idx]) : cells[idx];
+    });
+    if (obj.ticker || Object.keys(obj).length) rows.push(obj);
+  }
+  return rows;
+}
+
+// Compare imported field values against the pulled/live row. Returns
+// { fills: [{field,imported}], conflicts: [{field,pulled,imported}] }.
+// A "conflict" is when both have a value and they differ materially.
+function compareImportToRow(importObj, row) {
+  const fills = [], conflicts = [];
+  for (const [field, imported] of Object.entries(importObj)) {
+    if (field === 'ticker') continue;
+    const pulled = row?.[field];
+    if (pulled == null || pulled === '') {
+      fills.push({ field, imported });
+    } else {
+      // Material difference test
+      let differs;
+      if (typeof imported === 'number' && typeof pulled === 'number') {
+        const denom = Math.abs(pulled) || 1;
+        differs = Math.abs(imported - pulled) / denom > 0.02;  // >2% apart
+      } else {
+        differs = String(imported).trim() !== String(pulled).trim();
+      }
+      if (differs) conflicts.push({ field, pulled, imported });
+    }
+  }
+  return { fills, conflicts };
+}
+
+// Open the discrepancy resolver for one ticker given an import object.
+function openDiscrepancyResolver(ticker, importObj) {
+  const tic = ticker.toUpperCase();
+  const row = (typeof getStockbookRow === 'function') ? getStockbookRow(tic) : null;
+  const { fills, conflicts } = compareImportToRow(importObj, row || {});
+
+  let modal = document.getElementById('discrepancy-modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'discrepancy-modal'; modal.className = 'modal-backdrop';
+    document.body.appendChild(modal);
+  }
+  modal.style.display = 'flex';
+
+  const fieldLabel = (k) => {
+    const def = Object.values(OVERRIDABLE_FIELDS).flat().find(f => f.key === k);
+    return def?.label || k;
+  };
+  const fmtV = (v) => v == null ? '—' : (typeof v === 'number' && Math.abs(v) >= 1e6 ? (_fmtBig ? _fmtBig(v) : v.toLocaleString()) : (typeof v === 'number' ? v.toLocaleString(undefined,{maximumFractionDigits:4}) : escapeHtml(String(v))));
+
+  const conflictRows = conflicts.map((c, i) => `
+    <div class="editor-field editor-field-active" style="margin-bottom:8px">
+      <div class="editor-field-label">${escapeHtml(fieldLabel(c.field))} <span style="color:var(--neg);font-size:8px">⚠ CONFLICT</span></div>
+      <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap">
+        <label style="flex:1;min-width:120px;font-family:var(--mono);font-size:10px;cursor:pointer;padding:6px 8px;background:var(--bg-card);border:1px solid var(--rule);border-radius:3px">
+          <input type="radio" name="conflict-${i}" value="pulled" data-field="${c.field}" checked> pulled: <strong>${fmtV(c.pulled)}</strong>
+        </label>
+        <label style="flex:1;min-width:120px;font-family:var(--mono);font-size:10px;cursor:pointer;padding:6px 8px;background:var(--bg-card);border:1px solid var(--rule);border-radius:3px">
+          <input type="radio" name="conflict-${i}" value="imported" data-field="${c.field}"> imported: <strong>${fmtV(c.imported)}</strong>
+        </label>
+      </div>
+    </div>`).join('');
+
+  const fillRows = fills.map((f, i) => `
+    <label class="editor-field" style="display:flex;align-items:center;gap:8px;margin-bottom:6px;cursor:pointer">
+      <input type="checkbox" class="fill-check" data-field="${f.field}" checked>
+      <span style="font-family:var(--mono);font-size:10px;color:var(--ink-dim)">${escapeHtml(fieldLabel(f.field))}: <strong style="color:var(--ink)">${fmtV(f.imported)}</strong> <span style="color:var(--ink-faint)">(pulled is empty)</span></span>
+    </label>`).join('');
+
+  const durationOpts = OVERRIDE_DURATIONS.map((d, idx) =>
+    `<option value="${d.ms == null ? 'forever' : d.ms}" ${idx === OVERRIDE_DURATIONS.length-1 ? 'selected' : ''}>${d.label}</option>`).join('');
+
+  modal.innerHTML = `
+    <div class="modal-box" style="max-width:620px;max-height:88vh;overflow-y:auto">
+      <div class="modal-head">
+        <div>
+          <h2 style="margin:0;font-family:var(--serif)">Resolve Import · ${escapeHtml(tic)}</h2>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);margin-top:3px">${conflicts.length} conflict${conflicts.length===1?'':'s'} · ${fills.length} new field${fills.length===1?'':'s'} to fill</div>
+        </div>
+        <button class="modal-close" onclick="document.getElementById('discrepancy-modal').style.display='none'">✕</button>
+      </div>
+      <div style="padding:14px 28px">
+        ${conflicts.length ? `<div class="editor-section" style="padding:0"><h4>Conflicts — pick the final value</h4>${conflictRows}</div>` : '<div style="font-family:var(--mono);font-size:11px;color:var(--pos);padding:8px 0">No conflicts — imported data agrees with pulled data.</div>'}
+        ${fills.length ? `<div class="editor-section" style="padding:12px 0 0"><h4>Fill empty fields</h4>${fillRows}</div>` : ''}
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px;padding-top:12px;border-top:1px solid var(--rule)">
+          <span style="font-family:var(--mono);font-size:10px;color:var(--ink-dim)">Resolved values good for:</span>
+          <select id="discrepancy-duration" class="heat-filter-select">${durationOpts}</select>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:14px">
+          <button class="btn" id="discrepancy-apply">Apply Resolutions</button>
+          <button class="btn btn-ghost" onclick="document.getElementById('discrepancy-modal').style.display='none'">Cancel</button>
+        </div>
+      </div>
+    </div>`;
+
+  document.getElementById('discrepancy-apply')?.addEventListener('click', () => {
+    const durVal = document.getElementById('discrepancy-duration')?.value;
+    const durationMs = (durVal === 'forever' || durVal == null) ? null : Number(durVal);
+    let applied = 0;
+    // Conflicts: only override when user picked "imported" (pulled = leave as-is)
+    conflicts.forEach((c, i) => {
+      const sel = document.querySelector(`input[name="conflict-${i}"]:checked`);
+      if (sel && sel.value === 'imported') {
+        setOverride(tic, c.field, c.imported, { durationMs, source: 'import-resolved' });
+        applied++;
+      }
+    });
+    // Fills: checked → set as override
+    document.querySelectorAll('#discrepancy-modal .fill-check:checked').forEach(chk => {
+      const field = chk.dataset.field;
+      const f = fills.find(x => x.field === field);
+      if (f) { setOverride(tic, field, f.imported, { durationMs, source: 'import-fill' }); applied++; }
+    });
+    const row = (typeof getStockbookRow === 'function') ? getStockbookRow(tic) : null;
+    if (row) { delete row._preOverride; applyOverridesToRow(row); }
+    if (typeof renderStockBook === 'function') { try { renderStockBook(); } catch {} }
+    if (typeof flashStatus === 'function') flashStatus(`Applied ${applied} resolution${applied===1?'':'s'} for ${tic}`, 'success');
+    document.getElementById('discrepancy-modal').style.display = 'none';
+  });
+}
+
+// Entry point: handle a dropped/selected CSV file of company data.
+async function handleCompanyDataImport(file) {
+  const text = await file.text();
+  const rows = parseImportCsv(text);
+  if (!rows.length) { alert('No recognizable company-data columns found in that file. Headers should include things like Ticker, Revenue, Net Income, Sector, etc.'); return; }
+  // If rows have tickers, resolve each that matches the stockbook; else assume
+  // single-company file for the currently-open ticker.
+  const withTicker = rows.filter(r => r.ticker);
+  if (withTicker.length) {
+    // Resolve the first matching ticker (could iterate, but one-at-a-time is clearer)
+    for (const r of withTicker) {
+      const tic = String(r.ticker).toUpperCase();
+      const row = (typeof getStockbookRow === 'function') ? getStockbookRow(tic) : null;
+      if (row) { openDiscrepancyResolver(tic, r); return; }
+    }
+    alert('None of the tickers in the file match your stockbook.');
+  } else {
+    const tic = state.stock?.ticker;
+    if (!tic) { alert('Open a ticker first, or include a Ticker column in the file.'); return; }
+    openDiscrepancyResolver(tic, rows[0]);
+  }
+}
+
+
 
 // Apply overrides to a stockbook row in-place. Returns true if anything changed.
+// Applies EVERY overridable field (not just taxonomy), respects expiry, and
+// preserves the pre-override value in _preOverride so the discrepancy panel can
+// show "pulled X → you set Y".
 function applyOverridesToRow(row) {
   const ovr = loadOverrides()[row.ticker];
   if (!ovr) return false;
   let changed = false;
-  for (const field of ['sector', 'subSector', 'industry', 'status', 'function']) {
-    if (ovr[field] != null && ovr[field] !== row[field]) {
-      row[field] = ovr[field];
+  // Flatten the field catalog to the list of override-able keys
+  const allKeys = Object.values(OVERRIDABLE_FIELDS).flat().map(f => f.key)
+    .concat(['sector', 'subSector', 'industry', 'status', 'function']);  // legacy keys
+  for (const field of [...new Set(allKeys)]) {
+    const entry = ovr[field];
+    if (!_overrideActive(entry)) continue;
+    const val = _normalizeOverride(entry).value;
+    if (val != null && val !== row[field]) {
+      if (!row._preOverride) row._preOverride = {};
+      if (!(field in row._preOverride)) row._preOverride[field] = row[field];
+      row[field] = val;
       changed = true;
     }
   }
   if (changed) {
     row.source = (row.source || 'sheet').includes('override') ? row.source : (row.source + '+override');
+    row._hasOverride = true;
   }
   return changed;
 }
@@ -18424,14 +19415,14 @@ async function showEtfHoldings(ticker) {
   const classOrder = Object.entries(byClass).sort((a, b) => b[1].totalWeight - a[1].totalWeight);
   // Color per asset class — bonds amber-ish, equities green, derivatives blue
   const classColor = (cls) => {
-    if (/Government Bond|Treasury/i.test(cls)) return '#c4965a';
+    if (/Government Bond|Treasury/i.test(cls)) return 'var(--data-amber)';
     if (/Corporate Bond/i.test(cls)) return '#a88860';
-    if (/High Yield/i.test(cls)) return '#a5645a';
+    if (/High Yield/i.test(cls)) return 'var(--neg)';
     if (/Preferred/i.test(cls)) return '#8a7a55';
     if (/Derivative|Future|Option/i.test(cls)) return '#5a7a9a';
     if (/Cash/i.test(cls)) return '#7a8a6a';
     if (/Fund/i.test(cls)) return '#9a7aa0';
-    return '#5b8a72'; // Equity default
+    return 'var(--pos)'; // Equity default
   };
 
   // Build a horizontal composition bar (the user's "90% stock 10% bonds" view)
@@ -18988,7 +19979,7 @@ function renderHolyGrailChart() {
   const holyY = yScale(holyVol);
   s += `<line class="annotation-line" x1="${holyX}" y1="${margin.top + innerH}" x2="${holyX}" y2="${holyY}"/>`;
   s += `<line class="annotation-line" x1="${margin.left}" y1="${holyY}" x2="${holyX}" y2="${holyY}"/>`;
-  s += `<circle cx="${holyX}" cy="${holyY}" r="5" fill="#c4965a" stroke="#1a3a5e" stroke-width="1.5"/>`;
+  s += `<circle cx="${holyX}" cy="${holyY}" r="5" fill="var(--data-amber)" stroke="#1a3a5e" stroke-width="1.5"/>`;
   s += `<text class="callout" x="${holyX + 12}" y="${holyY - 8}">Risk cut ~${reductionPct}% at ${holyN} bets</text>`;
 
   // Curve labels at right end (each curve gets its own label)
@@ -19005,7 +19996,7 @@ function renderHolyGrailChart() {
     const corrLabel = measuredAvgCorr != null
       ? `ρ̄=${(measuredAvgCorr * 100).toFixed(0)}%`
       : 'estimated corr';
-    s += `<text class="callout" x="${px + 12}" y="${py + 4}" fill="#c4965a">YOUR PORTFOLIO · ${legs.length} legs · ${(portfolioPoint.vol * 100).toFixed(1)}% vol · ${corrLabel}</text>`;
+    s += `<text class="callout" x="${px + 12}" y="${py + 4}" fill="var(--data-amber)">YOUR PORTFOLIO · ${legs.length} legs · ${(portfolioPoint.vol * 100).toFixed(1)}% vol · ${corrLabel}</text>`;
     if (corrSummary && corrSummary.measured > 0) {
       s += `<text x="${px + 12}" y="${py + 17}" fill="var(--ink-faint)" font-family="var(--mono)" font-size="9">${corrSummary.measured} of ${corrSummary.total} pairs measured from price history</text>`;
     }
@@ -19069,7 +20060,7 @@ window.showHGTooltip = function(n) {
   tipTextG.innerHTML = '';
 
   // Build a row per curve at this N
-  const lines = [{ t: `N = ${n} ${n === 1 ? 'bet' : 'bets'}`, color: '#c4965a', weight: '700' }];
+  const lines = [{ t: `N = ${n} ${n === 1 ? 'bet' : 'bets'}`, color: 'var(--data-amber)', weight: '700' }];
   let firstY = null;
   ctx.curveData.forEach(c => {
     const point = c.points[n - 1];
@@ -19099,13 +20090,13 @@ window.showHGTooltip = function(n) {
     dot.setAttribute('cx', cx);
     dot.setAttribute('cy', py);
     dot.setAttribute('r', '6');
-    dot.setAttribute('fill', '#c4965a');
+    dot.setAttribute('fill', 'var(--data-amber)');
     dot.setAttribute('stroke', '#1a1a1a');
     dot.setAttribute('stroke-width', '1.5');
     dotsG.appendChild(dot);
     lines.push({
       t: `Your portfolio: ${(ctx.portfolioPoint.vol * 100).toFixed(2)}%${ctx.measuredAvgCorr != null ? ` (ρ̄=${(ctx.measuredAvgCorr * 100).toFixed(0)}%)` : ''}`,
-      color: '#c4965a',
+      color: 'var(--data-amber)',
       weight: '700',
     });
   }
@@ -19495,7 +20486,7 @@ function renderCorrelationMatrix(legs, corrInfo) {
           pair: `${legs[i].name} ↔ ${legs[j].name}`,
           rho,
           interp: 'negatively correlated (natural hedge)',
-          color: '#5b8a72',
+          color: 'var(--pos)',
         });
       }
     }
@@ -19519,7 +20510,7 @@ function renderCorrelationMatrix(legs, corrInfo) {
     if (total === 0) {
       status.textContent = 'Add 2+ legs to see correlations';
     } else if (measured === 0) {
-      status.innerHTML = `<span style="color:#c4965a">No pairs measured — leg names need ticker symbols (e.g. "GME · GameStop") and tickers must be in your sheet's price history</span>`;
+      status.innerHTML = `<span style="color:var(--data-amber)">No pairs measured — leg names need ticker symbols (e.g. "GME · GameStop") and tickers must be in your sheet's price history</span>`;
     } else {
       status.innerHTML = `<strong style="color:var(--ink)">${measured} of ${total} pairs measured</strong> from daily log returns · ${total - measured} estimated from your "avg corr" inputs · color: red=high+, blue=negative, dark=uncorrelated`;
     }
@@ -19852,13 +20843,13 @@ async function renderMarketCapCheck(stock) {
   badge.style.cssText = 'font-family:var(--mono);font-size:10px;margin-top:4px;cursor:help;letter-spacing:0.05em';
 
   if (result.status === 'confirmed') {
-    badge.style.color = '#5b8a72';
+    badge.style.color = 'var(--pos)';
     badge.innerHTML = `✓ Confirmed across ${result.sources.length} sources`;
   } else if (result.status === 'minor') {
     badge.style.color = '#7aa085';
     badge.innerHTML = `≈ ${result.ratio.toFixed(2)}× consensus · minor variance`;
   } else if (result.status === 'discrepancy') {
-    badge.style.color = '#c4965a';
+    badge.style.color = 'var(--data-amber)';
     badge.innerHTML = `? Discrepancy · sheet ${result.ratio.toFixed(2)}× consensus · hover for details`;
   } else {
     badge.style.color = 'var(--ink-faint)';
@@ -20179,8 +21170,8 @@ function renderStockBookPortfolio(content) {
     const misalignedPct = totalActiveValue > 0 ? misalignedValue / totalActiveValue : 0;
     const neutralPct = 1 - alignedPct - misalignedPct;
     // Color: aligned-dominant = green, misaligned-dominant = red, else amber
-    const cardColor = alignedPct > misalignedPct + 0.15 ? '#5b8a72'
-                    : misalignedPct > alignedPct + 0.15 ? '#a5645a'
+    const cardColor = alignedPct > misalignedPct + 0.15 ? 'var(--pos)'
+                    : misalignedPct > alignedPct + 0.15 ? 'var(--neg)'
                     : 'var(--amber)';
     const verdict = alignedPct > misalignedPct + 0.15 ? 'Aligned'
                   : misalignedPct > alignedPct + 0.15 ? 'Vulnerable'
@@ -20218,8 +21209,8 @@ function renderStockBookPortfolio(content) {
       </div>
       <div class="portfolio-stat">
         <div class="portfolio-stat-label">Unrealized P/L</div>
-        <div class="portfolio-stat-value" style="color:${totalPL >= 0 ? '#5b8a72' : '#a5645a'}">${totalPL >= 0 ? '+' : ''}${fmt$(totalPL)}</div>
-        <div class="portfolio-stat-sub" style="color:${totalPL >= 0 ? '#5b8a72' : '#a5645a'}">${totalPLPct != null ? (totalPLPct >= 0 ? '+' : '') + (totalPLPct * 100).toFixed(2) + '%' : ''}${totalFees > 0 ? ` · net of ${fmt$(totalFees)} fees` : ''}</div>
+        <div class="portfolio-stat-value" style="color:${totalPL >= 0 ? 'var(--pos)' : 'var(--neg)'}">${totalPL >= 0 ? '+' : ''}${fmt$(totalPL)}</div>
+        <div class="portfolio-stat-sub" style="color:${totalPL >= 0 ? 'var(--pos)' : 'var(--neg)'}">${totalPLPct != null ? (totalPLPct >= 0 ? '+' : '') + (totalPLPct * 100).toFixed(2) + '%' : ''}${totalFees > 0 ? ` · net of ${fmt$(totalFees)} fees` : ''}</div>
       </div>
       ` : ''}
       <div class="portfolio-stat" style="border-left:3px solid var(--amber)">
@@ -20233,9 +21224,9 @@ function renderStockBookPortfolio(content) {
         <div class="portfolio-stat-value" style="color:#a85a3a">−${fmt$(totalShortLiability)}</div>
         <div class="portfolio-stat-sub">cost to cover open shorts</div>
       </div>
-      <div class="portfolio-stat" style="border-left:3px solid #5b8a72" title="Cash + long positions market value − short liability. This is what your portfolio is actually worth right now.">
+      <div class="portfolio-stat" style="border-left:3px solid var(--pos)" title="Cash + long positions market value − short liability. This is what your portfolio is actually worth right now.">
         <div class="portfolio-stat-label">Net Equity</div>
-        <div class="portfolio-stat-value" style="color:#5b8a72">${fmt$(cashPosition + (totalValue - totalShortLiability) - totalShortLiability)}</div>
+        <div class="portfolio-stat-value" style="color:var(--pos)">${fmt$(cashPosition + (totalValue - totalShortLiability) - totalShortLiability)}</div>
         <div class="portfolio-stat-sub">cash + long MV − short liability</div>
       </div>
       ` : ''}
@@ -20330,12 +21321,12 @@ function renderStockBookPortfolio(content) {
   });
 
   const positionColor = pos => {
-    if (pos === 'Trading' || pos === 'Long') return '#5b8a72';
+    if (pos === 'Trading' || pos === 'Long') return 'var(--pos)';
     if (pos === 'Short') return '#a85a3a';
-    if (pos === 'Watching') return '#c4965a';
+    if (pos === 'Watching') return 'var(--data-amber)';
     if (pos === 'Tracking') return '#7faaca';
     if (pos === 'Sold') return 'var(--ink-faint)';
-    if (pos === 'Avoid') return '#a5645a';
+    if (pos === 'Avoid') return 'var(--neg)';
     return 'var(--ink)';
   };
 
@@ -20379,11 +21370,11 @@ function renderStockBookPortfolio(content) {
         <td>${fmtMcap(r?.marketCap)}</td>
         <td style="font-family:var(--mono);font-size:11px">${mktValue != null ? fmt$(mktValue) : (isPassive ? '—' : '—')}</td>
         <td>${e.livePrice != null ? fmt$(e.livePrice) : '—'}</td>
-        <td style="font-family:var(--mono);font-size:11px">${isPassive ? `<span style="color:${todayPct > 0 ? '#5b8a72' : todayPct < 0 ? '#a5645a' : 'var(--ink-dim)'}">${fmtPct(todayPct)}</span>` : (e.qty != null ? e.qty : '—')}</td>
+        <td style="font-family:var(--mono);font-size:11px">${isPassive ? `<span style="color:${todayPct > 0 ? 'var(--pos)' : todayPct < 0 ? 'var(--neg)' : 'var(--ink-dim)'}">${fmtPct(todayPct)}</span>` : (e.qty != null ? e.qty : '—')}</td>
         <td style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);white-space:nowrap" title="${e.addedAt || ''}">${entryDateDisplay}</td>
         <td style="font-family:var(--mono);font-size:11px">${e.costBasis != null && isActive ? fmt$(e.costBasis) : '—'}</td>
-        <td style="color:${e.plPct == null ? 'var(--ink-faint)' : e.plPct > 0 ? '#5b8a72' : '#a5645a'};font-weight:${e.plPct != null ? '600' : '400'}">${fmtPct(e.plPct)}</td>
-        <td style="color:${e.plDollar == null ? 'var(--ink-faint)' : e.plDollar > 0 ? '#5b8a72' : '#a5645a'};font-weight:${e.plDollar != null ? '600' : '400'}">${e.plDollar == null ? '—' : (e.plDollar >= 0 ? '+' : '') + fmt$(e.plDollar)}</td>
+        <td style="color:${e.plPct == null ? 'var(--ink-faint)' : e.plPct > 0 ? 'var(--pos)' : 'var(--neg)'};font-weight:${e.plPct != null ? '600' : '400'}">${fmtPct(e.plPct)}</td>
+        <td style="color:${e.plDollar == null ? 'var(--ink-faint)' : e.plDollar > 0 ? 'var(--pos)' : 'var(--neg)'};font-weight:${e.plDollar != null ? '600' : '400'}">${e.plDollar == null ? '—' : (e.plDollar >= 0 ? '+' : '') + fmt$(e.plDollar)}</td>
         <td>
           <button class="sb-icon-btn portfolio-notes-btn" data-id="${e.id}" title="${noteCount === 0 ? 'No notes' : `${noteCount} note${noteCount === 1 ? '' : 's'}\nLast: ${lastNote ? lastNote.text.slice(0, 100) : ''}`}">
             ${noteCount === 0 ? '+ Note' : `📝 ${noteCount}`}
@@ -20470,7 +21461,7 @@ function renderPortfolioChart(enriched, range) {
     console.error('[portfolio-chart] render threw:', e);
     const svg = document.getElementById('portfolio-chart-svg');
     if (svg) {
-      svg.innerHTML = `<text x="50%" y="45%" text-anchor="middle" fill="#a5645a" font-family="var(--mono)" font-size="11">Chart error: ${escapeHtml(String(e.message || e))}</text>` +
+      svg.innerHTML = `<text x="50%" y="45%" text-anchor="middle" fill="var(--neg)" font-family="var(--mono)" font-size="11">Chart error: ${escapeHtml(String(e.message || e))}</text>` +
         `<text x="50%" y="58%" text-anchor="middle" fill="var(--ink-faint)" font-family="var(--mono)" font-size="9">see console (Ctrl+Shift+I) for details</text>`;
     }
     renderPortfolioChart._priming = false;  // unlock so a retry can happen
@@ -20887,7 +21878,7 @@ function _renderPortfolioChartImpl(enriched, range) {
   const periodChange = endVal - startVal;
   const periodPct = startVal > 0 ? periodChange / startVal : 0;
   const isUp = periodChange >= 0;
-  const lineColor = isUp ? '#5b8a72' : '#a5645a';
+  const lineColor = isUp ? 'var(--pos)' : 'var(--neg)';
   const fillColor = isUp ? 'rgba(91,138,114,0.12)' : 'rgba(165,100,90,0.12)';
 
   // Format helpers
@@ -20923,8 +21914,8 @@ function _renderPortfolioChartImpl(enriched, range) {
   s += `<text x="${margin.left + 130}" y="36" font-family="var(--mono)" font-size="11" fill="${lineColor}" font-weight="600">${isUp ? '▲ +' : '▼ '}${fmt$L(periodChange)} (${(periodPct * 100).toFixed(2)}%)</text>`;
 
   // High/low badges right side
-  s += `<text x="${margin.left + innerW}" y="18" text-anchor="end" font-family="var(--mono)" font-size="10" fill="#5b8a72">HIGH ${fmt$(hi.value)}</text>`;
-  s += `<text x="${margin.left + innerW}" y="32" text-anchor="end" font-family="var(--mono)" font-size="10" fill="#a5645a">LOW ${fmt$(lo.value)}</text>`;
+  s += `<text x="${margin.left + innerW}" y="18" text-anchor="end" font-family="var(--mono)" font-size="10" fill="var(--pos)">HIGH ${fmt$(hi.value)}</text>`;
+  s += `<text x="${margin.left + innerW}" y="32" text-anchor="end" font-family="var(--mono)" font-size="10" fill="var(--neg)">LOW ${fmt$(lo.value)}</text>`;
 
   // Y grid (subtle)
   s += `<g stroke="var(--rule)" stroke-width="0.5" stroke-dasharray="2 3" opacity="0.5">`;
@@ -20947,9 +21938,9 @@ function _renderPortfolioChartImpl(enriched, range) {
 
   // High/low triangle markers
   const hiX = xScale(hiIdx), hiY = yScale(hi.value);
-  s += `<circle cx="${hiX}" cy="${hiY}" r="3.5" fill="#5b8a72" stroke="var(--bg)" stroke-width="1.5"/>`;
+  s += `<circle cx="${hiX}" cy="${hiY}" r="3.5" fill="var(--pos)" stroke="var(--bg)" stroke-width="1.5"/>`;
   const loX = xScale(loIdx), loY = yScale(lo.value);
-  s += `<circle cx="${loX}" cy="${loY}" r="3.5" fill="#a5645a" stroke="var(--bg)" stroke-width="1.5"/>`;
+  s += `<circle cx="${loX}" cy="${loY}" r="3.5" fill="var(--neg)" stroke="var(--bg)" stroke-width="1.5"/>`;
 
   // Endpoint dot
   const endX = xScale(portfolioSeries.length - 1);
@@ -21005,7 +21996,7 @@ function _renderPortfolioChartImpl(enriched, range) {
       .map(p => {
         const last = p.windowed[p.windowed.length - 1];
         const positionPct = p.direction * (last.price - p.cost) / p.cost;
-        const color = positionPct >= 0 ? '#5b8a72' : '#a5645a';
+        const color = positionPct >= 0 ? 'var(--pos)' : 'var(--neg)';
         return `<span style="display:inline-flex;align-items:center;gap:6px;white-space:nowrap">
           <span style="color:var(--amber);font-weight:700">${p.ticker}</span>
           <span style="color:var(--ink-faint);font-size:9px">${p.position}${p.qty && p.isActive ? ` · ${p.qty}sh` : ''}</span>
@@ -21051,7 +22042,7 @@ function showPCTooltip(idx) {
   const startDate = ctx.dataPoints[0].date;
   const change = pt.value - startVal;
   const pct = startVal > 0 ? change / startVal : 0;
-  const changeColor = change >= 0 ? '#5b8a72' : '#a5645a';
+  const changeColor = change >= 0 ? 'var(--pos)' : 'var(--neg)';
 
   const fmt$L = v => '$' + v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   let prettyDate = pt.date;
@@ -21257,10 +22248,10 @@ function renderGoodGlobeIndexView(content, summary, subTabs) {
   // Row renderer for the table
   const rowHtml = visible.map(e => {
     const flagsBadges = (e.flags || []).map(f => {
-      const color = f === 'Avoid'    ? '#a5645a'
-                  : f === 'Watching' ? '#c4965a'
+      const color = f === 'Avoid'    ? 'var(--neg)'
+                  : f === 'Watching' ? 'var(--data-amber)'
                   : f === 'Tracking' ? '#7faaca'
-                  : f === 'Trading' || f === 'Long' ? '#5b8a72'
+                  : f === 'Trading' || f === 'Long' ? 'var(--pos)'
                   : f === 'Short'    ? '#a85a3a'
                   : f === 'Sold'     ? 'var(--ink-faint)'
                   : f === 'Manual'   ? 'var(--amber)'
@@ -21272,7 +22263,7 @@ function renderGoodGlobeIndexView(content, summary, subTabs) {
     // Realized P/L cell — populated from the trade journal (shorts + options
     // handled with correct sign + 100× multiplier inside recordTradeInGoodGlobeIndex)
     const hasTradePL = e.realizedPL != null && e.tradeCount > 0;
-    const plColor = !hasTradePL ? 'var(--ink-faint)' : e.realizedPL >= 0 ? '#5b8a72' : '#a5645a';
+    const plColor = !hasTradePL ? 'var(--ink-faint)' : e.realizedPL >= 0 ? 'var(--pos)' : 'var(--neg)';
     const plCell = hasTradePL
       ? `<span style="color:${plColor};font-weight:600">${e.realizedPL >= 0 ? '+' : ''}$${Math.abs(e.realizedPL) >= 1000 ? (e.realizedPL/1000).toFixed(1) + 'k' : e.realizedPL.toFixed(2)}</span>`
         + `<br><span style="font-size:8px;color:var(--ink-faint)">${e.tradeCount} trade${e.tradeCount === 1 ? '' : 's'}${e.winRate != null ? ` · ${Math.round(e.winRate * 100)}% win` : ''}</span>`
@@ -21309,7 +22300,7 @@ function renderGoodGlobeIndexView(content, summary, subTabs) {
         if (traded.length === 0) return '';
         const totalPL = traded.reduce((s, e) => s + (e.realizedPL || 0), 0);
         const totalTrades = traded.reduce((s, e) => s + (e.tradeCount || 0), 0);
-        const c = totalPL >= 0 ? '#5b8a72' : '#a5645a';
+        const c = totalPL >= 0 ? 'var(--pos)' : 'var(--neg)';
         return ` · <strong style="color:${c}">${totalPL >= 0 ? '+' : ''}$${totalPL.toFixed(2)}</strong> realized across ${totalTrades} trade${totalTrades === 1 ? '' : 's'} on ${traded.length} ticker${traded.length === 1 ? '' : 's'}`;
       })()}</div>
       <div style="color:var(--ink-faint);font-family:var(--mono);font-size:10px">Auto-recorded whenever you add a position · trade P/L (incl. shorts + options ×100) tracked on close · Manual import only adds to this list (no portfolio impact)</div>
@@ -21484,7 +22475,15 @@ function renderTransactionsLedger(content, summary, subTabs) {
     const isShort = tx.type === 'short' || tx.type === 'sell-to-open';
     const direction = isShort ? -1 : 1;
     const mult = txMultiplier(tx);
-    return direction * (livePrice - tx.price) * tx.qty * mult - (tx.fee || 0);
+    let pl = direction * (livePrice - tx.price) * tx.qty * mult - (tx.fee || 0);
+    // SHORT negative carry: deduct the owed dividend, prorated from open date.
+    if (isShort && tx.ts) {
+      const notional = tx.price * tx.qty * mult;
+      const days = Math.max(0, (Date.now() - new Date(tx.ts).getTime()) / 86400000);
+      const carry = (typeof shortDividendCarry === 'function') ? shortDividendCarry(tx.ticker, notional, days) : 0;
+      pl -= carry;
+    }
+    return pl;
   };
 
   // Sum unrealized P/L across all open trades for the summary stat
@@ -21499,9 +22498,9 @@ function renderTransactionsLedger(content, summary, subTabs) {
   // BUYs and SHORTs are compact; SELLs expand to show entry, sell, and notes.
   const txRowsHtml = transactions.slice().reverse().map(tx => {
     const ts = new Date(tx.ts).toLocaleString('en-US', { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-    const typeColor = tx.type === 'buy' ? '#5b8a72'
-                    : tx.type === 'short' ? '#c4965a'
-                    : '#a5645a';
+    const typeColor = tx.type === 'buy' ? 'var(--pos)'
+                    : tx.type === 'short' ? 'var(--data-amber)'
+                    : 'var(--neg)';
     const typeBg = tx.type === 'buy' ? 'rgba(91,138,114,0.15)'
                  : tx.type === 'short' ? 'rgba(196,150,90,0.15)'
                  : 'rgba(165,100,90,0.15)';
@@ -21509,9 +22508,9 @@ function renderTransactionsLedger(content, summary, subTabs) {
     if (tx.type === 'buy')   cashFlow = -((tx.cost) || (tx.qty * tx.price + (tx.fee || 0)));
     else if (tx.type === 'short') cashFlow = tx.qty * tx.price - (tx.fee || 0);
     else if (tx.type === 'sell')  cashFlow = tx.proceeds || (tx.qty * tx.price - (tx.fee || 0));
-    const cashColor = cashFlow >= 0 ? '#5b8a72' : '#a5645a';
+    const cashColor = cashFlow >= 0 ? 'var(--pos)' : 'var(--neg)';
     const showPL = tx.type === 'sell' && tx.realizedPL != null;
-    const plColor = (tx.realizedPL || 0) >= 0 ? '#5b8a72' : '#a5645a';
+    const plColor = (tx.realizedPL || 0) >= 0 ? 'var(--pos)' : 'var(--neg)';
     const plPct = tx.realizedPLPct != null ? tx.realizedPLPct
                 : (tx.type === 'sell' && tx.entryPrice ? ((tx.price - tx.entryPrice) / tx.entryPrice) * 100 : null);
 
@@ -21520,7 +22519,7 @@ function renderTransactionsLedger(content, summary, subTabs) {
     // already), and skipped if no live price is available.
     const unrealizedPL = txUnrealizedPL(tx);
     const showUPL = unrealizedPL != null;
-    const uplColor = (unrealizedPL || 0) >= 0 ? '#5b8a72' : '#a5645a';
+    const uplColor = (unrealizedPL || 0) >= 0 ? 'var(--pos)' : 'var(--neg)';
 
     // For SELL transactions, build the expanded receipt with all details and the position's note history
     let receiptDetail = '';
@@ -21582,7 +22581,7 @@ function renderTransactionsLedger(content, summary, subTabs) {
       </div>
       <div class="portfolio-stat" title="Sum of all cash deltas across every transaction. Shorts ADD to this number because broker credits proceeds — but those proceeds are pledged collateral, not free profit. Look at Realized P/L for actual gains.">
         <div class="portfolio-stat-label">Total Cash Flow</div>
-        <div class="portfolio-stat-value" style="color:${totalCashFlow >= 0 ? '#5b8a72' : '#a5645a'}">${totalCashFlow >= 0 ? '+' : ''}${fmt$(totalCashFlow)}</div>
+        <div class="portfolio-stat-value" style="color:${totalCashFlow >= 0 ? 'var(--pos)' : 'var(--neg)'}">${totalCashFlow >= 0 ? '+' : ''}${fmt$(totalCashFlow)}</div>
         <div class="portfolio-stat-sub">net in/out across ${transactions.length} transaction${transactions.length === 1 ? '' : 's'}${(() => {
           const shortProceeds = transactions.filter(t => t.type === 'short').reduce((s, t) => s + (t.qty * t.price - (t.fee || 0)), 0);
           return shortProceeds > 0 ? ` · <span style="color:#a85a3a">incl. ${fmt$(shortProceeds)} short collateral</span>` : '';
@@ -21590,12 +22589,12 @@ function renderTransactionsLedger(content, summary, subTabs) {
       </div>
       <div class="portfolio-stat">
         <div class="portfolio-stat-label">Realized P/L</div>
-        <div class="portfolio-stat-value" style="color:${totalRealizedPL >= 0 ? '#5b8a72' : '#a5645a'}">${totalRealizedPL >= 0 ? '+' : ''}${fmt$(totalRealizedPL)}</div>
-        <div class="portfolio-stat-sub" style="color:${totalRealizedPLPct >= 0 ? '#5b8a72' : '#a5645a'}">${totalRealizedPLPct >= 0 ? '+' : ''}${totalRealizedPLPct.toFixed(2)}% on ${transactions.filter(t => t.type === 'sell').length} sell${transactions.filter(t => t.type === 'sell').length === 1 ? '' : 's'}</div>
+        <div class="portfolio-stat-value" style="color:${totalRealizedPL >= 0 ? 'var(--pos)' : 'var(--neg)'}">${totalRealizedPL >= 0 ? '+' : ''}${fmt$(totalRealizedPL)}</div>
+        <div class="portfolio-stat-sub" style="color:${totalRealizedPLPct >= 0 ? 'var(--pos)' : 'var(--neg)'}">${totalRealizedPLPct >= 0 ? '+' : ''}${totalRealizedPLPct.toFixed(2)}% on ${transactions.filter(t => t.type === 'sell').length} sell${transactions.filter(t => t.type === 'sell').length === 1 ? '' : 's'}</div>
       </div>
       <div class="portfolio-stat" title="Paper P/L if you marked every open position to market right now. Excludes already-closed trades.">
         <div class="portfolio-stat-label">Unrealized P/L</div>
-        <div class="portfolio-stat-value" style="color:${totalUnrealizedPL >= 0 ? '#5b8a72' : '#a5645a'}">${openTradeCount === 0 ? '—' : (totalUnrealizedPL >= 0 ? '+' : '') + fmt$(totalUnrealizedPL)}</div>
+        <div class="portfolio-stat-value" style="color:${totalUnrealizedPL >= 0 ? 'var(--pos)' : 'var(--neg)'}">${openTradeCount === 0 ? '—' : (totalUnrealizedPL >= 0 ? '+' : '') + fmt$(totalUnrealizedPL)}</div>
         <div class="portfolio-stat-sub">${openTradeCount === 0 ? 'no open trades' : `mark-to-market across ${openTradeCount} open ${openTradeCount === 1 ? 'trade' : 'trades'}`}</div>
       </div>
       <div class="portfolio-stat">
@@ -21727,7 +22726,7 @@ function openSellModal(entryId) {
     const proceeds = qty * price - fee;
     const grossPL = (price - (entry.costBasis || 0)) * qty - fee;
     const plPct = entry.costBasis ? ((price - entry.costBasis) / entry.costBasis) * 100 : 0;
-    const plColor = grossPL >= 0 ? '#5b8a72' : '#a5645a';
+    const plColor = grossPL >= 0 ? 'var(--pos)' : 'var(--neg)';
     document.getElementById('sell-preview').innerHTML = `
       <div>Gross proceeds: <strong>${fmt$(qty * price)}</strong></div>
       <div>Less broker fee: −${fmt$(fee)}</div>
@@ -22609,7 +23608,7 @@ const TA_SECTOR_TO_ETF = {
 };
 
 // Compare-line color palette (primary is amber)
-const TA_COMPARE_COLORS = ['#5b8a72', '#7faaca', '#c4965a', '#a5645a', '#9a7aa0', '#7a8a6a'];
+const TA_COMPARE_COLORS = ['var(--pos)', '#7faaca', 'var(--data-amber)', 'var(--neg)', '#9a7aa0', '#7a8a6a'];
 
 async function taInit() {
   // Default to first portfolio ticker, or first stock-book row, or fall back to SPY
@@ -22901,7 +23900,14 @@ function taRenderChart() {
   const W = 1200, H = 460;
   const margin = { top: 24, right: 70, bottom: 36, left: 60 };
   const plotW = W - margin.left - margin.right;
-  const plotH = H - margin.top - margin.bottom;
+  // Sub-panels (RSI / Volume) take height from the bottom of the price plot.
+  // Each active sub-panel gets a band; the price plot shrinks to fit.
+  const subPanels = [];
+  if (state.ta.activeTools.has('volume')) subPanels.push('volume');
+  if (state.ta.activeTools.has('rsi')) subPanels.push('rsi');
+  const SUBPANEL_H = 70, SUBPANEL_GAP = 14;
+  const subTotal = subPanels.length * (SUBPANEL_H + SUBPANEL_GAP);
+  const plotH = H - margin.top - margin.bottom - subTotal;
 
   const primary = state.ta.primary;
   const compares = [...state.ta.compare];
@@ -23052,8 +24058,8 @@ function taRenderChart() {
   let maPaths = '';
   const maConfigs = [];
   if (state.ta.activeTools.has('ma50'))  maConfigs.push({ window: 50,  color: '#7faaca', label: 'MA 50' });
-  if (state.ta.activeTools.has('ma100')) maConfigs.push({ window: 100, color: '#c4965a', label: 'MA 100' });
-  if (state.ta.activeTools.has('ma200')) maConfigs.push({ window: 200, color: '#a5645a', label: 'MA 200' });
+  if (state.ta.activeTools.has('ma100')) maConfigs.push({ window: 100, color: 'var(--data-amber)', label: 'MA 100' });
+  if (state.ta.activeTools.has('ma200')) maConfigs.push({ window: 200, color: 'var(--neg)', label: 'MA 200' });
 
   maConfigs.forEach(cfg => {
     const ma = taComputeMA(primaryHist, cfg.window);
@@ -23082,8 +24088,8 @@ function taRenderChart() {
     const vwap = taComputeVwap(primaryHist);
     if (vwap.length > 0) {
       const vwapT = adjustedTransform(vwap, primaryHist[0].price);
-      maPaths += `<path d="${pathFrom(vwapT)}" fill="none" stroke="#5fa07f" stroke-width="1.4" opacity="0.7"/>`;
-      maConfigs.push({ color: '#5fa07f', label: 'VWAP' });
+      maPaths += `<path d="${pathFrom(vwapT)}" fill="none" stroke="var(--pos)" stroke-width="1.4" opacity="0.7"/>`;
+      maConfigs.push({ color: 'var(--pos)', label: 'VWAP' });
     }
   }
 
@@ -23125,14 +24131,90 @@ function taRenderChart() {
     fibInstr = `<text x="${W/2}" y="${margin.top + 18}" text-anchor="middle" fill="#7faaca" font-family="var(--mono)" font-size="11">Trendline: click two pivots — the line extends through them to the chart edges.</text>`;
   }
 
+  // ===== SUB-PANELS (RSI, Volume) + P/E BAND =====
+  // Sub-panels stack below the price plot. The first sub-panel's top is at
+  // (margin.top + plotH + SUBPANEL_GAP); each subsequent one is below that.
+  let subPanelHtml = '';
+  const subPanelBaseY = margin.top + plotH;
+  subPanels.forEach((panel, idx) => {
+    const panelTop = subPanelBaseY + SUBPANEL_GAP + idx * (SUBPANEL_H + SUBPANEL_GAP);
+    const panelBottom = panelTop + SUBPANEL_H;
+    // Panel frame + divider
+    subPanelHtml += `<line class="ta-grid" x1="${margin.left}" y1="${panelTop}" x2="${W - margin.right}" y2="${panelTop}" opacity="0.6"/>`;
+
+    if (panel === 'rsi') {
+      const rsi = taComputeRSI(primaryHist, 14);
+      // align rsi dates to xScale
+      const rsiPts = rsi.filter(r => r.rsi != null);
+      const ry = v => panelTop + (1 - v / 100) * SUBPANEL_H;
+      // 30 / 70 reference bands
+      subPanelHtml += `<rect x="${margin.left}" y="${ry(70)}" width="${plotW}" height="${ry(30) - ry(70)}" fill="#7faaca" opacity="0.06"/>`;
+      [30, 50, 70].forEach(lvl => {
+        subPanelHtml += `<line x1="${margin.left}" y1="${ry(lvl)}" x2="${W - margin.right}" y2="${ry(lvl)}" stroke="var(--ink-faint)" stroke-width="0.4" stroke-dasharray="${lvl === 50 ? '1 3' : '3 2'}" opacity="0.5"/>`;
+        subPanelHtml += `<text class="ta-axis-label" x="${W - margin.right + 6}" y="${ry(lvl) + 3}" font-size="8">${lvl}</text>`;
+      });
+      if (rsiPts.length >= 2) {
+        const d = rsiPts.map((r, i) => `${i === 0 ? 'M' : 'L'}${xScale(r.date).toFixed(1)},${ry(r.rsi).toFixed(1)}`).join(' ');
+        subPanelHtml += `<path d="${d}" fill="none" stroke="var(--data-amber)" stroke-width="1.3"/>`;
+        const last = rsiPts[rsiPts.length - 1];
+        const lastColor = last.rsi >= 70 ? 'var(--neg)' : last.rsi <= 30 ? 'var(--pos)' : 'var(--data-amber)';
+        subPanelHtml += `<circle cx="${xScale(last.date).toFixed(1)}" cy="${ry(last.rsi).toFixed(1)}" r="3" fill="${lastColor}"/>`;
+        subPanelHtml += `<text x="${margin.left + 4}" y="${panelTop + 12}" fill="var(--ink-faint)" font-family="var(--mono)" font-size="9">RSI 14: <tspan fill="${lastColor}" font-weight="700">${last.rsi.toFixed(0)}</tspan>${last.rsi >= 70 ? ' overbought' : last.rsi <= 30 ? ' oversold' : ''}</text>`;
+      } else {
+        subPanelHtml += `<text x="${margin.left + 4}" y="${panelTop + SUBPANEL_H / 2}" fill="var(--ink-faint)" font-family="var(--mono)" font-size="9">RSI needs ≥15 data points</text>`;
+      }
+    }
+
+    if (panel === 'volume') {
+      const vols = primaryHist.map(p => p.volume || 0);
+      const maxV = Math.max(...vols, 1);
+      const hasVol = vols.some(v => v > 0);
+      if (hasVol) {
+        const barW = Math.max(0.5, plotW / primaryHist.length * 0.8);
+        primaryHist.forEach((p, i) => {
+          const v = p.volume || 0;
+          if (v <= 0) return;
+          const h = (v / maxV) * (SUBPANEL_H - 12);
+          const x = xScale(p.date) - barW / 2;
+          // Color by up/down day
+          const prevPrice = i > 0 ? primaryHist[i - 1].price : p.price;
+          const up = p.price >= prevPrice;
+          subPanelHtml += `<rect x="${x.toFixed(1)}" y="${(panelBottom - h).toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" fill="${up ? 'var(--pos)' : 'var(--neg)'}" opacity="0.6"/>`;
+        });
+        const fmtV = (typeof formatHumanNumber === 'function') ? formatHumanNumber : (n) => n.toLocaleString();
+        subPanelHtml += `<text x="${margin.left + 4}" y="${panelTop + 12}" fill="var(--ink-faint)" font-family="var(--mono)" font-size="9">Volume · max ${fmtV(maxV)}</text>`;
+      } else {
+        subPanelHtml += `<text x="${margin.left + 4}" y="${panelTop + SUBPANEL_H / 2}" fill="var(--ink-faint)" font-family="var(--mono)" font-size="9">No volume data for ${primary}</text>`;
+      }
+    }
+  });
+
+  // P/E band — when active, draw the EPS-implied "fair value at current P/E" line
+  // and annotate the live P/E. Reads pe + eps from the primary's stockbook row.
+  let peHtml = '';
+  if (state.ta.activeTools.has('pe') && effectiveMode === 'price') {
+    const row = (typeof getStockbookRow === 'function') ? getStockbookRow(primary) : null;
+    const pe = row?.pe, eps = row?.eps, px = row?.price;
+    if (pe != null && isFinite(pe) && pe > 0) {
+      // Mark the current price level (which embeds the current P/E) and label it.
+      const lastV = primarySeries[primarySeries.length - 1]._v;
+      const yLine = yScale(lastV);
+      peHtml += `<line x1="${margin.left}" y1="${yLine}" x2="${W - margin.right}" y2="${yLine}" stroke="var(--data-amber)" stroke-width="1" stroke-dasharray="6 3" opacity="0.8"/>`;
+      peHtml += `<rect x="${margin.left + 4}" y="${yLine - 26}" width="148" height="22" rx="3" fill="var(--bg-card)" stroke="var(--data-amber)" stroke-width="0.8" opacity="0.95"/>`;
+      peHtml += `<text x="${margin.left + 10}" y="${yLine - 11}" fill="var(--data-amber)" font-family="var(--mono)" font-size="10" font-weight="700">P/E ${pe.toFixed(1)}${eps != null ? ` · EPS $${eps.toFixed(2)}` : ''}</text>`;
+    }
+  }
+
   svg.innerHTML = `
     ${gridHtml}
     ${comparePaths}
     ${maPaths}
     ${primaryPath}
+    ${peHtml}
     ${trendHtml}
     ${fibHtml}
     ${fibInstr}
+    ${subPanelHtml}
     <g id="ta-hover-group" style="pointer-events:none;display:none">
       <line id="ta-hover-vline" class="ta-crosshair" x1="0" y1="${margin.top}" x2="0" y2="${margin.top + plotH}"/>
       <line id="ta-hover-hline" class="ta-crosshair" x1="${margin.left}" y1="0" x2="${W - margin.right}" y2="0"/>
@@ -23178,6 +24260,12 @@ function taRenderChart() {
     maConfigs.forEach(cfg => {
       html += `<div class="ta-chart-legend-item"><span class="ta-chart-legend-dot" style="background:${cfg.color}"></span>${cfg.label}</div>`;
     });
+    if (state.ta.activeTools.has('rsi')) html += `<div class="ta-chart-legend-item"><span class="ta-chart-legend-dot" style="background:var(--data-amber)"></span>RSI 14</div>`;
+    if (state.ta.activeTools.has('volume')) html += `<div class="ta-chart-legend-item"><span class="ta-chart-legend-dot" style="background:var(--pos)"></span>Volume</div>`;
+    if (state.ta.activeTools.has('pe')) {
+      const row = (typeof getStockbookRow === 'function') ? getStockbookRow(primary) : null;
+      if (row?.pe != null) html += `<div class="ta-chart-legend-item"><span class="ta-chart-legend-dot" style="background:var(--data-amber)"></span>P/E ${row.pe.toFixed(1)}</div>`;
+    }
     legend.innerHTML = html;
   }
 }
@@ -23223,6 +24311,32 @@ function taComputeVwap(hist) {
     cumV += v;
     out.push({ date: p.date, price: cumPV / cumV });
   });
+  return out;
+}
+
+// RSI — Wilder's Relative Strength Index over `period` (default 14).
+// Returns [{date, rsi}] where rsi is 0-100. Uses Wilder's smoothing.
+function taComputeRSI(hist, period = 14) {
+  if (!hist || hist.length < period + 1) return [];
+  const out = [];
+  let avgGain = 0, avgLoss = 0;
+  // Seed with the first `period` changes
+  for (let i = 1; i <= period; i++) {
+    const ch = hist[i].price - hist[i - 1].price;
+    if (ch >= 0) avgGain += ch; else avgLoss -= ch;
+  }
+  avgGain /= period; avgLoss /= period;
+  const rsiAt = (g, l) => l === 0 ? 100 : 100 - 100 / (1 + g / l);
+  out.push({ date: hist[period].date, rsi: rsiAt(avgGain, avgLoss) });
+  // Wilder smoothing for the rest
+  for (let i = period + 1; i < hist.length; i++) {
+    const ch = hist[i].price - hist[i - 1].price;
+    const gain = ch >= 0 ? ch : 0;
+    const loss = ch < 0 ? -ch : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+    out.push({ date: hist[i].date, rsi: rsiAt(avgGain, avgLoss) });
+  }
   return out;
 }
 
@@ -23425,13 +24539,13 @@ function taRenderFibonacci(anchors, primarySeries, xScale, yScale, margin, W) {
   if (!anchors || !anchors.start || !anchors.end) return '';
   // Classic Fibonacci retracement levels
   const levels = [
-    { level: 0,     color: '#5b8a72', label: '0.0%' },
+    { level: 0,     color: 'var(--pos)', label: '0.0%' },
     { level: 0.236, color: '#7faaca', label: '23.6%' },
     { level: 0.382, color: '#7faaca', label: '38.2%' },
-    { level: 0.5,   color: '#c4965a', label: '50.0%' },
-    { level: 0.618, color: '#c4965a', label: '61.8%' },
-    { level: 0.786, color: '#a5645a', label: '78.6%' },
-    { level: 1,     color: '#a5645a', label: '100.0%' },
+    { level: 0.5,   color: 'var(--data-amber)', label: '50.0%' },
+    { level: 0.618, color: 'var(--data-amber)', label: '61.8%' },
+    { level: 0.786, color: 'var(--neg)', label: '78.6%' },
+    { level: 1,     color: 'var(--neg)', label: '100.0%' },
     // Extensions
     { level: 1.272, color: '#9a7aa0', label: '127.2%', ext: true },
     { level: 1.618, color: '#9a7aa0', label: '161.8%', ext: true },
@@ -23489,7 +24603,7 @@ function taRenderComparison() {
       <div style="color:var(--ink-faint);font-size:10px;letter-spacing:0.1em;text-transform:uppercase;text-align:right">Status</div>
 
       <div style="color:var(--amber);font-weight:700">${primary}</div>
-      <div style="text-align:right;color:${primaryReturn >= 0 ? '#5b8a72' : '#a5645a'};font-weight:600">${primaryReturn >= 0 ? '+' : ''}${primaryReturn.toFixed(2)}%</div>
+      <div style="text-align:right;color:${primaryReturn >= 0 ? 'var(--pos)' : 'var(--neg)'};font-weight:600">${primaryReturn >= 0 ? '+' : ''}${primaryReturn.toFixed(2)}%</div>
       <div style="text-align:right;color:var(--ink-faint)">—</div>
       <div style="text-align:right;color:var(--ink-faint);font-size:10px">baseline</div>
   `;
@@ -23499,11 +24613,11 @@ function taRenderComparison() {
     if (r == null) return;
     const diff = primaryReturn - r;  // primary minus peer; positive = primary outperforming
     const status = diff > 0 ? `outperforming by ${diff.toFixed(1)}%` : diff < 0 ? `underperforming by ${Math.abs(diff).toFixed(1)}%` : 'matching';
-    const color = diff > 0 ? '#5b8a72' : diff < 0 ? '#a5645a' : 'var(--ink-dim)';
+    const color = diff > 0 ? 'var(--pos)' : diff < 0 ? 'var(--neg)' : 'var(--ink-dim)';
     const isAuto = tic === state.ta._autoCompare;
     rows += `
       <div>${tic}${isAuto ? ' <span style="color:var(--ink-faint);font-size:10px">(auto)</span>' : ''}</div>
-      <div style="text-align:right;color:${r >= 0 ? '#5b8a72' : '#a5645a'};font-weight:600">${r >= 0 ? '+' : ''}${r.toFixed(2)}%</div>
+      <div style="text-align:right;color:${r >= 0 ? 'var(--pos)' : 'var(--neg)'};font-weight:600">${r >= 0 ? '+' : ''}${r.toFixed(2)}%</div>
       <div style="text-align:right;color:${color};font-weight:600">${diff >= 0 ? '+' : ''}${diff.toFixed(2)}%</div>
       <div style="text-align:right;color:${color};font-size:10px;font-style:italic">${status}</div>
     `;
@@ -23570,7 +24684,7 @@ function taRenderCorrelation() {
       if (j < i) { html += '<td></td>'; return; }
       if (j === i) { html += '<td style="text-align:right;color:var(--ink-dim);padding:6px">1.00</td>'; return; }
       const c = corr(returnsMap[rT], returnsMap[cT]);
-      const color = c == null ? 'var(--ink-faint)' : c > 0.5 ? '#5b8a72' : c < -0.3 ? '#a5645a' : 'var(--ink-dim)';
+      const color = c == null ? 'var(--ink-faint)' : c > 0.5 ? 'var(--pos)' : c < -0.3 ? 'var(--neg)' : 'var(--ink-dim)';
       html += `<td style="text-align:right;color:${color};padding:6px">${c == null ? '—' : c.toFixed(2)}</td>`;
     });
     html += '</tr>';
@@ -23613,10 +24727,10 @@ function taRenderStats() {
 
   wrap.innerHTML = `
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px 18px;font-family:var(--mono);font-size:12px">
-      <div><div style="color:var(--ink-faint);font-size:9px;letter-spacing:0.1em;text-transform:uppercase">Annualized Return</div><strong style="font-size:16px;color:${annRet >= 0 ? '#5b8a72' : '#a5645a'}">${annRet >= 0 ? '+' : ''}${annRet.toFixed(2)}%</strong></div>
+      <div><div style="color:var(--ink-faint);font-size:9px;letter-spacing:0.1em;text-transform:uppercase">Annualized Return</div><strong style="font-size:16px;color:${annRet >= 0 ? 'var(--pos)' : 'var(--neg)'}">${annRet >= 0 ? '+' : ''}${annRet.toFixed(2)}%</strong></div>
       <div><div style="color:var(--ink-faint);font-size:9px;letter-spacing:0.1em;text-transform:uppercase">Annualized Vol</div><strong style="font-size:16px">${annVol.toFixed(2)}%</strong></div>
-      <div><div style="color:var(--ink-faint);font-size:9px;letter-spacing:0.1em;text-transform:uppercase">Sharpe (4% rf)</div><strong style="font-size:16px;color:${sharpe >= 1 ? '#5b8a72' : sharpe < 0 ? '#a5645a' : 'var(--ink)'}">${sharpe != null ? sharpe.toFixed(2) : '—'}</strong></div>
-      <div><div style="color:var(--ink-faint);font-size:9px;letter-spacing:0.1em;text-transform:uppercase">Max Drawdown</div><strong style="font-size:16px;color:#a5645a">${(maxDD * 100).toFixed(2)}%</strong></div>
+      <div><div style="color:var(--ink-faint);font-size:9px;letter-spacing:0.1em;text-transform:uppercase">Sharpe (4% rf)</div><strong style="font-size:16px;color:${sharpe >= 1 ? 'var(--pos)' : sharpe < 0 ? 'var(--neg)' : 'var(--ink)'}">${sharpe != null ? sharpe.toFixed(2) : '—'}</strong></div>
+      <div><div style="color:var(--ink-faint);font-size:9px;letter-spacing:0.1em;text-transform:uppercase">Max Drawdown</div><strong style="font-size:16px;color:var(--neg)">${(maxDD * 100).toFixed(2)}%</strong></div>
     </div>
   `;
 }
@@ -23769,11 +24883,11 @@ function taOnTabActive() {
 // ============================================================
 
 const HEALTH_GRADE = {
-  strong:  { color: '#5b8a72', label: 'STRONG',   icon: '▲' },
+  strong:  { color: 'var(--pos)', label: 'STRONG',   icon: '▲' },
   good:    { color: '#7faaca', label: 'GOOD',     icon: '▴' },
-  neutral: { color: '#c4965a', label: 'NEUTRAL',  icon: '◆' },
-  weak:    { color: '#a5645a', label: 'WEAK',     icon: '▾' },
-  poor:    { color: '#d97a6c', label: 'POOR',     icon: '▼' },
+  neutral: { color: 'var(--data-amber)', label: 'NEUTRAL',  icon: '◆' },
+  weak:    { color: 'var(--neg)', label: 'WEAK',     icon: '▾' },
+  poor:    { color: 'var(--red)', label: 'POOR',     icon: '▼' },
   unknown: { color: '#9a9387', label: 'UNKNOWN',  icon: '?' },
 };
 
@@ -23945,8 +25059,70 @@ function evaluateRisk(s) {
 //   Produces a conviction score + human-readable reasoning trail ("show your
 //   work"), reused by company valuation, CEO assessment, and news scoring.
 // ============================================================
+// ============================================================
+//   STOCK-BASED COMPENSATION ANALYSIS
+//
+//   SBC is a non-cash expense that distorts the numbers in two ways:
+//     1. It's added back to net income to get operating cash flow, so OCF/FCF
+//        look better than the true owner economics (the company really did pay
+//        employees — in equity, which dilutes existing holders).
+//     2. Companies routinely EXCLUDE it from "adjusted" EBITDA / non-GAAP EPS,
+//        which is the single biggest GAAP-vs-non-GAAP gap, especially in tech.
+//
+//   This returns SBC intensity (% of revenue, % of OCF), a severity rating, an
+//   SBC-adjusted FCF (FCF minus SBC — closer to real owner cash), and notes on
+//   what each headline metric does/doesn't include. Null if SBC is unavailable.
+// ============================================================
+function analyzeStockBasedComp(s) {
+  const num = (v) => (typeof v === 'number' && isFinite(v)) ? v : null;
+  const sbc = num(s.stockBasedComp);
+  if (sbc == null || sbc <= 0) {
+    return { available: false, sbc: sbc };
+  }
+  const revenue = num(s.revenue);
+  const ocf = num(s.operatingCashFlow);
+  const fcf = num(s.freeCashFlow != null ? s.freeCashFlow : (ocf != null && s.capex != null ? ocf - s.capex : null));
+  const netIncome = num(s.netIncome);
+  const ebitda = num(s.ebitda);
+
+  const pctRevenue = (revenue && revenue > 0) ? sbc / revenue : null;
+  const pctOcf = (ocf && ocf > 0) ? sbc / ocf : null;
+  const pctNetIncome = (netIncome && netIncome > 0) ? sbc / netIncome : null;
+
+  // SBC-adjusted FCF: subtract SBC back out, since it's a real (equity) cost
+  // the add-back removed. This is the more conservative owner-cash figure.
+  const adjFcf = (fcf != null) ? fcf - sbc : null;
+  const fcfHaircut = (fcf && fcf > 0 && adjFcf != null) ? (fcf - adjFcf) / fcf : null;
+
+  // Severity: by % of revenue (the cleanest cross-company yardstick).
+  //   <2%  negligible · 2-5% moderate · 5-10% high · >10% severe
+  let severity = 'negligible';
+  if (pctRevenue != null) {
+    if (pctRevenue >= 0.10) severity = 'severe';
+    else if (pctRevenue >= 0.05) severity = 'high';
+    else if (pctRevenue >= 0.02) severity = 'moderate';
+  }
+
+  return {
+    available: true,
+    sbc,
+    pctRevenue, pctOcf, pctNetIncome,
+    fcf, adjFcf, fcfHaircut,
+    severity,
+    // What each headline metric includes re: SBC — used for the disclosure UI.
+    inclusion: {
+      netIncome: 'expensed (GAAP net income includes SBC)',
+      ebitda: 'typically EXCLUDED from "adjusted" EBITDA — add it back to compare',
+      operatingCashFlow: 'added back (non-cash) — inflates OCF vs. true cost',
+      fcf: 'inflated by the OCF add-back — see SBC-adjusted FCF',
+      eps: 'GAAP EPS includes SBC; non-GAAP EPS usually excludes it',
+    },
+  };
+}
+
 function financialReasoningChain(s) {
   if (!s) return null;
+  s = (typeof normalizeEngineFields === 'function') ? normalizeEngineFields(s) : s;
   const steps = [];
   const num = (v) => (typeof v === 'number' && isFinite(v)) ? v : null;
   const pct = (v) => num(v) != null ? (v * 100).toFixed(1) + '%' : 'n/a';
@@ -23955,7 +25131,11 @@ function financialReasoningChain(s) {
   const eps = num(s.eps);
   const netMargin = num(s.netMargin != null ? s.netMargin : s.profitMargin);
   const fcf = num(s.freeCashFlow);
-  const roe = num(s.roe);
+  const roe = num(s.roe != null ? s.roe : s.returnOnEquity);
+  // Return on Tangible Common Equity: net income / (equity − goodwill − intangibles).
+  // More demanding than ROE — strips out acquisition goodwill so it reflects
+  // returns on the hard capital actually in the business. Null if not computable.
+  const rotce = (typeof researchROTCE === 'function') ? researchROTCE(s) : null;
   const de = num(s.debtToEquity);
   const curr = num(s.currentRatio);
   const cash = num(s.cash);
@@ -23991,19 +25171,34 @@ function financialReasoningChain(s) {
   // STEP 2: Survival / profitability
   let profitPass = null, profitPoints = null;
   const profitNotes = [];
+  // SBC analysis — a real (equity) cost that flatters cash-based metrics.
+  const sbcA = (typeof analyzeStockBasedComp === 'function') ? analyzeStockBasedComp(s) : null;
   if (eps != null) profitNotes.push(eps > 0 ? `EPS +${fmt$(eps)} (profitable)` : `EPS -$${Math.abs(eps).toFixed(2)} (loss-making)`);
   if (netMargin != null) profitNotes.push(`net margin ${pct(netMargin)}`);
   if (fcf != null) profitNotes.push(fcf > 0 ? `FCF positive ${fmt$(fcf)}` : `FCF negative ${fmt$(fcf)}`);
   if (roe != null) profitNotes.push(`ROE ${pct(roe)}`);
+  if (rotce != null) profitNotes.push(`ROTCE ${pct(rotce)}${rotce > 0.20 ? ' (excellent)' : rotce > 0.12 ? ' (solid)' : rotce < 0 ? ' (negative)' : ''}`);
+  if (sbcA?.available && sbcA.pctRevenue != null) {
+    profitNotes.push(`SBC ${pct(sbcA.pctRevenue)} of revenue (${sbcA.severity})${sbcA.adjFcf != null ? ` · SBC-adj FCF ${fmt$(sbcA.adjFcf)}` : ''}`);
+  }
   if (eps != null || netMargin != null || fcf != null) {
     const profitable = (eps != null && eps > 0) || (netMargin != null && netMargin > 0) || (fcf != null && fcf > 0);
     profitPass = profitable;
+    // ROTCE adds up to +12 for high-quality compounders (>20%), since strong
+    // tangible returns are a durable-advantage signal beyond raw ROE.
+    const rotceBonus = rotce != null ? (rotce > 0.20 ? 12 : rotce > 0.12 ? 6 : rotce < 0 ? -8 : 0) : 0;
+    // SBC penalty: high SBC means reported cash earnings overstate the real
+    // owner economics, AND it dilutes holders. Dock points by severity.
+    const sbcPenalty = sbcA?.available ? (sbcA.severity === 'severe' ? -15 : sbcA.severity === 'high' ? -8 : sbcA.severity === 'moderate' ? -3 : 0) : 0;
     profitPoints = profitable
-      ? Math.min(100, 55 + (netMargin != null ? Math.min(30, netMargin * 150) : 0) + (roe != null && roe > 0.15 ? 10 : 0))
-      : Math.max(0, 35 - (netMargin != null && netMargin < -0.1 ? 20 : 0));
+      ? Math.min(100, 55 + (netMargin != null ? Math.min(30, netMargin * 150) : 0) + (roe != null && roe > 0.15 ? 10 : 0) + rotceBonus + sbcPenalty)
+      : Math.max(0, 35 - (netMargin != null && netMargin < -0.1 ? 20 : 0) + sbcPenalty);
     profitNotes.unshift(profitable
       ? 'PROFITABLE - judged as a going concern.'
       : 'UNPROFITABLE - value on cash runway + path to profitability, not earnings.');
+    if (sbcA?.available && (sbcA.severity === 'high' || sbcA.severity === 'severe')) {
+      profitNotes.push(`⚠ heavy SBC — adjusted (non-GAAP) earnings exclude this; treat "adjusted" figures with caution.`);
+    }
   }
   steps.push({ step: 2, name: 'Survival / profitability', pass: profitPass, points: profitPoints,
     note: profitNotes.length ? profitNotes.join(' · ') : 'No profitability data.' });
@@ -24111,8 +25306,55 @@ function financialReasoningChain(s) {
   };
 }
 
+// ============================================================
+//   ENGINE FIELD NORMALIZATION — connect every unit value
+//
+//   The canonical data and the engine evaluators grew up with slightly
+//   different field names (returnOnEquity vs roe, earningsGrowth vs epsGrowth,
+//   profitMargin vs netMargin), and several ratios the engine wants (D/E,
+//   P/S, current ratio, payout) aren't provided directly. This silently left
+//   dimensions scoring on `undefined`. This normalizer maps the aliases and
+//   DERIVES the missing ratios from raw components, so the engine actually
+//   sees the data. Mutates a shallow copy — never the original row.
+// ============================================================
+function normalizeEngineFields(s) {
+  if (!s) return s;
+  const n = (v) => (typeof v === 'number' && isFinite(v)) ? v : null;
+  const out = Object.assign({}, s);
+
+  // Aliases — fill the engine-expected name from whichever the data has.
+  if (out.roe == null)        out.roe        = n(s.roe) ?? n(s.returnOnEquity);
+  if (out.returnOnEquity == null) out.returnOnEquity = n(s.returnOnEquity) ?? n(s.roe);
+  if (out.epsGrowth == null)  out.epsGrowth  = n(s.epsGrowth) ?? n(s.earningsGrowth);
+  if (out.netMargin == null)  out.netMargin  = n(s.netMargin) ?? n(s.profitMargin);
+  if (out.profitMargin == null) out.profitMargin = n(s.profitMargin) ?? n(s.netMargin);
+
+  // Derive Debt/Equity from raw components when not provided directly.
+  if (out.debtToEquity == null) {
+    const d = n(s.totalDebt), e = n(s.totalEquity) ?? n(s.totalStockholdersEquity);
+    if (d != null && e != null && e > 0) out.debtToEquity = d / e;
+  }
+  // Derive Price/Sales from market cap and revenue.
+  if (out.priceToSales == null) {
+    const mc = n(s.marketCap), rev = n(s.revenue);
+    if (mc != null && rev != null && rev > 0) out.priceToSales = mc / rev;
+  }
+  // Derive current ratio when current assets/liabilities exist.
+  if (out.currentRatio == null) {
+    const ca = n(s.totalCurrentAssets), cl = n(s.totalCurrentLiabilities);
+    if (ca != null && cl != null && cl > 0) out.currentRatio = ca / cl;
+  }
+  // Derive payout ratio from dividends and net income when available.
+  if (out.payoutRatio == null) {
+    const dv = n(s.dividendsPaid), ni = n(s.netIncome);
+    if (dv != null && ni != null && ni > 0) out.payoutRatio = Math.abs(dv) / ni;
+  }
+  return out;
+}
+
 function computeCompanyHealth(s) {
   if (!s) return null;
+  s = normalizeEngineFields(s);
   const dims = {
     scale:    evaluateScale(s),
     profit:   evaluateProfitability(s),
@@ -24526,31 +25768,6 @@ const CURATED_PRODUCTS = {
 
 // Extract candidate product names from a description string. Keywords like
 // "products include", "offers", "such as" tend to introduce product lists.
-function extractProductsFromDescription(desc) {
-  if (!desc) return [];
-  const products = [];
-  // Patterns that typically prelude a product list
-  const patterns = [
-    /(?:products include|product portfolio includes|offers|sells|markets|provides|including)\s+([^.]+)\./gi,
-    /(?:such as|including)\s+([^.;]+)/gi,
-  ];
-  for (const pat of patterns) {
-    let m;
-    while ((m = pat.exec(desc)) !== null) {
-      const list = m[1];
-      // Split on commas, "and", "&"
-      list.split(/[,;]|\band\b|\&/i)
-        .map(s => s.trim().replace(/^the\s+/i, '').replace(/\.$/, ''))
-        .filter(s => s.length > 2 && s.length < 60)
-        .filter(s => !/^[a-z]/.test(s) || /^(iphone|ipad|imac|airpods)/i.test(s)) // prefer proper nouns
-        .forEach(s => {
-          if (!products.some(p => p.toLowerCase() === s.toLowerCase())) products.push(s);
-        });
-    }
-  }
-  return products.slice(0, 20);  // cap
-}
-
 // Resolve country flag emoji for common country names (best-effort).
 const COUNTRY_FLAGS = {
   'united states': '🇺🇸', 'usa': '🇺🇸', 'us': '🇺🇸', 'america': '🇺🇸',
@@ -24765,7 +25982,7 @@ const PRODUCT_EXTRACTION_BLOCKLIST = new Set([
 function extractProductsFromDescription(text, ticker) {
   if (!text) return [];
   const found = new Set();
-  const lowerTicker = ticker.toLowerCase();
+  const lowerTicker = (ticker || '').toLowerCase();
 
   // Strategy 2 first (most precise): "products such as / including / brands like X, Y, and Z"
   const listPatterns = [
@@ -24962,7 +26179,7 @@ async function renderCompanyOverview() {
     // Try to find any container we could render into for diagnostic visibility
     const fallbackEl = document.querySelector('[data-cpanel="overview"]') || document.querySelector('.val-subpanel[data-subpanel="company"]');
     if (fallbackEl) {
-      fallbackEl.innerHTML = `<div style="padding:30px;color:#d97a6c;font-family:var(--mono);font-size:11px;line-height:1.7">
+      fallbackEl.innerHTML = `<div style="padding:30px;color:var(--red);font-family:var(--mono);font-size:11px;line-height:1.7">
         <strong>DOM ERROR:</strong> #company-overview-body element not found in the page.<br>
         Your index.html may be out of date. Please make sure you have the latest version.<br>
         Click ⚙ for full debug log.
@@ -24972,14 +26189,57 @@ async function renderCompanyOverview() {
   }
   console.log(`[company-overview] starting render for ${s.ticker}`);
 
+  // ===== SYNCHRONOUS BASELINE RENDER (zero async dependencies) =====
+  // Render real company info from the stockbook row + canonical data IMMEDIATELY,
+  // before any network fetch. This guarantees the tab is never blank even if
+  // every external source (Wikidata/FMP) fails or hangs. Enrichment below then
+  // layers richer data on top when it arrives.
+  try {
+    const sb = (typeof getCanonicalStockData === 'function' ? getCanonicalStockData(s.ticker) : null) || s;
+    const stockbookLoaded = !!(state.stockbook?.rows?.length);
+    const hasCanonical = (typeof getCanonicalStockData === 'function') && !!getCanonicalStockData(s.ticker);
+    const ctry = (typeof tickerCountry === 'function') ? tickerCountry(s.ticker) : { country: '—', flag: '' };
+    const baselineFields = [
+      ['Name', sb.name || s.name || s.ticker],
+      ['Ticker', s.ticker],
+      ['Sector', sb.sector || s.sector || '—'],
+      ['Industry', sb.industry || s.industry || '—'],
+      ['Sub-Sector', sb.subSector || s.subSector || '—'],
+      ['Country', ctry.country !== '—' ? `${ctry.flag} ${ctry.country}` : '—'],
+      ['Price', sb.price != null ? fmt$(sb.price) : '—'],
+      ['Market Cap', sb.marketCap != null ? fmt$(sb.marketCap) : '—'],
+      ['P/E', sb.pe != null ? sb.pe.toFixed(2) : '—'],
+      ['Beta', sb.beta != null ? sb.beta.toFixed(2) : '—'],
+      ['EPS', sb.eps != null ? fmt$(sb.eps) : '—'],
+      ['Dividend Yield', sb.dividendYield != null ? (sb.dividendYield * 100).toFixed(2) + '%' : '—'],
+    ];
+    const descText = sb.description || s.description || '';
+    const loadingHint = (!hasCanonical && !stockbookLoaded)
+      ? `<div style="margin-top:10px;font-family:var(--mono);font-size:10px;color:var(--data-amber);line-height:1.6">⏳ Stockbook still loading — figures will fill in once it finishes. Richer company data (leadership, filings, products) loads below.</div>`
+      : (!hasCanonical
+        ? `<div style="margin-top:10px;font-family:var(--mono);font-size:10px;color:var(--ink-faint)">No stockbook row for ${escapeHtml(s.ticker)} yet — showing what's available. Click Fetch &amp; Value to populate fully.</div>`
+        : '');
+    el.innerHTML = `
+      <div class="company-card">
+        <h4>${escapeHtml(sb.name || s.ticker)} <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· ${escapeHtml(s.ticker)} · loading more…</span></h4>
+        <div class="company-kv">
+          ${baselineFields.map(([k, v]) => `<div class="company-kv-label">${k}</div><div class="company-kv-value">${escapeHtml(String(v))}</div>`).join('')}
+        </div>
+        ${descText ? `<div style="margin-top:14px;font-family:var(--serif);font-size:13px;line-height:1.6;color:var(--ink)">${escapeHtml(descText)}</div>` : ''}
+        ${loadingHint}
+      </div>
+      <div id="company-overview-enriched" style="margin-top:0"></div>
+    `;
+    console.log('[company-overview] baseline rendered synchronously', { stockbookLoaded, hasCanonical });
+  } catch (e) {
+    console.error('[company-overview] baseline render failed:', e.message);
+  }
+
   // Show diagnostic loading state immediately. If everything past this point
   // throws, at least the user sees the function actually fired.
-  el.innerHTML = `
-    <div style="padding:20px;background:var(--bg-elev);border:1px solid var(--rule);border-radius:4px;font-family:var(--mono);font-size:11px;color:var(--ink-dim)">
-      <div style="color:var(--amber);margin-bottom:6px">[render] Loading company overview for ${escapeHtml(s.ticker)}…</div>
-      Fetching Wikidata facts from data/company/${escapeHtml(s.ticker)}.json…
-    </div>
-  `;
+  // (Baseline already rendered above — we only write into the enriched sub-div,
+  // so the baseline stays visible while enrichment loads.)
+  const _enrichedEl = document.getElementById('company-overview-enriched');
 
   // Run the multi-source enrichment chain. Pulls from Wikidata (GitHub) + FMP
   // profile + supply chain matches + description parsing. Returns a unified
@@ -25025,7 +26285,7 @@ async function renderCompanyOverview() {
   if (fmpProfile) sources.push('FMP');
   if (s.name && s !== enriched) sources.push('STOCKBOOK');
   if (enriched._chainMatches?.length) sources.push('SUPPLY-CHAINS');
-  const srcBadgeColor = sources.length >= 2 ? '#5b8a72' : sources.length === 1 ? 'var(--amber)' : 'var(--ink-faint)';
+  const srcBadgeColor = sources.length >= 2 ? 'var(--pos)' : sources.length === 1 ? 'var(--amber)' : 'var(--ink-faint)';
   const srcBgColor    = sources.length >= 2 ? 'rgba(91,138,114,0.15)' : sources.length === 1 ? 'rgba(212,162,76,0.12)' : 'rgba(196,150,90,0.06)';
   const srcBadge = `<span style="display:inline-block;padding:1px 6px;background:${srcBgColor};color:${srcBadgeColor};font-family:var(--mono);font-size:9px;letter-spacing:0.1em;border-radius:2px;margin-left:8px" title="Active data sources">${sources.length ? sources.join(' · ') : 'STOCKBOOK ONLY'}</span>`;
 
@@ -25113,6 +26373,35 @@ async function renderCompanyOverview() {
     } catch (e) {
       console.error('[company-overview] renderCompanyHealthScore failed:', e.message);
       healthSection = '';
+    }
+  }
+
+  // Stock-based comp disclosure — shows what SBC is doing to the numbers when
+  // it's material. SBC inflates cash metrics and is excluded from "adjusted"
+  // figures, so flagging it protects against being misled by non-GAAP results.
+  let sbcSection = '';
+  if (typeof analyzeStockBasedComp === 'function') {
+    const sbcA = analyzeStockBasedComp(s);
+    if (sbcA?.available) {
+      const sevColor = sbcA.severity === 'severe' ? 'var(--neg)' : sbcA.severity === 'high' ? 'var(--data-amber)' : sbcA.severity === 'moderate' ? '#7faaca' : 'var(--pos)';
+      const pct = (v) => v == null ? '—' : (v * 100).toFixed(1) + '%';
+      sbcSection = `
+        <div class="company-card" style="border-left:3px solid ${sevColor}">
+          <h4>Stock-Based Compensation <span style="color:${sevColor};font-size:9px;text-transform:uppercase;letter-spacing:0.05em">${sbcA.severity}</span></h4>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:10px">
+            <div><div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase">SBC</div><div style="font-family:var(--mono);font-size:15px;font-weight:700">${fmt$(sbcA.sbc)}</div></div>
+            <div><div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase">% of Revenue</div><div style="font-family:var(--mono);font-size:15px;font-weight:700;color:${sevColor}">${pct(sbcA.pctRevenue)}</div></div>
+            ${sbcA.pctOcf != null ? `<div><div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase">% of Op Cash Flow</div><div style="font-family:var(--mono);font-size:15px;font-weight:700">${pct(sbcA.pctOcf)}</div></div>` : ''}
+            ${sbcA.adjFcf != null ? `<div><div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase">SBC-Adjusted FCF</div><div style="font-family:var(--mono);font-size:15px;font-weight:700">${fmt$(sbcA.adjFcf)}</div></div>` : ''}
+          </div>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);line-height:1.7">
+            <strong style="color:var(--ink)">What includes SBC:</strong><br>
+            · GAAP net income & EPS — <span style="color:var(--pos)">expensed (included)</span><br>
+            · Adjusted EBITDA / non-GAAP EPS — <span style="color:var(--neg)">usually excluded</span> (flatters results)<br>
+            · Operating cash flow / FCF — <span style="color:var(--data-amber)">added back as non-cash</span>, inflating the cash figure${sbcA.fcfHaircut != null ? ` by ~${(sbcA.fcfHaircut*100).toFixed(0)}%` : ''}<br>
+            ${sbcA.severity === 'high' || sbcA.severity === 'severe' ? `<span style="color:var(--neg)">⚠ At ${pct(sbcA.pctRevenue)} of revenue, SBC materially dilutes holders and inflates "adjusted" profitability. Lean on GAAP and the SBC-adjusted FCF above.</span>` : `SBC is modest here — limited distortion to the headline numbers.`}
+          </div>
+        </div>`;
     }
   }
 
@@ -25224,7 +26513,7 @@ async function renderCompanyOverview() {
         <div style="display:flex;flex-wrap:wrap;gap:6px">
           ${chainRoles.map(r => {
             const conf = r.confidence || 'inferred';
-            const confColor = conf === 'verified' ? '#5b8a72' : conf === 'disclosed' ? '#7faaca' : '#c4965a';
+            const confColor = conf === 'verified' ? 'var(--pos)' : conf === 'disclosed' ? '#7faaca' : 'var(--data-amber)';
             return `<span class="company-tag" style="border-left:2px solid ${confColor}" title="${escapeHtml(r.tier + ' · ' + conf)}">${escapeHtml(r.role || '')}</span>`;
           }).join('')}
         </div>
@@ -25235,10 +26524,10 @@ async function renderCompanyOverview() {
       <div style="margin-bottom:14px">
         <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:6px">
           Extracted from Description · ${extracted.length} candidate${extracted.length === 1 ? '' : 's'}
-          <span style="color:#c4965a;font-size:9px;letter-spacing:0;text-transform:none;margin-left:6px">heuristic — may include false positives</span>
+          <span style="color:var(--data-amber);font-size:9px;letter-spacing:0;text-transform:none;margin-left:6px">heuristic — may include false positives</span>
         </div>
         <div style="display:flex;flex-wrap:wrap;gap:6px">
-          ${extracted.map(p => `<span class="company-tag" style="opacity:0.75;border-left:2px solid #c4965a" title="Inferred from text — verify against 10-K or company site">${escapeHtml(p)}</span>`).join('')}
+          ${extracted.map(p => `<span class="company-tag" style="opacity:0.75;border-left:2px solid var(--data-amber)" title="Inferred from text — verify against 10-K or company site">${escapeHtml(p)}</span>`).join('')}
         </div>
       </div>
     ` : '';
@@ -25270,7 +26559,7 @@ async function renderCompanyOverview() {
       const matchHtml = matches.map(m => {
         const tiers = m.tiers || [];
         const tierBadges = tiers.map(t => {
-          const tierColor = t === 'upstream' ? '#5b8a72' : t === 'midstream' ? '#7faaca' : '#c4965a';
+          const tierColor = t === 'upstream' ? 'var(--pos)' : t === 'midstream' ? '#7faaca' : 'var(--data-amber)';
           return `<span style="padding:1px 6px;background:rgba(91,138,114,0.12);color:${tierColor};border:1px solid ${tierColor};border-radius:2px;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;margin-right:4px">${escapeHtml(t)}</span>`;
         }).join('');
         return `
@@ -25380,7 +26669,7 @@ async function renderCompanyOverview() {
         : articles.map(n => {
             const dt = n.datetime || n.publishedAt;
             const when = dt ? (typeof fmtRelativeTime === 'function' ? fmtRelativeTime(dt) : new Date(dt).toLocaleDateString()) : '';
-            const priorityColor = n.priority === 'critical' ? '#d97a6c'
+            const priorityColor = n.priority === 'critical' ? 'var(--red)'
                                 : n.priority === 'high'     ? '#e0b04c'
                                 : n.priority === 'medium'   ? '#7faaca'
                                 : 'var(--ink-faint)';
@@ -25416,7 +26705,8 @@ async function renderCompanyOverview() {
   }
 
   // Final assembly — done as string concatenation, not template literal, so a
-  // failure in one section doesn't blank the whole page.
+  // failure in one section doesn't blank the whole page. Written into the
+  // enriched sub-div so the synchronous baseline stays put if this is sparse.
   const html =
     '<div class="company-grid-two">' +
       identitySection +
@@ -25429,11 +26719,115 @@ async function renderCompanyOverview() {
     tickerNewsSection +
     leadershipPreviewSection +
     foundersSection +
+    '<div id="company-13f-holders"></div>' +
+    '<div id="company-sec-filings"></div>' +
     filingsSection +
+    sbcSection +
     healthSection;
 
-  el.innerHTML = html;
-  console.log(`[company-overview] innerHTML written, length=${el.innerHTML.length}`);
+  const target = document.getElementById('company-overview-enriched') || el;
+  target.innerHTML = html;
+  // Remove the "loading more…" hint from the baseline header now enrichment is in
+  const hint = el.querySelector('.company-card h4 span');
+  if (hint && /loading more/.test(hint.textContent)) hint.remove();
+  console.log(`[company-overview] enriched innerHTML written, length=${target.innerHTML.length}`);
+
+  // Async-fill the institutional holders section (13F). Non-blocking; if no
+  // 13F data is staged, it stays empty rather than showing an error.
+  if (typeof renderCompany13fHolders === 'function') {
+    renderCompany13fHolders(s.ticker).catch(() => {});
+    if (typeof renderCompanySecFilings === 'function') renderCompanySecFilings(s.ticker).catch(() => {});
+  }
+}
+
+// Fill the Company tab's institutional-holders section from staged 13F data.
+async function renderCompany13fHolders(ticker) {
+  const host = document.getElementById('company-13f-holders');
+  if (!host || !ticker) return;
+  if (typeof load13fByCusip !== 'function') return;
+  let byCusip = {};
+  try { byCusip = await load13fByCusip(); } catch { return; }
+  if (!byCusip || !Object.keys(byCusip).length) return;  // no data staged yet
+
+  const tic = ticker.toUpperCase();
+  const cusip = (typeof _tickerCusip === 'function') ? _tickerCusip(tic) : null;
+  let holders = [];
+  if (cusip && byCusip[cusip]) {
+    holders = byCusip[cusip];
+  } else {
+    const row = (typeof getStockbookRow === 'function') ? getStockbookRow(tic) : null;
+    const firstWord = (row?.name || tic).toLowerCase().split(' ')[0];
+    if (firstWord && firstWord.length >= 4) {
+      for (const entries of Object.values(byCusip)) {
+        for (const e of entries) {
+          if ((e.name || '').toLowerCase().includes(firstWord)) holders.push(e);
+        }
+      }
+    }
+  }
+  if (!holders.length) return;  // no tracked institution holds it — stay silent
+
+  holders.sort((a, b) => (b.value || 0) - (a.value || 0));
+  const changeColor = (typeof _13fChangeColor === 'function') ? _13fChangeColor : () => 'var(--ink-dim)';
+  const changeLabel = (typeof _13fChangeLabel === 'function') ? _13fChangeLabel : (c) => c;
+  const rows = holders.map(h => {
+    const isOpt = h.option === 'PUT' || h.option === 'CALL';
+    return `<tr>
+      <td style="font-family:var(--mono);font-size:11px;font-weight:700">${escapeHtml(h.institution)}</td>
+      <td style="font-family:var(--mono);font-size:11px;text-align:right">$${(h.value / 1e6).toFixed(1)}M</td>
+      <td style="font-family:var(--mono);font-size:11px;text-align:right">${(h.shares || 0).toLocaleString()}</td>
+      <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${changeColor(h.change)}">${changeLabel(h.change)}</td>
+      <td style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${isOpt ? h.option + ' (mkt value)' : 'equity'}</td>
+    </tr>`;
+  }).join('');
+  host.innerHTML = `
+    <div class="company-card">
+      <h4>Institutional Holders (13F) <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· tracked institutions · latest quarter · Q/Q changes</span></h4>
+      <div style="overflow-x:auto">
+        <table class="sb-table" style="width:100%;min-width:520px">
+          <thead><tr><th>Institution</th><th style="text-align:right">Market Value</th><th style="text-align:right">Shares</th><th>Q/Q Change</th><th>Type</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:8px">Among ${holders.length} tracked institution(s). Press F2 → THF for full institutional portfolios.</div>
+    </div>`;
+}
+
+// Fill a "Recent SEC Filings" section in the Company tab from staged EDGAR data.
+async function renderCompanySecFilings(ticker) {
+  const host = document.getElementById('company-sec-filings');
+  if (!host || !ticker) return;
+  if (typeof loadSecFilings !== 'function') return;
+  let filings = {};
+  try { filings = await loadSecFilings(); } catch { return; }
+  const rec = filings[ticker.toUpperCase()];
+  if (!rec || !rec.filings || !rec.filings.length) return;  // nothing staged
+
+  const formColor = (f) => f.startsWith('10-K') || f === '20-F' ? 'var(--pos)'
+    : f.startsWith('10-Q') || f === '6-K' ? '#7faaca'
+    : f.startsWith('8-K') ? 'var(--data-amber)' : 'var(--ink-dim)';
+  const rows = rec.filings.slice(0, 10).map(f => `
+    <tr>
+      <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${formColor(f.form)}">${escapeHtml(f.form)}</td>
+      <td style="font-family:var(--mono);font-size:11px">${f.filed || '—'}</td>
+      <td style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${f.period || ''}</td>
+      <td style="text-align:right">${f.url ? `<a href="${escapeHtml(f.url)}" target="_blank" rel="noopener" style="color:var(--amber);text-decoration:none;font-size:10px">view ↗</a>` : ''}</td>
+    </tr>`).join('');
+  const le = rec.latestEarnings;
+  const leNote = le?.filed
+    ? `Latest earnings filing: <strong>${le.form}</strong> on ${le.filed}`
+    : '';
+  host.innerHTML = `
+    <div class="company-card">
+      <h4>Recent SEC Filings <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· EDGAR · 10-K/10-Q earnings · 8-K events</span></h4>
+      ${leNote ? `<div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);margin-bottom:8px">${leNote}</div>` : ''}
+      <div style="overflow-x:auto">
+        <table class="sb-table" style="width:100%;min-width:420px">
+          <thead><tr><th>Form</th><th>Filed</th><th>Period</th><th></th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </div>`;
 }
 
 // ---- Contact tab ----
@@ -26065,7 +27459,7 @@ function onCompanyTabActive() {
   });
   if (diagEl) {
     diagEl.innerHTML = `<div style="padding:16px;background:var(--bg-elev);border:1px solid var(--amber);border-radius:4px;font-family:var(--mono);font-size:11px;color:var(--ink-dim);line-height:1.8">
-      <div style="color:var(--amber);font-weight:700;margin-bottom:6px">[diagnostic] Company tab activated</div>
+      <div style="color:var(--amber);font-weight:700;margin-bottom:6px">[diagnostic] Company tab activated · build 2026-05-29-company-baseline</div>
       state.stock: <strong style="color:var(--ink)">${state.stock?.ticker || 'NULL'}</strong><br>
       ticker input: <strong style="color:var(--ink)">${escapeHtml(inputVal) || '(empty)'}</strong><br>
       Loading data…
@@ -26107,7 +27501,7 @@ function onCompanyTabActive() {
     console.error('[company-tab] renderCompanyTab threw:', e);
     const el = document.getElementById('company-overview-body');
     if (el) {
-      el.innerHTML = `<div style="padding:16px;background:rgba(217,122,108,0.1);border:1px solid #d97a6c;border-radius:4px;font-family:var(--mono);font-size:11px;color:#d97a6c;line-height:1.7">
+      el.innerHTML = `<div style="padding:16px;background:rgba(217,122,108,0.1);border:1px solid var(--red);border-radius:4px;font-family:var(--mono);font-size:11px;color:var(--red);line-height:1.7">
         <strong>renderCompanyTab error:</strong><br>${escapeHtml(e.message || String(e))}<br>
         <span style="color:var(--ink-faint)">Full stack in console (Ctrl+Shift+I)</span>
       </div>`;
@@ -26124,7 +27518,7 @@ function onCompanyTabActive() {
 //   future risk weighting) can call resolveTickerPriority() too.
 // ============================================================
 const MARKET_CAP_TIERS = [
-  { tier: 'mega',     label: 'Mega-cap',  min: 200e9, color: '#d97a6c' },  // > $200B
+  { tier: 'mega',     label: 'Mega-cap',  min: 200e9, color: 'var(--red)' },  // > $200B
   { tier: 'large',    label: 'Large-cap', min: 10e9,  color: '#e0b04c' },  // > $10B
   { tier: 'mid',      label: 'Mid-cap',   min: 2e9,   color: '#7faaca' },  // > $2B
   { tier: 'small',    label: 'Small-cap', min: 300e6, color: '#9aa68f' },  // > $300M
@@ -26229,11 +27623,6 @@ function articleKey(article) {
   return article.url || article.id || (article.ticker + ':' + article.headline);
 }
 
-function getArticleState(article) {
-  const states = loadArticleStates();
-  return states[articleKey(article)] || null;
-}
-
 function setArticleState(article, status, opts = {}) {
   const states = loadArticleStates();
   const key = articleKey(article);
@@ -26265,6 +27654,144 @@ function clearArticleState(article) {
 
 function clearArticleStates() {
   try { localStorage.removeItem(ARTICLE_STATE_KEY); } catch {}
+}
+
+// ============================================================
+//   DURABLE ARTICLE CORRECTIONS (survive news cache clears)
+//
+//   The problem: clearNewsCache() wipes everything under "valuatio.news.*",
+//   which would erase ticker fixes on refresh. So corrections live in a SEPARATE
+//   key ("valuatio.articleFixes.v1") that news-clearing never touches. Keyed by
+//   article URL — when the same article is re-fetched after a refresh, its fix
+//   re-attaches automatically because the URL is stable.
+//
+//   A correction can: fix the matched ticker(s), confirm them as correct, or
+//   mark the article as bad (reported → hidden from future pulls). Confirmed
+//   ticker matches also feed back so the matcher improves.
+// ============================================================
+const ARTICLE_FIXES_KEY = 'valuatio.articleFixes.v1';   // NOT under valuatio.news.* on purpose
+
+function loadArticleFixes() {
+  try { return JSON.parse(localStorage.getItem(ARTICLE_FIXES_KEY) || '{}'); } catch { return {}; }
+}
+function saveArticleFixes(fixes) {
+  try {
+    const entries = Object.entries(fixes);
+    if (entries.length > 5000) {
+      const sorted = entries.sort((a, b) => (b[1].ts || 0) - (a[1].ts || 0));
+      fixes = Object.fromEntries(sorted.slice(0, 5000));
+    }
+    localStorage.setItem(ARTICLE_FIXES_KEY, JSON.stringify(fixes));
+  } catch {}
+}
+
+// Apply a durable correction to an article. verdict: 'confirmed' | 'fixed' |
+// 'bad'. tickers = the corrected ticker array (for 'fixed'/'confirmed').
+function setArticleFix(article, verdict, tickers, opts = {}) {
+  const fixes = loadArticleFixes();
+  const key = articleKey(article);
+  fixes[key] = {
+    verdict,
+    tickers: tickers || (article.ticker ? [article.ticker] : []),
+    originalTicker: article.ticker || null,
+    headline: article.headline?.slice(0, 200),
+    ts: Date.now(),
+    note: opts.note || null,
+  };
+  saveArticleFixes(fixes);
+}
+function getArticleFix(article) {
+  return loadArticleFixes()[articleKey(article)] || null;
+}
+
+// Apply any stored fix to a freshly-fetched article IN PLACE. Called after news
+// load so corrections re-attach after a refresh. Returns true if a fix applied.
+function applyArticleFix(article) {
+  const fix = getArticleFix(article);
+  if (!fix) return false;
+  if (fix.verdict === 'bad') { article._suppressed = true; return true; }
+  if ((fix.verdict === 'fixed' || fix.verdict === 'confirmed') && Array.isArray(fix.tickers)) {
+    article.ticker = fix.tickers[0] || article.ticker;
+    article.tickers = fix.tickers.slice();
+    article._tickerCorrected = fix.verdict === 'fixed';
+    article._tickerConfirmed = fix.verdict === 'confirmed';
+  }
+  return true;
+}
+
+// Queue an article into the Review hub for ticker confirmation. Reuses the same
+// review queue as posts, with type 'news'.
+function queueArticleForReview(article) {
+  if (typeof loadReviewQueue !== 'function') return;
+  const q = loadReviewQueue();
+  const key = articleKey(article);
+  if (q.some(x => x.articleKey === key)) return;  // already queued
+  q.unshift({
+    id: `rev-news-${Date.now()}`,
+    type: 'news',
+    articleKey: key,
+    url: article.url || null,
+    headline: article.headline || article.title || '(no headline)',
+    matchedTicker: article.ticker || null,
+    allTickers: article.tickers || (article.ticker ? [article.ticker] : []),
+    source: article.source || article.site || null,
+    queuedAt: new Date().toISOString(),
+  });
+  saveReviewQueue(q);
+}
+
+// ============================================================
+//   GENERIC REVIEW FLAG — "when a value anywhere is in doubt, send to Review"
+//
+//   Any part of the app can call flagForReview() to route an uncertain value
+//   into the Review hub for human confirmation. This makes the principle
+//   enforceable in code rather than a convention: derivative-link guesses,
+//   ambiguous ticker matches, low-confidence sentiment, FX conversions that
+//   couldn't resolve, etc. Deduplicates by (kind + key) so the same doubt isn't
+//   queued repeatedly. The hub renders a generic card for unknown kinds.
+// ============================================================
+function flagForReview(kind, payload) {
+  if (typeof loadReviewQueue !== 'function') return;
+  const q = loadReviewQueue();
+  const dedupeKey = `${kind}:${payload.key || payload.ticker || payload.headline || ''}`;
+  if (q.some(x => x._dedupe === dedupeKey)) return;  // already flagged
+  q.unshift({
+    id: `rev-${kind}-${Date.now()}`,
+    type: kind,                 // e.g. 'derivative', 'fxConvert', 'genericDoubt'
+    _dedupe: dedupeKey,
+    label: payload.label || `${kind} needs review`,
+    detail: payload.detail || '',
+    ticker: payload.ticker || null,
+    value: payload.value != null ? payload.value : null,
+    confidence: payload.confidence != null ? payload.confidence : null,
+    options: payload.options || null,   // array of {label, action} the card can offer
+    queuedAt: new Date().toISOString(),
+  });
+  saveReviewQueue(q);
+}
+
+// Queue an imported THESIS into the Review hub so its ticker + direction can be
+// confirmed/corrected in-app. Carries the thesis id so corrections write back
+// to the actual thesis in state.probability.theses.
+function queueThesisForReview(thesis, parsed) {
+  if (typeof loadReviewQueue !== 'function') return;
+  const q = loadReviewQueue();
+  if (q.some(x => x.thesisId === thesis.id)) return;
+  q.unshift({
+    id: `rev-thesis-${Date.now()}`,
+    type: 'thesis',
+    thesisId: thesis.id,
+    ticker: thesis.ticker,
+    strike: thesis.strike,
+    direction: thesis.direction,
+    targetDate: thesis.targetDate,
+    sourceText: thesis.sourceText || (parsed && parsed.text) || '',
+    allTickers: (parsed && parsed.tickers ? parsed.tickers.map(t => t.ticker) : [thesis.ticker]),
+    brainSentiment: parsed?.sentiment?.label || null,
+    confidence: parsed?.sentiment?.confidence ?? null,
+    queuedAt: new Date().toISOString(),
+  });
+  saveReviewQueue(q);
 }
 
 
@@ -26669,10 +28196,6 @@ function saveNewsCache(items) {
   try {
     localStorage.setItem(NEWS_CACHE_KEY, JSON.stringify({ fetchedAt: Date.now(), items }));
   } catch {}
-}
-
-function getFinnhubKey() {
-  try { return localStorage.getItem('valuatio.finnhub.key') || ''; } catch { return ''; }
 }
 
 // Fetch news from Finnhub for a single ticker.
@@ -27213,7 +28736,15 @@ function renderNewsFeed() {
   const feed = document.getElementById('news-feed');
   if (!feed) return;
 
+  // Re-apply durable ticker corrections (kept outside the news cache so they
+  // survive refreshes). Fixes re-attach by URL; 'bad' articles get suppressed.
+  if (typeof applyArticleFix === 'function') {
+    for (const a of state.news.items) { try { applyArticleFix(a); } catch {} }
+  }
+
   let items = state.news.items.slice();
+  // Drop articles the user reported as bad (durable suppression).
+  items = items.filter(a => !a._suppressed);
 
   // 1. Market-cap tier filter (mega → micro hierarchy)
   if (state.news.filterPriority !== 'all') {
@@ -27354,7 +28885,7 @@ function renderNewsFeed() {
     // Breaking-event badge
     const breaking = detectBreaking(article);
     const breakingBadge = breaking
-      ? `<span class="news-item-mcap" style="color:#d97a6c;border-color:#d97a6c;font-weight:700;background:rgba(217,122,108,0.08)" title="High-signal event detected: ${escapeHtml(breaking.matchedKeyword)}">⚠ ${breaking.category.toUpperCase()}</span>`
+      ? `<span class="news-item-mcap" style="color:var(--red);border-color:var(--red);font-weight:700;background:rgba(217,122,108,0.08)" title="High-signal event detected: ${escapeHtml(breaking.matchedKeyword)}">⚠ ${breaking.category.toUpperCase()}</span>`
       : '';
 
     // Ticker reassignment badge (if validateAndFixTicker re-tagged the article)
@@ -27381,7 +28912,7 @@ function renderNewsFeed() {
         const top = entities.percentages.slice(0, 2);
         top.forEach(p => {
           const ctx = p.context ? ` <span style="color:var(--ink-faint)">${escapeHtml(p.context)}</span>` : '';
-          entityChips.push(`<span style="font-family:var(--mono);font-size:10px;color:${p.value >= 0 ? '#5b8a72' : '#a5645a'}">${escapeHtml(p.raw)}${ctx}</span>`);
+          entityChips.push(`<span style="font-family:var(--mono);font-size:10px;color:${p.value >= 0 ? 'var(--pos)' : 'var(--neg)'}">${escapeHtml(p.raw)}${ctx}</span>`);
         });
       }
     }
@@ -27452,7 +28983,8 @@ function renderNewsFeed() {
               }
               return `<button class="news-item-cta" onclick="markArticleStateAndRender('${articleId}', 'dismissed')" style="background:transparent;cursor:pointer" title="Hide from feed">✕ Hide</button>`;
             })()}
-            <button class="news-item-cta" onclick="reportAndRetryArticle('${articleId}')" style="background:transparent;cursor:pointer;color:#a5645a" title="Report as wrong / irrelevant and try fetching this article from another source">⚠ Report &amp; Retry</button>
+            <button class="news-item-cta" onclick="reportAndRetryArticle('${articleId}')" style="background:transparent;cursor:pointer;color:var(--neg)" title="Report as wrong / irrelevant and try fetching this article from another source">⚠ Report &amp; Retry</button>
+            <button class="news-item-cta" onclick="sendArticleToReview('${articleId}')" style="background:transparent;cursor:pointer;color:#7faaca" title="Wrong ticker? Send to Review to confirm, fix, or delete the ticker — the fix survives news refreshes">🧠 Fix ticker</button>
           </div>
         </div>
       </article>
@@ -27468,6 +29000,14 @@ function renderNewsFeed() {
 }
 
 // Helpers exposed globally so the per-card buttons can call them via onclick
+window.sendArticleToReview = function(articleId) {
+  const article = (state.news?.items || []).find(a => articleKey(a) === articleId);
+  if (!article) return;
+  if (typeof queueArticleForReview === 'function') {
+    queueArticleForReview(article);
+    if (typeof flashStatus === 'function') flashStatus('Sent to Review hub — confirm or fix the ticker there', 'success');
+  }
+};
 window.markArticleStateAndRender = function(articleId, status) {
   const article = (state.news?.items || []).find(a => articleKey(a) === articleId);
   if (!article) return;
@@ -27711,12 +29251,12 @@ function _renderNewsTickerPickerList() {
 // ============================================================
 
 const EPISTEMIC_TIERS = {
-  reported:   { label: 'REPORTED',   color: '#5b8a72', icon: '◉', rank: 6, desc: 'Filed financial statement' },
+  reported:   { label: 'REPORTED',   color: 'var(--pos)', icon: '◉', rank: 6, desc: 'Filed financial statement' },
   computed:   { label: 'COMPUTED',   color: '#7faaca', icon: '◎', rank: 5, desc: 'Deterministic formula on reported data' },
   model:      { label: 'MODEL',      color: '#c49b5a', icon: '◆', rank: 4, desc: 'Stated model with named inputs' },
-  estimate:   { label: 'ESTIMATE',   color: '#c4965a', icon: '◇', rank: 3, desc: 'Extrapolation with stated method' },
-  anchored:   { label: 'ANCHORED',   color: '#a5645a', icon: '⊘', rank: 2, desc: 'Placed near a reference, not derived' },
-  subjective: { label: 'SUBJECTIVE', color: '#d97a6c', icon: '◌', rank: 1, desc: 'Judgment, not modeled' },
+  estimate:   { label: 'ESTIMATE',   color: 'var(--data-amber)', icon: '◇', rank: 3, desc: 'Extrapolation with stated method' },
+  anchored:   { label: 'ANCHORED',   color: 'var(--neg)', icon: '⊘', rank: 2, desc: 'Placed near a reference, not derived' },
+  subjective: { label: 'SUBJECTIVE', color: 'var(--red)', icon: '◌', rank: 1, desc: 'Judgment, not modeled' },
 };
 
 // Tag a value with its epistemic provenance. Returns a tagged object that
@@ -27814,7 +29354,7 @@ function renderConfidenceAudit(taggedInputs, opts = {}) {
       ` : ''}
       <div style="margin-top:10px;padding-top:8px;border-top:1px dashed var(--rule);font-family:var(--mono);font-size:9px;color:var(--ink-faint);line-height:1.6">
         A model's output is only as good as its weakest input. If anything here is tagged
-        <span style="color:#a5645a">⊘ ANCHORED</span> or <span style="color:#d97a6c">◌ SUBJECTIVE</span>,
+        <span style="color:var(--neg)">⊘ ANCHORED</span> or <span style="color:var(--red)">◌ SUBJECTIVE</span>,
         treat the output as a thinking aid, not a forecast.
       </div>
     </div>
@@ -27835,14 +29375,14 @@ function renderSymmetricFraming(bullPoints, bearPoints) {
   // the asymmetry is the analysis.
   return `
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:16px 0">
-      <div style="background:var(--bg-elev);border-left:3px solid #5b8a72;border-radius:0 3px 3px 0;padding:12px 14px">
-        <div style="font-family:var(--mono);font-size:10px;color:#5b8a72;letter-spacing:0.12em;text-transform:uppercase;margin-bottom:8px">Long Thesis · ${bull.length} point${bull.length === 1 ? '' : 's'}</div>
+      <div style="background:var(--bg-elev);border-left:3px solid var(--pos);border-radius:0 3px 3px 0;padding:12px 14px">
+        <div style="font-family:var(--mono);font-size:10px;color:var(--pos);letter-spacing:0.12em;text-transform:uppercase;margin-bottom:8px">Long Thesis · ${bull.length} point${bull.length === 1 ? '' : 's'}</div>
         ${bull.length === 0
           ? '<div style="font-style:italic;color:var(--ink-faint);font-size:11px">No bull case stated</div>'
           : `<ul style="margin:0;padding-left:18px;color:var(--ink);font-size:12px;line-height:1.6">${bull.map(p => `<li>${escapeHtml(p)}</li>`).join('')}</ul>`}
       </div>
-      <div style="background:var(--bg-elev);border-left:3px solid #a5645a;border-radius:0 3px 3px 0;padding:12px 14px">
-        <div style="font-family:var(--mono);font-size:10px;color:#a5645a;letter-spacing:0.12em;text-transform:uppercase;margin-bottom:8px">Short Thesis · ${bear.length} point${bear.length === 1 ? '' : 's'}</div>
+      <div style="background:var(--bg-elev);border-left:3px solid var(--neg);border-radius:0 3px 3px 0;padding:12px 14px">
+        <div style="font-family:var(--mono);font-size:10px;color:var(--neg);letter-spacing:0.12em;text-transform:uppercase;margin-bottom:8px">Short Thesis · ${bear.length} point${bear.length === 1 ? '' : 's'}</div>
         ${bear.length === 0
           ? '<div style="font-style:italic;color:var(--ink-faint);font-size:11px">No bear case stated</div>'
           : `<ul style="margin:0;padding-left:18px;color:var(--ink);font-size:12px;line-height:1.6">${bear.map(p => `<li>${escapeHtml(p)}</li>`).join('')}</ul>`}
@@ -27931,17 +29471,17 @@ function renderAuditedScenarios(audit) {
           <tfoot>
             <tr style="border-top:1px solid var(--rule)">
               <td style="padding:8px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.08em">Expected Value</td>
-              <td colspan="2" style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:13px;color:${audit.tier === 'subjective' ? '#a5645a' : 'var(--ink)'};font-weight:700">
+              <td colspan="2" style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:13px;color:${audit.tier === 'subjective' ? 'var(--neg)' : 'var(--ink)'};font-weight:700">
                 ${fmt$(ev)}
-                ${audit.tier === 'subjective' ? '<span style="font-size:9px;color:#a5645a;margin-left:6px">⚠ inputs subjective</span>' : ''}
+                ${audit.tier === 'subjective' ? '<span style="font-size:9px;color:var(--neg);margin-left:6px">⚠ inputs subjective</span>' : ''}
               </td>
             </tr>
           </tfoot>
         ` : ''}
       </table>
       ${audit.warning ? `
-        <div style="margin-top:10px;padding:8px 10px;background:rgba(217,122,108,0.08);border-left:2px solid #d97a6c;font-family:var(--mono);font-size:10px;color:var(--ink);line-height:1.6">
-          <strong style="color:#d97a6c">FABRICATED PRECISION WARNING:</strong> ${escapeHtml(audit.warning)}
+        <div style="margin-top:10px;padding:8px 10px;background:rgba(217,122,108,0.08);border-left:2px solid var(--red);font-family:var(--mono);font-size:10px;color:var(--ink);line-height:1.6">
+          <strong style="color:var(--red)">FABRICATED PRECISION WARNING:</strong> ${escapeHtml(audit.warning)}
         </div>
       ` : ''}
     </div>
@@ -28816,8 +30356,8 @@ function renderAvgRates(avgRatesData) {
       return `${x.toFixed(1)},${y.toFixed(1)}`;
     }).join(' ');
     const trendColor = delta12m == null ? 'var(--ink-faint)'
-                     : delta12m > 0.0005 ? '#5b8a72'   // rising rate environment
-                     : delta12m < -0.0005 ? '#a5645a'  // falling rate environment
+                     : delta12m > 0.0005 ? 'var(--pos)'   // rising rate environment
+                     : delta12m < -0.0005 ? 'var(--neg)'  // falling rate environment
                      : 'var(--ink-faint)';
     const lastVal = rates[rates.length - 1];
     const lastY = h - ((lastVal - min) / range) * h;
@@ -28905,7 +30445,7 @@ function renderPublicDebt(debtData) {
       ${dailyChange != null && isFinite(dailyChange) ? `
       <div>
         <div class="debt-stat-label">${hasBreakdown ? 'Daily Change' : 'Quarterly Change'}</div>
-        <div class="debt-stat-value" style="color:${dailyChange > 0 ? '#a5645a' : '#5b8a72'}">
+        <div class="debt-stat-value" style="color:${dailyChange > 0 ? 'var(--neg)' : 'var(--pos)'}">
           ${dailyChange > 0 ? '+' : ''}${(dailyChange / 1e9).toFixed(2)}B
         </div>
         <div class="debt-stat-sub">vs prior period</div>
@@ -28914,7 +30454,7 @@ function renderPublicDebt(debtData) {
       ${monthAgo && monthAgo.total !== latest.total ? `
       <div>
         <div class="debt-stat-label">${hasBreakdown ? '~30 Day Change' : 'YoY Change'}</div>
-        <div class="debt-stat-value" style="color:${(latest.total - monthAgo.total) > 0 ? '#a5645a' : '#5b8a72'}">
+        <div class="debt-stat-value" style="color:${(latest.total - monthAgo.total) > 0 ? 'var(--neg)' : 'var(--pos)'}">
           ${(latest.total - monthAgo.total) > 0 ? '+' : ''}${((latest.total - monthAgo.total) / 1e9).toFixed(1)}B
         </div>
         <div class="debt-stat-sub">vs ${monthAgo.date}</div>
@@ -29027,10 +30567,10 @@ async function renderCpiChart() {
     const yBot = Math.max(yMoM(p.mom), yMoM(0));
     const h = Math.max(1, yBot - yTop);
     // Color: green for low MoM (cooling), red for hot (≥0.4% MoM is hot)
-    const color = p.mom < 0.15 ? '#5b8a72'
+    const color = p.mom < 0.15 ? 'var(--pos)'
                 : p.mom < 0.30 ? '#a89e6c'
-                : p.mom < 0.45 ? '#c4965a'
-                : '#a5645a';
+                : p.mom < 0.45 ? 'var(--data-amber)'
+                : 'var(--neg)';
     return `<rect x="${x.toFixed(1)}" y="${yTop.toFixed(1)}" width="${barWidth.toFixed(1)}" height="${h.toFixed(1)}" fill="${color}" opacity="0.85">
       <title>${p.date}: MoM ${p.mom >= 0 ? '+' : ''}${p.mom.toFixed(2)}% · YoY ${p.yoy.toFixed(2)}%</title>
     </rect>`;
@@ -29060,8 +30600,8 @@ async function renderCpiChart() {
   }).filter(Boolean).join('');
 
   // Headline strip — latest MoM, latest YoY, 1-year change in YoY
-  const momColor = latestMoM < 0.15 ? '#5b8a72' : latestMoM < 0.30 ? '#a89e6c' : latestMoM < 0.45 ? '#c4965a' : '#a5645a';
-  const yoyColor = latestYoY < 2.5 ? '#5b8a72' : latestYoY < 3.5 ? '#a89e6c' : latestYoY < 4.5 ? '#c4965a' : '#a5645a';
+  const momColor = latestMoM < 0.15 ? 'var(--pos)' : latestMoM < 0.30 ? '#a89e6c' : latestMoM < 0.45 ? 'var(--data-amber)' : 'var(--neg)';
+  const yoyColor = latestYoY < 2.5 ? 'var(--pos)' : latestYoY < 3.5 ? '#a89e6c' : latestYoY < 4.5 ? 'var(--data-amber)' : 'var(--neg)';
 
   wrap.innerHTML = `
     <div class="cpi-stats-strip">
@@ -29080,7 +30620,7 @@ async function renderCpiChart() {
       ${yoyTrend != null ? `
         <div class="cpi-stat">
           <div class="cpi-stat-label">YoY vs Year Ago</div>
-          <div class="cpi-stat-value" style="color:${yoyTrend < 0 ? '#5b8a72' : '#a5645a'}">${yoyTrend >= 0 ? '+' : ''}${yoyTrend.toFixed(2)} pp</div>
+          <div class="cpi-stat-value" style="color:${yoyTrend < 0 ? 'var(--pos)' : 'var(--neg)'}">${yoyTrend >= 0 ? '+' : ''}${yoyTrend.toFixed(2)} pp</div>
         </div>
       ` : ''}
     </div>
@@ -29157,7 +30697,7 @@ async function loadBondsTab(forceRefresh = false) {
     const sourceLabel = tenorsFound >= 12 ? 'Treasury' : tenorsFound >= 8 ? 'FRED' : 'Stooq';
     if (ycStatus) ycStatus.textContent = `As of ${yieldCurve[yieldCurve.length - 1].date} · ${sourceLabel} · ${tenorsFound} tenors`;
   } else {
-    if (ycStatus) ycStatus.innerHTML = '<span style="color:#a5645a">All sources unreachable · check console (F12) for details</span>';
+    if (ycStatus) ycStatus.innerHTML = '<span style="color:var(--neg)">All sources unreachable · check console (F12) for details</span>';
   }
   if (avgRates) {
     renderAvgRates(avgRates);
@@ -29710,11 +31250,11 @@ function _scnFmtPct(v) {
 
 function _scnImpactColor(mid) {
   if (mid == null) return 'var(--ink-faint)';
-  if (mid > 0.05) return '#5b8a72';
+  if (mid > 0.05) return 'var(--pos)';
   if (mid > 0.01) return '#7faaca';
   if (mid > -0.01) return 'var(--ink-dim)';
-  if (mid > -0.05) return '#c4965a';
-  return '#a5645a';
+  if (mid > -0.05) return 'var(--data-amber)';
+  return 'var(--neg)';
 }
 
 function _scnRenderSectorImpacts(results) {
@@ -29728,9 +31268,9 @@ function _scnRenderSectorImpacts(results) {
         return `
           <div style="display:grid;grid-template-columns:1.2fr 0.6fr 0.6fr 0.6fr 2fr;gap:10px;padding:8px 12px;background:var(--bg-card);border:1px solid var(--rule);border-radius:3px;align-items:center;font-family:var(--mono);font-size:11px">
             <div style="color:var(--ink);font-weight:600">${escapeHtml(sector)}</div>
-            <div style="color:#a5645a;text-align:right">${_scnFmtPct(imp.low)}</div>
+            <div style="color:var(--neg);text-align:right">${_scnFmtPct(imp.low)}</div>
             <div style="color:${_scnImpactColor(imp.mid)};text-align:right;font-weight:700">${_scnFmtPct(imp.mid)}</div>
-            <div style="color:#5b8a72;text-align:right">${_scnFmtPct(imp.high)}</div>
+            <div style="color:var(--pos);text-align:right">${_scnFmtPct(imp.high)}</div>
             <div style="color:var(--ink-faint);font-size:10px">${escapeHtml(driversTxt)}</div>
           </div>
         `;
@@ -29751,9 +31291,9 @@ function _scnRenderTickerImpacts(results, limit = 30) {
           <div style="color:var(--amber);font-weight:700">${escapeHtml(t.ticker)}</div>
           <div style="color:var(--ink);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(t.name || '')}</div>
           <div style="color:var(--ink-faint);font-size:10px">${escapeHtml(t.sector || '')}</div>
-          <div style="color:#a5645a;text-align:right">${_scnFmtPct(t.low)}</div>
+          <div style="color:var(--neg);text-align:right">${_scnFmtPct(t.low)}</div>
           <div style="color:${_scnImpactColor(t.mid)};text-align:right;font-weight:700">${_scnFmtPct(t.mid)}</div>
-          <div style="color:#5b8a72;text-align:right">${_scnFmtPct(t.high)}</div>
+          <div style="color:var(--pos);text-align:right">${_scnFmtPct(t.high)}</div>
         </div>
       `).join('')}
     </div>
@@ -30165,9 +31705,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // Standard tier labels for confidence
 const SC_CONFIDENCE = {
-  verified:  { label: 'verified',  color: '#5b8a72', explainer: 'Documented in 10-K supplier list or annual report' },
+  verified:  { label: 'verified',  color: 'var(--pos)', explainer: 'Documented in 10-K supplier list or annual report' },
   disclosed: { label: 'disclosed', color: '#7faaca', explainer: 'Public press release / partnership announcement' },
-  inferred:  { label: 'inferred',  color: '#c4965a', explainer: 'Sector-knowledge inferred — unverified' },
+  inferred:  { label: 'inferred',  color: 'var(--data-amber)', explainer: 'Sector-knowledge inferred — unverified' },
 };
 
 // The supply chain database. Each chain has id, name, description, and three
@@ -30179,6 +31719,2350 @@ const SC_CONFIDENCE = {
 // IMPORTANT: when adding new chains, verify ticker assignments against the
 // stockbook canonical alias map. Mis-tagging here cascades into the exposure
 // computation.
+
+
+
+// ============================================================
+//   13F INSTITUTIONAL HOLDINGS (reads data/13f/ from the pipeline)
+//
+//   Two views, per the user:
+//     1. A tracked institution's full portfolio with quarter-over-quarter
+//        change per position (NEW / SOLD / TRIMMED / INCREASED / UNCHANGED).
+//     2. Reverse lookup: which institutions hold a given ticker.
+//
+//   Option positions (PUT/CALL) are shown with their reported market value,
+//   just like equity positions, and flagged with the option type.
+//
+//   Data comes from the quarterly GitHub pipeline (fetch_13f.py). The browser
+//   can't read EDGAR directly, so this reads the staged JSON.
+// ============================================================
+
+const F13F_INSTITUTIONS_KEY = 'valuatio.13f.institutions.v1';
+let _13fInstitutions = null;
+let _13fByCusip = null;
+let _13fInstCache = {};   // cik -> full doc
+
+function _13fBase() {
+  // 13F files live alongside the other dynamic data (TRAPP2-1).
+  return (typeof DYNAMIC_DATA_BASE !== 'undefined')
+    ? DYNAMIC_DATA_BASE
+    : 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-1/main/data/';
+}
+
+async function load13fInstitutions() {
+  if (_13fInstitutions) return _13fInstitutions;
+  try {
+    const r = await fetch(_13fBase() + '13f/institutions.json', { cache: 'no-cache' });
+    if (r.ok) {
+      const j = await r.json();
+      _13fInstitutions = j.institutions || [];
+      return _13fInstitutions;
+    }
+  } catch (e) { console.warn('[13f] institutions load failed:', e.message); }
+  return [];
+}
+
+async function load13fInstitution(cik) {
+  if (_13fInstCache[cik]) return _13fInstCache[cik];
+  try {
+    const r = await fetch(_13fBase() + `13f/${cik}.json`, { cache: 'no-cache' });
+    if (r.ok) { const j = await r.json(); _13fInstCache[cik] = j; return j; }
+  } catch (e) { console.warn('[13f] institution load failed:', e.message); }
+  return null;
+}
+
+async function load13fByCusip() {
+  if (_13fByCusip) return _13fByCusip;
+  try {
+    const r = await fetch(_13fBase() + '13f/by_ticker.json', { cache: 'no-cache' });
+    if (r.ok) { const j = await r.json(); _13fByCusip = j.byCusip || {}; return _13fByCusip; }
+  } catch (e) { console.warn('[13f] by-ticker load failed:', e.message); }
+  return {};
+}
+
+// Map a ticker → CUSIP using the stockbook row if it carries one; else null.
+// (The pipeline keys by CUSIP because that's what EDGAR uses; the app may not
+// have CUSIPs for every ticker, so name-matching is the fallback.)
+function _tickerCusip(ticker) {
+  const row = (typeof getStockbookRow === 'function') ? getStockbookRow(ticker) : null;
+  return row?.cusip || row?.CUSIP || null;
+}
+
+// ============================================================
+//   SEC FILINGS (data/sec_filings.json → Company tab + engine)
+//   Per-company 10-K/10-Q (earnings) + 8-K (events) from EDGAR. Drives a
+//   "Recent SEC Filings" section and an earnings-recency signal.
+// ============================================================
+let _secFilings = null;
+
+async function loadSecFilings() {
+  if (_secFilings) return _secFilings;
+  try {
+    const r = await fetch(_13fBase() + 'sec_filings.json', { cache: 'no-cache' });
+    if (r.ok) { const j = await r.json(); _secFilings = j.companies || {}; return _secFilings; }
+  } catch (e) { console.warn('[sec] filings load failed:', e.message); }
+  return {};
+}
+
+// Earnings-recency signal: days since the latest 10-K/10-Q. A context signal
+// (tiny weight) — fresh fundamentals slightly positive, very stale slightly
+// negative. Returns { daysSince, signed, label } or null.
+function earningsRecencySignal(ticker) {
+  if (!_secFilings) return null;
+  const rec = _secFilings[ticker.toUpperCase()];
+  const latest = rec?.latestEarnings;
+  if (!latest?.filed) return null;
+  const days = Math.round((Date.now() - new Date(latest.filed).getTime()) / 86400000);
+  if (!isFinite(days) || days < 0) return null;
+  let signed = 0;
+  if (days < 100) signed = 0.15;
+  else if (days > 200) signed = -0.2;
+  else if (days > 140) signed = -0.05;
+  return { daysSince: days, signed, form: latest.form, filed: latest.filed,
+    label: `Last ${latest.form} ${days}d ago` };
+}
+
+// ============================================================
+//   INSTITUTIONAL SIGNAL (13F → engine)
+//   Turns tracked institutions' 13F holdings into a SCORED conviction input —
+//   the "feel of funds" fed into the engine. Reads the already-loaded
+//   by_ticker cache synchronously. 13F is quarterly + ~45d lagged, so this is
+//   a SLOW contextual signal (modest engine weight), and returns null when no
+//   tracked institution holds the ticker so it never penalizes un-held names.
+//   Signal: net adding (NEW+INCREASED) vs trimming (SOLD+TRIMMED), scaled by
+//   holder breadth; PUTs bearish, CALLs bullish → signed [-1,+1].
+// ============================================================
+function institutionalSignal(ticker) {
+  if (!_13fByCusip) return null;   // cache not loaded yet — no signal
+  const cusip = _tickerCusip(ticker);
+  let holders = null;
+  if (cusip && _13fByCusip[cusip]) {
+    holders = _13fByCusip[cusip];
+  } else {
+    const row = (typeof getStockbookRow === 'function') ? getStockbookRow(ticker) : null;
+    const firstWord = (row?.name || ticker).toLowerCase().split(' ')[0];
+    if (firstWord && firstWord.length >= 4) {
+      holders = [];
+      for (const entries of Object.values(_13fByCusip)) {
+        for (const e of entries) {
+          if ((e.name || '').toLowerCase().includes(firstWord)) holders.push(e);
+        }
+      }
+    }
+  }
+  if (!holders || !holders.length) return null;
+
+  let bull = 0, bear = 0, adds = 0, trims = 0, puts = 0, calls = 0;
+  for (const h of holders) {
+    const opt = (h.option || '').toUpperCase();
+    if (opt === 'PUT') { bear += 1; puts += 1; continue; }
+    if (opt === 'CALL') { bull += 1; calls += 1; }
+    switch (h.change) {
+      case 'NEW':       bull += 1.0; adds += 1; break;
+      case 'INCREASED': bull += 0.6; adds += 1; break;
+      case 'TRIMMED':   bear += 0.5; trims += 1; break;
+      case 'SOLD':      bear += 1.0; trims += 1; break;
+      default: break;
+    }
+  }
+  const holderCount = holders.filter(h => (h.option || '') === '').length || holders.length;
+  const net = bull - bear;
+  const activity = bull + bear;
+  const lean = activity > 0 ? net / activity : 0;
+  const breadth = Math.min(1, holderCount / 5);
+  const signed = Math.max(-1, Math.min(1, lean * (0.5 + 0.5 * breadth)));
+
+  return {
+    signed, holderCount, adds, trims, puts, calls,
+    netInstitutions: adds - trims,
+    label: `${holderCount} institution${holderCount === 1 ? '' : 's'} hold · ${adds} adding / ${trims} trimming${puts ? ` · ${puts} PUT` : ''}${calls ? ` · ${calls} CALL` : ''}`,
+  };
+}
+
+const _13fChangeColor = (c) => ({
+  NEW: 'var(--pos)', INCREASED: 'var(--pos)', TRIMMED: '#d4a24c',
+  SOLD: 'var(--neg)', UNCHANGED: 'var(--ink-dim)',
+}[c] || 'var(--ink-dim)');
+const _13fChangeLabel = (c) => ({
+  NEW: '✦ NEW', INCREASED: '▲ ADDED', TRIMMED: '▽ TRIMMED',
+  SOLD: '✕ SOLD', UNCHANGED: '— UNCHANGED',
+}[c] || c);
+
+// ---- F2 function: 13F browser ----
+async function fn13F(ticker) {
+  openFnOverlay('THF', ticker || '');
+  const institutions = await load13fInstitutions();
+
+  if (!institutions.length) {
+    setFnOverlayBody(`
+      <div style="padding:40px;text-align:center;font-family:var(--mono);font-size:12px;color:var(--ink-dim);line-height:1.8">
+        No 13F data loaded yet.<br>
+        The quarterly pipeline (<strong>fetch_13f.py</strong>) writes <strong>data/13f/</strong> to TRAPP2-1.<br>
+        Run that workflow, then reopen this.
+      </div>`);
+    return;
+  }
+
+  // Default view: institution list → click to expand portfolio. If a ticker
+  // was passed, show the reverse lookup (who holds it) first.
+  const instOptions = institutions.map(i =>
+    `<option value="${i.cik}">${escapeHtml(i.institution)} (${i.positionCount} pos · $${(i.totalValue / 1e6).toFixed(0)}M · ${i.period || '—'})</option>`
+  ).join('');
+
+  setFnOverlayBody(`
+    <div style="display:flex;flex-direction:column;height:100%;min-height:520px">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding-bottom:12px;border-bottom:1px solid var(--rule);margin-bottom:12px">
+        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.1em">Institution</div>
+        <select id="f13f-inst" class="heat-filter-select" style="min-width:300px">${instOptions}</select>
+        <span style="color:var(--ink-faint);font-family:var(--mono);font-size:10px">or</span>
+        <input id="f13f-ticker" placeholder="ticker → who holds it" value="${escapeHtml(ticker || '')}" style="background:var(--bg-elev);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:11px;padding:5px 8px;border-radius:3px;width:180px;text-transform:uppercase">
+        <button id="f13f-lookup" class="btn btn-ghost" style="font-size:10px">Who Holds It</button>
+      </div>
+      <div id="f13f-content" style="flex:1;overflow-y:auto"></div>
+    </div>
+  `);
+
+  const renderInstitution = async (cik) => {
+    const content = document.getElementById('f13f-content');
+    content.innerHTML = `<div style="padding:30px;text-align:center;color:var(--ink-dim);font-family:var(--mono);font-size:11px">Loading portfolio…</div>`;
+    const doc = await load13fInstitution(cik);
+    if (!doc) { content.innerHTML = `<div style="padding:30px;color:var(--neg);font-family:var(--mono);font-size:11px">Could not load ${cik}.json</div>`; return; }
+    const rows = doc.holdings.map(h => {
+      const isOpt = h.option === 'PUT' || h.option === 'CALL';
+      return `
+        <tr>
+          <td style="font-family:var(--mono);font-size:11px">${escapeHtml(h.name || '—')}${isOpt ? ` <span style="color:#c47ba0;font-size:9px;font-weight:700">${h.option}</span>` : ''}</td>
+          <td style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${escapeHtml(h.cusip || '')}</td>
+          <td style="font-family:var(--mono);font-size:11px;text-align:right">$${(h.value / 1e6).toFixed(1)}M</td>
+          <td style="font-family:var(--mono);font-size:11px;text-align:right">${(h.shares || 0).toLocaleString()}</td>
+          <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${_13fChangeColor(h.change)}">${_13fChangeLabel(h.change)}${h.pct_change != null && (h.change === 'INCREASED' || h.change === 'TRIMMED') ? ` ${h.pct_change > 0 ? '+' : ''}${h.pct_change}%` : ''}</td>
+        </tr>`;
+    }).join('');
+    content.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;margin-bottom:10px">
+        <h3 style="font-family:var(--serif);font-size:20px;margin:0">${escapeHtml(doc.institution)}</h3>
+        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-dim)">${doc.positionCount} positions · $${(doc.totalValue / 1e9).toFixed(2)}B · period ${doc.period || '—'}${doc.prevPeriod ? ` (vs ${doc.prevPeriod})` : ''}</span>
+      </div>
+      <table class="sb-table" style="width:100%;min-width:640px">
+        <thead><tr><th>Issuer</th><th>CUSIP</th><th style="text-align:right">Market Value</th><th style="text-align:right">Shares</th><th>Q/Q Change</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:10px;line-height:1.6">
+        Filed ${doc.filed || '—'} · option positions (PUT/CALL) shown at reported market value · SOLD = exited since last quarter
+      </div>`;
+  };
+
+  const renderReverseLookup = async (tic) => {
+    const content = document.getElementById('f13f-content');
+    content.innerHTML = `<div style="padding:30px;text-align:center;color:var(--ink-dim);font-family:var(--mono);font-size:11px">Looking up holders of ${escapeHtml(tic)}…</div>`;
+    const byCusip = await load13fByCusip();
+    const cusip = _tickerCusip(tic);
+    let holders = [];
+    if (cusip && byCusip[cusip]) {
+      holders = byCusip[cusip];
+    } else {
+      // Name-match fallback across all CUSIP entries
+      const row = (typeof getStockbookRow === 'function') ? getStockbookRow(tic) : null;
+      const targetName = (row?.name || tic).toLowerCase().replace(/\b(inc|corp|co|ltd|the|class [a-c])\b/g, '').trim();
+      for (const entries of Object.values(byCusip)) {
+        for (const e of entries) {
+          const en = (e.name || '').toLowerCase();
+          if (targetName && en.includes(targetName.split(' ')[0]) && targetName.split(' ')[0].length >= 4) {
+            holders.push(e);
+          }
+        }
+      }
+    }
+    if (!holders.length) {
+      content.innerHTML = `<div style="padding:30px;color:var(--ink-dim);font-family:var(--mono);font-size:11px;line-height:1.7">
+        No tracked institution reports holding <strong>${escapeHtml(tic)}</strong> in the latest 13F data.<br>
+        <span style="color:var(--ink-faint)">Only the institutions in the tracked list are searched. ${cusip ? '' : 'No CUSIP on file for this ticker — used name matching.'}</span>
+      </div>`;
+      return;
+    }
+    holders.sort((a, b) => (b.value || 0) - (a.value || 0));
+    const rows = holders.map(h => {
+      const isOpt = h.option === 'PUT' || h.option === 'CALL';
+      return `<tr>
+        <td style="font-family:var(--mono);font-size:11px;font-weight:700">${escapeHtml(h.institution)}</td>
+        <td style="font-family:var(--mono);font-size:11px;text-align:right">$${(h.value / 1e6).toFixed(1)}M</td>
+        <td style="font-family:var(--mono);font-size:11px;text-align:right">${(h.shares || 0).toLocaleString()}</td>
+        <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${_13fChangeColor(h.change)}">${_13fChangeLabel(h.change)}</td>
+        <td style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${isOpt ? h.option : 'equity'}</td>
+      </tr>`;
+    }).join('');
+    content.innerHTML = `
+      <h3 style="font-family:var(--serif);font-size:20px;margin:0 0 10px">Institutional holders of ${escapeHtml(tic)}</h3>
+      <table class="sb-table" style="width:100%;min-width:560px">
+        <thead><tr><th>Institution</th><th style="text-align:right">Market Value</th><th style="text-align:right">Shares</th><th>Q/Q Change</th><th>Type</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:10px">Among ${holders.length} tracked institution(s) · latest reported quarter</div>`;
+  };
+
+  // Wire controls
+  const instSel = document.getElementById('f13f-inst');
+  if (instSel) instSel.addEventListener('change', () => renderInstitution(instSel.value));
+  const lookupBtn = document.getElementById('f13f-lookup');
+  const ticInput = document.getElementById('f13f-ticker');
+  const doLookup = () => { const v = (ticInput.value || '').trim().toUpperCase(); if (v) renderReverseLookup(v); };
+  if (lookupBtn) lookupBtn.addEventListener('click', doLookup);
+  if (ticInput) ticInput.addEventListener('keydown', e => { if (e.key === 'Enter') doLookup(); });
+
+  // Initial view
+  if (ticker) renderReverseLookup(ticker.toUpperCase());
+  else if (institutions.length) renderInstitution(institutions[0].cik);
+}
+
+
+// ============================================================
+//   RESEARCH TAB — cross-stockbook statistical ranking + grading
+//
+//   Ranks EVERY stockbook row across a catalog of financial metrics, assigns
+//   each company a percentile + position ("#37 of 412") per metric, and a
+//   composite letter grade. A filter page surfaces the top/bottom 100 on any
+//   single metric so you can dig for names to watch or trade.
+//
+//   HONESTY RULES (per user):
+//     • A company missing a metric is EXCLUDED from that metric's ranking —
+//       never fabricated, never ranked-last. Shown as "n/a · not ranked".
+//     • "#37 of 412" always states how many companies actually had the data.
+//     • Ranking is computed over the WHOLE stockbook, not just the displayed 100.
+//     • The composite grade notes how many metrics it could actually use, so a
+//       sparsely-covered company carries a confidence caveat.
+//     • Equal weight across metrics (user's choice).
+// ============================================================
+
+// Metric catalog. Each: key, label, category, extractor(row)→number|null,
+// higherIsBetter, format(v)→string. Only EQUITIES are ranked (FX/index/futures
+// have no fundamentals); the extractor returns null for those and they're
+// excluded per-metric automatically.
+const RESEARCH_METRICS = [
+  // --- Profitability / Quality ---
+  { key: 'roe',        label: 'Return on Equity',        cat: 'Profitability', higher: true,  fmt: v => (v*100).toFixed(1)+'%', get: r => _num(r.returnOnEquity) },
+  { key: 'rotce',      label: 'Return on Tangible Common Equity', cat: 'Profitability', higher: true, fmt: v => (v*100).toFixed(1)+'%', get: r => researchROTCE(r) },
+  { key: 'roa',        label: 'Return on Assets',        cat: 'Profitability', higher: true,  fmt: v => (v*100).toFixed(1)+'%', get: r => _num(r.returnOnAssets) },
+  { key: 'grossMargin',label: 'Gross Margin',            cat: 'Profitability', higher: true,  fmt: v => (v*100).toFixed(1)+'%', get: r => _num(r.grossMargin) },
+  { key: 'opMargin',   label: 'Operating Margin',        cat: 'Profitability', higher: true,  fmt: v => (v*100).toFixed(1)+'%', get: r => _num(r.operatingMargin) },
+  { key: 'netMargin',  label: 'Net Margin',              cat: 'Profitability', higher: true,  fmt: v => (v*100).toFixed(1)+'%', get: r => _num(r.profitMargin) },
+  { key: 'fcfMargin',  label: 'FCF Margin',              cat: 'Profitability', higher: true,  fmt: v => (v*100).toFixed(1)+'%', get: r => { const rev=_num(r.revenue), fcf=_num(r.freeCashFlow); return (rev&&fcf!=null&&rev>0)? fcf/rev : null; } },
+  { key: 'sbcPctRev',  label: 'Stock-Based Comp % Rev',  cat: 'Profitability', higher: false, fmt: v => (v*100).toFixed(1)+'%', get: r => { const rev=_num(r.revenue), sbc=_num(r.stockBasedComp); return (rev&&sbc!=null&&rev>0&&sbc>0)? sbc/rev : null; } },
+  // --- Growth ---
+  { key: 'revGrowth',  label: 'Revenue Growth',          cat: 'Growth',        higher: true,  fmt: v => (v*100).toFixed(1)+'%', get: r => _num(r.revenueGrowth) },
+  { key: 'epsGrowth',  label: 'Earnings Growth',         cat: 'Growth',        higher: true,  fmt: v => (v*100).toFixed(1)+'%', get: r => _num(r.earningsGrowth) },
+  // --- Valuation (lower is better) ---
+  { key: 'pe',         label: 'P/E Ratio',               cat: 'Valuation',     higher: false, fmt: v => v.toFixed(1)+'x', get: r => { const v=_num(r.pe); return (v!=null&&v>0)?v:null; } },
+  { key: 'pb',         label: 'Price / Book',            cat: 'Valuation',     higher: false, fmt: v => v.toFixed(2)+'x', get: r => { const v=_num(r.priceToBook); return (v!=null&&v>0)?v:null; } },
+  { key: 'evEbitda',   label: 'EV / EBITDA',             cat: 'Valuation',     higher: false, fmt: v => v.toFixed(1)+'x', get: r => { const v=_num(r.evToEbitda); return (v!=null&&v>0)?v:null; } },
+  { key: 'evRev',      label: 'EV / Revenue',            cat: 'Valuation',     higher: false, fmt: v => v.toFixed(2)+'x', get: r => { const v=_num(r.evToRevenue); return (v!=null&&v>0)?v:null; } },
+  // --- Financial strength ---
+  { key: 'debtEquity', label: 'Debt / Equity',           cat: 'Balance Sheet', higher: false, fmt: v => v.toFixed(2), get: r => { const d=_num(r.totalDebt), e=_num(r.totalEquity); return (d!=null&&e&&e>0)? d/e : null; } },
+  { key: 'cashRatio',  label: 'Cash / Market Cap',       cat: 'Balance Sheet', higher: true,  fmt: v => (v*100).toFixed(1)+'%', get: r => { const c=_num(r.cash), m=_num(r.marketCap); return (c!=null&&m&&m>0)? c/m : null; } },
+  // --- Income ---
+  { key: 'divYield',   label: 'Dividend Yield',          cat: 'Income',        higher: true,  fmt: v => (v*100).toFixed(2)+'%', get: r => { const v=_num(r.dividendYield); return (v!=null&&v>0)?v:null; } },
+  // --- Scale (absolute size — informational ranking) ---
+  { key: 'revenue',    label: 'Revenue',                 cat: 'Scale',         higher: true,  fmt: v => _fmtBig(v), get: r => _num(r.revenue) },
+  { key: 'netIncome',  label: 'Net Income',              cat: 'Scale',         higher: true,  fmt: v => _fmtBig(v), get: r => _num(r.netIncome) },
+  { key: 'ebitda',     label: 'EBITDA',                  cat: 'Scale',         higher: true,  fmt: v => _fmtBig(v), get: r => _num(r.ebitda) },
+  { key: 'fcf',        label: 'Free Cash Flow',          cat: 'Scale',         higher: true,  fmt: v => _fmtBig(v), get: r => _num(r.freeCashFlow) },
+  { key: 'marketCap',  label: 'Market Cap',              cat: 'Scale',         higher: true,  fmt: v => _fmtBig(v), get: r => _num(r.marketCap) },
+  { key: 'totalAssets',label: 'Total Assets',            cat: 'Scale',         higher: true,  fmt: v => _fmtBig(v), get: r => _num(r.totalAssets) },
+];
+
+function _num(v) { return (typeof v === 'number' && isFinite(v)) ? v : null; }
+function _fmtBig(v) {
+  if (v == null) return '—';
+  if (typeof fmt$ === 'function') return fmt$(v);
+  const a = Math.abs(v);
+  if (a >= 1e12) return '$' + (v/1e12).toFixed(2) + 'T';
+  if (a >= 1e9)  return '$' + (v/1e9).toFixed(2) + 'B';
+  if (a >= 1e6)  return '$' + (v/1e6).toFixed(1) + 'M';
+  return '$' + v.toFixed(0);
+}
+
+// Return on Tangible Common Equity = net income / (common equity − goodwill −
+// intangibles). Falls back to plain equity if intangible breakdown is absent
+// (and flags that via the absence of a separate value — here we only return a
+// value if we can compute a genuinely tangible figure, else null so it's
+// excluded honestly).
+function researchROTCE(r) {
+  const ni = _num(r.netIncome);
+  const eq = _num(r.totalEquity);
+  if (ni == null || eq == null || eq === 0) return null;
+  const intang = _num(r.intangibleAssets) ?? _num(r.intangibles);
+  const goodwill = _num(r.goodwill);
+  let tangible = eq;
+  if (intang != null) tangible -= intang;
+  if (goodwill != null) tangible -= goodwill;
+  // If tangible equity is negative (common for buyback-heavy names), ROTCE is
+  // not meaningful — exclude rather than show a misleading huge/negative number.
+  if (tangible <= 0) return null;
+  return ni / tangible;
+}
+
+// Build the full ranking across ALL stockbook rows. Returns:
+//   { perMetric: { key: { ranked:[{ticker,value,rank,pct}], total } },
+//     byTicker: { ticker: { grade, gradeScore, coverage, ranks:{key:{rank,total,pct,value}} } } }
+let _researchCache = null;
+let _researchCacheStamp = 0;
+
+function computeResearchRankings(force = false) {
+  // Cache for 30s so re-renders don't recompute on every interaction
+  if (!force && _researchCache && (Date.now() - _researchCacheStamp) < 30000) return _researchCache;
+
+  const rows = (typeof state !== 'undefined' && state.stockbook?.rows) ? state.stockbook.rows : [];
+  // Only equities are rankable on fundamentals
+  const equities = rows.filter(r => {
+    const cls = (typeof classifyAsset === 'function') ? classifyAsset(r.ticker) : 'equity';
+    return !['fx', 'index', 'future', 'crypto'].includes(cls);
+  });
+
+  const perMetric = {};
+  for (const m of RESEARCH_METRICS) {
+    // Collect (ticker, value) for rows that HAVE this metric
+    const vals = [];
+    for (const r of equities) {
+      const v = m.get(r);
+      if (v != null && isFinite(v)) vals.push({ ticker: r.ticker, name: r.name || r.ticker, value: v });
+    }
+    // Sort by direction
+    vals.sort((a, b) => m.higher ? b.value - a.value : a.value - b.value);
+    const total = vals.length;
+    vals.forEach((entry, i) => {
+      entry.rank = i + 1;
+      entry.pct = total > 1 ? Math.round((1 - i / (total - 1)) * 100) : 100;  // 100 = best
+    });
+    perMetric[m.key] = { ranked: vals, total, metric: m };
+  }
+
+  // Build per-ticker grade from average percentile across metrics it HAS
+  const byTicker = {};
+  for (const r of equities) {
+    const ranks = {};
+    let pctSum = 0, covered = 0;
+    for (const m of RESEARCH_METRICS) {
+      const pm = perMetric[m.key];
+      const entry = pm.ranked.find(e => e.ticker === r.ticker);
+      if (entry) {
+        ranks[m.key] = { rank: entry.rank, total: pm.total, pct: entry.pct, value: entry.value };
+        pctSum += entry.pct; covered++;
+      } else {
+        ranks[m.key] = null;  // n/a · not ranked
+      }
+    }
+    const gradeScore = covered > 0 ? pctSum / covered : null;
+    byTicker[r.ticker] = {
+      ticker: r.ticker,
+      name: r.name || r.ticker,
+      sector: r.sector || null,
+      gradeScore,
+      grade: researchGradeLetter(gradeScore),
+      coverage: covered,
+      coverageTotal: RESEARCH_METRICS.length,
+      ranks,
+    };
+  }
+
+  _researchCache = { perMetric, byTicker, universeSize: equities.length };
+  _researchCacheStamp = Date.now();
+  return _researchCache;
+}
+
+// Average-percentile → letter grade. Percentile is "% of peers you beat", so
+// 90+ is A territory. Tuned so grades spread reasonably across a real universe.
+function researchGradeLetter(score) {
+  if (score == null) return null;
+  if (score >= 93) return 'A+';
+  if (score >= 85) return 'A';
+  if (score >= 78) return 'A-';
+  if (score >= 70) return 'B+';
+  if (score >= 62) return 'B';
+  if (score >= 54) return 'B-';
+  if (score >= 46) return 'C+';
+  if (score >= 38) return 'C';
+  if (score >= 30) return 'C-';
+  if (score >= 22) return 'D+';
+  if (score >= 14) return 'D';
+  return 'F';
+}
+
+function researchGradeColor(grade) {
+  if (!grade) return 'var(--ink-faint)';
+  const g = grade[0];
+  return g === 'A' ? 'var(--pos)' : g === 'B' ? '#7faaca' : g === 'C' ? 'var(--data-amber)' : 'var(--neg)';
+}
+
+
+// ============================================================
+//   RESEARCH TAB RENDERER
+// ============================================================
+const RESEARCH_STATE = { view: 'filter', metric: 'roe', side: 'top', gradeSort: 'grade', detailTicker: null };
+
+function renderResearchTab() {
+  const body = document.getElementById('research-body');
+  if (!body) return;
+  const rows = (typeof state !== 'undefined' && state.stockbook?.rows) ? state.stockbook.rows : [];
+  if (!rows.length) {
+    body.innerHTML = `<div style="padding:40px;text-align:center;color:var(--ink-dim);font-family:var(--mono);font-size:12px">No stockbook loaded. Configure a data source first.</div>`;
+    return;
+  }
+  const data = computeResearchRankings();
+
+  // View toggle
+  const head = `
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:16px 0 18px">
+      <div class="seg-control">
+        <button class="seg-btn ${RESEARCH_STATE.view==='filter'?'active':''}" data-rview="filter">Screener</button>
+        <button class="seg-btn ${RESEARCH_STATE.view==='grade'?'active':''}" data-rview="grade">Grades</button>
+      </div>
+      <span style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-left:auto">${data.universeSize} equities ranked across ${RESEARCH_METRICS.length} metrics</span>
+    </div>`;
+
+  if (RESEARCH_STATE.view === 'filter') {
+    body.innerHTML = head + renderResearchScreener(data);
+    wireResearchScreener();
+  } else if (RESEARCH_STATE.detailTicker) {
+    body.innerHTML = head + renderResearchDetail(data, RESEARCH_STATE.detailTicker);
+    wireResearchDetailBack();
+  } else {
+    body.innerHTML = head + renderResearchGrades(data);
+    wireResearchGrades();
+  }
+  // View toggle handler
+  body.querySelectorAll('[data-rview]').forEach(b => b.addEventListener('click', () => {
+    RESEARCH_STATE.view = b.dataset.rview;
+    RESEARCH_STATE.detailTicker = null;
+    renderResearchTab();
+  }));
+}
+
+function renderResearchScreener(data) {
+  const m = RESEARCH_METRICS.find(x => x.key === RESEARCH_STATE.metric) || RESEARCH_METRICS[0];
+  const pm = data.perMetric[m.key];
+  const side = RESEARCH_STATE.side;
+  // Top 100 = best (already sorted best-first); Bottom 100 = worst (tail, reversed)
+  let list = pm.ranked;
+  let shown = side === 'top' ? list.slice(0, 100) : list.slice(-100).reverse();
+
+  // Metric picker grouped by category
+  const cats = [...new Set(RESEARCH_METRICS.map(x => x.cat))];
+  const metricOptions = cats.map(cat =>
+    `<optgroup label="${cat}">` +
+    RESEARCH_METRICS.filter(x => x.cat === cat).map(x =>
+      `<option value="${x.key}" ${x.key===m.key?'selected':''}>${x.label}</option>`).join('') +
+    `</optgroup>`
+  ).join('');
+
+  const rowsHtml = shown.map(e => {
+    const tk = data.byTicker[e.ticker];
+    return `<tr class="research-row" data-ticker="${e.ticker}" style="cursor:pointer">
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);text-align:right">#${e.rank}</td>
+      <td style="font-family:var(--mono);font-weight:700">${escapeHtml(e.ticker)}</td>
+      <td style="font-size:11px;color:var(--ink-dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(e.name)}</td>
+      <td style="font-family:var(--mono);font-size:12px;font-weight:700;text-align:right">${m.fmt(e.value)}</td>
+      <td style="text-align:right"><span style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${e.pct}%ile</span></td>
+      <td style="text-align:center">${tk?.grade ? `<span style="font-family:var(--mono);font-weight:700;color:${researchGradeColor(tk.grade)}">${tk.grade}</span>` : '—'}</td>
+    </tr>`;
+  }).join('');
+
+  return `
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px">
+      <select id="research-metric" class="heat-filter-select" style="min-width:240px">${metricOptions}</select>
+      <div class="seg-control">
+        <button class="seg-btn ${side==='top'?'active':''}" data-rside="top">Top 100</button>
+        <button class="seg-btn ${side==='bottom'?'active':''}" data-rside="bottom">Bottom 100</button>
+      </div>
+      <span style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${pm.total} companies have this metric ${m.higher ? '· higher = better' : '· lower = better'}</span>
+    </div>
+    <div class="company-card" style="margin:0">
+      <table class="sb-table" style="width:100%">
+        <thead><tr>
+          <th style="text-align:right">Rank</th><th>Ticker</th><th>Company</th>
+          <th style="text-align:right">${escapeHtml(m.label)}</th><th style="text-align:right">Percentile</th><th style="text-align:center">Grade</th>
+        </tr></thead>
+        <tbody>${rowsHtml || '<tr><td colspan="6" style="padding:20px;text-align:center;color:var(--ink-faint)">No companies have this metric</td></tr>'}</tbody>
+      </table>
+    </div>`;
+}
+
+function wireResearchScreener() {
+  document.getElementById('research-metric')?.addEventListener('change', e => {
+    RESEARCH_STATE.metric = e.target.value; renderResearchTab();
+  });
+  document.querySelectorAll('[data-rside]').forEach(b => b.addEventListener('click', () => {
+    RESEARCH_STATE.side = b.dataset.rside; renderResearchTab();
+  }));
+  document.querySelectorAll('.research-row').forEach(r => r.addEventListener('click', () => {
+    RESEARCH_STATE.view = 'grade'; RESEARCH_STATE.detailTicker = r.dataset.ticker; renderResearchTab();
+  }));
+}
+
+function renderResearchGrades(data) {
+  // All companies sorted by grade score (desc). Show grade + coverage + top categories.
+  const all = Object.values(data.byTicker).filter(t => t.gradeScore != null);
+  all.sort((a, b) => b.gradeScore - a.gradeScore);
+
+  const rowsHtml = all.map((t, i) => `
+    <tr class="research-row" data-ticker="${t.ticker}" style="cursor:pointer">
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);text-align:right">${i+1}</td>
+      <td style="font-family:var(--mono);font-weight:700">${escapeHtml(t.ticker)}</td>
+      <td style="font-size:11px;color:var(--ink-dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(t.name)}</td>
+      <td style="text-align:center"><span style="font-family:var(--mono);font-size:15px;font-weight:700;color:${researchGradeColor(t.grade)}">${t.grade}</span></td>
+      <td style="text-align:right;font-family:var(--mono);font-size:11px">${t.gradeScore.toFixed(0)}<span style="color:var(--ink-faint);font-size:9px">/100</span></td>
+      <td style="text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${t.coverage}/${t.coverageTotal} metrics</td>
+    </tr>`).join('');
+
+  return `
+    <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);margin-bottom:12px;line-height:1.6">
+      Composite grade = average percentile across all metrics a company has data for (equal-weighted). Click any company for its full per-category breakdown and rank in each. Companies are graded only on metrics they actually report.
+    </div>
+    <div class="company-card" style="margin:0">
+      <table class="sb-table" style="width:100%">
+        <thead><tr>
+          <th style="text-align:right">#</th><th>Ticker</th><th>Company</th>
+          <th style="text-align:center">Grade</th><th style="text-align:right">Score</th><th style="text-align:right">Coverage</th>
+        </tr></thead>
+        <tbody>${rowsHtml}</tbody>
+      </table>
+    </div>`;
+}
+
+function wireResearchGrades() {
+  document.querySelectorAll('.research-row').forEach(r => r.addEventListener('click', () => {
+    RESEARCH_STATE.detailTicker = r.dataset.ticker; renderResearchTab();
+  }));
+}
+
+function renderResearchDetail(data, ticker) {
+  const t = data.byTicker[ticker];
+  if (!t) return `<div style="padding:20px;color:var(--ink-faint)">No data for ${escapeHtml(ticker)}</div>`;
+
+  // Group ranks by category
+  const cats = [...new Set(RESEARCH_METRICS.map(x => x.cat))];
+  const catBlocks = cats.map(cat => {
+    const metrics = RESEARCH_METRICS.filter(x => x.cat === cat);
+    const rowsHtml = metrics.map(m => {
+      const rk = t.ranks[m.key];
+      if (!rk) {
+        return `<tr><td style="font-size:11px;color:var(--ink-dim)">${escapeHtml(m.label)}</td>
+          <td style="text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-faint)">n/a · not ranked</td>
+          <td style="text-align:right"></td><td style="text-align:right"></td></tr>`;
+      }
+      const pctColor = rk.pct >= 70 ? 'var(--pos)' : rk.pct >= 40 ? 'var(--data-amber)' : 'var(--neg)';
+      return `<tr>
+        <td style="font-size:11px;color:var(--ink-dim)">${escapeHtml(m.label)}</td>
+        <td style="text-align:right;font-family:var(--mono);font-size:12px;font-weight:700">${m.fmt(rk.value)}</td>
+        <td style="text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink)">#${rk.rank} <span style="color:var(--ink-faint);font-size:9px">of ${rk.total}</span></td>
+        <td style="text-align:right;font-family:var(--mono);font-size:11px;color:${pctColor};font-weight:700">${rk.pct}<span style="font-size:8px">%ile</span></td>
+      </tr>`;
+    }).join('');
+    return `
+      <div class="company-card" style="margin:0 0 12px">
+        <h4>${escapeHtml(cat)}</h4>
+        <table class="sb-table" style="width:100%">
+          <thead><tr><th>Metric</th><th style="text-align:right">Value</th><th style="text-align:right">Rank</th><th style="text-align:right">Percentile</th></tr></thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+      </div>`;
+  }).join('');
+
+  return `
+    <button class="btn btn-ghost" id="research-back" style="margin-bottom:14px;font-size:11px">← Back to grades</button>
+    <div class="company-card" style="border-left:3px solid ${researchGradeColor(t.grade)};margin:0 0 14px">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+        <div>
+          <h3 style="font-family:var(--serif);font-size:24px;margin:0">${escapeHtml(t.ticker)} <span style="font-size:13px;color:var(--ink-dim);font-weight:400">${escapeHtml(t.name)}</span></h3>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-top:4px">${escapeHtml(t.sector || '')} · graded on ${t.coverage} of ${t.coverageTotal} metrics${t.coverage < t.coverageTotal/2 ? ' · ⚠ sparse data, grade less reliable' : ''}</div>
+        </div>
+        <div style="text-align:center">
+          <div style="font-family:var(--mono);font-size:48px;font-weight:700;line-height:1;color:${researchGradeColor(t.grade)}">${t.grade}</div>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-top:2px">${t.gradeScore.toFixed(0)}/100 composite</div>
+        </div>
+      </div>
+      <div style="margin-top:10px"><button class="btn btn-ghost" style="font-size:10px" onclick="document.getElementById('ticker').value='${t.ticker}';switchTab('valuation');setTimeout(()=>document.getElementById('fetch-btn')?.click(),100)">Open in Valuation →</button></div>
+    </div>
+    ${catBlocks}`;
+}
+
+function wireResearchDetailBack() {
+  document.getElementById('research-back')?.addEventListener('click', () => {
+    RESEARCH_STATE.detailTicker = null; renderResearchTab();
+  });
+}
+
+
+// ============================================================
+//   TWEET / POST READER — prediction extraction "brain"
+//
+//   Reads a post (text now; screenshot OCR later) and extracts the tradeable
+//   claim: ticker(s), price target, date/horizon, and bull/bear sentiment.
+//   Then timestamps the price at post-time and tracks performance forward.
+//   Frozen-entry, never-rewritten — same honesty model as the bot.
+//
+//   Storage: GitHub-JSON-friendly (data/posts.json) — no database needed for
+//   Phase 1. The learning feedback loop (accept/reject → improve) is where a
+//   real DB earns its place; for now accepted calls persist in localStorage.
+//
+//   "NVDA will be $500 by 2027" → {ticker:NVDA, target:500, date:2027, bull}
+//   is a DETAILED call (3 values). Vaguer posts yield fewer fields, flagged.
+// ============================================================
+
+const POSTS_KEY = 'valuatio.posts.v1';
+
+// Bull / bear lexicons — phrases that signal direction. Weighted: strong cues
+// count more. This is the seed; the ML layer will extend it from accepted calls.
+// ============================================================
+//   LEARNABLE SENTIMENT LEXICON (the retrainable "model")
+//
+//   Phrases start from a seed but GROW from human feedback. When the user
+//   confirms a post's direction in the Review hub, the system attributes that
+//   post's distinctive phrases to the chosen direction and bumps their weight.
+//   Over time "loading up", "coiled spring", whatever the user validates,
+//   become recognized. Transparent + editable — the user can see and prune what
+//   it learned. Persists in localStorage; exportable to XTRAPP/data/lexicon.json.
+//
+//   This is honest lightweight learning (phrase frequency), NOT a neural net —
+//   it only knows patterns the user has validated, stays conservative on the
+//   rest, and asks when unsure. The LLM hook (llmClassifyPost) is where true
+//   language comprehension plugs in once an API key is provided.
+// ============================================================
+const LEXICON_KEY = 'valuatio.lexicon.v1';
+
+const BULL_SEED = [
+  ['buy', 2], ['bullish', 3], ['long', 2], ['calls', 2], ['moon', 2], ['rip', 1],
+  ['breakout', 2], ['undervalued', 2], ['accumulate', 2], ['load up', 3], ['squeeze', 2],
+  ['upside', 2], ['rally', 2], ['strong buy', 3], ['oversold', 1],
+  ['gains', 1], ['winner', 1], ['outperform', 2], ['beat', 1], ['loading up', 3],
+];
+const BEAR_SEED = [
+  ['sell', 2], ['bearish', 3], ['short', 2], ['puts', 2], ['crash', 3], ['dump', 2],
+  ['overvalued', 2], ['avoid', 2], ['breakdown', 2], ['downside', 2],
+  ['weak', 1], ['underperform', 2], ['miss', 1],
+  ['rug', 2], ['collapse', 3], ['tank', 2], ['warning', 1], ['toppy', 2],
+];
+
+// Load the lexicon: { bull: {phrase: weight}, bear: {phrase: weight}, meta:{...} }.
+// Seeds are merged in on first load so a fresh install still works.
+function loadLexicon() {
+  let lex;
+  try { lex = JSON.parse(localStorage.getItem(LEXICON_KEY) || 'null'); } catch { lex = null; }
+  if (!lex || !lex.bull) {
+    lex = { bull: {}, bear: {}, meta: { trainedCount: 0, version: 1 } };
+    for (const [p, w] of BULL_SEED) lex.bull[p] = w;
+    for (const [p, w] of BEAR_SEED) lex.bear[p] = w;
+    saveLexicon(lex);
+  }
+  return lex;
+}
+function saveLexicon(lex) { try { localStorage.setItem(LEXICON_KEY, JSON.stringify(lex)); } catch {} }
+
+// Retrain: given a post's text and the human-confirmed direction, extract its
+// distinctive phrases (1-3 word n-grams, minus stopwords/tickers/numbers) and
+// reinforce them toward that direction. This is the loop that makes new
+// keywords "picked up" on future posts.
+const _LEX_STOP = new Set(('a an the to of in on at for and or but is are be will would could should this that it its by with from as i you he she they we me my your his her their our up down out so just now then than into over under about'.split(' ')));
+function extractLexPhrases(text) {
+  const clean = text.toLowerCase()
+    .replace(/\$[a-z]{1,5}\b/g, ' ')      // drop cashtags
+    .replace(/[^a-z\s]/g, ' ')             // drop punctuation/numbers
+    .replace(/\s+/g, ' ').trim();
+  const words = clean.split(' ').filter(w => w.length > 2 && !_LEX_STOP.has(w));
+  const grams = new Set();
+  for (let i = 0; i < words.length; i++) {
+    grams.add(words[i]);                                   // unigram
+    if (i + 1 < words.length) grams.add(words[i] + ' ' + words[i + 1]);   // bigram
+  }
+  return [...grams];
+}
+
+function retrainLexicon(text, direction) {
+  if (direction !== 'bullish' && direction !== 'bearish') return 0;  // neutral doesn't train
+  const lex = loadLexicon();
+  const bucket = direction === 'bullish' ? lex.bull : lex.bear;
+  const opp = direction === 'bullish' ? lex.bear : lex.bull;
+  const phrases = extractLexPhrases(text);
+  let learned = 0;
+  for (const p of phrases) {
+    // Reinforce in the chosen direction (cap weight so it can't run away).
+    bucket[p] = Math.min(5, (bucket[p] || 0) + 1);
+    // Slightly decay the same phrase in the opposite bucket (it was contradicted).
+    if (opp[p]) { opp[p] = Math.max(0, opp[p] - 0.5); if (opp[p] === 0) delete opp[p]; }
+    learned++;
+  }
+  lex.meta.trainedCount = (lex.meta.trainedCount || 0) + 1;
+  saveLexicon(lex);
+  return learned;
+}
+
+// ---- LLM hook (Phase: deep understanding). Returns null unless an API key is
+// configured; the app falls back to the lexicon. Wire your provider here. ----
+async function llmClassifyPost(text) {
+  const key = (typeof localStorage !== 'undefined') ? localStorage.getItem('valuatio.llm.key') : null;
+  if (!key) return null;  // no key → lexicon-only (honest default)
+  // Scaffold: a real implementation POSTs `text` to the provider asking for
+  // {ticker, target, date, sentiment, confidence} as JSON. Left unwired so the
+  // app never silently depends on an external call the user hasn't set up.
+  return null;
+}
+
+// Extract candidate tickers from text. Handles $TICKER cashtags (highest
+// confidence) and bare uppercase 1-5 letter tokens that match the stockbook.
+function extractTickers(text) {
+  const found = new Map();  // ticker -> confidence
+  // $CASHTAGS — explicit, high confidence
+  const cashtags = text.match(/\$[A-Za-z]{1,5}\b/g) || [];
+  for (const c of cashtags) found.set(c.slice(1).toUpperCase(), 'explicit');
+  // Bare uppercase tokens that exist in the stockbook
+  const bareTokens = text.match(/\b[A-Z]{1,5}\b/g) || [];
+  for (const tok of bareTokens) {
+    if (found.has(tok)) continue;
+    const row = (typeof getStockbookRow === 'function') ? getStockbookRow(tok) : null;
+    if (row) found.set(tok, 'matched');
+  }
+  // Company names → ticker (common ones; the stockbook name index extends this)
+  const nameToTicker = {
+    nvidia: 'NVDA', tesla: 'TSLA', apple: 'AAPL', microsoft: 'MSFT', amazon: 'AMZN',
+    google: 'GOOGL', alphabet: 'GOOGL', meta: 'META', facebook: 'META', netflix: 'NFLX',
+    'advanced micro': 'AMD', palantir: 'PLTR', gamestop: 'GME', bitcoin: 'BTC-USD',
+    ethereum: 'ETH-USD',
+  };
+  const lower = text.toLowerCase();
+  for (const [nm, tk] of Object.entries(nameToTicker)) {
+    if (lower.includes(nm) && !found.has(tk)) found.set(tk, 'name');
+  }
+  return [...found.entries()].map(([ticker, conf]) => ({ ticker, conf }));
+}
+
+// Extract a price target: "$500", "500", "to 250", "PT 180". Returns number|null.
+function extractPriceTarget(text) {
+  // Prefer explicit $-amounts
+  const dollar = text.match(/\$\s?([\d,]+(?:\.\d+)?)/);
+  if (dollar) { const n = parseFloat(dollar[1].replace(/,/g, '')); if (isFinite(n)) return n; }
+  // "PT 180", "target 250", "to 500"
+  const pt = text.match(/(?:pt|price target|target|to|hits?|reach(?:es)?)\s+\$?([\d,]+(?:\.\d+)?)/i);
+  if (pt) { const n = parseFloat(pt[1].replace(/,/g, '')); if (isFinite(n)) return n; }
+  return null;
+}
+
+// Extract a date / horizon: "by 2027", "end of year", "Q3", "in 6 months".
+// Returns { raw, targetDate (ISO|null), horizonDays (num|null) }.
+function extractHorizon(text) {
+  const now = new Date();
+  // Explicit year
+  const yr = text.match(/\b(?:by|before|end of|eoy)\s+(20\d{2})\b/i) || text.match(/\b(20\d{2})\b/);
+  if (yr) {
+    const y = parseInt(yr[1]);
+    if (y >= now.getFullYear() && y <= now.getFullYear() + 10) {
+      const d = new Date(`${y}-12-31`);
+      return { raw: yr[0], targetDate: d.toISOString().slice(0, 10), horizonDays: Math.round((d - now) / 86400000) };
+    }
+  }
+  // "in N months / weeks / days / years"
+  const rel = text.match(/\bin\s+(\d+)\s+(day|week|month|year)s?\b/i)
+           || text.match(/\b(\d+)\s+(day|week|month|year)s?\b/i);
+  if (rel) {
+    const n = parseInt(rel[1]); const unit = rel[2].toLowerCase();
+    const mult = unit === 'day' ? 1 : unit === 'week' ? 7 : unit === 'month' ? 30 : 365;
+    const days = n * mult;
+    const d = new Date(now.getTime() + days * 86400000);
+    return { raw: rel[0], targetDate: d.toISOString().slice(0, 10), horizonDays: days };
+  }
+  // "end of year" / "EOY"
+  if (/\b(end of year|eoy|year[- ]end)\b/i.test(text)) {
+    const d = new Date(`${now.getFullYear()}-12-31`);
+    return { raw: 'EOY', targetDate: d.toISOString().slice(0, 10), horizonDays: Math.round((d - now) / 86400000) };
+  }
+  return { raw: null, targetDate: null, horizonDays: null };
+}
+
+// Sentiment from the LEARNABLE lexicon → {label, score (-1..+1), bull, bear,
+// confidence, matched}. Low confidence = the system is unsure and should ask
+// (which is the human-in-the-loop trigger).
+function extractSentiment(text) {
+  const lex = loadLexicon();
+  const lower = ' ' + text.toLowerCase() + ' ';
+  let bull = 0, bear = 0;
+  const matched = [];
+  for (const [p, w] of Object.entries(lex.bull)) {
+    if (lower.includes(' ' + p + ' ') || lower.includes(p)) { bull += w; matched.push({ p, dir: 'bull', w }); }
+  }
+  for (const [p, w] of Object.entries(lex.bear)) {
+    if (lower.includes(' ' + p + ' ') || lower.includes(p)) { bear += w; matched.push({ p, dir: 'bear', w }); }
+  }
+  const total = bull + bear;
+  const score = total > 0 ? (bull - bear) / total : 0;
+  let label = 'neutral';
+  if (score > 0.2) label = 'bullish';
+  else if (score < -0.2) label = 'bearish';
+  // Confidence: strong when total weight is high AND the lean is decisive.
+  // Near-zero total (no recognized phrases) or a near-tie = low confidence → ask.
+  const decisiveness = Math.abs(score);
+  const evidence = Math.min(1, total / 6);
+  const confidence = +(decisiveness * 0.6 + evidence * 0.4).toFixed(2);
+  return { label, score, bull, bear, confidence, matched };
+}
+
+// Look up a ticker's price on (or nearest before) a past date, from the 5-year
+// daily history the equity repos publish. Returns { price, date, exact } or null.
+// Lets a BACKDATED call ("last May I said SPY→800") freeze its entry at the
+// actual historical close, then track forward. Daily-close granularity.
+async function priceOnDate(ticker, isoDate) {
+  if (!ticker || !isoDate) return null;
+  let hist = null;
+  try {
+    hist = (typeof getHistoryForTickerAsync === 'function')
+      ? await getHistoryForTickerAsync(ticker)
+      : (typeof getHistoryForTicker === 'function' ? getHistoryForTicker(ticker) : null);
+  } catch {}
+  if (!hist || !hist.length) return null;
+  const target = new Date(isoDate).getTime();
+  let best = null;
+  for (const bar of hist) {
+    const bt = new Date(bar.date).getTime();
+    if (bt <= target) best = bar;
+    else break;
+  }
+  if (!best) best = hist[0];
+  const px = (typeof best.price === 'number') ? best.price
+           : (typeof best.close === 'number') ? best.close : null;
+  if (px == null) return null;
+  return { price: px, date: best.date, exact: best.date === isoDate.slice(0, 10) };
+}
+
+// The full brain: parse one post into a structured prediction. Async because a
+// BACKDATED post (opts.postedAt in the past) resolves its frozen entry from
+// historical price data rather than the current price.
+async function parsePost(text, opts = {}) {
+  const tickers = extractTickers(text);
+  const target = extractPriceTarget(text);
+  const horizon = extractHorizon(text);
+  let sentiment = extractSentiment(text);
+
+  const primary = tickers[0]?.ticker;
+  const postedAt = opts.postedAt || new Date().toISOString();
+  // Is this backdated? (more than ~2 days in the past)
+  const isBackdated = (Date.now() - new Date(postedAt).getTime()) > 2 * 86400000;
+
+  let entryPrice = null, entryDate = null, entryExact = true;
+  if (primary) {
+    if (isBackdated && typeof priceOnDate === 'function') {
+      // Pull the historical close from the equity repos for the post date.
+      const hp = await priceOnDate(primary, postedAt.slice(0, 10));
+      if (hp) { entryPrice = hp.price; entryDate = hp.date; entryExact = hp.exact; }
+    }
+    if (entryPrice == null) {
+      const row = (typeof getStockbookRow === 'function') ? getStockbookRow(primary) : null;
+      entryPrice = row?.price ?? null;
+      entryDate = new Date().toISOString().slice(0, 10);
+    }
+    if (sentiment.label === 'neutral' && target != null && entryPrice != null) {
+      if (target > entryPrice * 1.02) sentiment = { ...sentiment, label: 'bullish', score: 0.3, inferred: true };
+      else if (target < entryPrice * 0.98) sentiment = { ...sentiment, label: 'bearish', score: -0.3, inferred: true };
+    }
+  }
+
+  const detail = (primary ? 1 : 0) + (target != null ? 1 : 0) + (horizon.targetDate ? 1 : 0);
+
+  return {
+    text,
+    tickers,
+    primaryTicker: primary || null,
+    priceTarget: target,
+    horizon,
+    sentiment,
+    entryPrice,
+    entryDate,           // the date the entry price is FROM (historical if backdated)
+    entryExact,          // false if it fell back to nearest prior trading day
+    isBackdated,
+    detail,
+    detailLabel: detail >= 3 ? 'detailed' : detail === 2 ? 'partial' : 'vague',
+    author: opts.author || 'me',
+    postedAt,
+  };
+}
+
+
+// ============================================================
+//   POSTS TAB — entry, prediction list, performance tracking
+// ============================================================
+function loadPosts() {
+  try { return JSON.parse(localStorage.getItem(POSTS_KEY) || '[]'); } catch { return []; }
+}
+function savePosts(arr) { try { localStorage.setItem(POSTS_KEY, JSON.stringify(arr)); } catch {} }
+
+// Accept a parsed post into the tracked record. Frozen entry price/date.
+function acceptPost(parsed, overrideSentiment) {
+  const posts = loadPosts();
+  const sentiment = overrideSentiment || parsed.sentiment.label;
+  // The human confirmed the direction — RETRAIN the lexicon on this post so its
+  // phrases get recognized next time. This is the feedback loop. Only train when
+  // the human actively confirmed (always true here, since accept requires it).
+  let learned = 0;
+  const brainGuess = parsed.sentiment.label;
+  if (typeof retrainLexicon === 'function') {
+    learned = retrainLexicon(parsed.text, sentiment);
+  }
+  posts.unshift({
+    id: `${parsed.primaryTicker || 'post'}-${Date.now()}`,
+    text: parsed.text,
+    author: parsed.author,
+    primaryTicker: parsed.primaryTicker,
+    allTickers: parsed.tickers.map(t => t.ticker),
+    priceTarget: parsed.priceTarget,
+    targetDate: parsed.horizon.targetDate,
+    sentiment,                       // user can override the brain's guess
+    brainGuess,                      // what the system thought (for learning audit)
+    corrected: brainGuess !== sentiment,  // did the human correct it?
+    entryPrice: parsed.entryPrice,   // FROZEN at accept time
+    entryDate: parsed.entryDate,     // date the entry price is FROM (historical if backdated)
+    isBackdated: parsed.isBackdated,
+    detail: parsed.detailLabel,
+    postedAt: parsed.postedAt,
+    acceptedAt: new Date().toISOString(),
+    status: 'open',
+    phrasesLearned: learned,
+  });
+  savePosts(posts);
+  return posts;
+}
+
+// Mark-to-market each tracked post: current price vs frozen entry, directional
+// by sentiment. If a target + date exist, also compute progress toward target.
+function postPerformance(post) {
+  const row = (typeof getStockbookRow === 'function') ? getStockbookRow(post.primaryTicker) : null;
+  const cur = row?.price;
+  if (cur == null || post.entryPrice == null) return { pct: null, hitTarget: null, cur };
+  const rawPct = (cur - post.entryPrice) / post.entryPrice * 100;
+  // Bullish call profits when price rises; bearish when it falls.
+  let dirPct = post.sentiment === 'bearish' ? -rawPct : rawPct;
+  // A bearish call on a dividend payer carries the negative dividend cost for as
+  // long as it's "held" — deduct it as a percentage drag so the tracked return
+  // reflects the real cost of being short a yielder.
+  let carryPct = 0;
+  if (post.sentiment === 'bearish' && row?.dividendYield > 0 && post.postedAt) {
+    const days = Math.max(0, (Date.now() - new Date(post.postedAt).getTime()) / 86400000);
+    carryPct = row.dividendYield * (days / 365) * 100;
+    dirPct -= carryPct;
+  }
+  let targetProgress = null, hitTarget = null;
+  if (post.priceTarget != null) {
+    const denom = (post.priceTarget - post.entryPrice) || 1;
+    targetProgress = (cur - post.entryPrice) / denom * 100;  // % of the way to target
+    hitTarget = post.sentiment === 'bearish' ? cur <= post.priceTarget : cur >= post.priceTarget;
+  }
+  return { pct: dirPct, rawPct, cur, targetProgress, hitTarget, carryPct: carryPct > 0 ? +carryPct.toFixed(2) : 0 };
+}
+
+const POSTS_STATE = { filterTicker: null, filterAuthor: null, pending: null };
+
+// (Calls tab UI removed — renderPostsTab/wirePostsTab/renderPostPreview retired.
+//  The posts data layer below — loadPosts/acceptPost/postPerformance/postsForTicker —
+//  stays, shared by the Probability import + Review hub + chart overlay.)
+
+function deletePost(id) {
+  const posts = loadPosts().filter(p => p.id !== id);
+  savePosts(posts);
+  // Re-render wherever posts surface now (Probability tab / chart). Guarded so
+  // it's a no-op if those aren't active.
+  if (typeof renderProbabilityTab === 'function') { try { renderProbabilityTab(); } catch {} }
+}
+
+// Posts for a ticker, for the chart overlay (used by renderPriceChart).
+function postsForTicker(ticker) {
+  return loadPosts().filter(p => (p.allTickers || []).includes(ticker.toUpperCase()));
+}
+
+
+// ============================================================
+//   REVIEW HUB — unified human-in-the-loop feedback
+//
+//   One place where the system surfaces what it's UNSURE about and the human
+//   confirms/corrects. Every confirmation retrains the relevant model. Sections:
+//     1. Post sentiment — low-confidence posts awaiting a bull/bear call
+//     2. Ambiguous tickers — posts where the ticker match is uncertain
+//     3. Lexicon inspector — see/prune what the model has learned
+//     4. Other model guesses — derivative links, news sentiment (extensible)
+// ============================================================
+const REVIEW_QUEUE_KEY = 'valuatio.reviewQueue.v1';
+
+function loadReviewQueue() {
+  try { return JSON.parse(localStorage.getItem(REVIEW_QUEUE_KEY) || '[]'); } catch { return []; }
+}
+function saveReviewQueue(q) { try { localStorage.setItem(REVIEW_QUEUE_KEY, JSON.stringify(q)); } catch {} }
+
+// Queue a post for human review when the brain is unsure (low confidence or
+// ambiguous ticker). Called from the Calls tab when parse confidence is low.
+function queueForReview(parsed, reason) {
+  const q = loadReviewQueue();
+  q.unshift({
+    id: `rev-${Date.now()}`,
+    type: reason,                     // 'sentiment' | 'ticker'
+    text: parsed.text,
+    author: parsed.author,
+    brainGuess: parsed.sentiment.label,
+    confidence: parsed.sentiment.confidence,
+    tickers: parsed.tickers,
+    primaryTicker: parsed.primaryTicker,
+    priceTarget: parsed.priceTarget,
+    targetDate: parsed.horizon?.targetDate,
+    entryPrice: parsed.entryPrice,
+    postedAt: parsed.postedAt,
+    queuedAt: new Date().toISOString(),
+  });
+  saveReviewQueue(q);
+}
+
+function renderReviewHub() {
+  const body = document.getElementById('review-body');
+  if (!body) return;
+  const queue = loadReviewQueue();
+  const lex = (typeof loadLexicon === 'function') ? loadLexicon() : { bull: {}, bear: {}, meta: {} };
+
+  // --- Section 1+2: pending review items ---
+  const sentimentItems = queue.filter(q => q.type === 'sentiment');
+  const tickerItems = queue.filter(q => q.type === 'ticker');
+  const newsItems = queue.filter(q => q.type === 'news');
+  const thesisItems = queue.filter(q => q.type === 'thesis');
+  // Anything else queued via flagForReview() (derivative links, FX, etc.)
+  const knownTypes = new Set(['sentiment', 'ticker', 'news', 'thesis']);
+  const genericItems = queue.filter(q => !knownTypes.has(q.type));
+
+  // Generic doubt card — for anything flagForReview() queued. Shows the label,
+  // detail, and any options the flagging code supplied; otherwise a confirm/skip.
+  const genericCard = (q) => `
+    <div class="company-card" style="border-left:3px solid var(--data-amber);margin:0 0 10px" data-rev="${q.id}">
+      <div style="font-family:var(--mono);font-size:9px;color:var(--data-amber);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px">⚑ ${escapeHtml(q.type)} ${q.confidence!=null?'· conf '+q.confidence:''}</div>
+      <div style="font-family:var(--mono);font-size:12px;color:var(--ink);margin-bottom:4px">${escapeHtml(q.label || 'Value in doubt')}</div>
+      ${q.detail?`<div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-bottom:8px">${escapeHtml(q.detail)}${q.ticker?' · '+escapeHtml(q.ticker):''}${q.value!=null?' · '+escapeHtml(String(q.value)):''}</div>`:''}
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        ${(q.options||[]).map((o,i)=>`<button class="btn btn-ghost" style="font-size:10px" onclick="reviewGenericOption('${q.id}',${i})">${escapeHtml(o.label)}</button>`).join('')}
+        <button class="btn" style="font-size:10px;background:var(--pos)" onclick="reviewDismiss('${q.id}')">✓ OK / Confirm</button>
+        <button class="btn btn-ghost" style="font-size:10px" onclick="reviewDismiss('${q.id}')">Skip</button>
+      </div>
+    </div>`;
+
+  // Thesis review card: confirm or correct the ticker + direction of an
+  // imported probability thesis. Corrections write back to the real thesis.
+  const thesisCard = (q) => `
+    <div class="company-card" style="border-left:3px solid #9a7aa0;margin:0 0 10px" data-rev="${q.id}">
+      <div style="font-family:var(--mono);font-size:9px;color:#9a7aa0;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px">🎯 Thesis check${q.confidence!=null?' · brain conf '+q.confidence:''}</div>
+      ${q.sourceText?`<div style="font-family:var(--mono);font-size:11px;color:var(--ink);margin-bottom:6px">"${escapeHtml(q.sourceText)}"</div>`:''}
+      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-dim);margin-bottom:8px">
+        Reads as: <strong style="color:var(--ink)">${escapeHtml(q.ticker)} ${q.direction} $${q.strike}</strong> by ${q.targetDate?q.targetDate.slice(0,10):'—'}
+        ${q.allTickers && q.allTickers.length>1?`<br><span style="color:var(--data-amber)">multiple tickers seen: ${q.allTickers.map(escapeHtml).join(', ')}</span>`:''}
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+        <button class="btn" style="font-size:10px;background:var(--pos)" onclick="reviewThesisConfirm('${q.id}')">✓ Correct</button>
+        ${q.allTickers && q.allTickers.length>1 ? q.allTickers.map(t=>`<button class="btn btn-ghost" style="font-size:10px" onclick="reviewThesisFixTicker('${q.id}','${t}')">use ${t}</button>`).join('') : ''}
+        <input id="thesisfix-${q.id}" placeholder="correct ticker" style="background:var(--bg-card);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:10px;padding:4px 6px;border-radius:3px;width:120px;text-transform:uppercase">
+        <button class="btn btn-ghost" style="font-size:10px" onclick="reviewThesisFixTickerInput('${q.id}')">Fix ticker</button>
+        <button class="btn btn-ghost" style="font-size:10px" onclick="reviewThesisFlip('${q.id}')" title="Flip above↔below">⇅ Flip dir</button>
+        <button class="btn" style="font-size:10px;background:var(--neg)" onclick="reviewThesisDelete('${q.id}')">✕ Delete thesis</button>
+        <button class="btn btn-ghost" style="font-size:10px" onclick="reviewDismiss('${q.id}')">Skip</button>
+      </div>
+    </div>`;
+
+  // News review card: confirm the matched ticker, fix it, or mark the article bad.
+  const newsCard = (q) => `
+    <div class="company-card" style="border-left:3px solid #7faaca;margin:0 0 10px" data-rev="${q.id}">
+      <div style="font-family:var(--mono);font-size:9px;color:#7faaca;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px">📰 News ticker check${q.source?' · '+escapeHtml(q.source):''}</div>
+      <div style="font-family:var(--serif);font-size:13px;color:var(--ink);margin-bottom:6px">${escapeHtml(q.headline)}</div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-bottom:8px">
+        Matched to: <strong style="color:var(--ink)">${escapeHtml(q.matchedTicker || '—')}</strong>${q.allTickers && q.allTickers.length>1?' (+ '+q.allTickers.slice(1).map(escapeHtml).join(', ')+')':''}
+        ${q.url?` · <a href="${escapeHtml(q.url)}" target="_blank" rel="noopener" style="color:var(--amber)">read ↗</a>`:''}
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+        <button class="btn" style="font-size:10px;background:var(--pos)" onclick="reviewNewsConfirm('${q.id}')">✓ Ticker is right</button>
+        <input id="newsfix-${q.id}" placeholder="correct ticker(s), comma-sep" style="background:var(--bg-card);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:10px;padding:4px 6px;border-radius:3px;width:170px;text-transform:uppercase">
+        <button class="btn btn-ghost" style="font-size:10px" onclick="reviewNewsFix('${q.id}')">Fix ticker</button>
+        <button class="btn" style="font-size:10px;background:var(--neg)" onclick="reviewNewsBad('${q.id}')">✕ Bad article (hide)</button>
+        <button class="btn btn-ghost" style="font-size:10px" onclick="reviewDismiss('${q.id}')">Skip</button>
+      </div>
+    </div>`;
+
+  const itemCard = (q) => `
+    <div class="company-card" style="border-left:3px solid var(--data-amber);margin:0 0 10px" data-rev="${q.id}">
+      <div style="font-family:var(--mono);font-size:12px;color:var(--ink);margin-bottom:6px">"${escapeHtml(q.text)}"</div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-bottom:8px">
+        ${escapeHtml(q.author)} · ${q.primaryTicker ? 'ticker ' + escapeHtml(q.primaryTicker) : 'no ticker'} ${q.priceTarget!=null?'· target $'+q.priceTarget:''}
+        · brain guessed <strong style="color:var(--ink-dim)">${q.brainGuess}</strong> (conf ${q.confidence})
+      </div>
+      ${q.type === 'ticker' && q.tickers.length > 1 ? `
+        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);margin-bottom:6px">Which ticker is this about?
+          ${q.tickers.map(t => `<button class="btn btn-ghost" style="font-size:10px;margin:2px" onclick="reviewResolveTicker('${q.id}','${t.ticker}')">${t.ticker}</button>`).join('')}
+        </div>` : ''}
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn" style="font-size:10px;background:var(--pos)" onclick="reviewConfirm('${q.id}','bullish')">▲ Bullish</button>
+        <button class="btn" style="font-size:10px;background:var(--neg)" onclick="reviewConfirm('${q.id}','bearish')">▼ Bearish</button>
+        <button class="btn btn-ghost" style="font-size:10px" onclick="reviewConfirm('${q.id}','neutral')">Neutral / noise</button>
+        <button class="btn btn-ghost" style="font-size:10px" onclick="reviewDismiss('${q.id}')">Skip</button>
+      </div>
+    </div>`;
+
+  const pendingSection = queue.length ? `
+    <div style="margin-bottom:20px">
+      <div class="regime-section-title">PENDING REVIEW · ${queue.length}</div>
+      <div class="gt-section-sub">The system is unsure about these. Your call retrains the model so it recognizes the phrasing next time.</div>
+      ${sentimentItems.map(itemCard).join('')}
+      ${tickerItems.map(itemCard).join('')}
+      ${newsItems.map(newsCard).join('')}
+      ${thesisItems.map(thesisCard).join('')}
+      ${genericItems.map(genericCard).join('')}
+    </div>` : `
+    <div class="company-card" style="margin-bottom:20px">
+      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);padding:10px">Nothing pending review. Low-confidence imports from the Probability and Calls tabs, plus mis-tagged news articles, land here for your confirmation.</div>
+    </div>`;
+
+  // --- Section 3: lexicon inspector (what the model learned) ---
+  const sortW = (obj) => Object.entries(obj).sort((a, b) => b[1] - a[1]);
+  const lexChip = (p, w, dir) => `<span style="display:inline-flex;align-items:center;gap:4px;font-family:var(--mono);font-size:10px;background:var(--bg-elev);border:1px solid var(--rule);border-radius:3px;padding:2px 6px;margin:2px;color:${dir==='bull'?'var(--pos)':'var(--neg)'}">${escapeHtml(p)} ·${w}<span style="cursor:pointer;color:var(--ink-faint)" onclick="lexiconPrune('${dir}','${escapeHtml(p).replace(/'/g,"")}')">✕</span></span>`;
+  const lexSection = `
+    <div style="margin-bottom:20px">
+      <div class="regime-section-title">LEXICON · what the model learned <span style="color:var(--ink-faint);font-weight:400">(${lex.meta.trainedCount||0} trainings)</span></div>
+      <div class="gt-section-sub">Editable. Click ✕ to prune a phrase the model shouldn't trust. Bigger weight = stronger signal.</div>
+      <div class="company-card" style="margin:0 0 10px">
+        <h4 style="color:var(--pos)">Bullish phrases (${Object.keys(lex.bull).length})</h4>
+        <div>${sortW(lex.bull).slice(0,60).map(([p,w])=>lexChip(p,w,'bull')).join('')}</div>
+      </div>
+      <div class="company-card" style="margin:0">
+        <h4 style="color:var(--neg)">Bearish phrases (${Object.keys(lex.bear).length})</h4>
+        <div>${sortW(lex.bear).slice(0,60).map(([p,w])=>lexChip(p,w,'bear')).join('')}</div>
+      </div>
+    </div>`;
+
+  // --- Section 4: other feedback areas (extensible hub) ---
+  const otherSection = `
+    <div>
+      <div class="regime-section-title">OTHER MODEL GUESSES</div>
+      <div class="gt-section-sub">The same confirm/correct loop, extended to other parts of the engine.</div>
+      <div class="company-card" style="margin:0 0 10px">
+        <div style="font-family:var(--mono);font-size:11px;color:var(--ink);margin-bottom:4px">Derivative relationship links</div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">When the system links a vehicle to an underlying (MSFD → MSFT), low-confidence guesses can be confirmed here. Confirmed links feed the engine.</div>
+      </div>
+      <div class="company-card" style="margin:0">
+        <div style="font-family:var(--mono);font-size:11px;color:var(--ink);margin-bottom:4px">News article sentiment</div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">News sentiment uses the same lexicon — correcting a post's tone here also sharpens news reading. Shared brain.</div>
+      </div>
+    </div>`;
+
+  body.innerHTML = pendingSection + lexSection + otherSection + `
+    <div style="margin-top:20px;padding-top:14px;border-top:1px solid var(--rule)">
+      <div class="regime-section-title">XTRAPP BACKEND</div>
+      <div class="gt-section-sub">The lexicon + tracked posts persist to the XTRAPP repo (data/xtrapp_data.json), wiring into the app like the other data feeds. Export to commit, and the app reads it back on load.</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-ghost" onclick="exportXtrappData()">Export for XTRAPP</button>
+        <button class="btn btn-ghost" onclick="fetchXtrappData().then(()=>renderReviewHub())">Reload from XTRAPP</button>
+      </div>
+    </div>`;
+}
+
+// Confirm a queued item's direction → retrain + (if it had a ticker) track it.
+function reviewConfirm(id, direction) {
+  const q = loadReviewQueue();
+  const item = q.find(x => x.id === id);
+  if (!item) return;
+  if (typeof retrainLexicon === 'function' && (direction === 'bullish' || direction === 'bearish')) {
+    retrainLexicon(item.text, direction);
+  }
+  // If it has a ticker, promote it to a tracked call.
+  if (item.primaryTicker && direction !== 'neutral' && typeof acceptPost === 'function') {
+    acceptPost({
+      text: item.text, author: item.author, primaryTicker: item.primaryTicker,
+      tickers: item.tickers, priceTarget: item.priceTarget,
+      horizon: { targetDate: item.targetDate }, sentiment: { label: direction },
+      entryPrice: item.entryPrice, detailLabel: 'reviewed', postedAt: item.postedAt,
+    }, direction);
+  }
+  saveReviewQueue(q.filter(x => x.id !== id));
+  renderReviewHub();
+  if (typeof flashStatus === 'function') flashStatus(`Confirmed ${direction} — model retrained`, 'success');
+}
+function reviewResolveTicker(id, ticker) {
+  const q = loadReviewQueue();
+  const item = q.find(x => x.id === id);
+  if (item) { item.primaryTicker = ticker; item.type = 'sentiment'; saveReviewQueue(q); renderReviewHub(); }
+}
+function reviewDismiss(id) {
+  saveReviewQueue(loadReviewQueue().filter(x => x.id !== id));
+  renderReviewHub();
+}
+
+// --- News review handlers: write a DURABLE fix (survives news refresh) ---
+function _findQueuedArticle(id) {
+  const item = loadReviewQueue().find(x => x.id === id);
+  if (!item) return { item: null, article: null };
+  const article = (state.news?.items || []).find(a => articleKey(a) === item.articleKey)
+    || { url: item.url, ticker: item.matchedTicker, tickers: item.allTickers, headline: item.headline };
+  return { item, article };
+}
+function reviewNewsConfirm(id) {
+  const { item, article } = _findQueuedArticle(id);
+  if (!item) return;
+  setArticleFix(article, 'confirmed', article.tickers || (article.ticker ? [article.ticker] : []));
+  saveReviewQueue(loadReviewQueue().filter(x => x.id !== id));
+  if (typeof renderNewsFeed === 'function') { try { renderNewsFeed(); } catch {} }
+  renderReviewHub();
+  if (typeof flashStatus === 'function') flashStatus('Ticker confirmed - persists across refreshes', 'success');
+}
+function reviewNewsFix(id) {
+  const { item, article } = _findQueuedArticle(id);
+  if (!item) return;
+  const raw = (document.getElementById('newsfix-' + id)?.value || '').trim().toUpperCase();
+  if (!raw) { if (typeof flashStatus === 'function') flashStatus('Enter the correct ticker first', 'error'); return; }
+  const tickers = raw.split(/[,\s]+/).filter(Boolean);
+  setArticleFix(article, 'fixed', tickers);
+  saveReviewQueue(loadReviewQueue().filter(x => x.id !== id));
+  if (typeof renderNewsFeed === 'function') { try { renderNewsFeed(); } catch {} }
+  renderReviewHub();
+  if (typeof flashStatus === 'function') flashStatus('Ticker fixed -> ' + tickers.join(', ') + ' (durable)', 'success');
+}
+function reviewNewsBad(id) {
+  const { item, article } = _findQueuedArticle(id);
+  if (!item) return;
+  setArticleFix(article, 'bad', []);
+  saveReviewQueue(loadReviewQueue().filter(x => x.id !== id));
+  if (typeof renderNewsFeed === 'function') { try { renderNewsFeed(); } catch {} }
+  renderReviewHub();
+  if (typeof flashStatus === 'function') flashStatus('Article marked bad - hidden from future pulls', 'success');
+}
+
+function lexiconPrune(dir, phrase) {
+  const lex = loadLexicon();
+  const bucket = dir === 'bull' ? lex.bull : lex.bear;
+  delete bucket[phrase];
+  saveLexicon(lex);
+  renderReviewHub();
+}
+
+// --- Thesis review handlers: corrections write back to the live thesis ---
+function _findThesisForReview(id) {
+  const item = loadReviewQueue().find(x => x.id === id);
+  if (!item) return { item: null, thesis: null };
+  const thesis = (state.probability?.theses || []).find(t => t.id === item.thesisId) || null;
+  return { item, thesis };
+}
+function _dequeue(id) { saveReviewQueue(loadReviewQueue().filter(x => x.id !== id)); }
+function _afterThesisFix() {
+  if (typeof saveTheses === 'function') saveTheses(state.probability.theses);
+  if (typeof renderProbabilityTab === 'function') { try { renderProbabilityTab(); } catch {} }
+  renderReviewHub();
+}
+function reviewThesisConfirm(id) {
+  _dequeue(id); renderReviewHub();
+  if (typeof flashStatus === 'function') flashStatus('Thesis confirmed', 'success');
+}
+function reviewThesisFixTicker(id, ticker) {
+  const { thesis } = _findThesisForReview(id);
+  if (thesis) { thesis.ticker = ticker.toUpperCase(); thesis.snapshots = []; }  // reset snapshots — different ticker
+  _dequeue(id); _afterThesisFix();
+  if (typeof flashStatus === 'function') flashStatus(`Thesis ticker → ${ticker.toUpperCase()}`, 'success');
+}
+function reviewThesisFixTickerInput(id) {
+  const v = (document.getElementById('thesisfix-' + id)?.value || '').trim().toUpperCase();
+  if (!v) { if (typeof flashStatus === 'function') flashStatus('Enter a ticker first', 'error'); return; }
+  reviewThesisFixTicker(id, v);
+}
+function reviewThesisFlip(id) {
+  const { thesis } = _findThesisForReview(id);
+  if (thesis) thesis.direction = thesis.direction === 'above' ? 'below' : 'above';
+  _dequeue(id); _afterThesisFix();
+  if (typeof flashStatus === 'function') flashStatus(`Direction flipped → ${thesis?.direction}`, 'success');
+}
+function reviewThesisDelete(id) {
+  const { thesis } = _findThesisForReview(id);
+  if (thesis) state.probability.theses = state.probability.theses.filter(t => t.id !== thesis.id);
+  _dequeue(id); _afterThesisFix();
+  if (typeof flashStatus === 'function') flashStatus('Thesis deleted', 'success');
+}
+
+// Execute an option attached to a generic flagForReview item, then dequeue.
+function reviewGenericOption(id, optIdx) {
+  const item = loadReviewQueue().find(x => x.id === id);
+  const opt = item?.options?.[optIdx];
+  if (opt && typeof window[opt.action] === 'function') {
+    try { window[opt.action](item); } catch (e) { console.warn('[review] option action failed', e); }
+  }
+  _dequeue(id);
+  renderReviewHub();
+}
+
+
+// Export the lexicon + tracked posts for the XTRAPP backend repo. XTRAPP hosts
+// the post data (data/posts.json) and the learned lexicon (data/lexicon.json),
+// wiring into the app the same way TRAPP2-1 hosts FX/13F data. The app reads
+// these back on load so the model state persists across devices via the repo.
+function exportXtrappData() {
+  const payload = {
+    _schema: 'valuatio-xtrapp-v1',
+    updatedAt: new Date().toISOString(),
+    lexicon: (typeof loadLexicon === 'function') ? loadLexicon() : null,
+    posts: (typeof loadPosts === 'function') ? loadPosts() : [],
+    // Article ticker-corrections — so news fixes sync across devices via the
+    // repo (they're otherwise per-browser localStorage).
+    articleFixes: (typeof loadArticleFixes === 'function') ? loadArticleFixes() : {},
+    // Imported theses (calls turned into probability theses).
+    theses: (typeof state !== 'undefined' && state.probability?.theses) ? state.probability.theses : [],
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'xtrapp_data.json';
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+  if (typeof flashStatus === 'function') flashStatus('Exported lexicon + posts + news fixes for XTRAPP — commit to the repo', 'success');
+}
+
+// Read the XTRAPP repo's data back into the app (model + posts persistence).
+const XTRAPP_BASE = 'https://raw.githubusercontent.com/GoodGlobeLLC/XTRAPP/main/data/';
+async function fetchXtrappData() {
+  try {
+    const r = await fetch(XTRAPP_BASE + 'xtrapp_data.json', { cache: 'no-cache' });
+    if (!r.ok) { console.warn('[xtrapp] not found (status', r.status + ')'); return null; }
+    const j = await r.json();
+    // Merge the repo lexicon with local (repo wins on conflict — it's the
+    // shared source of truth), but never clobber locally-learned phrases that
+    // aren't in the repo yet.
+    if (j.lexicon && typeof saveLexicon === 'function') {
+      const local = loadLexicon();
+      const merged = { bull: { ...local.bull, ...j.lexicon.bull }, bear: { ...local.bear, ...j.lexicon.bear },
+        meta: j.lexicon.meta || local.meta };
+      saveLexicon(merged);
+    }
+    // Merge article fixes (repo wins on conflict). Keeps news corrections in
+    // sync across devices.
+    if (j.articleFixes && typeof saveArticleFixes === 'function') {
+      const localFixes = (typeof loadArticleFixes === 'function') ? loadArticleFixes() : {};
+      saveArticleFixes({ ...localFixes, ...j.articleFixes });
+    }
+    const fixCount = j.articleFixes ? Object.keys(j.articleFixes).length : 0;
+    console.log(`[xtrapp] loaded lexicon (${j.lexicon?Object.keys(j.lexicon.bull||{}).length:0} bull phrases) + ${(j.posts||[]).length} posts + ${fixCount} news fixes`);
+    return j;
+  } catch (e) { console.warn('[xtrapp] fetch failed:', e.message); return null; }
+}
+
+// ============================================================
+//   TRADING BOT — pattern/trend signal engine + paper portfolio
+//
+//   GOAL: give the bot $1,000 and 6 months to beat the user. It makes 3-4
+//   bets/day max, never the same ticker twice in one day, and EVERY bet it
+//   makes is permanent — once placed, the entry price/date/thesis are frozen
+//   and it counts toward the track record forever (win or lose). This is both
+//   the user's "never remove a signal" rule AND what keeps the backtest honest:
+//   no look-ahead, no cherry-picking, no retroactive reconstruction. The record
+//   only accumulates forward from the day the bot is switched on.
+//
+//   MANDATE (per user):
+//     • Long, short, or SIT OUT (no forced trades on weak days)
+//     • Size by conviction (stronger signal = bigger bet)
+//     • May LEVERAGE on very strong conviction
+//     • May HEDGE when the regime is risky
+//
+//   The conviction score fuses ALL available sources:
+//     fundamentals (reasoning chain) · company health · cross-asset alignment ·
+//     Fed rate tailwind · supply-chain momentum · price trend/momentum/
+//     mean-reversion · volatility regime.
+// ============================================================
+
+const BOT_KEY = 'valuatio.bot.v1';
+const BOT_STARTING_BANKROLL = 1000;
+const BOT_MAX_BETS_PER_DAY = 4;
+const BOT_MIN_BETS_PER_DAY = 0;   // can sit out entirely
+const BOT_CONVICTION_THRESHOLD = 0.62;  // below this absolute conviction → no bet
+
+function loadBotState() {
+  try {
+    const raw = localStorage.getItem(BOT_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {}
+  return {
+    bankroll: BOT_STARTING_BANKROLL,
+    startedAt: null,            // set on first bet
+    bets: [],                   // permanent record; never pruned
+    lastRunDate: null,          // YYYY-MM-DD of last daily run
+    benchmarkStart: null,       // SPY price when bot started (for vs-SPY)
+  };
+}
+
+function saveBotState(b) {
+  try { localStorage.setItem(BOT_KEY, JSON.stringify(b)); }
+  catch (e) { console.warn('[bot] save failed:', e.message); }
+}
+
+// ---- Conviction scoring: fuse every signal source for one ticker ----
+// Returns { ticker, conviction (-1..+1, sign = direction), confidence (0..1),
+//   direction: 'long'|'short', leverage, hedge, rationale[], components{} }
+// conviction sign: positive = bullish (long), negative = bearish (short).
+async function botScoreTicker(ticker) {
+  const t = ticker.toUpperCase();
+  const row = (typeof getStockbookRow === 'function') ? getStockbookRow(t) : null;
+  if (!row) return null;
+
+  // Skip non-tradeable-as-equity instruments for the core engine (FX/index).
+  // Derivatives/ETFs are allowed (the bot can use them to express/hedge views).
+  const cls = (typeof classifyAsset === 'function') ? classifyAsset(t) : 'equity';
+  if (['fx', 'index'].includes(cls)) return null;
+
+  const components = {};
+  const rationale = [];
+  let score = 0, weightSum = 0;
+  const add = (key, signed, weight, note) => {
+    if (signed == null || !isFinite(signed)) return;
+    components[key] = +signed.toFixed(3);
+    score += signed * weight;
+    weightSum += weight;
+    if (note) rationale.push(note);
+  };
+
+  // 1. Fundamental reasoning chain (conviction 0-100 → center on 50 → signed)
+  try {
+    if (typeof financialReasoningChain === 'function') {
+      const chain = financialReasoningChain(row);
+      if (chain?.conviction != null) {
+        const signed = (chain.conviction - 50) / 50;  // -1..+1
+        add('fundamentals', signed, 0.26, `Fundamentals: ${chain.verdict} (conviction ${chain.conviction.toFixed(0)})`);
+      }
+    }
+  } catch {}
+
+  // 2. Company health composite (0-100 → signed)
+  try {
+    if (typeof computeCompanyHealth === 'function') {
+      const h = computeCompanyHealth(row);
+      if (h?.composite != null) add('health', (h.composite - 50) / 50, 0.12, null);
+    }
+  } catch {}
+
+  // 3. Price trend (slope + R² → conviction in trend direction)
+  let history = null;
+  try { history = (typeof getHistoryForTicker === 'function') ? getHistoryForTicker(t) : null; } catch {}
+  if (history && history.length >= 30) {
+    try {
+      const trend = featureTrendStrength(history);
+      if (trend) {
+        // slopePerDayPct scaled; weighted by R² (trend reliability)
+        const signed = Math.max(-1, Math.min(1, trend.slopePerDayPct * 40)) * Math.min(1, trend.r2 * 1.5);
+        add('trend', signed, 0.18, trend.slope > 0
+          ? `Uptrend (R²=${trend.r2.toFixed(2)})` : `Downtrend (R²=${trend.r2.toFixed(2)})`);
+      }
+    } catch {}
+    // 4. Momentum (0-1 → signed)
+    try {
+      const mom = featureMomentum(history, row.price);
+      if (mom != null) add('momentum', (mom - 0.5) * 2, 0.14, null);
+    } catch {}
+    // 5. Mean-reversion (only as a counter-weight; oversold = bullish tilt)
+    try {
+      const mr = featureMeanReversion(history, row.price, row.price, 'above', 20);
+      if (mr != null) add('meanReversion', (mr - 0.5) * 2, 0.06, null);
+    } catch {}
+  }
+
+  // 6. Cross-asset / sector alignment
+  try {
+    if (typeof extractCrossAssetSignals === 'function') {
+      const xa = extractCrossAssetSignals();
+      const sector = (row.sector || '').toLowerCase();
+      // Pick the most relevant cross-asset signal for the sector
+      let sig = null;
+      if (/material|metal|chem/.test(sector)) sig = xa.signals?.industrialDemand;
+      else if (/energy/.test(sector)) sig = xa.signals?.energyComplex;
+      else if (/financ/.test(sector)) sig = xa.signals?.globalIndices;
+      else if (/tech|communication/.test(sector)) sig = xa.signals?.globalIndices;
+      else sig = xa.signals?.macroAlignment;
+      if (sig && typeof sig.raw === 'number') {
+        add('crossAsset', Math.max(-1, Math.min(1, sig.raw)), 0.10,
+          `Sector cross-asset: ${sig.tone || ''}`);
+      }
+    }
+  } catch {}
+
+  // 7. Fed rate tailwind/headwind for rate-sensitive sectors
+  try {
+    if (typeof fedRateExpectation === 'function') {
+      const fed = fedRateExpectation();
+      const sector = (row.sector || '').toLowerCase();
+      const easing = Math.max(-1, Math.min(1, -fed.expectedBpsChange / 75));
+      let sens = 0;
+      if (/real estate|reit|utilit|homebuild/.test(sector)) sens = 1;
+      else if (/tech|growth|biotech/.test(sector)) sens = 0.5;
+      else if (/financ|bank/.test(sector)) sens = -0.4;
+      if (sens !== 0) add('fed', easing * sens, 0.08,
+        `Fed ${fed.stance} (${fed.expectedBpsChange >= 0 ? '+' : ''}${fed.expectedBpsChange.toFixed(0)}bps)`);
+    }
+  } catch {}
+
+  // 8. Supply-chain momentum: the actual average performance of the ticker's
+  //    chain peers. This is now a SCORED signal (0.06 weight), not just a note —
+  //    if a name's chain peers are rallying/falling, that tailwind/headwind
+  //    moves conviction, connecting the supply-chain data into the engine.
+  try {
+    if (typeof findChainsForTicker === 'function') {
+      const matches = findChainsForTicker(t);
+      if (matches?.length) {
+        const cm = (typeof chainMomentumForTicker === 'function') ? chainMomentumForTicker(t) : null;
+        if (cm && cm.signed != null) {
+          add('supplyChain', cm.signed, 0.06,
+            `Supply-chain peers ${cm.avgPct >= 0 ? '+' : ''}${cm.avgPct.toFixed(1)}% (${cm.peerCount} peers in ${matches.map(m => m.chain.name).slice(0, 2).join(', ')})`);
+        } else {
+          rationale.push(`In ${matches.length} supply chain${matches.length === 1 ? '' : 's'}: ${matches.map(m => m.chain.name).slice(0, 2).join(', ')}`);
+        }
+      }
+    }
+  } catch {}
+
+  // 9. Stock-based comp drag: heavy SBC inflates reported cash metrics and
+  //    dilutes holders, so it's a genuine conviction headwind. Connect it.
+  try {
+    if (typeof analyzeStockBasedComp === 'function') {
+      const sbcA = analyzeStockBasedComp(row);
+      if (sbcA?.available && sbcA.pctRevenue != null) {
+        // Map severity to a small negative signal (only ever a drag).
+        const sbcSigned = sbcA.severity === 'severe' ? -0.7 : sbcA.severity === 'high' ? -0.4 : sbcA.severity === 'moderate' ? -0.15 : 0;
+        if (sbcSigned !== 0) add('sbc', sbcSigned, 0.04, `SBC ${(sbcA.pctRevenue*100).toFixed(0)}% of revenue (${sbcA.severity})`);
+      }
+    }
+  } catch {}
+
+  // 10. Institutional positioning (13F): tracked funds' net adding/trimming.
+  //     A slow, contextual "smart money" signal — quarterly + lagged, so it's a
+  //     modest weight (0.05). Only contributes when an institution holds it.
+  try {
+    if (typeof institutionalSignal === 'function') {
+      const inst = institutionalSignal(t);
+      if (inst && inst.signed != null && inst.holderCount > 0) {
+        add('institutional', inst.signed, 0.05, `13F: ${inst.label}`);
+      }
+    }
+  } catch {}
+
+  // 11. Earnings recency (SEC filings): fundamentals freshly confirmed vs stale.
+  //     A tiny context weight (0.03) — recency isn't direction, just confidence.
+  try {
+    if (typeof earningsRecencySignal === 'function') {
+      const er = earningsRecencySignal(t);
+      if (er && er.signed !== 0) add('earningsRecency', er.signed, 0.03, `SEC: ${er.label}`);
+    }
+  } catch {}
+
+  if (weightSum === 0) return null;
+  let conviction = score / weightSum;  // -1..+1
+  let direction = conviction >= 0 ? 'long' : 'short';
+
+  // SHORT carry penalty: a short on a dividend-payer owes that dividend (negative
+  // carry). Over a typical hold (~horizonDays) that cost eats into the edge, so a
+  // short needs EXTRA bearish conviction to be worth opening on a high-yielder.
+  // Shrink the (negative) conviction toward zero proportional to the expected
+  // carry drag — enough yield can make a marginal short not worth it.
+  let carryNote = null;
+  if (direction === 'short') {
+    const yld = row.dividendYield;
+    if (yld != null && isFinite(yld) && yld > 0) {
+      const horizon = confidenceHorizonDays(Math.abs(conviction));   // expected hold
+      const carryDrag = yld * (horizon / 365);            // fractional cost over the hold
+      // Translate the carry into a conviction haircut: a 2% expected carry over
+      // the hold trims ~0.2 off the |conviction| (capped so it can flip a weak short to a sit-out).
+      const haircut = Math.min(Math.abs(conviction), carryDrag * 10);
+      conviction += haircut;   // conviction is negative for shorts; adding moves it toward 0
+      if (haircut > 0.001) carryNote = `Short carry: ${(yld*100).toFixed(1)}% yield ≈ ${(carryDrag*100).toFixed(1)}% over hold — trimmed conviction ${haircut.toFixed(2)}`;
+      // Re-derive direction in case the haircut flipped it past zero (→ sit out).
+      direction = conviction >= 0 ? 'long' : 'short';
+    }
+  }
+  const confidence = Math.min(1, Math.abs(conviction));
+  if (carryNote) rationale.push(carryNote);
+
+  // Volatility regime → hedge flag (risky times)
+  let hedge = false, volRegime = null;
+  if (history && history.length >= 60) {
+    try {
+      volRegime = featureVolRegime(history);
+      if (volRegime != null && volRegime > 1.4) hedge = true;  // expanding vol
+    } catch {}
+  }
+
+  // Leverage on very strong conviction (and not in a high-vol regime)
+  const leverage = (confidence >= 0.8 && !hedge) ? 2 : 1;
+
+  return {
+    ticker: t,
+    name: row.name || t,
+    sector: row.sector || null,
+    price: row.price,
+    conviction,
+    confidence,
+    direction,
+    leverage,
+    hedge,
+    volRegime: volRegime != null ? +volRegime.toFixed(2) : null,
+    rationale,
+    components,
+  };
+}
+
+// ---- Daily run: score the universe, pick the best 3-4, place permanent bets ----
+async function botDailyRun(force = false) {
+  const bot = loadBotState();
+  const today = new Date().toISOString().slice(0, 10);
+  if (!force && bot.lastRunDate === today) {
+    console.log('[bot] already ran today', today);
+    return bot;
+  }
+
+  const rows = (typeof state !== 'undefined' && state.stockbook?.rows) ? state.stockbook.rows : [];
+  if (!rows.length) { console.warn('[bot] no stockbook rows — skipping run'); return bot; }
+
+  // Candidate universe: tradeable equities/ETFs with a price and enough history.
+  const candidates = rows.filter(r => {
+    const cls = (typeof classifyAsset === 'function') ? classifyAsset(r.ticker) : 'equity';
+    return r.price > 0 && !['fx', 'index'].includes(cls);
+  });
+
+  // Tickers already bet today (none same-day duplicates)
+  const betToday = new Set(bot.bets.filter(b => b.entryDate === today).map(b => b.ticker));
+
+  // Score candidates (cap the work — score a rotating slice if huge)
+  const scored = [];
+  for (const r of candidates) {
+    if (betToday.has(r.ticker)) continue;
+    const s = await botScoreTicker(r.ticker).catch(() => null);
+    if (s && s.confidence >= BOT_CONVICTION_THRESHOLD) scored.push(s);
+  }
+
+  // Rank by confidence (absolute conviction), take top N
+  scored.sort((a, b) => b.confidence - a.confidence);
+  const slotsLeft = BOT_MAX_BETS_PER_DAY - bot.bets.filter(b => b.entryDate === today).length;
+  const picks = scored.slice(0, Math.max(0, slotsLeft));
+
+  if (!bot.startedAt && picks.length) {
+    bot.startedAt = today;
+    // Record SPY benchmark start
+    const spy = (typeof getStockbookRow === 'function') ? getStockbookRow('SPY') : null;
+    bot.benchmarkStart = spy?.price || null;
+  }
+
+  // Position sizing: by conviction, from current bankroll. Reserve so 4 bets
+  // can coexist; scale each by its share of conviction.
+  const convSum = picks.reduce((s, p) => s + p.confidence, 0) || 1;
+  for (const p of picks) {
+    const sizeFraction = (p.confidence / convSum) * 0.8;  // deploy up to 80% across picks
+    const dollars = bot.bankroll * sizeFraction * p.leverage;
+    bot.bets.push({
+      id: `${p.ticker}-${today}-${Date.now()}`,
+      ticker: p.ticker,
+      name: p.name,
+      sector: p.sector,
+      direction: p.direction,
+      entryDate: today,
+      entryPrice: p.price,
+      dollars: +dollars.toFixed(2),
+      leverage: p.leverage,
+      hedge: p.hedge,
+      conviction: +p.conviction.toFixed(3),
+      confidence: +p.confidence.toFixed(3),
+      rationale: p.rationale,
+      components: p.components,
+      // Horizon: stronger conviction → willing to hold longer; default 20 sessions
+      horizonDays: confidenceHorizonDays(p.confidence),
+      status: 'open',
+      exitDate: null,
+      exitPrice: null,
+      // Frozen forever — performance measured forward from here.
+    });
+    console.log(`[bot] BET ${p.direction.toUpperCase()} ${p.ticker} $${dollars.toFixed(0)}${p.leverage > 1 ? ` (${p.leverage}x)` : ''} — conf ${(p.confidence * 100).toFixed(0)}%`);
+  }
+
+  bot.lastRunDate = today;
+  saveBotState(bot);
+  return bot;
+}
+
+// ---- Mark-to-market + close bets that hit their horizon ----
+// Expected hold length for a bet, derived from conviction strength — used both
+// for sizing the dividend-carry penalty and for setting a bet's horizon.
+function confidenceHorizonDays(confidence) {
+  return confidence >= 0.8 ? 20 : 10;
+}
+
+// Negative carry on a SHORT: when you short a dividend-paying stock you OWE the
+// dividend to the lender, deducted from your account. On $100 short of an 8%
+// yielder that's $8/yr — a real cost that erodes a short's P&L the longer it's
+// held, and makes opening shorts on high-yielders expensive. Returns the dollar
+// carry cost for a short of `dollars` notional held `days` days at the row's yield.
+function shortDividendCarry(ticker, dollars, days) {
+  const row = (typeof getStockbookRow === 'function') ? getStockbookRow(ticker) : null;
+  const yld = row?.dividendYield;
+  if (yld == null || !isFinite(yld) || yld <= 0 || !(dollars > 0) || !(days > 0)) return 0;
+  // Annual carry = notional × yield; prorate by days held.
+  return dollars * yld * (days / 365);
+}
+
+// Honest scoring: uses ONLY the current price vs the frozen entry. No rewriting.
+function botMarkToMarket() {
+  const bot = loadBotState();
+  const today = new Date().toISOString().slice(0, 10);
+  let changed = false;
+  for (const bet of bot.bets) {
+    const row = (typeof getStockbookRow === 'function') ? getStockbookRow(bet.ticker) : null;
+    const px = row?.price;
+    if (px == null || !isFinite(px)) continue;
+    bet.lastPrice = px;
+    // Raw % move of the underlying since entry
+    const rawPct = bet.entryPrice > 0 ? (px - bet.entryPrice) / bet.entryPrice : 0;
+    // Directional return (short profits when price falls), times leverage
+    const dirPct = (bet.direction === 'long' ? rawPct : -rawPct) * (bet.leverage || 1);
+    let pnl = bet.dollars * dirPct;
+    // SHORT negative carry: deduct the owed dividend, prorated by days held.
+    // This is a genuine cost that makes shorts on high-yielders expensive to hold.
+    if (bet.direction === 'short') {
+      const heldDays = Math.max(0, Math.round((new Date(today) - new Date(bet.entryDate)) / 86400000));
+      const carry = (typeof shortDividendCarry === 'function')
+        ? shortDividendCarry(bet.ticker, bet.dollars * (bet.leverage || 1), heldDays) : 0;
+      if (carry > 0) {
+        pnl -= carry;
+        bet.dividendCarry = +carry.toFixed(2);   // surfaced in the ledger
+      }
+    }
+    bet.returnPct = +(dirPct * 100).toFixed(2);
+    bet.pnl = +pnl.toFixed(2);
+    // Auto-close at horizon
+    if (bet.status === 'open') {
+      const ageDays = Math.round((new Date(today) - new Date(bet.entryDate)) / 86400000);
+      if (ageDays >= bet.horizonDays) {
+        bet.status = 'closed';
+        bet.exitDate = today;
+        bet.exitPrice = px;
+        changed = true;
+      }
+    }
+  }
+  if (changed) saveBotState(bot);
+  return bot;
+}
+
+// ---- Aggregate performance (optionally filtered to one ticker) ----
+function botPerformance(filterTicker = null) {
+  const bot = botMarkToMarket();
+  let bets = bot.bets;
+  if (filterTicker) bets = bets.filter(b => b.ticker === filterTicker.toUpperCase());
+
+  const closed = bets.filter(b => b.status === 'closed');
+  const open = bets.filter(b => b.status === 'open');
+  const wins = closed.filter(b => (b.pnl || 0) > 0);
+  const losses = closed.filter(b => (b.pnl || 0) < 0);
+  const totalPnl = bets.reduce((s, b) => s + (b.pnl || 0), 0);
+  const realizedPnl = closed.reduce((s, b) => s + (b.pnl || 0), 0);
+
+  // vs SPY benchmark
+  let spyReturn = null;
+  const spy = (typeof getStockbookRow === 'function') ? getStockbookRow('SPY') : null;
+  if (bot.benchmarkStart && spy?.price) {
+    spyReturn = ((spy.price - bot.benchmarkStart) / bot.benchmarkStart) * 100;
+  }
+
+  return {
+    startedAt: bot.startedAt,
+    bankroll: bot.bankroll,
+    currentValue: +(bot.bankroll + totalPnl).toFixed(2),
+    totalReturnPct: +((totalPnl / BOT_STARTING_BANKROLL) * 100).toFixed(2),
+    totalPnl: +totalPnl.toFixed(2),
+    realizedPnl: +realizedPnl.toFixed(2),
+    betCount: bets.length,
+    openCount: open.length,
+    closedCount: closed.length,
+    winCount: wins.length,
+    lossCount: losses.length,
+    winRate: closed.length ? +((wins.length / closed.length) * 100).toFixed(1) : null,
+    avgWin: wins.length ? +(wins.reduce((s, b) => s + b.pnl, 0) / wins.length).toFixed(2) : null,
+    avgLoss: losses.length ? +(losses.reduce((s, b) => s + b.pnl, 0) / losses.length).toFixed(2) : null,
+    spyReturn: spyReturn != null ? +spyReturn.toFixed(2) : null,
+    bets,
+  };
+}
+
+// ============================================================
+//   BETS TAB RENDERER + TODAY'S-BETS TOP BANNER
+// ============================================================
+function renderBetsTab() {
+  const body = document.getElementById('bets-body');
+  if (!body) return;
+  const filter = (document.getElementById('bets-filter')?.value || '').trim().toUpperCase() || null;
+  const perf = botPerformance(filter);
+  const today = new Date().toISOString().slice(0, 10);
+
+  const fmtPnl = (v) => v == null ? '—' : `${v >= 0 ? '+' : ''}$${Math.abs(v).toFixed(2)}`;
+  const pnlColor = (v) => v > 0 ? 'var(--pos)' : v < 0 ? 'var(--neg)' : 'var(--ink-dim)';
+  const dirBadge = (d) => d === 'long'
+    ? `<span style="color:var(--pos);font-weight:700">▲ LONG</span>`
+    : `<span style="color:var(--neg);font-weight:700">▼ SHORT</span>`;
+
+  // ---- Performance summary cards ----
+  const beatingYou = '';  // (user portfolio comparison wired separately)
+  const vsSpyColor = (perf.spyReturn != null && perf.totalReturnPct != null)
+    ? (perf.totalReturnPct > perf.spyReturn ? 'var(--pos)' : 'var(--neg)') : 'var(--ink-dim)';
+  const summary = `
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:18px 0">
+      <div class="company-card" style="margin:0;border-left:3px solid ${pnlColor(perf.totalPnl)}">
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Portfolio Value</div>
+        <div style="font-family:var(--mono);font-size:24px;font-weight:700;color:${pnlColor(perf.totalPnl)};margin-top:4px">$${perf.currentValue.toFixed(2)}</div>
+        <div style="font-family:var(--mono);font-size:9px;color:${pnlColor(perf.totalPnl)};margin-top:2px">${perf.totalReturnPct >= 0 ? '+' : ''}${perf.totalReturnPct}% from $1,000</div>
+      </div>
+      <div class="company-card" style="margin:0">
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Total P/L</div>
+        <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:${pnlColor(perf.totalPnl)};margin-top:4px">${fmtPnl(perf.totalPnl)}</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">${fmtPnl(perf.realizedPnl)} realized</div>
+      </div>
+      <div class="company-card" style="margin:0">
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Win Rate</div>
+        <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:var(--ink);margin-top:4px">${perf.winRate != null ? perf.winRate + '%' : '—'}</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">${perf.winCount}W / ${perf.lossCount}L · ${perf.closedCount} closed</div>
+      </div>
+      <div class="company-card" style="margin:0">
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">vs SPY</div>
+        <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:${vsSpyColor};margin-top:4px">${perf.spyReturn != null ? (perf.spyReturn >= 0 ? '+' : '') + perf.spyReturn + '%' : '—'}</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">${perf.totalReturnPct != null && perf.spyReturn != null ? (perf.totalReturnPct > perf.spyReturn ? 'bot winning' : 'SPY winning') : 'benchmark'}</div>
+      </div>
+      <div class="company-card" style="margin:0">
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Total Bets</div>
+        <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:var(--ink);margin-top:4px">${perf.betCount}</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">${perf.openCount} open · since ${perf.startedAt || '—'}</div>
+      </div>
+    </div>`;
+
+  // ---- Today's bets highlight ----
+  const todayBets = perf.bets.filter(b => b.entryDate === today);
+  const todayHtml = todayBets.length ? `
+    <div class="company-card" style="border-left:3px solid var(--amber)">
+      <h4>Today's Bets · ${today}</h4>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px">
+        ${todayBets.map(b => `
+          <div style="padding:10px 12px;background:var(--bg-elev);border:1px solid var(--rule);border-radius:3px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+              <strong style="color:var(--amber);font-family:var(--mono)">${b.ticker}</strong>
+              <span style="font-family:var(--mono);font-size:10px">${dirBadge(b.direction)}${b.leverage > 1 ? ` <span style="color:#e0b04c">${b.leverage}x</span>` : ''}${b.hedge ? ' 🛡' : ''}</span>
+            </div>
+            <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim)">$${b.dollars.toFixed(0)} · conf ${(b.confidence * 100).toFixed(0)}% · entry $${b.entryPrice.toFixed(2)}</div>
+            <div style="font-size:10px;color:var(--ink-faint);margin-top:6px;line-height:1.4">${(b.rationale || []).slice(0, 2).map(escapeHtml).join(' · ')}</div>
+          </div>
+        `).join('')}
+      </div>
+    </div>` : `
+    <div class="company-card">
+      <h4>Today's Bets · ${today}</h4>
+      <div style="color:var(--ink-faint);font-family:var(--mono);font-size:11px;padding:10px 0">
+        No bets placed today yet. ${perf.startedAt ? 'The bot sits out when nothing clears its conviction threshold.' : 'Click <strong style="color:var(--amber)">Run Scan</strong> to start the bot.'}
+      </div>
+    </div>`;
+
+  // ---- Full bet ledger ----
+  const ledgerRows = perf.bets.slice().reverse().map(b => `
+    <tr>
+      <td style="font-family:var(--mono);font-size:11px">${b.entryDate}</td>
+      <td style="font-family:var(--mono);font-weight:700">${b.ticker}</td>
+      <td style="font-family:var(--mono);font-size:11px">${dirBadge(b.direction)}${b.leverage > 1 ? ` ${b.leverage}x` : ''}${b.hedge ? ' 🛡' : ''}</td>
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">$${b.dollars.toFixed(0)}</td>
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">$${b.entryPrice.toFixed(2)}</td>
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${b.lastPrice != null ? '$' + b.lastPrice.toFixed(2) : '—'}</td>
+      <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${pnlColor(b.returnPct)}">${b.returnPct != null ? (b.returnPct >= 0 ? '+' : '') + b.returnPct + '%' : '—'}</td>
+      <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${pnlColor(b.pnl)}">${fmtPnl(b.pnl)}</td>
+      <td style="font-family:var(--mono);font-size:10px;color:${b.status === 'open' ? 'var(--amber)' : 'var(--ink-faint)'}">${b.status.toUpperCase()}</td>
+    </tr>
+  `).join('');
+
+  const ledger = perf.bets.length ? `
+    <div class="company-card">
+      <h4>${filter ? filter + ' — ' : ''}Bet Ledger <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· every bet permanent · ${perf.bets.length} total</span></h4>
+      <div style="overflow-x:auto">
+        <table class="sb-table" style="width:100%;min-width:680px">
+          <thead><tr><th>Entry Date</th><th>Ticker</th><th>Direction</th><th>Size</th><th>Entry</th><th>Last</th><th>Return</th><th>P/L</th><th>Status</th></tr></thead>
+          <tbody>${ledgerRows}</tbody>
+        </table>
+      </div>
+    </div>` : '';
+
+  // ---- Honesty note ----
+  const note = `
+    <div class="company-card" style="border-left:3px solid var(--ink-faint)">
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);line-height:1.7">
+        <strong style="color:var(--ink)">How this stays honest:</strong> every bet is frozen at its entry price/date the moment it's placed and is <strong>never removed</strong> — wins and losses both count. The track record only accumulates <strong>forward</strong> from the day the bot started (${perf.startedAt || 'not yet started'}); it does not reconstruct hypothetical past trades. Returns are measured purely from the underlying's move since entry (shorts profit when price falls; leverage multiplies both ways). This is a paper portfolio.
+      </div>
+    </div>`;
+
+  body.innerHTML = summary + todayHtml + ledger + note;
+}
+
+// Top-of-page banner showing today's bets (rendered on the Valuation/Home view).
+function renderTodaysBetsBanner() {
+  const host = document.getElementById('todays-bets-banner');
+  if (!host) return;
+  const today = new Date().toISOString().slice(0, 10);
+  const bot = (typeof botMarkToMarket === 'function') ? botMarkToMarket() : loadBotState();
+  const todayBets = bot.bets.filter(b => b.entryDate === today);
+  if (!todayBets.length) { host.style.display = 'none'; return; }
+  host.style.display = '';
+  host.innerHTML = `
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 14px;background:var(--bg-elev);border:1px solid var(--amber);border-radius:4px">
+      <span style="font-family:var(--mono);font-size:10px;color:var(--amber);font-weight:700;letter-spacing:0.1em">🤖 TODAY'S BOT BETS</span>
+      ${todayBets.map(b => `
+        <span style="font-family:var(--mono);font-size:11px;cursor:pointer" onclick="switchTab('bets')" title="${escapeHtml((b.rationale||[]).slice(0,2).join(' · '))}">
+          <strong style="color:var(--ink)">${b.ticker}</strong>
+          <span style="color:${b.direction === 'long' ? 'var(--pos)' : 'var(--neg)'}">${b.direction === 'long' ? '▲' : '▼'}</span>${b.leverage > 1 ? `<span style="color:#e0b04c">${b.leverage}x</span>` : ''}
+        </span>
+      `).join('<span style="color:var(--ink-faint)">·</span>')}
+      <span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-left:auto;cursor:pointer" onclick="switchTab('bets')">view all →</span>
+    </div>`;
+}
+
+
+// ============================================================
+//   WEB: 3D Supply-Chain Relationship Graph (Bloomberg-style)
+//
+//   Force-directed 3D graph of companies connected by shared supply chains.
+//   Nodes = tickers (sized by chain participation, colored by sector).
+//   Edges = two companies co-occur in a supply chain.
+//   The layout runs a 3D spring simulation; we project to 2D with perspective
+//   so closer nodes are larger/brighter. The whole cloud auto-rotates and can
+//   be dragged. A lens filter re-scopes the graph (by chain, sector, or a
+//   keyword like "AI" that matches chain names/descriptions/roles).
+//
+//   No external 3D library — physics + projection are written here so it works
+//   in the artifact/standalone environment with zero dependencies.
+// ============================================================
+
+const WEB_STATE = {
+  lens: 'all',          // 'all' | chain id | 'sector:<Sector>' | 'kw:<keyword>'
+  rotX: -0.3, rotY: 0,
+  autoRotate: true,
+  nodes: [], edges: [],
+  dragging: false, lastX: 0, lastY: 0,
+  raf: null, hover: null,
+};
+
+// Build the node/edge graph from SUPPLY_CHAINS under the current lens.
+function buildWebGraph() {
+  const lens = WEB_STATE.lens;
+  const chains = (typeof SUPPLY_CHAINS !== 'undefined' ? SUPPLY_CHAINS : []);
+  const kw = lens.startsWith('kw:') ? lens.slice(3).toLowerCase() : null;
+  const sectorFilter = lens.startsWith('sector:') ? lens.slice(7) : null;
+
+  // Which chains are in scope?
+  const inScope = chains.filter(ch => {
+    if (lens === 'all') return true;
+    if (sectorFilter) return (ch.sector || '') === sectorFilter;
+    if (kw) {
+      const hay = `${ch.name} ${ch.description} ${[...(ch.upstream||[]),...(ch.midstream||[]),...(ch.downstream||[])].map(n=>n.role||'').join(' ')}`.toLowerCase();
+      return hay.includes(kw);
+    }
+    return ch.id === lens;  // specific chain
+  });
+
+  // Collect nodes (tickers) and edges (co-membership within a chain).
+  const nodeMap = new Map();  // ticker -> { ticker, name, sector, chains:Set, tiers:Set, degree }
+  const edgeSet = new Map();  // "A|B" -> { a, b, chains:Set }
+  const tickerSector = {};
+
+  const addNode = (member, chain, tier) => {
+    const t = (member.ticker || member.name || '').toUpperCase();
+    if (!t) return null;
+    if (!nodeMap.has(t)) {
+      nodeMap.set(t, { ticker: t, name: member.name || t, sector: chain.sector || 'Other', chains: new Set(), tiers: new Set() });
+    }
+    const n = nodeMap.get(t);
+    n.chains.add(chain.name);
+    n.tiers.add(tier);
+    tickerSector[t] = chain.sector || 'Other';
+    return t;
+  };
+
+  for (const ch of inScope) {
+    const members = [];
+    (ch.upstream || []).forEach(m => { const t = addNode(m, ch, 'up'); if (t) members.push(t); });
+    (ch.midstream || []).forEach(m => { const t = addNode(m, ch, 'mid'); if (t) members.push(t); });
+    (ch.downstream || []).forEach(m => { const t = addNode(m, ch, 'down'); if (t) members.push(t); });
+    // Edges: connect all members of this chain (co-membership). To avoid an
+    // O(n^2) hairball on big chains, connect each node to the next few in
+    // sequence (chain proximity) plus cross-tier links.
+    for (let i = 0; i < members.length; i++) {
+      for (let j = i + 1; j < Math.min(i + 4, members.length); j++) {
+        const a = members[i], b = members[j];
+        if (a === b) continue;
+        const key = a < b ? `${a}|${b}` : `${b}|${a}`;
+        if (!edgeSet.has(key)) edgeSet.set(key, { a, b, chains: new Set() });
+        edgeSet.get(key).chains.add(ch.name);
+      }
+    }
+  }
+
+  // Sector color palette
+  const SECTOR_COLORS = {
+    'Technology': '#5b9ad4', 'Energy': '#d4a24c', 'Materials': '#9a7b5a',
+    'Industrials': '#7faaca', 'Consumer Discretionary': '#c47ba0',
+    'Consumer Staples': '#7fb37f', 'Utilities': '#6db3b3',
+    'Financials': '#8a8fd4', 'Healthcare': '#d47f7f', 'Other': '#9a9387',
+  };
+
+  // Initialize 3D positions on a sphere, sized by degree.
+  const nodes = [...nodeMap.values()].map((n, i, arr) => {
+    const phi = Math.acos(1 - 2 * (i + 0.5) / arr.length);
+    const theta = Math.PI * (1 + Math.sqrt(5)) * i;
+    const R = 220;
+    return {
+      ...n,
+      degree: n.chains.size,
+      color: SECTOR_COLORS[n.sector] || SECTOR_COLORS.Other,
+      x: R * Math.sin(phi) * Math.cos(theta),
+      y: R * Math.sin(phi) * Math.sin(theta),
+      z: R * Math.cos(phi),
+      vx: 0, vy: 0, vz: 0,
+    };
+  });
+  const idx = {}; nodes.forEach((n, i) => idx[n.ticker] = i);
+  const edges = [...edgeSet.values()].map(e => ({ a: idx[e.a], b: idx[e.b], w: e.chains.size }))
+    .filter(e => e.a != null && e.b != null);
+
+  WEB_STATE.nodes = nodes;
+  WEB_STATE.edges = edges;
+  return { nodes, edges, sectorColors: SECTOR_COLORS };
+}
+
+// One step of the 3D force simulation (repulsion + spring + centering).
+function stepWebForces() {
+  const nodes = WEB_STATE.nodes, edges = WEB_STATE.edges;
+  const n = nodes.length;
+  if (!n) return;
+  const REP = 1400, SPRING = 0.012, DAMP = 0.86, CENTER = 0.004;
+  // Repulsion (O(n^2) — fine for the few-hundred-node graphs here)
+  for (let i = 0; i < n; i++) {
+    const a = nodes[i];
+    for (let j = i + 1; j < n; j++) {
+      const b = nodes[j];
+      let dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+      let d2 = dx*dx + dy*dy + dz*dz + 0.01;
+      const f = REP / d2;
+      const d = Math.sqrt(d2);
+      const fx = f * dx / d, fy = f * dy / d, fz = f * dz / d;
+      a.vx += fx; a.vy += fy; a.vz += fz;
+      b.vx -= fx; b.vy -= fy; b.vz -= fz;
+    }
+  }
+  // Springs along edges
+  for (const e of edges) {
+    const a = nodes[e.a], b = nodes[e.b];
+    let dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+    const d = Math.sqrt(dx*dx + dy*dy + dz*dz) + 0.01;
+    const target = 90;
+    const f = SPRING * (d - target);
+    const fx = f * dx / d, fy = f * dy / d, fz = f * dz / d;
+    a.vx += fx; a.vy += fy; a.vz += fz;
+    b.vx -= fx; b.vy -= fy; b.vz -= fz;
+  }
+  // Integrate + centering pull + damping
+  for (const nd of nodes) {
+    nd.vx -= nd.x * CENTER; nd.vy -= nd.y * CENTER; nd.vz -= nd.z * CENTER;
+    nd.vx *= DAMP; nd.vy *= DAMP; nd.vz *= DAMP;
+    nd.x += nd.vx; nd.y += nd.vy; nd.z += nd.vz;
+  }
+}
+
+// Project a 3D point to 2D with rotation + perspective.
+function projectWeb(p, cx, cy) {
+  const { rotX, rotY } = WEB_STATE;
+  // Rotate around Y then X
+  let x = p.x * Math.cos(rotY) - p.z * Math.sin(rotY);
+  let z = p.x * Math.sin(rotY) + p.z * Math.cos(rotY);
+  let y = p.y * Math.cos(rotX) - z * Math.sin(rotX);
+  z = p.y * Math.sin(rotX) + z * Math.cos(rotX);
+  const FOV = 520, VIEW = 520;
+  const scale = FOV / (VIEW + z);
+  return { sx: cx + x * scale, sy: cy + y * scale, scale, z };
+}
+
+function renderWebFrame() {
+  const canvas = document.getElementById('web-canvas');
+  if (!canvas) { if (WEB_STATE.raf) cancelAnimationFrame(WEB_STATE.raf); return; }
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  if (canvas.width !== W * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const cx = W / 2, cy = H / 2;
+
+  // Physics: run a few sub-steps until it settles, then ease off
+  stepWebForces();
+  if (WEB_STATE.autoRotate && !WEB_STATE.dragging) WEB_STATE.rotY += 0.0035;
+
+  const nodes = WEB_STATE.nodes, edges = WEB_STATE.edges;
+  // Project all nodes
+  const proj = nodes.map(p => projectWeb(p, cx, cy));
+
+  // Draw edges first (depth-sorted by average z, back to front)
+  const edgeList = edges.map(e => ({ e, z: (proj[e.a].z + proj[e.b].z) / 2 })).sort((a, b) => b.z - a.z);
+  for (const { e } of edgeList) {
+    const pa = proj[e.a], pb = proj[e.b];
+    const depth = (pa.scale + pb.scale) / 2;
+    ctx.strokeStyle = `rgba(150,150,160,${0.06 + depth * 0.12})`;
+    ctx.lineWidth = Math.max(0.3, e.w * 0.4 * depth);
+    ctx.beginPath();
+    ctx.moveTo(pa.sx, pa.sy);
+    ctx.lineTo(pb.sx, pb.sy);
+    ctx.stroke();
+  }
+
+  // Draw nodes back-to-front
+  const order = nodes.map((n, i) => i).sort((a, b) => proj[b].z - proj[a].z);
+  for (const i of order) {
+    const n = nodes[i], pp = proj[i];
+    const r = Math.max(2, (3 + Math.sqrt(n.degree) * 3) * pp.scale);
+    const isHover = WEB_STATE.hover === i;
+    ctx.globalAlpha = Math.min(1, 0.35 + pp.scale * 0.6);
+    ctx.fillStyle = n.color;
+    ctx.beginPath();
+    ctx.arc(pp.sx, pp.sy, r, 0, Math.PI * 2);
+    ctx.fill();
+    if (isHover) {
+      ctx.globalAlpha = 1; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+    // Label larger / hovered nodes
+    if (n.degree >= 3 || isHover || pp.scale > 1.05) {
+      ctx.globalAlpha = Math.min(1, pp.scale);
+      ctx.fillStyle = isHover ? '#fff' : 'rgba(220,215,205,0.9)';
+      ctx.font = `${Math.max(8, 10 * pp.scale)}px JetBrains Mono, monospace`;
+      ctx.textAlign = 'center';
+      ctx.fillText(n.ticker, pp.sx, pp.sy - r - 3);
+    }
+  }
+  ctx.globalAlpha = 1;
+  WEB_STATE._proj = proj;
+  WEB_STATE.raf = requestAnimationFrame(renderWebFrame);
+}
+
+function fnWEB() {
+  openFnOverlay('WEB', '');
+  const chains = (typeof SUPPLY_CHAINS !== 'undefined' ? SUPPLY_CHAINS : []);
+  const sectors = [...new Set(chains.map(c => c.sector).filter(Boolean))].sort();
+
+  const lensOptions = [
+    `<option value="all">All Chains (full web)</option>`,
+    `<optgroup label="By Sector">` +
+      sectors.map(s => `<option value="sector:${escapeHtml(s)}">${escapeHtml(s)}</option>`).join('') +
+    `</optgroup>`,
+    `<optgroup label="By Supply Chain">` +
+      chains.map(c => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.name)}</option>`).join('') +
+    `</optgroup>`,
+  ].join('');
+
+  setFnOverlayBody(`
+    <div style="display:flex;flex-direction:column;height:100%;min-height:560px">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding-bottom:12px;border-bottom:1px solid var(--rule);margin-bottom:8px">
+        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.1em">Lens</div>
+        <select id="web-lens" class="heat-filter-select" style="min-width:220px">${lensOptions}</select>
+        <input id="web-kw" placeholder="keyword (e.g. AI, lithium, cloud)" style="background:var(--bg-elev);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:11px;padding:5px 8px;border-radius:3px;width:200px">
+        <button id="web-kw-go" class="btn btn-ghost" style="font-size:10px">Apply Keyword</button>
+        <label style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);display:flex;align-items:center;gap:4px;cursor:pointer">
+          <input type="checkbox" id="web-rotate" checked> auto-rotate
+        </label>
+        <span id="web-stats" style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-left:auto"></span>
+      </div>
+      <div style="position:relative;flex:1;min-height:480px;background:radial-gradient(ellipse at center, rgba(40,42,54,0.4), var(--bg))">
+        <canvas id="web-canvas" style="width:100%;height:100%;display:block;cursor:grab"></canvas>
+        <div id="web-tooltip" style="position:absolute;display:none;background:var(--bg);border:1px solid var(--amber);border-radius:4px;padding:8px 10px;font-family:var(--mono);font-size:11px;color:var(--ink);pointer-events:none;z-index:10;max-width:240px;line-height:1.5"></div>
+        <div style="position:absolute;bottom:8px;left:8px;font-family:var(--mono);font-size:9px;color:var(--ink-faint);line-height:1.5;pointer-events:none">
+          drag to rotate · node size = # chains · edges = shared chain<br>
+          double-click a node → valuate it
+        </div>
+      </div>
+    </div>
+  `);
+
+  buildWebGraph();
+  updateWebStats();
+  if (WEB_STATE.raf) cancelAnimationFrame(WEB_STATE.raf);
+  WEB_STATE.raf = requestAnimationFrame(renderWebFrame);
+  wireWebControls();
+}
+
+function updateWebStats() {
+  const el = document.getElementById('web-stats');
+  if (el) el.textContent = `${WEB_STATE.nodes.length} companies · ${WEB_STATE.edges.length} links`;
+}
+
+function wireWebControls() {
+  const canvas = document.getElementById('web-canvas');
+  const lensSel = document.getElementById('web-lens');
+  const kwInput = document.getElementById('web-kw');
+  const kwGo = document.getElementById('web-kw-go');
+  const rotChk = document.getElementById('web-rotate');
+  const tip = document.getElementById('web-tooltip');
+
+  if (lensSel) lensSel.addEventListener('change', () => {
+    WEB_STATE.lens = lensSel.value;
+    if (kwInput) kwInput.value = '';
+    buildWebGraph(); updateWebStats();
+  });
+  const applyKw = () => {
+    const v = (kwInput.value || '').trim();
+    if (v) { WEB_STATE.lens = 'kw:' + v; buildWebGraph(); updateWebStats(); }
+  };
+  if (kwGo) kwGo.addEventListener('click', applyKw);
+  if (kwInput) kwInput.addEventListener('keydown', e => { if (e.key === 'Enter') applyKw(); });
+  if (rotChk) rotChk.addEventListener('change', () => { WEB_STATE.autoRotate = rotChk.checked; });
+
+  if (canvas) {
+    canvas.addEventListener('mousedown', e => {
+      WEB_STATE.dragging = true; WEB_STATE.lastX = e.clientX; WEB_STATE.lastY = e.clientY;
+      canvas.style.cursor = 'grabbing';
+    });
+    window.addEventListener('mouseup', () => { WEB_STATE.dragging = false; if (canvas) canvas.style.cursor = 'grab'; });
+    canvas.addEventListener('mousemove', e => {
+      if (WEB_STATE.dragging) {
+        WEB_STATE.rotY += (e.clientX - WEB_STATE.lastX) * 0.008;
+        WEB_STATE.rotX += (e.clientY - WEB_STATE.lastY) * 0.008;
+        WEB_STATE.lastX = e.clientX; WEB_STATE.lastY = e.clientY;
+      } else {
+        // Hover detection
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+        const proj = WEB_STATE._proj || [];
+        let best = -1, bestD = 18;
+        for (let i = 0; i < proj.length; i++) {
+          const d = Math.hypot(proj[i].sx - mx, proj[i].sy - my);
+          if (d < bestD) { bestD = d; best = i; }
+        }
+        WEB_STATE.hover = best >= 0 ? best : null;
+        if (best >= 0 && tip) {
+          const n = WEB_STATE.nodes[best];
+          tip.style.display = 'block';
+          tip.style.left = Math.min(mx + 14, rect.width - 240) + 'px';
+          tip.style.top = (my + 14) + 'px';
+          tip.innerHTML = `<strong style="color:var(--amber)">${escapeHtml(n.ticker)}</strong> · ${escapeHtml(n.name)}<br>
+            <span style="color:var(--ink-dim)">${escapeHtml(n.sector)}</span><br>
+            In ${n.chains.size} chain${n.chains.size === 1 ? '' : 's'}: ${escapeHtml([...n.chains].slice(0,4).join(', '))}${n.chains.size > 4 ? '…' : ''}`;
+        } else if (tip) {
+          tip.style.display = 'none';
+        }
+      }
+    });
+    canvas.addEventListener('dblclick', () => {
+      if (WEB_STATE.hover != null) {
+        const n = WEB_STATE.nodes[WEB_STATE.hover];
+        closeFnOverlay();
+        const inp = document.getElementById('ticker');
+        if (inp) { inp.value = n.ticker; document.getElementById('fetch-btn')?.click(); }
+      }
+    });
+    // Stop the animation loop when the overlay closes
+    const obs = new MutationObserver(() => {
+      const ov = document.getElementById('fn-overlay');
+      if (ov && ov.style.display === 'none' && WEB_STATE.raf) {
+        cancelAnimationFrame(WEB_STATE.raf); WEB_STATE.raf = null; obs.disconnect();
+      }
+    });
+    const ov = document.getElementById('fn-overlay');
+    if (ov) obs.observe(ov, { attributes: true, attributeFilter: ['style'] });
+  }
+}
+
 const SUPPLY_CHAINS = [
   // ----- SEMICONDUCTORS / AI COMPUTE -----
   {
@@ -31431,6 +35315,51 @@ function _chainEntryMatchesTicker(entry, normalizedTicker) {
   return false;
 }
 
+// Compute the momentum of a ticker's supply-chain PEERS — the average recent
+// price performance of the other companies in the same chain(s). This is the
+// real, scoreable supply-chain signal: if a ticker's chain peers are rallying,
+// that's a sector/theme tailwind; if they're falling, a headwind. Returns a
+// signed value in roughly [-1, +1] (peer avg % move, scaled), or null if there
+// aren't enough peers with price data.
+function chainMomentumForTicker(ticker) {
+  const matches = findChainsForTicker(ticker);
+  if (!matches.length) return null;
+  const selfNorm = _normalizeTickerForChainLookup(ticker);
+  const peerTickers = new Set();
+  for (const m of matches) {
+    for (const tierKey of ['upstream', 'midstream', 'downstream']) {
+      for (const e of (m.chain[tierKey] || [])) {
+        const t = e.ticker;
+        if (t && _normalizeTickerForChainLookup(t) !== selfNorm) peerTickers.add(t);
+      }
+    }
+  }
+  if (peerTickers.size < 2) return null;
+  // Average each peer's recent % change (session change preferred, else 20-day)
+  let sum = 0, n = 0;
+  for (const t of peerTickers) {
+    let pct = null;
+    if (typeof _getTodayPctChange === 'function') {
+      try { pct = _getTodayPctChange(t); } catch {}
+    }
+    if (pct == null) {
+      // fall back to 20-session price change from history
+      try {
+        const hist = (typeof getHistoryForTicker === 'function') ? getHistoryForTicker(t) : null;
+        if (hist && hist.length >= 21) {
+          const last = hist[hist.length - 1].price, prior = hist[hist.length - 21].price;
+          if (last > 0 && prior > 0) pct = (last - prior) / prior * 100;
+        }
+      } catch {}
+    }
+    if (pct != null && isFinite(pct)) { sum += pct; n++; }
+  }
+  if (n < 2) return null;
+  const avgPct = sum / n;            // average peer % move
+  // Scale: a 10% average peer move maps to ~1.0 conviction; clamp to [-1, 1].
+  return { signed: Math.max(-1, Math.min(1, avgPct / 10)), avgPct, peerCount: n };
+}
+
 function findChainsForTicker(ticker) {
   const norm = _normalizeTickerForChainLookup(ticker);
   if (!norm) return [];
@@ -31748,7 +35677,7 @@ function renderChainCard(chain, opts = {}) {
     if (ret == null || !isFinite(ret)) return '';
     const pct = ret * 100;
     const sign = pct >= 0 ? '+' : '';
-    const color = pct >= 0 ? '#5b8a72' : '#a5645a';
+    const color = pct >= 0 ? 'var(--pos)' : 'var(--neg)';
     return `<span style="font-family:var(--mono);font-size:9px;color:${color};margin-left:6px;font-weight:600">${sign}${pct.toFixed(1)}%</span>`;
   };
 
@@ -31867,9 +35796,9 @@ function renderChainCard(chain, opts = {}) {
       ${relatedChainsHtml}
       <div class="sc-legend">
         <span><strong>Confidence:</strong></span>
-        <span style="color:#5b8a72"><strong>verified</strong> 10-K disclosed</span>
+        <span style="color:var(--pos)"><strong>verified</strong> 10-K disclosed</span>
         <span style="color:#7faaca"><strong>disclosed</strong> press release / partnership</span>
-        <span style="color:#c4965a"><strong>inferred</strong> sector knowledge — unverified</span>
+        <span style="color:var(--data-amber)"><strong>inferred</strong> sector knowledge — unverified</span>
         ${chain.citations?.length ? `<span style="margin-left:auto;color:var(--ink-faint)">Sources: ${chain.citations.map(c => escapeHtml(c)).join(' · ')}</span>` : ''}
       </div>
     </div>
@@ -33156,7 +37085,7 @@ function renderGlobalTradeLogistics() {
         <span class="tier-pill tier-live" style="margin:0;font-size:7px;padding:1px 5px">LIVE</span>
       </div>
       <div class="gt-logistics-title">${escapeHtml(c.ticker)}${c.row?.name ? ` · ${escapeHtml(c.row.name)}` : ''}</div>
-      <div class="gt-logistics-value">${c.px != null ? '$' + c.px.toFixed(2) : '—'}${c.pct != null ? ` <span style="font-size:13px;color:${c.tone==='bull'?'#5b8a72':c.tone==='bear'?'#a5645a':'var(--ink-faint)'}">${c.pct >= 0 ? '+' : ''}${c.pct.toFixed(2)}%</span>` : ''}</div>
+      <div class="gt-logistics-value">${c.px != null ? '$' + c.px.toFixed(2) : '—'}${c.pct != null ? ` <span style="font-size:13px;color:${c.tone==='bull'?'var(--pos)':c.tone==='bear'?'var(--neg)':'var(--ink-faint)'}">${c.pct >= 0 ? '+' : ''}${c.pct.toFixed(2)}%</span>` : ''}</div>
       <div class="gt-logistics-sub">${escapeHtml(c.signal)}</div>
       <div class="gt-logistics-proxy">${escapeHtml(c.desc)}</div>
     </div>
@@ -33180,19 +37109,19 @@ function renderGlobalTradePulse() {
   let headline, tone, context;
   if (bullCount >= 5) {
     headline = 'Global trade accelerating';
-    tone = '#5b8a72';
+    tone = 'var(--pos)';
     context = `${bullCount}/${moves.length} logistics proxies are positive today. Average move: ${avg >= 0 ? '+' : ''}${avg.toFixed(2)}%. The tape is saying ships, planes, and pipelines are moving more goods than yesterday — typically a risk-on signal for emerging markets + industrials + freight equities.`;
   } else if (bearCount >= 5) {
     headline = 'Global trade decelerating';
-    tone = '#a5645a';
+    tone = 'var(--neg)';
     context = `${bearCount}/${moves.length} logistics proxies are red today. Average move: ${avg >= 0 ? '+' : ''}${avg.toFixed(2)}%. This is the kind of broad-based logistics weakness that often precedes (or accompanies) PMI contractions. Watch for confirmation in next week's BDI prints + rail carload data.`;
   } else if (bullCount > bearCount) {
     headline = 'Mixed · leaning positive';
-    tone = '#c4965a';
+    tone = 'var(--data-amber)';
     context = `${bullCount} green vs ${bearCount} red across ${moves.length} proxies. Average: ${avg >= 0 ? '+' : ''}${avg.toFixed(2)}%. The signal isn't broad-based but the bias is positive. Often the more interesting setup — divergences between modes (e.g. tankers up but rail down) tell you what kind of trade is happening.`;
   } else if (bearCount > bullCount) {
     headline = 'Mixed · leaning negative';
-    tone = '#c4965a';
+    tone = 'var(--data-amber)';
     context = `${bearCount} red vs ${bullCount} green. Average: ${avg >= 0 ? '+' : ''}${avg.toFixed(2)}%. Selective weakness — check the cards above for which modes specifically. If shipping is weak but pipelines are flat, that's a goods-trade story, not an energy-trade story.`;
   } else {
     headline = 'Flat / no signal';
@@ -33226,7 +37155,7 @@ function renderGlobalTradePartners() {
         ${GT_US_PARTNERS.map(p => {
           const total = p.exports + p.imports;
           const pctOfTop10 = (total / totalTrade) * 100;
-          const balColor = p.balance >= 0 ? '#5b8a72' : '#a5645a';
+          const balColor = p.balance >= 0 ? 'var(--pos)' : 'var(--neg)';
           return `<tr>
             <td><span class="gt-partners-flag">${GT_PARTNER_FLAGS[p.code] || ''}</span><strong>${escapeHtml(p.name)}</strong></td>
             <td>$${p.exports.toFixed(1)}</td>
@@ -33247,18 +37176,38 @@ function renderGlobalTradePartners() {
 function renderGlobalTradeCountries() {
   const grid = document.getElementById('gt-countries-grid');
   if (!grid) return;
+  const wb = _gtWorldBankData;  // may be null until loaded
   grid.innerHTML = GT_COUNTRIES.map(c => {
     const etfRow = _gtGetRow(c.countryEtf);
     const etfPx = etfRow?.price;
     const etfPct = _gtSessionPct(c.countryEtf);
+    // Upgrade the static GDP baseline with live World Bank data when present.
+    const wbRow = wb && c.iso ? wb[c.iso] : null;
+    let gdpDisplay, gdpYear, gdpTier, extraRows = '';
+    if (wbRow && wbRow.gdpUsd) {
+      gdpDisplay = (wbRow.gdpUsd / 1e12).toFixed(2);
+      gdpYear = wbRow.gdpUsdYear || c.gdpYear;
+      gdpTier = 'tier-quarterly';  // annual, but freshest we have
+      const exp = wbRow.exportsPctGdp, imp = wbRow.importsPctGdp, gr = wbRow.gdpGrowthPct;
+      extraRows = `
+        ${exp != null ? `<div class="gt-country-row"><span>Exports % GDP (${wbRow.exportsPctGdpYear})</span><strong>${exp.toFixed(1)}%</strong></div>` : ''}
+        ${imp != null ? `<div class="gt-country-row"><span>Imports % GDP (${wbRow.importsPctGdpYear})</span><strong>${imp.toFixed(1)}%</strong></div>` : ''}
+        ${gr != null ? `<div class="gt-country-row"><span>GDP growth (${wbRow.gdpGrowthPctYear})</span><strong style="color:${gr>=0?'var(--pos)':'var(--neg)'}">${gr>=0?'+':''}${gr.toFixed(1)}%</strong></div>` : ''}`;
+    } else {
+      gdpDisplay = c.gdpUsdT.toFixed(2);
+      gdpYear = c.gdpYear;
+      gdpTier = 'tier-quarterly';
+    }
+    const gdpSrc = wbRow && wbRow.gdpUsd ? 'World Bank' : 'baseline';
     return `
       <div class="gt-country-card" data-country="${c.code}">
         <div class="gt-country-head">
           <div><span class="gt-country-flag">${c.flag}</span><span class="gt-country-name">${escapeHtml(c.name)}</span></div>
-          <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint)">#${c.gdpRank}</div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint)">#${(wbRow && wbRow.gdpRank) || c.gdpRank}</div>
         </div>
-        <div class="gt-country-row"><span>GDP (${c.gdpYear})</span><strong>$${c.gdpUsdT.toFixed(2)}T <span class="tier-pill tier-quarterly" style="margin-left:4px;font-size:7px;padding:1px 4px">QUARTERLY</span></strong></div>
-        <div class="gt-country-row"><span>Country ETF</span><strong>${escapeHtml(c.countryEtf)} ${etfPx != null ? '· $' + etfPx.toFixed(2) : ''} ${etfPct != null ? `<span style="color:${etfPct>=0?'#5b8a72':'#a5645a'}">${etfPct>=0?'+':''}${etfPct.toFixed(2)}%</span>` : ''}</strong></div>
+        <div class="gt-country-row"><span>GDP (${gdpYear} · ${gdpSrc})</span><strong>$${gdpDisplay}T <span class="tier-pill ${gdpTier}" style="margin-left:4px;font-size:7px;padding:1px 4px">ANNUAL</span></strong></div>
+        ${extraRows}
+        <div class="gt-country-row"><span>Country ETF</span><strong>${escapeHtml(c.countryEtf)} ${etfPx != null ? '· $' + etfPx.toFixed(2) : ''} ${etfPct != null ? `<span style="color:${etfPct>=0?'var(--pos)':'var(--neg)'}">${etfPct>=0?'+':''}${etfPct.toFixed(2)}%</span>` : ''}</strong></div>
         <div class="gt-country-actionables">
           For US-listed exposure: <strong style="color:var(--amber)">${escapeHtml(c.countryEtf)}</strong> ETF tracks ${escapeHtml(c.name)} equity market. Click to add to your stockbook for ongoing tracking.
         </div>
@@ -33299,7 +37248,7 @@ function renderGlobalTradeProducts() {
         </div>
         <div style="font-family:var(--mono);font-size:11px;color:var(--ink-dim);margin-bottom:6px">
           ${proxyPx != null ? `<span style="color:var(--ink);font-weight:600">$${proxyPx.toFixed(2)}</span>` : '—'}
-          ${proxyPct != null ? ` <span style="color:${tone==='bull'?'#5b8a72':tone==='bear'?'#a5645a':'var(--ink-faint)'}">${proxyPct>=0?'+':''}${proxyPct.toFixed(2)}%</span>` : ''}
+          ${proxyPct != null ? ` <span style="color:${tone==='bull'?'var(--pos)':tone==='bear'?'var(--neg)':'var(--ink-faint)'}">${proxyPct>=0?'+':''}${proxyPct.toFixed(2)}%</span>` : ''}
           <span class="tier-pill tier-live" style="margin-left:6px;font-size:7px;padding:1px 4px">LIVE</span>
         </div>
         <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);line-height:1.6">
@@ -33333,8 +37282,8 @@ function renderGlobalTradeBilateral() {
       const fromCountry = GT_COUNTRIES.find(c => c.code === f);
       const toCountry   = GT_COUNTRIES.find(c => c.code === t);
       out.innerHTML = `
-        <div style="padding:20px;background:var(--bg-card);border-left:3px solid #c4965a;font-family:var(--mono);font-size:12px;line-height:1.7">
-          <strong style="color:#c4965a">Bilateral data for ${escapeHtml(fromCountry?.name || f)} ↔ ${escapeHtml(toCountry?.name || t)} requires the IMF DOTS API integration.</strong><br><br>
+        <div style="padding:20px;background:var(--bg-card);border-left:3px solid var(--data-amber);font-family:var(--mono);font-size:12px;line-height:1.7">
+          <strong style="color:var(--data-amber)">Bilateral data for ${escapeHtml(fromCountry?.name || f)} ↔ ${escapeHtml(toCountry?.name || t)} requires the IMF DOTS API integration.</strong><br><br>
           The current static dataset only covers US-anchored bilateral flows. The pipeline upgrade needed to support non-US pairs is documented in the Data Sources tab.<br><br>
           <strong>What you can do today:</strong> open the country ETFs side by side (${escapeHtml(fromCountry?.countryEtf || '?')} and ${escapeHtml(toCountry?.countryEtf || '?')}) to compare equity-market moves, which often correlate with bilateral trade health.
         </div>
@@ -33362,7 +37311,7 @@ function renderGlobalTradeBilateral() {
         </div>
         <div style="font-family:var(--mono);font-size:11px;color:var(--ink-dim);line-height:1.7">
           Counter-flow (${escapeHtml(toName)} → ${escapeHtml(fromName)}): <strong style="color:var(--ink)">$${counterFlow.toFixed(1)}B</strong><br>
-          Net balance for US: <strong style="color:${partner.balance >= 0 ? '#5b8a72' : '#a5645a'}">${partner.balance >= 0 ? '+' : ''}$${partner.balance.toFixed(1)}B</strong>
+          Net balance for US: <strong style="color:${partner.balance >= 0 ? 'var(--pos)' : 'var(--neg)'}">${partner.balance >= 0 ? '+' : ''}$${partner.balance.toFixed(1)}B</strong>
           ${partner.balance < 0 ? ' (US runs trade deficit)' : ' (US runs trade surplus)'}
         </div>
         <div style="margin-top:14px;padding-top:14px;border-top:1px dashed var(--rule);font-family:var(--mono);font-size:10px;color:var(--ink-faint);line-height:1.7">
@@ -33383,48 +37332,46 @@ function renderGlobalTradeDataSources() {
   wrap.innerHTML = `
     <h3>What we have today</h3>
     <div class="source-row have">
-      <strong style="color:#5b8a72">LIVE · Tradeable proxies</strong> · <span style="color:var(--ink-dim)">In place</span><br>
+      <strong style="color:var(--pos)">LIVE · Tradeable proxies</strong> · <span style="color:var(--ink-dim)">In place</span><br>
       Pulled from your existing stockbook. Every logistics card here reads
       <code>state.stockbook.rows</code> for these tickers: BDRY, BWET, IYT, XTN, JETS, AMLP, UNP, CPER plus the country ETFs (MCHI, EWG, EWJ, etc.).
       No new pipeline work needed — these are already fetched by <code>fetch_data.py</code>.
     </div>
     <div class="source-row have">
-      <strong style="color:#5b8a72">STATIC · US Top-10 partners</strong> · <span style="color:var(--ink-dim)">FY2023 baseline embedded</span><br>
+      <strong style="color:var(--pos)">STATIC · US Top-10 partners</strong> · <span style="color:var(--ink-dim)">FY2023 baseline embedded</span><br>
       Hard-coded annual totals from US Census Bureau. Good as a baseline; the pipeline upgrade below replaces these with monthly live numbers.
     </div>
 
-    <h3>Pipeline upgrades to add (Python side)</h3>
-    <div class="source-row partial">
-      <strong style="color:#c4965a">FRED · Monthly US trade balance</strong> · <span style="color:var(--ink-dim)">Easy add</span><br>
-      FRED has all US trade series free with API key. Relevant codes:
-      <code>BOPGSTB</code> (goods trade balance), <code>EXPGS</code> (exports), <code>IMPGS</code> (imports),
-      <code>BOPGEXP</code>, <code>BOPGIMP</code>. Add to <code>fetch_macro.py</code> with the rest of FRED pulls.
-      Writes monthly numbers to <code>data/macro_trade.json</code>, browser reads from there.
-      Cadence: <span class="tier-pill tier-monthly">MONTHLY</span>
+    <div class="source-row have">
+      <strong style="color:var(--pos)">LIVE · FRED US trade balance</strong> · <span style="color:var(--ink-dim)">BUILT</span><br>
+      <code>fetch_macro_trade.py</code> pulls BOPGSTB (goods balance), BOPGEXP/BOPGIMP (exports/imports),
+      and the BEA series monthly using your FED_API_KEY, writing <code>data/macro_trade.json</code>.
+      Shown in the US Trade Balance card above with a history sparkline. Cadence: <span class="tier-pill tier-monthly">MONTHLY</span>
     </div>
-    <div class="source-row partial">
-      <strong style="color:#c4965a">World Bank · Annual GDP composition</strong> · <span style="color:var(--ink-dim)">Free API, no key</span><br>
-      <code>api.worldbank.org/v2/country/{ISO3}/indicator/NY.GDP.MKTP.CD?format=json</code>
-      gives annual GDP for every country. Plus <code>NE.EXP.GNFS.ZS</code> (exports % of GDP),
-      <code>NE.IMP.GNFS.ZS</code> (imports % of GDP). Add a new <code>fetch_worldbank.py</code> that
-      writes <code>data/worldbank_countries.json</code>. Cadence: <span class="tier-pill tier-quarterly">ANNUAL</span>
+    <div class="source-row have">
+      <strong style="color:var(--pos)">LIVE · World Bank GDP composition</strong> · <span style="color:var(--ink-dim)">BUILT</span><br>
+      <code>fetch_worldbank.py</code> (no key) pulls GDP, exports/imports % of GDP, and GDP growth for
+      18 major economies, writing <code>data/worldbank_countries.json</code>. The Countries view upgrades
+      its static GDP baseline with these live figures. Cadence: <span class="tier-pill tier-quarterly">ANNUAL</span>
     </div>
+
+    <h3>Pipeline upgrades still to add</h3>
     <div class="source-row partial">
-      <strong style="color:#c4965a">UN Comtrade · Product-level bilateral flows</strong> · <span style="color:var(--ink-dim)">Free API key, rate limited</span><br>
+      <strong style="color:var(--data-amber)">UN Comtrade · Product-level bilateral flows</strong> · <span style="color:var(--ink-dim)">Free API key, rate limited</span><br>
       <code>comtradeapi.un.org</code> · 500 free calls/day with sign-up. Lets you query exactly
       "country X exports of product Y to country Z in year/month N". Heavy quota — best
       to pre-fetch the top 10 products × top 20 country pairs nightly. Writes to
       <code>data/comtrade_flows.json</code>. Cadence: <span class="tier-pill tier-monthly">MONTHLY</span>
     </div>
     <div class="source-row todo">
-      <strong style="color:#a5645a">IMF DOTS · Bilateral trade matrix</strong> · <span style="color:var(--ink-dim)">Paid subscription</span><br>
+      <strong style="color:var(--neg)">IMF DOTS · Bilateral trade matrix</strong> · <span style="color:var(--ink-dim)">Paid subscription</span><br>
       Direction of Trade Statistics is the gold standard for non-US bilateral flows
       (Germany ↔ China, India ↔ Brazil, etc.). The free API is severely rate-limited.
       Recommendation: only invest in this integration if non-US bilateral coverage
       becomes a high-priority feature. World Bank + UN Comtrade cover 80% of the use case.
     </div>
     <div class="source-row todo">
-      <strong style="color:#a5645a">Real-time logistics data</strong> · <span style="color:var(--ink-dim)">Mostly paywalled</span><br>
+      <strong style="color:var(--neg)">Real-time logistics data</strong> · <span style="color:var(--ink-dim)">Mostly paywalled</span><br>
       Baltic Exchange (Baltic Dry Index): paid. ATA Truck Tonnage: members-only.
       AAR rail carloads: free but weekly with lag. Flightradar24 cargo movements:
       paid API. <strong>The tradeable proxies in the logistics panel above are
@@ -33481,6 +37428,82 @@ function renderGlobalTradeTab() {
   }
 }
 
+// ---- Live data loaders for the Global Trade tab ----
+// World Bank (annual GDP composition) + FRED (monthly US trade balance), both
+// staged by the pipeline into TRAPP2-1's data/ folder.
+let _gtWorldBankData = null;
+let _gtTradeData = null;
+
+async function loadGtWorldBank() {
+  if (_gtWorldBankData) return _gtWorldBankData;
+  const base = (typeof DYNAMIC_DATA_BASE !== 'undefined') ? DYNAMIC_DATA_BASE
+    : 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-1/main/data/';
+  try {
+    const r = await fetch(base + 'worldbank_countries.json', { cache: 'no-cache' });
+    if (r.ok) {
+      const j = await r.json();
+      _gtWorldBankData = j.countries || {};
+      console.log(`[global-trade] World Bank loaded — ${Object.keys(_gtWorldBankData).length} countries`);
+      return _gtWorldBankData;
+    }
+  } catch (e) { console.warn('[global-trade] World Bank load failed:', e.message); }
+  return null;
+}
+
+async function loadGtTrade() {
+  if (_gtTradeData) return _gtTradeData;
+  const base = (typeof DYNAMIC_DATA_BASE !== 'undefined') ? DYNAMIC_DATA_BASE
+    : 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-1/main/data/';
+  try {
+    const r = await fetch(base + 'macro_trade.json', { cache: 'no-cache' });
+    if (r.ok) {
+      const j = await r.json();
+      _gtTradeData = j.series || {};
+      console.log(`[global-trade] FRED trade loaded — ${Object.keys(_gtTradeData).length} series`);
+      return _gtTradeData;
+    }
+  } catch (e) { console.warn('[global-trade] FRED trade load failed:', e.message); }
+  return null;
+}
+
+// Render the live US trade-balance card from FRED data.
+function renderGtTradeBalanceCard() {
+  const host = document.getElementById('gt-trade-balance-card');
+  if (!host || !_gtTradeData) return;
+  const bal = _gtTradeData.BOPGSTB;   // goods trade balance, monthly
+  const exp = _gtTradeData.BOPGEXP;   // goods exports
+  const imp = _gtTradeData.BOPGIMP;   // goods imports
+  if (!bal) { host.style.display = 'none'; return; }
+  host.style.display = '';
+  const fmtB = (v) => v == null ? '—' : `$${(v / 1000).toFixed(1)}B`;  // $M → $B
+  const balVal = bal.latest.value;
+  const hist = bal.history || [];
+  let spark = '';
+  if (hist.length >= 2) {
+    const vals = hist.map(h => h.value);
+    const min = Math.min(...vals), max = Math.max(...vals), rng = (max - min) || 1;
+    const W = 160, H = 28;
+    const pts = hist.map((h, i) => `${(i / (hist.length - 1) * W).toFixed(1)},${(H - (h.value - min) / rng * H).toFixed(1)}`).join(' ');
+    spark = `<svg viewBox="0 0 ${W} ${H}" style="width:${W}px;height:${H}px"><polyline points="${pts}" fill="none" stroke="${balVal < 0 ? 'var(--neg)' : 'var(--pos)'}" stroke-width="1.5"/></svg>`;
+  }
+  host.innerHTML = `
+    <div class="company-card" style="border-left:3px solid ${balVal < 0 ? 'var(--neg)' : 'var(--pos)'}">
+      <h4>US Goods Trade Balance <span class="tier-pill tier-monthly" style="font-size:7px;padding:1px 4px">MONTHLY · FRED</span></h4>
+      <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
+        <div>
+          <div style="font-family:var(--mono);font-size:24px;font-weight:700;color:${balVal < 0 ? 'var(--neg)' : 'var(--pos)'}">${fmtB(balVal)}</div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint)">${bal.latest.date}${bal.changePct != null ? ` · ${bal.changePct >= 0 ? '+' : ''}${bal.changePct}% MoM` : ''}</div>
+        </div>
+        ${spark}
+        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);line-height:1.6">
+          Exports: <strong>${fmtB(exp?.latest?.value)}</strong><br>
+          Imports: <strong>${fmtB(imp?.latest?.value)}</strong>
+        </div>
+      </div>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:8px">Goods balance of payments basis · prints ~45 days after the reference month</div>
+    </div>`;
+}
+
 // Wire view-mode picker + initial render
 let _gtWired = false;
 function loadGlobalTradeTab() {
@@ -33489,6 +37512,18 @@ function loadGlobalTradeTab() {
     _gtWired = true;
   }
   renderGlobalTradeTab();
+  // Pull live World Bank + FRED trade data, then re-render the affected views.
+  if (typeof loadGtWorldBank === 'function') {
+    loadGtWorldBank().then(() => {
+      const mode = document.getElementById('gt-view-mode')?.value || 'overview';
+      if (mode === 'countries') renderGlobalTradeCountries();
+    }).catch(() => {});
+  }
+  if (typeof loadGtTrade === 'function') {
+    loadGtTrade().then(() => {
+      if (typeof renderGtTradeBalanceCard === 'function') renderGtTradeBalanceCard();
+    }).catch(() => {});
+  }
   // Refresh logistics every 60s while the tab is open
   if (!window._gtRefreshTimer) {
     window._gtRefreshTimer = setInterval(() => {
