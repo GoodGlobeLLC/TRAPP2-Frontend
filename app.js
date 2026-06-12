@@ -28121,6 +28121,12 @@ function setArticleFix(article, verdict, tickers, opts = {}) {
     headline: article.headline?.slice(0, 200),
     ts: Date.now(),
     note: opts.note || null,
+    // Rich edit fields — every one optional. Anything set here OVERRIDES the
+    // pulled article on every future refresh (XTRAPP-durable human truth).
+    fixHeadline: opts.headline || null,     // corrected headline
+    fixSummary: opts.summary || null,       // corrected description/summary
+    sentiment: opts.sentiment || null,      // bullish | bearish | neutral
+    impact: opts.impact || null,            // high | medium | low
   };
   saveArticleFixes(fixes);
 }
@@ -28135,16 +28141,115 @@ function applyArticleFix(article) {
   if (!fix) return false;
   if (fix.verdict === 'bad') { article._suppressed = true; return true; }
   if ((fix.verdict === 'fixed' || fix.verdict === 'confirmed') && Array.isArray(fix.tickers)) {
-    article.ticker = fix.tickers[0] || article.ticker;
-    article.tickers = fix.tickers.slice();
+    article.ticker = fix.tickers[0] || article.ticker;   // main ticker
+    article.tickers = fix.tickers.slice();               // + additional tickers
     article._tickerCorrected = fix.verdict === 'fixed';
     article._tickerConfirmed = fix.verdict === 'confirmed';
   }
+  // Rich overrides: XTRAPP's human-fixed data SHIPS OVER the pulled article.
+  if (fix.fixHeadline) { article.headline = fix.fixHeadline; article._humanEdited = true; }
+  if (fix.fixSummary) { article.summary = fix.fixSummary; article.expandedSummary = fix.fixSummary; article._humanEdited = true; }
+  if (fix.sentiment) { article.sentiment = fix.sentiment; article._humanEdited = true; }
+  if (fix.impact) { article.impact = fix.impact; article._humanEdited = true; }
   return true;
 }
 
 // Queue an article into the Review hub for ticker confirmation. Reuses the same
 // review queue as posts, with type 'news'.
+// ============================================================
+//   ARTICLE EDITOR — full human-correction surface for any news article.
+//   Opens from the ✎ button on every feed row and from Review hub cards.
+//   Edits: main ticker, additional tickers, headline, description/summary,
+//   sentiment, impact. Saved as a durable fix (keyed by URL) that overrides
+//   the pulled article on every refresh — and travels through XTRAPP.
+// ============================================================
+function openArticleEditor(key) {
+  const article = (state.news?.items || []).find(a => articleKey(a) === key)
+    || (() => {
+      const q = (typeof loadReviewQueue === 'function' ? loadReviewQueue() : []).find(x => x.articleKey === key);
+      return q ? { url: q.url, ticker: q.matchedTicker || '', tickers: q.allTickers || [], headline: q.headline, summary: '' } : null;
+    })();
+  if (!article) { if (typeof flashStatus === 'function') flashStatus('Article not found in current feed', 'error'); return; }
+  const fix = getArticleFix(article) || {};
+  const main = (fix.tickers?.[0]) || article.ticker || (fix.verdict === 'bad' ? '' : article._proposedTicker) || '';
+  const extra = (fix.tickers || article.tickers || []).slice(1).join(', ');
+  document.getElementById('article-editor-modal')?.remove();
+  const wrap = document.createElement('div');
+  wrap.id = 'article-editor-modal';
+  wrap.style.cssText = 'position:fixed;inset:0;z-index:99998;background:rgba(0,0,0,0.65);display:flex;align-items:center;justify-content:center;padding:16px';
+  const inputCss = 'width:100%;background:var(--bg-card);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:11px;padding:6px;border-radius:4px;box-sizing:border-box';
+  const lbl = 'font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.05em;margin:8px 0 3px;display:block';
+  wrap.innerHTML = `
+    <div style="background:var(--bg-panel,#16181d);border:1px solid var(--rule);border-radius:8px;max-width:560px;width:100%;max-height:88vh;overflow-y:auto;padding:16px">
+      <div style="font-family:var(--mono);font-size:10px;color:#7faaca;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px">✎ Edit article${article._humanEdited ? ' · previously human-edited' : ''}</div>
+      <label style="${lbl}">Headline</label>
+      <input id="ae-headline" style="${inputCss}" value="${escapeHtml(article.headline || '')}">
+      <label style="${lbl}">Main ticker</label>
+      <input id="ae-main" style="${inputCss};text-transform:uppercase;width:140px" value="${escapeHtml(main)}">
+      <label style="${lbl}">Additional tickers involved (comma-separated)</label>
+      <input id="ae-extra" style="${inputCss};text-transform:uppercase" value="${escapeHtml(extra)}" placeholder="e.g. MSFT, NVDA">
+      <label style="${lbl}">Description / summary</label>
+      <textarea id="ae-summary" style="${inputCss};min-height:90px;resize:vertical">${escapeHtml(article.summary || article.expandedSummary || '')}</textarea>
+      <label style="${lbl}">Sentiment</label>
+      <div style="display:flex;gap:6px">
+        ${['bullish','neutral','bearish'].map(s => `<button class="btn btn-ghost ae-sent" data-s="${s}" style="font-size:10px;${(fix.sentiment||article.sentiment)===s?'outline:1px solid var(--amber)':''}">${s==='bullish'?'▲':s==='bearish'?'▼':'·'} ${s}</button>`).join('')}
+      </div>
+      <label style="${lbl}">Impact</label>
+      <div style="display:flex;gap:6px">
+        ${['high','medium','low'].map(s => `<button class="btn btn-ghost ae-imp" data-s="${s}" style="font-size:10px;${(fix.impact||article.impact)===s?'outline:1px solid var(--amber)':''}">${s}</button>`).join('')}
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:14px">
+        <button class="btn" id="ae-save" style="font-size:11px;background:var(--pos)">Save fix (durable)</button>
+        <button class="btn" id="ae-bad" style="font-size:11px;background:var(--neg)">✕ Bad article (hide)</button>
+        <button class="btn btn-ghost" id="ae-cancel" style="font-size:11px">Cancel</button>
+      </div>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:8px">Saved fixes override every future pull of this article, and ride along in the XTRAPP export.</div>
+    </div>`;
+  document.body.appendChild(wrap);
+  let chosenSent = fix.sentiment || article.sentiment || null;
+  let chosenImp = fix.impact || article.impact || null;
+  wrap.querySelectorAll('.ae-sent').forEach(b => b.addEventListener('click', () => {
+    chosenSent = b.dataset.s;
+    wrap.querySelectorAll('.ae-sent').forEach(x => x.style.outline = x === b ? '1px solid var(--amber)' : 'none');
+  }));
+  wrap.querySelectorAll('.ae-imp').forEach(b => b.addEventListener('click', () => {
+    chosenImp = b.dataset.s;
+    wrap.querySelectorAll('.ae-imp').forEach(x => x.style.outline = x === b ? '1px solid var(--amber)' : 'none');
+  }));
+  const close = () => wrap.remove();
+  wrap.addEventListener('click', e => { if (e.target === wrap) close(); });
+  wrap.querySelector('#ae-cancel').addEventListener('click', close);
+  wrap.querySelector('#ae-bad').addEventListener('click', () => {
+    setArticleFix(article, 'bad', []);
+    applyArticleFix(article);
+    close();
+    if (typeof renderNewsFeed === 'function') { try { renderNewsFeed(); } catch {} }
+    if (typeof flashStatus === 'function') flashStatus('Article hidden — durable', 'success');
+  });
+  wrap.querySelector('#ae-save').addEventListener('click', () => {
+    const mainT = (wrap.querySelector('#ae-main').value || '').trim().toUpperCase();
+    if (!mainT) { if (typeof flashStatus === 'function') flashStatus('Main ticker required (or use Bad article to hide)', 'error'); return; }
+    const extras = (wrap.querySelector('#ae-extra').value || '').toUpperCase().split(/[,\s]+/).filter(Boolean).filter(t => t !== mainT);
+    const tickers = [mainT, ...extras];
+    const headline = (wrap.querySelector('#ae-headline').value || '').trim();
+    const summary = (wrap.querySelector('#ae-summary').value || '').trim();
+    setArticleFix(article, 'fixed', tickers, {
+      headline: headline && headline !== (article.headline || '') ? headline : (getArticleFix(article)?.fixHeadline || null) || (headline || null),
+      summary: summary || null,
+      sentiment: chosenSent,
+      impact: chosenImp,
+    });
+    applyArticleFix(article);
+    // Remove from review queue if it was queued.
+    try { saveReviewQueue(loadReviewQueue().filter(x => x.articleKey !== articleKey(article))); } catch {}
+    close();
+    if (typeof renderNewsFeed === 'function') { try { renderNewsFeed(); } catch {} }
+    if (typeof renderReviewHub === 'function') { try { renderReviewHub(); } catch {} }
+    if (typeof flashStatus === 'function') flashStatus(`Fixed: ${tickers.join(', ')} — durable + XTRAPP-ready`, 'success');
+  });
+}
+if (typeof window !== 'undefined') window.openArticleEditor = openArticleEditor;
+
 function queueArticleForReview(article) {
   if (typeof loadReviewQueue !== 'function') return;
   // Once a human has fixed this article (via Review → XTRAPP), never re-queue it.
@@ -29417,6 +29522,8 @@ function renderNewsFeed() {
           ${healthBadge}
           <span class="news-item-source">${escapeHtml(article.source)}</span>
           <span class="news-item-time">${timeLabel} · ${ts.toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' })}</span>
+          ${article._humanEdited ? '<span style="font-family:var(--mono);font-size:8px;color:var(--amber)" title="Human-corrected via Review/XTRAPP">✎ edited</span>' : ''}
+          <button class="btn btn-ghost" style="font-size:9px;padding:1px 6px;margin-left:auto" onclick="openArticleEditor('${articleId}')" title="Fix ticker(s), headline, description, sentiment, impact">✎ fix</button>
         </div>
         <h3 class="news-item-title">
           <a href="${article.url}" target="_blank" rel="noopener" onclick="markArticleStateAndRender('${articleId}', 'read')">${escapeHtml(article.headline)}</a>
@@ -33348,13 +33455,14 @@ function renderReviewHub() {
       <div style="font-family:var(--mono);font-size:9px;color:#7faaca;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px">📰 News ticker check${q.source?' · '+escapeHtml(q.source):''}</div>
       <div style="font-family:var(--serif);font-size:13px;color:var(--ink);margin-bottom:6px">${escapeHtml(q.headline)}</div>
       <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-bottom:8px">
-        Matched to: <strong style="color:var(--ink)">${escapeHtml(q.matchedTicker || '—')}</strong>${q.allTickers && q.allTickers.length>1?' (+ '+q.allTickers.slice(1).map(escapeHtml).join(', ')+')':''}
+        Matched to: <strong style="color:var(--ink)">${escapeHtml(q.matchedTicker || '—')}</strong>${q.suggestedTicker ? ' · matcher suggests <strong style="color:var(--amber)">' + escapeHtml(q.suggestedTicker) + '</strong>' : ''}${q.allTickers && q.allTickers.length>1?' (+ '+q.allTickers.slice(1).map(escapeHtml).join(', ')+')':''}
         ${q.url?` · <a href="${escapeHtml(q.url)}" target="_blank" rel="noopener" style="color:var(--amber)">read ↗</a>`:''}
       </div>
       <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
         <button class="btn" style="font-size:10px;background:var(--pos)" onclick="reviewNewsConfirm('${q.id}')">✓ Ticker is right</button>
         <input id="newsfix-${q.id}" placeholder="correct ticker(s), comma-sep" style="background:var(--bg-card);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:10px;padding:4px 6px;border-radius:3px;width:170px;text-transform:uppercase">
         <button class="btn btn-ghost" style="font-size:10px" onclick="reviewNewsFix('${q.id}')">Fix ticker</button>
+        <button class="btn btn-ghost" style="font-size:10px" onclick="openArticleEditor('${escapeHtml(q.articleKey)}')">✎ Full editor</button>
         <button class="btn" style="font-size:10px;background:var(--neg)" onclick="reviewNewsBad('${q.id}')">✕ Bad article (hide)</button>
         <button class="btn btn-ghost" style="font-size:10px" onclick="reviewDismiss('${q.id}')">Skip</button>
       </div>
@@ -33430,7 +33538,9 @@ function renderReviewHub() {
       <div class="regime-section-title">XTRAPP BACKEND</div>
       <div class="gt-section-sub">The lexicon + tracked posts persist to the XTRAPP repo (data/xtrapp_data.json), wiring into the app like the other data feeds. Export to commit, and the app reads it back on load.</div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <button class="btn btn-ghost" onclick="exportXtrappData()">Export for XTRAPP</button>
+        <button class="btn" onclick="pushXtrappToGitHub()" style="background:var(--pos)" title="Commits xtrapp_data.json directly (token) or via clipboard + GitHub editor (no token)">⇧ Push to XTRAPP</button>
+        <button class="btn btn-ghost" onclick="exportXtrappData()">Export file</button>
+        <button class="btn btn-ghost" onclick="setGitHubToken()" title="Fine-grained token, XTRAPP repo only">⚙ Token</button>
         <button class="btn btn-ghost" onclick="fetchXtrappData().then(()=>renderReviewHub())">Reload from XTRAPP</button>
       </div>
     </div>`;
@@ -33574,7 +33684,7 @@ function reviewGenericOption(id, optIdx) {
 function _lsJson(key) {
   try { return JSON.parse(localStorage.getItem(key) || 'null'); } catch { return null; }
 }
-function exportXtrappData() {
+function _buildXtrappPayload() {
   const payload = {
     _schema: 'valuatio-xtrapp-v1',
     updatedAt: new Date().toISOString(),
@@ -33592,6 +33702,17 @@ function exportXtrappData() {
     botWeights: (typeof loadBotWeights === 'function') ? loadBotWeights() : {},
     // Open review items so the human-in-the-loop queue follows you too.
     reviewQueue: (typeof loadReviewQueue === 'function') ? loadReviewQueue() : [],
+    // News corpus — the pulled articles themselves (last 500, lean fields), so
+    // the article database lives in the repo, not just this browser. Fixed
+    // fields ride along; on import, articleFixes still override everything.
+    articles: ((typeof state !== 'undefined' && state.news?.items) ? state.news.items : (_newsMemCache?.items || []))
+      .slice(0, 500)
+      .map(a => ({
+        url: a.url, headline: a.headline, summary: (a.summary || '').slice(0, 500),
+        ticker: a.ticker, tickers: a.tickers || undefined, source: a.source,
+        datetime: a.datetime, sentiment: a.sentiment || undefined,
+        impact: a.impact || undefined, _humanEdited: a._humanEdited || undefined,
+      })),
     // Personal data layer — manually-added tickers, manual field overrides,
     // portfolio, transactions, cash, and saved valuations — so a fresh browser
     // rebuilds your whole setup from the repo. Deliberately NO API keys and NO
@@ -33603,6 +33724,10 @@ function exportXtrappData() {
     cashPosition: _lsJson('valuatio.cashPosition.v1'),
     savedValuations: _lsJson('valuatio.savedValuations.v1'),
   };
+  return payload;
+}
+function exportXtrappData() {
+  const payload = _buildXtrappPayload();
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -33635,6 +33760,71 @@ async function fetchJsonMaybeGz(url) {
 if (typeof window !== 'undefined') window.fetchJsonMaybeGz = fetchJsonMaybeGz;
 
 const XTRAPP_BASE = 'https://raw.githubusercontent.com/GoodGlobeLLC/XTRAPP/main/data/';
+// ============================================================
+//   PUSH TO XTRAPP — commit xtrapp_data.json straight from the app.
+//
+//   Two modes, honest about the tradeoff:
+//   · WITH a token: fully automatic. Settings prompt stores a FINE-GRAINED
+//     GitHub PAT (create at github.com/settings/personal-access-tokens →
+//     "Only select repositories" → XTRAPP only → Contents: Read and write).
+//     Scoped that way, a leaked token can touch nothing but XTRAPP data.
+//   · WITHOUT a token: semi-automatic. Copies the JSON to the clipboard and
+//     opens GitHub's web editor on the file — paste, commit, done.
+// ============================================================
+const GH_TOKEN_KEY = 'valuatio.github.token';
+const XTRAPP_FILE_API = 'https://api.github.com/repos/GoodGlobeLLC/XTRAPP/contents/data/xtrapp_data.json';
+const XTRAPP_FILE_EDIT = 'https://github.com/GoodGlobeLLC/XTRAPP/edit/main/data/xtrapp_data.json';
+function setGitHubToken() {
+  const cur = localStorage.getItem(GH_TOKEN_KEY);
+  const t = prompt(
+    'Paste a FINE-GRAINED GitHub token scoped to ONLY the XTRAPP repo with Contents: Read & write.\n' +
+    '(github.com → Settings → Developer settings → Fine-grained tokens)\n\n' +
+    'Leave empty + OK to REMOVE the stored token.', cur ? '••••stored••••' : '');
+  if (t === null) return;
+  if (!t.trim()) { localStorage.removeItem(GH_TOKEN_KEY); flashStatus('GitHub token removed', 'success'); return; }
+  if (t.includes('•')) return;  // unchanged placeholder
+  localStorage.setItem(GH_TOKEN_KEY, t.trim());
+  flashStatus('Token stored (this browser only — never included in XTRAPP exports)', 'success');
+}
+async function pushXtrappToGitHub() {
+  const payload = _buildXtrappPayload();
+  const json = JSON.stringify(payload, null, 2);
+  const token = localStorage.getItem(GH_TOKEN_KEY);
+  if (!token) {
+    // Tokenless path: clipboard + GitHub web editor.
+    try { await navigator.clipboard.writeText(json); } catch {}
+    window.open(XTRAPP_FILE_EDIT, '_blank', 'noopener');
+    if (typeof flashStatus === 'function') flashStatus('JSON copied to clipboard — paste into the GitHub editor that just opened, then Commit. (Add a token via setGitHubToken() for one-tap push.)', 'success');
+    return;
+  }
+  try {
+    if (typeof flashStatus === 'function') flashStatus('Pushing to XTRAPP…', 'success');
+    const headers = { Authorization: 'Bearer ' + token, Accept: 'application/vnd.github+json' };
+    // Need the current file's sha to update it (absent = first creation).
+    let sha;
+    const cur = await fetch(XTRAPP_FILE_API, { headers });
+    if (cur.ok) sha = (await cur.json()).sha;
+    else if (cur.status !== 404) throw new Error('GitHub read failed: HTTP ' + cur.status);
+    // UTF-8 safe base64
+    const b64 = btoa(unescape(encodeURIComponent(json)));
+    const put = await fetch(XTRAPP_FILE_API, {
+      method: 'PUT', headers,
+      body: JSON.stringify({ message: 'xtrapp: app push ' + new Date().toISOString(), content: b64, ...(sha ? { sha } : {}) }),
+    });
+    if (!put.ok) {
+      const err = await put.json().catch(() => ({}));
+      throw new Error('HTTP ' + put.status + (err.message ? ' — ' + err.message : ''));
+    }
+    if (typeof flashStatus === 'function') flashStatus('✓ Pushed to XTRAPP — fixes, posts, bets, articles all committed', 'success');
+  } catch (e) {
+    console.error('[xtrapp-push]', e);
+    if (typeof flashStatus === 'function') flashStatus('Push failed (' + e.message + ') — falling back to clipboard + web editor', 'error');
+    try { await navigator.clipboard.writeText(json); } catch {}
+    window.open(XTRAPP_FILE_EDIT, '_blank', 'noopener');
+  }
+}
+if (typeof window !== 'undefined') { window.pushXtrappToGitHub = pushXtrappToGitHub; window.setGitHubToken = setGitHubToken; }
+
 async function fetchXtrappData() {
   try {
     const j = await fetchJsonMaybeGz(XTRAPP_BASE + 'xtrapp_data.json');
@@ -33671,6 +33861,27 @@ async function fetchXtrappData() {
     if (j.botWeights && typeof saveBotWeights === 'function') {
       const localW = (typeof loadBotWeights === 'function') ? loadBotWeights() : {};
       saveBotWeights({ ...localW, ...j.botWeights });
+    }
+    // News corpus from the repo: merge by URL (fill-if-missing — live pulls and
+    // local edits always win; the repo backfills what this browser hasn't seen).
+    if (Array.isArray(j.articles) && j.articles.length) {
+      try {
+        const cache = _newsMemCache || { fetchedAt: Date.now(), items: [] };
+        const have = new Set(cache.items.map(a => a.url));
+        let added = 0;
+        for (const a of j.articles) {
+          if (a?.url && !have.has(a.url)) { cache.items.push(a); have.add(a.url); added++; }
+        }
+        if (added) {
+          _newsMemCache = cache;
+          idbSetDebounced('newsCache', () => _newsMemCache);
+          if (typeof state !== 'undefined' && state.news?.items) {
+            const liveHave = new Set(state.news.items.map(a => a.url));
+            for (const a of j.articles) if (a?.url && !liveHave.has(a.url)) state.news.items.push(a);
+          }
+          console.log(`[xtrapp] merged ${added} articles from repo corpus`);
+        }
+      } catch (e) { console.warn('[xtrapp] article merge failed:', e.message); }
     }
     // Personal data: FILL-IF-MISSING only. The repo seeds a fresh browser, but
     // never clobbers live local edits (your current device is the live truth;
@@ -33822,14 +34033,20 @@ function saveBotState(b) {
 // ============================================================
 let _botRegime = null;
 function botAssessRegime() {
-  // 1) Nightly pipeline snapshot (computed with full macro context) — trust if < 36h old.
+  // 1) The nightly pipeline's regime_current.json (loaded into state.marketRegime
+  //    by loadRegimeSnapshot) — it sees macro/liquidity/breadth data the browser
+  //    doesn't. Trusted when fresh (<36h) and confident (≥0.4).
   try {
-    const snap = (typeof state !== 'undefined') ? state._regimeSnapshot : null;
-    if (snap?.regime) {
-      const age = snap.asOf ? Date.now() - new Date(snap.asOf).getTime() : 0;
-      if (age < 36 * 3600 * 1000) {
-        const riskOff = /recession|fear|crisis|deflat|stagflat|risk.?off/i.test(snap.regime);
-        const riskOn = /goldilocks|expansion|reflat|risk.?on|growth/i.test(snap.regime);
+    const snap = (typeof state !== 'undefined') ? state.marketRegime : null;
+    if (snap?.regime && (snap.confidence == null || snap.confidence >= 0.4)) {
+      const when = snap.date ? new Date(snap.date + 'T00:00:00Z').getTime() : (snap.loadedAt || 0);
+      if (Date.now() - when < 36 * 3600 * 1000) {
+        // Map the pipeline's regime vocabulary onto the bot's three branches:
+        //   expansion / risk_on_melt_up / goldilocks → risk-on
+        //   recession_fear / inflation_shock / deflation / crisis → risk-off
+        //   neutral / anything else → choppy (the cautious default)
+        const riskOff = /recession|fear|crisis|deflat|stagflat|inflation_shock|risk.?off/i.test(snap.regime);
+        const riskOn = /goldilocks|expansion|melt.?up|reflat|risk.?on|growth/i.test(snap.regime);
         _botRegime = _regimeProfile(riskOn ? 'risk-on' : riskOff ? 'risk-off' : 'choppy',
           `pipeline: ${snap.regime} (conf ${snap.confidence ?? '?'})`);
         return _botRegime;
