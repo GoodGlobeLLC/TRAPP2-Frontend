@@ -4,6 +4,86 @@
    Per Damodaran framework (intrinsic + relative + risk-adjusted)
    ============================================================ */
 
+// ============================================================
+//   ENVIRONMENT LAYER — production / beta / testing
+//
+//   One repo, three branches, three URLs off the same Pages site:
+//     /            → production (main branch)   — the working app
+//     /beta/       → beta branch                — rollout staging
+//     /testing/    → testing branch             — where new builds land first
+//
+//   Detected from the URL path. MUST run before anything touches storage:
+//   non-production environments get ISOLATED storage (prefixed localStorage
+//   keys + their own IndexedDB database), so a testing build can corrupt
+//   nothing in the real app. First visit to an environment seeds a copy of
+//   production data so it starts realistic.
+// ============================================================
+const APP_ENV = (() => {
+  try {
+    const p = location.pathname;
+    if (/\/testing(\/|$)/.test(p)) return 'testing';
+    if (/\/beta(\/|$)/.test(p)) return 'beta';
+  } catch {}
+  return 'production';
+})();
+const _ENV_PREFIX = APP_ENV === 'production' ? '' : `__${APP_ENV}__`;
+
+// Storage isolation for beta/testing. Wraps window.localStorage so every key
+// the app reads/writes is transparently prefixed — zero changes needed at the
+// hundreds of call sites. Falls back to SHARED storage (with a loud warning)
+// in any browser that refuses the override.
+(function isolateStorage() {
+  if (APP_ENV === 'production') return;
+  try {
+    const native = window.localStorage;
+    // One-time seed: copy production keys into this env's namespace so the
+    // sandbox starts with your real book/portfolio instead of empty.
+    const seededFlag = `${_ENV_PREFIX}__seeded__`;
+    if (!native.getItem(seededFlag)) {
+      let copied = 0;
+      for (let i = 0; i < native.length; i++) {
+        const k = native.key(i);
+        if (k && !k.startsWith('__') && native.getItem(_ENV_PREFIX + k) == null) {
+          try { native.setItem(_ENV_PREFIX + k, native.getItem(k)); copied++; } catch {}
+        }
+      }
+      try { native.setItem(seededFlag, new Date().toISOString()); } catch {}
+      console.log(`[env:${APP_ENV}] seeded ${copied} keys from production into sandbox`);
+    }
+    const envKeys = () => {
+      const out = [];
+      for (let i = 0; i < native.length; i++) {
+        const k = native.key(i);
+        if (k && k.startsWith(_ENV_PREFIX)) out.push(k.slice(_ENV_PREFIX.length));
+      }
+      return out;
+    };
+    const shim = {
+      getItem: k => native.getItem(_ENV_PREFIX + k),
+      setItem: (k, v) => native.setItem(_ENV_PREFIX + k, v),
+      removeItem: k => native.removeItem(_ENV_PREFIX + k),
+      key: i => envKeys()[i] ?? null,
+      clear: () => { for (const k of envKeys()) native.removeItem(_ENV_PREFIX + k); },
+      get length() { return envKeys().length; },
+    };
+    Object.defineProperty(window, 'localStorage', { value: shim, configurable: true });
+    console.log(`[env:${APP_ENV}] localStorage ISOLATED under prefix "${_ENV_PREFIX}"`);
+  } catch (e) {
+    console.warn(`[env:${APP_ENV}] storage isolation unavailable (${e.message}) — SHARED with production, be careful`);
+  }
+})();
+
+// Badge so you always know which build you're in.
+document.addEventListener('DOMContentLoaded', () => {
+  if (APP_ENV === 'production') return;
+  const b = document.createElement('div');
+  b.textContent = APP_ENV.toUpperCase() + ' ENV';
+  b.style.cssText = 'position:fixed;top:0;right:0;z-index:99999;padding:3px 12px;font:700 10px monospace;letter-spacing:1px;color:#000;border-bottom-left-radius:6px;pointer-events:none;'
+    + (APP_ENV === 'testing' ? 'background:#ff5555;' : 'background:#ffb000;');
+  document.body.appendChild(b);
+  document.title = `[${APP_ENV.toUpperCase()}] ` + document.title;
+});
+
 // ---------- STATE ----------
 const state = {
   stock: null,          // raw fetched data
@@ -3300,53 +3380,286 @@ function findSheetRow(sheet, ticker) {
 // Get price history for a ticker from cached sheet, or null if absent.
 // Per-ticker price history cache (external API results, 1-day TTL)
 const PRICE_HIST_CACHE_KEY = 'valuatio.priceHist.cache.v1';
+// ============================================================
+//   INDEXEDDB STORAGE ENGINE — the fix for "page slows / crashes at 4MB+"
+//
+//   localStorage is SYNCHRONOUS and capped ~5MB: every multi-MB
+//   JSON.parse/stringify on it blocks the main thread, which is exactly why
+//   the page crawled after importing news + stock data. IndexedDB is async
+//   (never blocks rendering) and holds hundreds of MB.
+//
+//   Pattern: MEMORY-FIRST. Hot code paths keep reading synchronously from
+//   in-memory mirrors (zero behavior change at call sites); saves write the
+//   mirror and queue an async IndexedDB write-through. At boot,
+//   hydrateIdbCaches() loads the mirrors and performs a ONE-TIME migration
+//   that moves the big blobs (news, sheet, price history) OUT of
+//   localStorage — instantly freeing the ~4MB that was choking it.
+//   localStorage keeps only small hot state (settings, bot state, weights,
+//   review queue — a few KB).
+// ============================================================
+const IDB_NAME = 'valuatio-db' + (typeof _ENV_PREFIX !== 'undefined' && _ENV_PREFIX ? '-' + APP_ENV : ''), IDB_STORE = 'kv';  // beta/testing get their own DB
+let _idbPromise = null;
+function idbOpen() {
+  if (_idbPromise) return _idbPromise;
+  _idbPromise = new Promise((resolve, reject) => {
+    try {
+      const req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    } catch (e) { reject(e); }
+  });
+  return _idbPromise;
+}
+async function idbGet(key) {
+  try {
+    const db = await idbOpen();
+    return await new Promise((res, rej) => {
+      const tx = db.transaction(IDB_STORE, 'readonly').objectStore(IDB_STORE).get(key);
+      tx.onsuccess = () => res(tx.result ?? null);
+      tx.onerror = () => rej(tx.error);
+    });
+  } catch { return null; }
+}
+async function idbSet(key, val) {
+  try {
+    const db = await idbOpen();
+    return await new Promise((res, rej) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite').objectStore(IDB_STORE).put(val, key);
+      tx.onsuccess = () => res(true);
+      tx.onerror = () => rej(tx.error);
+    });
+  } catch { return false; }
+}
+async function idbDel(key) {
+  try {
+    const db = await idbOpen();
+    return await new Promise((res, rej) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite').objectStore(IDB_STORE).delete(key);
+      tx.onsuccess = () => res(true);
+      tx.onerror = () => rej(tx.error);
+    });
+  } catch { return false; }
+}
+// Debounced write-through so rapid saves coalesce into one IDB transaction.
+const _idbWriteTimers = {};
+function idbSetDebounced(key, getVal, ms = 800) {
+  clearTimeout(_idbWriteTimers[key]);
+  _idbWriteTimers[key] = setTimeout(() => { idbSet(key, getVal()); }, ms);
+}
+
+// ---- In-memory mirrors (the synchronous read surface) ----
+let _sheetMemCache = null;        // { t, data } | null
+let _newsMemCache = null;         // { fetchedAt, items } | null
+let _idbHydrated = false;
+
+// Synchronous accessor replacing every JSON.parse(localStorage[SHEET_CACHE_KEY])
+// call site — those re-parsed a multi-MB blob on EVERY read (a major source of
+// the slowness). Now it's a pointer dereference.
+function getSheetCacheObj() { return _sheetMemCache; }
+
+async function hydrateIdbCaches() {
+  // ONE-TIME MIGRATION: lift the big blobs out of localStorage → IndexedDB.
+  const migrations = [
+    ['valuatio.news.v1', 'newsCache'],
+    [SHEET_CACHE_KEY_NAME(), 'sheetCache'],
+    [PRICE_HIST_CACHE_KEY, 'priceHist'],
+  ];
+  for (const [lsKey, idbKey] of migrations) {
+    try {
+      const raw = lsKey && localStorage.getItem(lsKey);
+      if (raw) {
+        await idbSet(idbKey, JSON.parse(raw));
+        localStorage.removeItem(lsKey);
+        console.log(`[idb] migrated ${lsKey} (${(raw.length / 1024).toFixed(0)}KB) localStorage → IndexedDB`);
+      }
+    } catch (e) { console.warn('[idb] migration failed for', lsKey, e.message); }
+  }
+  // Hydrate memory mirrors.
+  try {
+    const [sheet, news, hist] = await Promise.all([idbGet('sheetCache'), idbGet('newsCache'), idbGet('priceHist')]);
+    if (sheet) _sheetMemCache = sheet;
+    if (news) _newsMemCache = news;
+    if (hist && typeof _priceHistMemCache === 'object') Object.assign(_priceHistMemCache, hist);
+    _idbHydrated = true;
+    console.log(`[idb] hydrated: sheet=${!!sheet} news=${news?.items?.length || 0} items, history=${hist ? Object.keys(hist).length : 0} tickers`);
+    // If the news tab rendered empty before hydration, fill it now.
+    if (news?.items?.length && typeof state !== 'undefined' && state.news && !state.news.items?.length) {
+      state.news.items = news.items;
+      state.news.loadedAt = news.fetchedAt;
+      if (typeof renderNewsFeed === 'function') { try { renderNewsFeed(); } catch {} }
+    }
+  } catch (e) { console.warn('[idb] hydration failed:', e.message); _idbHydrated = true; }
+}
+// SHEET_CACHE_KEY is declared ~3000 lines below this point (const hoisting in
+// TDZ would throw) — resolve it lazily by name.
+function SHEET_CACHE_KEY_NAME() { try { return SHEET_CACHE_KEY; } catch { return 'valuatio.sheet.cache.v1'; } }
+document.addEventListener('DOMContentLoaded', () => { hydrateIdbCaches().then(checkStorageHealth); });
+
+// ============================================================
+//   STORAGE HEALTH — "make sure browser storage is never full"
+//
+//   1. Asks the browser for PERSISTENT storage: without it, Chrome (especially
+//      on Chromebooks) may silently EVICT IndexedDB under disk pressure.
+//      Granted persistence = the data survives until the user deletes it.
+//   2. Watchdog: measures localStorage every boot. If it crosses the soft
+//      ceiling (3.5MB of the ~5MB quota), auto-prunes the re-fetchable caches
+//      (descriptions first — everything irreplaceable lives in IndexedDB,
+//      XTRAPP, or the backup file, never in the prune path).
+// ============================================================
+function localStorageBytes() {
+  let total = 0;
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    total += k.length + (localStorage.getItem(k) || '').length;
+  }
+  return total;
+}
+async function checkStorageHealth() {
+  // Request durable storage (no-op if already granted).
+  try {
+    if (navigator.storage?.persist) {
+      const persisted = await navigator.storage.persisted();
+      const granted = persisted || await navigator.storage.persist();
+      console.log(`[storage] persistent storage ${granted ? 'GRANTED — data survives disk pressure' : 'not granted (browser may evict under pressure)'}`);
+    }
+  } catch {}
+  const bytes = localStorageBytes();
+  const mb = bytes / 1048576;
+  console.log(`[storage] localStorage at ${(mb).toFixed(2)}MB`);
+  if (mb > 3.5) {
+    // Prune order: re-fetchable, biggest-first. NEVER touches portfolio, bets,
+    // notes, valuations, personal book, overrides, or settings.
+    const prunable = ['valuatio.desc.cache.v1', 'valuatio.macroData.v1', 'valuatio.bonds.v1', 'valuatio.cryptoPrices.v1', 'valuatio.signalsConsensus.v1'];
+    let freed = 0;
+    for (const k of prunable) {
+      const v = localStorage.getItem(k);
+      if (v) { freed += v.length; localStorage.removeItem(k); }
+      if ((bytes - freed) / 1048576 < 3.0) break;
+    }
+    console.warn(`[storage] soft ceiling hit — pruned ${(freed / 1024).toFixed(0)}KB of re-fetchable caches`);
+    if (typeof flashStatus === 'function') { try { flashStatus(`Storage was filling — freed ${(freed / 1024).toFixed(0)}KB of re-fetchable cache`, 'success'); } catch {} }
+  }
+}
+
+// ============================================================
+//   FULL BACKUP / RESTORE — one file that preserves EVERYTHING
+//
+//   Downloads every valuatio.* localStorage key (portfolio, bot record,
+//   personal book, overrides, valuations, theses, settings, API keys — the
+//   irreplaceable set) into a single dated JSON. Restore merges it back on
+//   any device. This file is for YOUR storage (Drive/local) — unlike the
+//   XTRAPP export it includes API keys, so don't commit it to a public repo.
+// ============================================================
+function exportFullBackup() {
+  const dump = { _schema: 'valuatio-backup-v1', exportedAt: new Date().toISOString(), keys: {} };
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k && k.startsWith('valuatio.')) dump.keys[k] = localStorage.getItem(k);
+  }
+  const blob = new Blob([JSON.stringify(dump)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `valuatio-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+  if (typeof flashStatus === 'function') { try { flashStatus(`Backup downloaded — ${Object.keys(dump.keys).length} keys. Keep it somewhere safe (includes API keys).`, 'success'); } catch {} }
+}
+function importFullBackup() {
+  const input = document.createElement('input');
+  input.type = 'file'; input.accept = '.json,application/json';
+  input.onchange = async () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+      const dump = JSON.parse(await file.text());
+      if (dump._schema !== 'valuatio-backup-v1' || !dump.keys) throw new Error('not a Valuatio backup file');
+      const n = Object.keys(dump.keys).length;
+      if (!confirm(`Restore ${n} keys from backup dated ${dump.exportedAt?.slice(0, 10)}? Existing values for those keys are overwritten.`)) return;
+      for (const [k, v] of Object.entries(dump.keys)) {
+        try { localStorage.setItem(k, v); } catch (e) { console.warn('[restore] failed', k, e.message); }
+      }
+      if (typeof flashStatus === 'function') { try { flashStatus(`Restored ${n} keys — reloading`, 'success'); } catch {} }
+      setTimeout(() => location.reload(), 800);
+    } catch (e) { alert('Restore failed: ' + e.message); }
+  };
+  input.click();
+}
+if (typeof window !== 'undefined') { window.exportFullBackup = exportFullBackup; window.importFullBackup = importFullBackup; }
+// Surface the buttons next to the existing Clear Cache button.
+document.addEventListener('DOMContentLoaded', () => {
+  const sib = document.getElementById('stockbook-clear-cache-btn');
+  if (sib && !document.getElementById('backup-btn')) {
+    const mk = (id, label, title, fn) => {
+      const b = document.createElement('button');
+      b.className = 'btn btn-ghost'; b.id = id; b.textContent = label; b.title = title;
+      b.addEventListener('click', fn);
+      sib.parentNode.insertBefore(b, sib.nextSibling);
+      return b;
+    };
+    mk('restore-btn', 'Restore', 'Restore everything from a backup file', importFullBackup);
+    mk('backup-btn', 'Backup', 'Download EVERYTHING (portfolio, bets, valuations, settings) to one file', exportFullBackup);
+  }
+});
+
+// ---- Storage report: see exactly where the bytes are ----
+async function storageReport() {
+  const ls = [];
+  let lsTotal = 0;
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    const size = (localStorage.getItem(k) || '').length;
+    lsTotal += size;
+    ls.push([k, size]);
+  }
+  ls.sort((a, b) => b[1] - a[1]);
+  console.log(`localStorage TOTAL: ${(lsTotal / 1024).toFixed(0)}KB`);
+  for (const [k, s] of ls.slice(0, 15)) console.log(`  ${(s / 1024).toFixed(1).padStart(8)}KB  ${k}`);
+  for (const key of ['sheetCache', 'newsCache', 'priceHist', 'botScanCheckpoint']) {
+    const v = await idbGet(key);
+    console.log(`IndexedDB ${key}: ${v ? (JSON.stringify(v).length / 1024).toFixed(0) + 'KB' : '(empty)'}`);
+  }
+  if (navigator.storage?.estimate) {
+    const est = await navigator.storage.estimate();
+    console.log(`Browser quota: using ${(est.usage / 1048576).toFixed(1)}MB of ${(est.quota / 1048576).toFixed(0)}MB`);
+  }
+}
+if (typeof window !== 'undefined') { window.storageReport = storageReport; window.idbGet = idbGet; window.idbSet = idbSet; }
 const PRICE_HIST_TTL_MS = 24 * 60 * 60 * 1000;
 // Browser localStorage is 5-10 MB. Each ticker's 5-year history is ~25-40 KB.
 // Cap to 100 most-recently-used to avoid silently busting quota.
-const PRICE_HIST_CACHE_MAX_TICKERS = 60;
+const PRICE_HIST_CACHE_MAX_TICKERS = 500;  // was 60 under localStorage's 5MB cap;
+// IndexedDB has the headroom — full-book history is what lets the bot scan
+// every candidate with real data instead of starving on the uncached ones.
 
 // In-memory cache for the FULL ticker set this session. localStorage holds only
 // the most-recently-used PRICE_HIST_CACHE_MAX_TICKERS so quota doesn't burst.
 const _priceHistMemCache = {};
 
 function loadPriceHistCache() {
-  if (Object.keys(_priceHistMemCache).length > 0) {
-    try {
-      const persistent = JSON.parse(localStorage.getItem(PRICE_HIST_CACHE_KEY) || '{}');
-      return { ...persistent, ..._priceHistMemCache };
-    } catch { return { ..._priceHistMemCache }; }
-  }
-  try { return JSON.parse(localStorage.getItem(PRICE_HIST_CACHE_KEY) || '{}'); }
-  catch { return {}; }
+  // Memory-only read (hydrated from IndexedDB at boot). The old path re-parsed
+  // an ~9MB localStorage blob on EVERY call — including once per ticker inside
+  // the bot scan, which is a large part of why scans timed out.
+  return _priceHistMemCache;
 }
 function savePriceHistCache(c) {
-  // Trim each history to the last ~260 points (≈1 trading year). The chart,
-  // correlations, and probability models don't need more than a year of daily
-  // data, and keeping full multi-year histories for 100+ tickers was what
-  // pushed price-history storage to ~9MB and started silently failing saves
-  // (which broke the portfolio chart — new entries couldn't persist).
+  // Trim each history to the last ~260 points (≈1 trading year) — enough for
+  // every chart/correlation/probability model while keeping the store compact.
   const MAX_POINTS = 260;
-  const trimmed = {};
   for (const [k, v] of Object.entries(c)) {
     if (v && Array.isArray(v.data) && v.data.length > MAX_POINTS) {
-      trimmed[k] = { ...v, data: v.data.slice(-MAX_POINTS) };
+      _priceHistMemCache[k] = { ...v, data: v.data.slice(-MAX_POINTS) };
     } else {
-      trimmed[k] = v;
-    }
-    _priceHistMemCache[k] = trimmed[k];
-  }
-  const sorted = Object.entries(trimmed).sort((a, b) => (b[1].t || 0) - (a[1].t || 0));
-  const top = Object.fromEntries(sorted.slice(0, PRICE_HIST_CACHE_MAX_TICKERS));
-  try { localStorage.setItem(PRICE_HIST_CACHE_KEY, JSON.stringify(top)); }
-  catch {
-    // Quota burst — halve and retry, then quarter if still failing
-    const half = Object.fromEntries(sorted.slice(0, Math.floor(PRICE_HIST_CACHE_MAX_TICKERS / 2)));
-    try { localStorage.setItem(PRICE_HIST_CACHE_KEY, JSON.stringify(half)); }
-    catch {
-      const quarter = Object.fromEntries(sorted.slice(0, Math.floor(PRICE_HIST_CACHE_MAX_TICKERS / 4)));
-      try { localStorage.setItem(PRICE_HIST_CACHE_KEY, JSON.stringify(quarter)); } catch {}
+      _priceHistMemCache[k] = v;
     }
   }
+  // Keep the most recently-touched N tickers; persist async to IndexedDB.
+  const entries = Object.entries(_priceHistMemCache);
+  if (entries.length > PRICE_HIST_CACHE_MAX_TICKERS) {
+    entries.sort((a, b) => (b[1].t || 0) - (a[1].t || 0));
+    for (const [k] of entries.slice(PRICE_HIST_CACHE_MAX_TICKERS)) delete _priceHistMemCache[k];
+  }
+  idbSetDebounced('priceHist', () => _priceHistMemCache, 1500);
 }
 
 // Get price history with fallback chain:
@@ -6217,14 +6530,15 @@ async function getSheetData(forceRefresh = false) {
   if (!getSheetUrl()) return null;
   if (!forceRefresh) {
     try {
-      const cached = JSON.parse(localStorage.getItem(SHEET_CACHE_KEY) || 'null');
+      const cached = getSheetCacheObj();
       if (cached && (Date.now() - cached.t) < SHEET_CACHE_TTL_MS) return cached.data;
     } catch {}
   }
   const data = await fetchSheetData();
-  try {
-    localStorage.setItem(SHEET_CACHE_KEY, JSON.stringify({ t: Date.now(), data }));
-  } catch {}
+  // Memory-first + async IndexedDB write-through (was: a multi-MB synchronous
+  // localStorage write that frequently burst the 5MB quota and blocked the UI).
+  _sheetMemCache = { t: Date.now(), data };
+  idbSetDebounced('sheetCache', () => _sheetMemCache);
   return data;
 }
 
@@ -7470,7 +7784,7 @@ function renderFedTab() {
 function _priceMoveAfter(ticker, dateStr, sessions) {
   let history = null;
   try {
-    const cached = JSON.parse(localStorage.getItem(SHEET_CACHE_KEY) || 'null');
+    const cached = getSheetCacheObj();
     history = cached?.data?.priceHistory?.[ticker];
   } catch {}
   if (!history?.length) {
@@ -8183,7 +8497,7 @@ function renderSectorTable() {
   // Pull cached sheet history
   let sheetHistory = null;
   try {
-    const cached = JSON.parse(localStorage.getItem(SHEET_CACHE_KEY) || 'null');
+    const cached = getSheetCacheObj();
     if (cached?.data?.priceHistory) sheetHistory = cached.data.priceHistory;
   } catch {}
   const extCache = loadPriceHistCache();
@@ -9588,7 +9902,24 @@ function purgeAllDataCaches() {
     'valuatio.news.mynews.v1',   // per-ticker my-news cache
   ];
   dataCacheKeys.forEach(k => localStorage.removeItem(k));
+  // Same caches now live in IndexedDB + memory mirrors — clear those too.
+  try { idbDel('sheetCache'); idbDel('newsCache'); idbDel('priceHist'); } catch {}
+  _sheetMemCache = null;
+  _newsMemCache = null;
+  if (typeof _priceHistMemCache === 'object') { for (const k of Object.keys(_priceHistMemCache)) delete _priceHistMemCache[k]; }
 }
+
+// Clear ONLY the sheet (stock-data snapshot) cache — refetches on next load.
+function clearSheetCache() {
+  localStorage.removeItem('valuatio.sheet.cache.v1');
+  try { idbDel('sheetCache'); } catch {}
+  _sheetMemCache = null;
+}
+// Clear ONLY the taxonomy (stable identity fields) cache — rebuilds from stockbook.
+function clearTaxonomyCache() {
+  localStorage.removeItem('valuatio.taxonomy.cache.v1');
+}
+if (typeof window !== 'undefined') { window.clearSheetCache = clearSheetCache; window.clearTaxonomyCache = clearTaxonomyCache; }
 
 // Clear ONLY the news caches. The news article cache is the most common
 // space hog (several MB of article bodies + summaries). This frees that
@@ -9601,6 +9932,10 @@ function clearNewsCache() {
       localStorage.removeItem(k);
     }
   });
+  // Clear the IndexedDB copy + memory mirror too (news now lives there).
+  if (_newsMemCache) { try { freed += JSON.stringify(_newsMemCache).length; } catch {} }
+  _newsMemCache = null;
+  try { idbDel('newsCache'); } catch {}
   // Reset in-memory news state so the feed doesn't re-serve cleared articles
   if (typeof state !== 'undefined' && state.news) {
     state.news.items = [];
@@ -9640,12 +9975,14 @@ function openClearCachePrompt() {
   const choice = prompt(
     'Choose what to clear:\n' +
     '  N = NEWS cache ONLY (clears all stored articles — often several MB)\n' +
+    '  S = SHEET cache ONLY (stock data snapshot — refetches on next load)\n' +
+    '  T = TAXONOMY cache ONLY (sector/identity fields — rebuilds from stockbook)\n' +
     '  0 = Price history ONLY (the biggest cache — frees the most space, re-fetches on demand)\n' +
     '  1 = Caches only (sectors, descriptions, taxonomy, macro, bonds, sheet cache, price history, news)\n' +
     '  2 = Caches + personal book (manually-added tickers)\n' +
     '  3 = EVERYTHING (caches + personal book + portfolio + saved valuations + ' +
        'notes + overrides + probability theses + risk portfolio + API keys + sheet URLs)\n\n' +
-    'Type N, 0, 1, 2, or 3:'
+    'Type N, S, T, 0, 1, 2, or 3:'
   );
   if (!choice) return;
   const c = choice.trim().toUpperCase();
@@ -9656,11 +9993,24 @@ function openClearCachePrompt() {
     flashStatus(`News cache cleared — freed ~${(freed / 1024 / 1024).toFixed(1)}MB`, 'success');
     return;
   }
+  if (c === 'S') {
+    clearSheetCache();
+    if (typeof renderStorageStats === 'function') renderStorageStats();
+    flashStatus('Sheet cache cleared — next load refetches', 'success');
+    return;
+  }
+  if (c === 'T') {
+    clearTaxonomyCache();
+    if (typeof renderStorageStats === 'function') renderStorageStats();
+    flashStatus('Taxonomy cache cleared', 'success');
+    return;
+  }
   if (c === '0') {
     // Price history is usually the largest single cache (often 8-9MB with
     // hundreds of tickers). Clearing just this frees the most space without
     // touching portfolio, settings, or other caches. Re-fetches on demand.
     localStorage.removeItem('valuatio.priceHist.cache.v1');
+    idbDel('priceHist');
     // Also clear the in-memory mirror so getHistoryForTicker doesn't serve stale data
     if (typeof _priceHistMemCache === 'object') {
       for (const k of Object.keys(_priceHistMemCache)) delete _priceHistMemCache[k];
@@ -11424,7 +11774,7 @@ async function fnGMM() {
 
   let sheetHistory = null;
   try {
-    const cached = JSON.parse(localStorage.getItem(SHEET_CACHE_KEY) || 'null');
+    const cached = getSheetCacheObj();
     if (cached?.data?.priceHistory) sheetHistory = cached.data.priceHistory;
   } catch {}
 
@@ -11589,7 +11939,7 @@ async function fnIMAP() {
   // Pull sheet history first
   let sheetHistory = null;
   try {
-    const cached = JSON.parse(localStorage.getItem(SHEET_CACHE_KEY) || 'null');
+    const cached = getSheetCacheObj();
     if (cached?.data?.priceHistory) sheetHistory = cached.data.priceHistory;
   } catch {}
 
@@ -16902,7 +17252,7 @@ async function fnHEAT(arg) {
   // Pull sheet history (for fallback if changepct not in raw row)
   let sheetHistory = null;
   try {
-    const cached = JSON.parse(localStorage.getItem(SHEET_CACHE_KEY) || 'null');
+    const cached = getSheetCacheObj();
     if (cached?.data?.priceHistory) sheetHistory = cached.data.priceHistory;
   } catch {}
   const extCache = loadPriceHistCache();
@@ -17692,7 +18042,7 @@ function _tapeRow(ticker) {
 // where we don't keep daily history but the live quote does carry session %.
 function _tapeChangePct(ticker) {
   try {
-    const cached = JSON.parse(localStorage.getItem(SHEET_CACHE_KEY) || 'null');
+    const cached = getSheetCacheObj();
     const sheetHistory = cached?.data?.priceHistory;
     if (sheetHistory?.[ticker]?.length >= 2) return priceChangeFromHistory(sheetHistory[ticker], 1);
   } catch {}
@@ -18895,7 +19245,63 @@ function applyOverridesToRow(row) {
 //     so the cell renders as "—" instead of empty whitespace.
 //
 // Runs after overrides so user overrides always win over auto-classification.
+// ============================================================
+//   ROW FIELD NORMALIZER — snake_case (pipeline) → camelCase (app)
+//
+//   master.json rows arrive with pipeline-named fields {dividend_yield,
+//   marketcap, changepct, closeyest, ...} while the app reads camelCase
+//   everywhere (dividendYield, marketCap, ...). Without this mapping,
+//   Research grading, the bot engine, and short-carry silently see nothing
+//   for those fields. Mutates the row in place, filling camelCase aliases
+//   only when not already set (so a richer valued object isn't clobbered).
+//   Idempotent — safe to call repeatedly.
+// ============================================================
+const _ROW_FIELD_ALIASES = {
+  dividend_yield: 'dividendYield',
+  marketcap: 'marketCap',
+  changepct: 'changesPercentage',
+  closeyest: 'priorClose',
+  priceopen: 'open',
+  volumeavg: 'avgVolume',
+  web_url: 'website',
+  asset_class: 'assetClass',
+  // financial-statement fields, if the pipeline ever emits them snake_case
+  return_on_equity: 'returnOnEquity', roe: 'returnOnEquity',
+  return_on_assets: 'returnOnAssets', roa: 'returnOnAssets',
+  gross_margin: 'grossMargin', operating_margin: 'operatingMargin',
+  profit_margin: 'profitMargin', net_margin: 'profitMargin',
+  revenue_growth: 'revenueGrowth', earnings_growth: 'earningsGrowth',
+  free_cash_flow: 'freeCashFlow', fcf: 'freeCashFlow',
+  price_to_book: 'priceToBook', pb: 'priceToBook',
+  ev_to_ebitda: 'evToEbitda', ev_to_revenue: 'evToRevenue',
+  total_debt: 'totalDebt', total_equity: 'totalEquity', total_assets: 'totalAssets',
+  net_income: 'netIncome', stock_based_comp: 'stockBasedComp',
+};
+function normalizeRowFields(row) {
+  if (!row) return row;
+  for (const [snake, camel] of Object.entries(_ROW_FIELD_ALIASES)) {
+    if (row[snake] != null && row[snake] !== '' && (row[camel] == null || row[camel] === '')) {
+      let v = row[snake];
+      // Coerce numeric-looking strings to numbers (pipeline sometimes emits strings)
+      if (typeof v === 'string' && v.trim() !== '' && !isNaN(+v)) v = +v;
+      row[camel] = v;
+    }
+  }
+  // dividend_yield arrives as a PERCENT in this pipeline (KO=2.54 meaning
+  // 2.54%) — but the app treats dividendYield as a DECIMAL (0.0254). Convert
+  // only when we mapped it FROM the snake_case source this pass (tracked via
+  // the raw field still being present and the camel value matching it), so we
+  // never double-divide a value that arrived already-decimal from a valuation.
+  if (row.dividend_yield != null && row.dividend_yield !== '' &&
+      row.dividendYield === (typeof row.dividend_yield === 'string' ? +row.dividend_yield : row.dividend_yield)) {
+    row.dividendYield = row.dividendYield / 100;
+  }
+  return row;
+}
+if (typeof window !== 'undefined') window.normalizeRowFields = normalizeRowFields;
+
 function enrichRowClassification(row) {
+  normalizeRowFields(row);
   if (!row || !row.ticker) return;
   const sub = subClassifyAsset(row.ticker);
 
@@ -19619,7 +20025,7 @@ function annualizedReturn(history, lookbackDays = 252) {
 function getHistoryForTicker(ticker) {
   let sheetHistory = null;
   try {
-    const cached = JSON.parse(localStorage.getItem(SHEET_CACHE_KEY) || 'null');
+    const cached = getSheetCacheObj();
     sheetHistory = cached?.data?.priceHistory;
   } catch {}
   if (sheetHistory?.[ticker]?.length >= 2) return sheetHistory[ticker];
@@ -27459,12 +27865,30 @@ function onCompanyTabActive() {
   });
   if (diagEl) {
     diagEl.innerHTML = `<div style="padding:16px;background:var(--bg-elev);border:1px solid var(--amber);border-radius:4px;font-family:var(--mono);font-size:11px;color:var(--ink-dim);line-height:1.8">
-      <div style="color:var(--amber);font-weight:700;margin-bottom:6px">[diagnostic] Company tab activated · build 2026-05-29-company-baseline</div>
+      <div style="color:var(--amber);font-weight:700;margin-bottom:6px">[diagnostic] Company tab activated · build 2026-06-12</div>
       state.stock: <strong style="color:var(--ink)">${state.stock?.ticker || 'NULL'}</strong><br>
       ticker input: <strong style="color:var(--ink)">${escapeHtml(inputVal) || '(empty)'}</strong><br>
       Loading data…
     </div>`;
   }
+
+  // ===== [company-vis] DISPLAY-CHAIN DIAGNOSTIC =====
+  // Logs the computed display + height of every element between the valuation
+  // panel and the overview body. If the tab "shows nothing", these four lines
+  // identify the exact element that's hidden/collapsed in five seconds.
+  try {
+    const chain = [
+      ['valuation panel', document.querySelector('[data-panel="valuation"], #panel-valuation')],
+      ['company subpanel', document.querySelector('[data-vpanel="company"], #company-subpanel')],
+      ['company-content', document.querySelector('.company-content')],
+      ['overview-body', document.getElementById('company-overview-body')],
+    ];
+    for (const [label, el] of chain) {
+      if (!el) { console.warn(`[company-vis] ${label}: ELEMENT NOT FOUND`); continue; }
+      const cs = getComputedStyle(el);
+      console.log(`[company-vis] ${label}: display=${cs.display} visibility=${cs.visibility} height=${el.offsetHeight}px overflow=${cs.overflow}`);
+    }
+  } catch (e) { console.warn('[company-vis] diagnostic failed:', e.message); }
 
   // Ensure state.company exists (guards a possible undefined-state crash)
   if (!state.company) {
@@ -27723,6 +28147,8 @@ function applyArticleFix(article) {
 // review queue as posts, with type 'news'.
 function queueArticleForReview(article) {
   if (typeof loadReviewQueue !== 'function') return;
+  // Once a human has fixed this article (via Review → XTRAPP), never re-queue it.
+  if (typeof getArticleFix === 'function' && getArticleFix(article)) return;
   const q = loadReviewQueue();
   const key = articleKey(article);
   if (q.some(x => x.articleKey === key)) return;  // already queued
@@ -27732,7 +28158,8 @@ function queueArticleForReview(article) {
     articleKey: key,
     url: article.url || null,
     headline: article.headline || article.title || '(no headline)',
-    matchedTicker: article.ticker || null,
+    matchedTicker: article.ticker || article._reassignedFrom || null,
+    suggestedTicker: article._proposedTicker || null,   // matcher's best guess, if any
     allTickers: article.tickers || (article.ticker ? [article.ticker] : []),
     source: article.source || article.site || null,
     queuedAt: new Date().toISOString(),
@@ -28183,19 +28610,16 @@ function extractCompanyStructure(description) {
 }
 
 function loadNewsCache() {
-  try {
-    const raw = localStorage.getItem(NEWS_CACHE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (!parsed?.fetchedAt || !Array.isArray(parsed.items)) return null;
-    if (Date.now() - parsed.fetchedAt > NEWS_CACHE_TTL_MS) return null;
-    return parsed;
-  } catch { return null; }
+  // Memory-first (hydrated from IndexedDB at boot). The old localStorage path
+  // is gone — multi-MB news blobs were the single biggest localStorage burden.
+  const parsed = _newsMemCache;
+  if (!parsed?.fetchedAt || !Array.isArray(parsed.items)) return null;
+  if (Date.now() - parsed.fetchedAt > NEWS_CACHE_TTL_MS) return null;
+  return parsed;
 }
 function saveNewsCache(items) {
-  try {
-    localStorage.setItem(NEWS_CACHE_KEY, JSON.stringify({ fetchedAt: Date.now(), items }));
-  } catch {}
+  _newsMemCache = { fetchedAt: Date.now(), items };
+  idbSetDebounced('newsCache', () => _newsMemCache);
 }
 
 // Fetch news from Finnhub for a single ticker.
@@ -28214,6 +28638,7 @@ async function fetchFinnhubNews(ticker, daysBack = 7) {
     if (!Array.isArray(arr)) return null;
     return arr.map(n => ({
       ticker,
+      _fetchedByTicker: true,   // came from this ticker's own company-news feed
       headline: n.headline || '',
       summary: n.summary || '',
       url: n.url || '',
@@ -28238,6 +28663,7 @@ async function fetchFmpStockNews(ticker, limit = 10) {
     if (!Array.isArray(arr)) return null;
     return arr.map(n => ({
       ticker,
+      _fetchedByTicker: true,   // per-ticker FMP stock_news request
       headline: n.title || '',
       summary: n.text || '',
       url: n.url || '',
@@ -28267,6 +28693,15 @@ async function fetchFmpStockNews(ticker, limit = 10) {
 // ============================================================
 function validateAndFixTicker(article) {
   if (!article || !article.headline) return article;
+
+  // 0. Human override trumps everything — if a durable fix exists for this URL,
+  //    apply it and never re-flag. This is what makes Review corrections stick.
+  if (typeof getArticleFix === 'function' && getArticleFix(article)) {
+    if (typeof applyArticleFix === 'function') applyArticleFix(article);
+    article._tickerConfidence = 'human';
+    return article;
+  }
+
   const aliases = _buildCompanyAliasMap();  // { 'apple': 'AAPL', ... }
   if (Object.keys(aliases).length === 0) return article;  // no stockbook = no validation
 
@@ -28287,35 +28722,73 @@ function validateAndFixTicker(article) {
     let score = 0;
     if (headline.includes(alias)) score += 3;
     if (summaryPreview.includes(alias)) score += 1;
-    if (alias.split(/\s+/).length >= 2) score += 1;  // multi-word match bonus
+    // Multi-word bonus ONLY when the alias actually matched — previously this
+    // was unconditional, so every multi-word company name scored 1 on every
+    // article, creating phantom matches and spurious re-tags.
+    if (score > 0 && alias.split(/\s+/).length >= 2) score += 1;
     if (score > 0) {
       scores[tic] = (scores[tic] || 0) + score;
     }
   }
 
-  // If the assigned ticker is in the scores AND has the top score (or tied), keep it
   const assignedScore = scores[article.ticker] || 0;
   const maxScore = Math.max(...Object.values(scores), 0);
+  const trusted = article._fetchedByTicker === true;
+
+  // ---- CONFIDENCE GATE ----
+  // The output is one of: keep (trusted/matched), confident retag, or
+  // BLANK + queue to Review. Guessing under uncertainty is what produced the
+  // wrong-company bug; blanking + human review is the epistemically honest path.
 
   if (maxScore === 0) {
-    // Headline doesn't mention any tracked company by name — trust the API's tagging
+    // No tracked company named anywhere in the text.
+    if (trusted) {
+      // Came from this ticker's own feed — the API tag is reliable there.
+      article._tickerConfidence = 'trusted';
+      return article;
+    }
+    // General-source article with no recognizable company → don't guess.
+    article._proposedTicker = null;
+    article._needsTickerReview = true;
+    article._reassignedFrom = article.ticker || null;
+    article.ticker = '';
+    if (typeof queueArticleForReview === 'function') queueArticleForReview(article);
     return article;
   }
+
   if (assignedScore === maxScore && assignedScore > 0) {
-    // Assigned ticker is the top match (or tied) — keep it
+    // Assigned ticker is the top match (or tied) — keep it.
+    article._tickerConfidence = 'matched';
     return article;
   }
   if (assignedScore === 0 && assignedName && textToScan.includes(assignedName)) {
-    // Edge case: the alias map missed the assigned ticker but its name IS in the text
+    // Edge case: the alias map missed the assigned ticker but its name IS in the text.
+    article._tickerConfidence = 'matched';
     return article;
   }
 
-  // Find the new top ticker
-  const newTicker = Object.entries(scores).sort((a, b) => b[1] - a[1])[0][0];
-  if (newTicker !== article.ticker) {
-    // Re-tag
-    return { ...article, ticker: newTicker, _reassignedFrom: article.ticker };
+  // A DIFFERENT company outranks the assigned one.
+  const [topTicker, topScore] = Object.entries(scores).sort((a, b) => b[1] - a[1])[0];
+  if (topScore >= 3) {
+    // Strong headline-level evidence → confidently auto-correct (the
+    // "Intuit article tagged META" case re-tags to INTU here).
+    article._reassignedFrom = article.ticker;
+    article.ticker = topTicker;
+    article._tickerConfidence = 'retagged';
+    return article;
   }
+  // Weak (summary-only) contrary evidence.
+  if (trusted) {
+    // Its own feed says X, a faint summary mention says Y — keep the feed's tag.
+    article._tickerConfidence = 'trusted-weak';
+    return article;
+  }
+  // Untrusted + weak → blank it, suggest the candidate, queue for the human.
+  article._proposedTicker = topTicker;
+  article._needsTickerReview = true;
+  article._reassignedFrom = article.ticker || null;
+  article.ticker = '';
+  if (typeof queueArticleForReview === 'function') queueArticleForReview(article);
   return article;
 }
 
@@ -28576,14 +29049,21 @@ async function loadPortfolioNews(forceRefresh = false) {
     return true;
   });
 
-  // Validate ticker assignments. Some news APIs mis-tag articles (e.g. tagging
-  // an Intuit Barron's article as META because both appeared in a wire cluster).
-  // We scan each article's headline + summary against the stockbook alias map
-  // and re-tag if there's a clearly more prominent company mentioned.
+  // Re-attach durable human corrections FIRST (XTRAPP-synced, keyed by URL),
+  // so overrides trump the matcher and fixed articles are never re-flagged.
+  if (typeof applyArticleFix === 'function') {
+    for (const a of deduped) { try { applyArticleFix(a); } catch {} }
+  }
+  deduped = deduped.filter(a => !a._suppressed);   // human-reported 'bad' articles
+
+  // Validate ticker assignments with the confidence gate. Trusted company-feed
+  // articles keep their tag; clear headline evidence auto-corrects; genuinely
+  // ambiguous ones are BLANKED and queued to Review instead of guessed at.
   deduped = deduped.map(validateAndFixTicker);
 
   // After re-tagging, dedupe again — two articles tagged AAPL might now both
-  // be tagged MSFT after correction; only keep the first.
+  // be tagged MSFT after correction; only keep the first. Blanked-for-review
+  // articles fall out here too (held back from the feed until a human rules).
   const seen2 = new Set();
   deduped = deduped.filter(a => {
     const k = a.url || a.id;
@@ -28687,7 +29167,7 @@ function _getPriceOnDate(ticker, targetDateMs) {
   // Try sheet history first
   let history = null;
   try {
-    const cached = JSON.parse(localStorage.getItem(SHEET_CACHE_KEY) || 'null');
+    const cached = getSheetCacheObj();
     history = cached?.data?.priceHistory?.[ticker];
   } catch {}
   if (!history?.length) {
@@ -28714,7 +29194,7 @@ function _getPriceOnDate(ticker, targetDateMs) {
 function _getTodayPctChange(ticker) {
   let history = null;
   try {
-    const cached = JSON.parse(localStorage.getItem(SHEET_CACHE_KEY) || 'null');
+    const cached = getSheetCacheObj();
     history = cached?.data?.priceHistory?.[ticker];
   } catch {}
   if (!history?.length) {
@@ -30162,7 +30642,7 @@ async function renderBondEtfTable() {
   // Pull sheet history for fallback
   let sheetHistory = null;
   try {
-    const cached = JSON.parse(localStorage.getItem(SHEET_CACHE_KEY) || 'null');
+    const cached = getSheetCacheObj();
     if (cached?.data?.priceHistory) sheetHistory = cached.data.priceHistory;
   } catch {}
 
@@ -33091,6 +33571,9 @@ function reviewGenericOption(id, optIdx) {
 // the post data (data/posts.json) and the learned lexicon (data/lexicon.json),
 // wiring into the app the same way TRAPP2-1 hosts FX/13F data. The app reads
 // these back on load so the model state persists across devices via the repo.
+function _lsJson(key) {
+  try { return JSON.parse(localStorage.getItem(key) || 'null'); } catch { return null; }
+}
 function exportXtrappData() {
   const payload = {
     _schema: 'valuatio-xtrapp-v1',
@@ -33102,6 +33585,23 @@ function exportXtrappData() {
     articleFixes: (typeof loadArticleFixes === 'function') ? loadArticleFixes() : {},
     // Imported theses (calls turned into probability theses).
     theses: (typeof state !== 'undefined' && state.probability?.theses) ? state.probability.theses : [],
+    // Paper-bot state — bets are the permanent track record; weights are the
+    // learned signal multipliers. Committing these makes the bot's history and
+    // its learning portable across devices.
+    bot: (typeof loadBotState === 'function') ? loadBotState() : null,
+    botWeights: (typeof loadBotWeights === 'function') ? loadBotWeights() : {},
+    // Open review items so the human-in-the-loop queue follows you too.
+    reviewQueue: (typeof loadReviewQueue === 'function') ? loadReviewQueue() : [],
+    // Personal data layer — manually-added tickers, manual field overrides,
+    // portfolio, transactions, cash, and saved valuations — so a fresh browser
+    // rebuilds your whole setup from the repo. Deliberately NO API keys and NO
+    // sheet URLs: XTRAPP is a public repo, secrets stay out of the export.
+    personalBook: _lsJson('valuatio.personalBook.v1'),
+    overrides: _lsJson('valuatio.overrides.v1'),
+    portfolio: _lsJson('valuatio.portfolio.v1'),
+    transactions: _lsJson('valuatio.transactions.v1'),
+    cashPosition: _lsJson('valuatio.cashPosition.v1'),
+    savedValuations: _lsJson('valuatio.savedValuations.v1'),
   };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -33113,12 +33613,32 @@ function exportXtrappData() {
 }
 
 // Read the XTRAPP repo's data back into the app (model + posts persistence).
+// ---- gzip-aware JSON fetch ----
+// raw.githubusercontent already gzips on the WIRE (transfer is compressed
+// automatically), so .gz files mainly shrink what's stored in the repo. This
+// helper lets any data file be committed as .json.gz (~80% smaller) and
+// decompressed natively in the browser via DecompressionStream.
+async function fetchJsonMaybeGz(url) {
+  // Prefer the plain file; fall back to .gz transparently.
+  try {
+    const r = await fetch(url, { cache: 'no-cache' });
+    if (r.ok) return await r.json();
+  } catch {}
+  try {
+    const rg = await fetch(url + '.gz', { cache: 'no-cache' });
+    if (!rg.ok || typeof DecompressionStream === 'undefined') return null;
+    const ds = rg.body.pipeThrough(new DecompressionStream('gzip'));
+    const text = await new Response(ds).text();
+    return JSON.parse(text);
+  } catch { return null; }
+}
+if (typeof window !== 'undefined') window.fetchJsonMaybeGz = fetchJsonMaybeGz;
+
 const XTRAPP_BASE = 'https://raw.githubusercontent.com/GoodGlobeLLC/XTRAPP/main/data/';
 async function fetchXtrappData() {
   try {
-    const r = await fetch(XTRAPP_BASE + 'xtrapp_data.json', { cache: 'no-cache' });
-    if (!r.ok) { console.warn('[xtrapp] not found (status', r.status + ')'); return null; }
-    const j = await r.json();
+    const j = await fetchJsonMaybeGz(XTRAPP_BASE + 'xtrapp_data.json');
+    if (!j) { console.warn('[xtrapp] xtrapp_data.json not found (plain or .gz)'); return null; }
     // Merge the repo lexicon with local (repo wins on conflict — it's the
     // shared source of truth), but never clobber locally-learned phrases that
     // aren't in the repo yet.
@@ -33133,6 +33653,50 @@ async function fetchXtrappData() {
     if (j.articleFixes && typeof saveArticleFixes === 'function') {
       const localFixes = (typeof loadArticleFixes === 'function') ? loadArticleFixes() : {};
       saveArticleFixes({ ...localFixes, ...j.articleFixes });
+    }
+    // Bot state: union bets by id (the track record is append-only — never drop
+    // a bet from either side); bankroll/lastRunDate from whichever side ran
+    // most recently. Weights: repo wins (shared source of truth), but local
+    // keys absent from the repo survive.
+    if (j.bot && typeof loadBotState === 'function' && typeof saveBotState === 'function') {
+      try {
+        const local = loadBotState();
+        const byId = new Map((local.bets || []).map(b => [b.id, b]));
+        for (const b of (j.bot.bets || [])) if (!byId.has(b.id)) byId.set(b.id, b);
+        const repoNewer = (j.bot.lastRunDate || '') > (local.lastRunDate || '');
+        const merged = { ...(repoNewer ? j.bot : local), bets: Array.from(byId.values()) };
+        saveBotState(merged);
+      } catch (e) { console.warn('[xtrapp] bot merge failed:', e.message); }
+    }
+    if (j.botWeights && typeof saveBotWeights === 'function') {
+      const localW = (typeof loadBotWeights === 'function') ? loadBotWeights() : {};
+      saveBotWeights({ ...localW, ...j.botWeights });
+    }
+    // Personal data: FILL-IF-MISSING only. The repo seeds a fresh browser, but
+    // never clobbers live local edits (your current device is the live truth;
+    // the repo is the parachute).
+    for (const [field, lsKey] of [
+      ['personalBook', 'valuatio.personalBook.v1'],
+      ['overrides', 'valuatio.overrides.v1'],
+      ['portfolio', 'valuatio.portfolio.v1'],
+      ['transactions', 'valuatio.transactions.v1'],
+      ['cashPosition', 'valuatio.cashPosition.v1'],
+      ['savedValuations', 'valuatio.savedValuations.v1'],
+    ]) {
+      try {
+        if (j[field] != null && localStorage.getItem(lsKey) == null) {
+          localStorage.setItem(lsKey, JSON.stringify(j[field]));
+          console.log(`[xtrapp] seeded ${field} from repo (fresh browser)`);
+        }
+      } catch {}
+    }
+    if (Array.isArray(j.reviewQueue) && typeof loadReviewQueue === 'function' && typeof saveReviewQueue === 'function') {
+      try {
+        const localQ = loadReviewQueue();
+        const ids = new Set(localQ.map(x => x.id));
+        for (const item of j.reviewQueue) if (!ids.has(item.id)) localQ.push(item);
+        saveReviewQueue(localQ);
+      } catch (e) { console.warn('[xtrapp] review-queue merge failed:', e.message); }
     }
     const fixCount = j.articleFixes ? Object.keys(j.articleFixes).length : 0;
     console.log(`[xtrapp] loaded lexicon (${j.lexicon?Object.keys(j.lexicon.bull||{}).length:0} bull phrases) + ${(j.posts||[]).length} posts + ${fixCount} news fixes`);
@@ -33164,6 +33728,51 @@ async function fetchXtrappData() {
 // ============================================================
 
 const BOT_KEY = 'valuatio.bot.v1';
+// ---- Learnable signal weights ----
+// Per-signal multipliers (key = the component name botScoreTicker uses, e.g.
+// 'trend', 'health', 'fundamental'). 1.0 = neutral. botRetrain() nudges them
+// from SETTLED bet outcomes: signals that pointed the right way on winners get
+// amplified; signals that pointed into losers get damped. Clamped 0.25–4 so no
+// single signal can dominate or vanish — the "never remove a signal" rule.
+const BOT_WEIGHTS_KEY = 'valuatio.botWeights.v1';
+function loadBotWeights() {
+  try { return JSON.parse(localStorage.getItem(BOT_WEIGHTS_KEY) || '{}'); } catch { return {}; }
+}
+function saveBotWeights(w) {
+  try { localStorage.setItem(BOT_WEIGHTS_KEY, JSON.stringify(w)); } catch {}
+}
+function botRetrain() {
+  const bot = loadBotState();
+  const w = loadBotWeights();
+  const settled = (bot.bets || []).filter(b => b.status === 'closed' && b.components && isFinite(b.pnl));
+  if (!settled.length) { console.log('[bot-retrain] no settled bets with components yet'); return w; }
+  const lr = 0.05;  // small steps; weights converge over many settles
+  let nudges = 0;
+  for (const bet of settled) {
+    if (bet._trained) continue;          // each settled bet teaches exactly once
+    const won = bet.pnl > 0;
+    // direction sign: long bets reward positive-signed signals on wins;
+    // short bets reward negative-signed signals on wins.
+    const dirSign = bet.direction === 'short' ? -1 : 1;
+    for (const [key, signed] of Object.entries(bet.components)) {
+      if (!isFinite(signed) || signed === 0) continue;
+      // Did this signal agree with the bet's direction?
+      const agreed = Math.sign(signed) === dirSign;
+      // Winners: amplify agreeing signals, damp disagreeing. Losers: inverse.
+      const delta = (won === agreed ? +1 : -1) * lr * Math.min(1, Math.abs(signed));
+      w[key] = Math.max(0.25, Math.min(4, (w[key] ?? 1) * (1 + delta)));
+      nudges++;
+    }
+    bet._trained = true;
+  }
+  saveBotState(bot);
+  saveBotWeights(w);
+  console.log(`[bot-retrain] ${settled.length} settled bets → ${nudges} weight nudges`, w);
+  if (typeof flashStatus === 'function') { try { flashStatus(`Bot retrained from ${settled.length} settled bets`, 'success'); } catch {} }
+  return w;
+}
+if (typeof window !== 'undefined') { window.botRetrain = botRetrain; window.loadBotWeights = loadBotWeights; }
+
 const BOT_STARTING_BANKROLL = 1000;
 const BOT_MAX_BETS_PER_DAY = 4;
 const BOT_MIN_BETS_PER_DAY = 0;   // can sit out entirely
@@ -33192,6 +33801,79 @@ function saveBotState(b) {
 // Returns { ticker, conviction (-1..+1, sign = direction), confidence (0..1),
 //   direction: 'long'|'short', leverage, hedge, rationale[], components{} }
 // conviction sign: positive = bullish (long), negative = bearish (short).
+// ============================================================
+//   MARKET REGIME — the ROOT of the bot's decision tree
+//
+//   Every scoring pass first classifies the CURRENT market environment, and
+//   that classification changes how every downstream signal is weighed:
+//
+//   ROOT: regime?
+//   ├─ risk-on  (uptrend, calm vol)  → trend/momentum amplified ×1.3,
+//   │     mean-reversion damped ×0.7, shorts need a higher bar, leverage allowed
+//   ├─ risk-off (downtrend / vol spike) → fundamentals & health amplified ×1.3,
+//   │     trend damped (downtrends break), NO leverage, hedge bias, longs need
+//   │     a higher bar
+//   └─ choppy   (no trend, normal vol) → mean-reversion amplified ×1.3, trend
+//         damped ×0.7, conviction threshold RAISED (sit out more)
+//
+//   Source priority: the nightly pipeline's regime_current.json snapshot when
+//   fresh (it sees macro data the browser doesn't), else computed locally from
+//   benchmark history (SPY, fallback QQQ): 20d-vs-60d trend + realized vol.
+// ============================================================
+let _botRegime = null;
+function botAssessRegime() {
+  // 1) Nightly pipeline snapshot (computed with full macro context) — trust if < 36h old.
+  try {
+    const snap = (typeof state !== 'undefined') ? state._regimeSnapshot : null;
+    if (snap?.regime) {
+      const age = snap.asOf ? Date.now() - new Date(snap.asOf).getTime() : 0;
+      if (age < 36 * 3600 * 1000) {
+        const riskOff = /recession|fear|crisis|deflat|stagflat|risk.?off/i.test(snap.regime);
+        const riskOn = /goldilocks|expansion|reflat|risk.?on|growth/i.test(snap.regime);
+        _botRegime = _regimeProfile(riskOn ? 'risk-on' : riskOff ? 'risk-off' : 'choppy',
+          `pipeline: ${snap.regime} (conf ${snap.confidence ?? '?'})`);
+        return _botRegime;
+      }
+    }
+  } catch {}
+  // 2) Local computation from benchmark history.
+  let bench = null, benchName = null;
+  for (const t of ['SPY', 'QQQ', 'VOO']) {
+    const h = (typeof getHistoryForTicker === 'function') ? getHistoryForTicker(t) : null;
+    if (h && h.length >= 60) { bench = h; benchName = t; break; }
+  }
+  if (!bench) { _botRegime = _regimeProfile('choppy', 'no benchmark history — defaulting cautious'); return _botRegime; }
+  const px = bench.map(p => p.price);
+  const last = px[px.length - 1];
+  const sma20 = px.slice(-20).reduce((a, b) => a + b, 0) / 20;
+  const sma60 = px.slice(-60).reduce((a, b) => a + b, 0) / 60;
+  // Realized vol: stdev of last-20 daily returns, annualized-ish vs prior-60 baseline
+  const rets = [];
+  for (let i = px.length - 20; i < px.length; i++) rets.push((px[i] - px[i - 1]) / px[i - 1]);
+  const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
+  const vol20 = Math.sqrt(rets.reduce((a, b) => a + (b - mean) ** 2, 0) / rets.length);
+  const trendUp = last > sma20 && sma20 > sma60;
+  const trendDown = last < sma20 && sma20 < sma60;
+  const volHigh = vol20 > 0.018;   // ~> 28% annualized daily vol
+  let mode = 'choppy';
+  if (trendDown || (volHigh && !trendUp)) mode = 'risk-off';
+  else if (trendUp && !volHigh) mode = 'risk-on';
+  _botRegime = _regimeProfile(mode, `${benchName}: ${trendUp ? 'uptrend' : trendDown ? 'downtrend' : 'flat'}, vol ${(vol20 * 100).toFixed(2)}%/d`);
+  return _botRegime;
+}
+function _regimeProfile(mode, evidence) {
+  const profiles = {
+    'risk-on':  { mode, evidence, leverageOK: true,  thresholdMod: 0,     shortBar: 0.10, longBar: 0,
+                  weightMods: { trend: 1.3, momentum: 1.3, meanReversion: 0.7, health: 1.0, fundamentals: 1.0, crossAsset: 1.1 } },
+    'risk-off': { mode, evidence, leverageOK: false, thresholdMod: 0.03,  shortBar: 0,    longBar: 0.10,
+                  weightMods: { trend: 0.7, momentum: 0.8, meanReversion: 1.0, health: 1.3, fundamentals: 1.3, fed: 1.2 } },
+    'choppy':   { mode, evidence, leverageOK: false, thresholdMod: 0.06,  shortBar: 0.05, longBar: 0.05,
+                  weightMods: { trend: 0.7, momentum: 0.8, meanReversion: 1.3, health: 1.1, fundamentals: 1.1 } },
+  };
+  return profiles[mode] || profiles['choppy'];
+}
+if (typeof window !== 'undefined') window.botAssessRegime = botAssessRegime;
+
 async function botScoreTicker(ticker) {
   const t = ticker.toUpperCase();
   const row = (typeof getStockbookRow === 'function') ? getStockbookRow(t) : null;
@@ -33204,13 +33886,23 @@ async function botScoreTicker(ticker) {
 
   const components = {};
   const rationale = [];
+  const decisionPath = [];
   let score = 0, weightSum = 0;
+  // Learned per-signal multipliers from botRetrain() — 1.0 when untrained.
+  const _learned = (typeof loadBotWeights === 'function') ? loadBotWeights() : {};
+  // Regime branch of the decision tree: changes how each signal is weighed.
+  const regime = _botRegime || botAssessRegime();
+  decisionPath.push(`regime:${regime.mode} (${regime.evidence})`);
   const add = (key, signed, weight, note) => {
     if (signed == null || !isFinite(signed)) return;
     components[key] = +signed.toFixed(3);
-    score += signed * weight;
-    weightSum += weight;
+    const regMod = regime.weightMods[key] ?? 1;
+    const w = weight * (isFinite(_learned[key]) ? _learned[key] : 1) * regMod;
+    score += signed * w;
+    weightSum += w;
     if (note) rationale.push(note);
+    if (regMod !== 1) decisionPath.push(`${key}:${signed > 0 ? '+' : ''}${signed.toFixed(2)} ×${regMod} (regime)`);
+    else decisionPath.push(`${key}:${signed > 0 ? '+' : ''}${signed.toFixed(2)}`);
   };
 
   // 1. Fundamental reasoning chain (conviction 0-100 → center on 50 → signed)
@@ -33368,8 +34060,17 @@ async function botScoreTicker(ticker) {
       direction = conviction >= 0 ? 'long' : 'short';
     }
   }
-  const confidence = Math.min(1, Math.abs(conviction));
-  if (carryNote) rationale.push(carryNote);
+  let confidence = Math.min(1, Math.abs(conviction));
+  if (carryNote) { rationale.push(carryNote); decisionPath.push('shortCarry: conviction trimmed'); }
+
+  // Regime direction-bar: in risk-off, LONGS need extra conviction (knife-
+  // catching is how bots bleed); in risk-on, SHORTS need extra (fighting the
+  // tape). Applied as a confidence haircut against the disfavored direction.
+  const bar = direction === 'long' ? regime.longBar : regime.shortBar;
+  if (bar > 0) {
+    confidence = Math.max(0, confidence - bar);
+    decisionPath.push(`${direction} in ${regime.mode}: confidence -${bar} bar`);
+  }
 
   // Volatility regime → hedge flag (risky times)
   let hedge = false, volRegime = null;
@@ -33380,10 +34081,13 @@ async function botScoreTicker(ticker) {
     } catch {}
   }
 
-  // Leverage on very strong conviction (and not in a high-vol regime)
-  const leverage = (confidence >= 0.8 && !hedge) ? 2 : 1;
+  // Leverage on very strong conviction — only when the regime allows it AND
+  // ticker-level vol isn't expanding.
+  const leverage = (confidence >= 0.8 && !hedge && regime.leverageOK) ? 2 : 1;
+  decisionPath.push(leverage > 1 ? 'leverage:2x (strong + risk-on)' : hedge ? 'hedge:on (vol expanding)' : 'leverage:1x');
 
   return {
+    decisionPath,
     ticker: t,
     name: row.name || t,
     sector: row.sector || null,
@@ -33411,22 +34115,70 @@ async function botDailyRun(force = false) {
   const rows = (typeof state !== 'undefined' && state.stockbook?.rows) ? state.stockbook.rows : [];
   if (!rows.length) { console.warn('[bot] no stockbook rows — skipping run'); return bot; }
 
-  // Candidate universe: tradeable equities/ETFs with a price and enough history.
-  const candidates = rows.filter(r => {
+  // ============================================================
+  //   FULL-UNIVERSE BACKGROUND SCAN — no cap, no timeout, resumable
+  //
+  //   The scan sifts EVERY tradeable candidate. It can run for however long
+  //   it needs: work happens in chunks of 10 with a yield to the browser
+  //   between chunks (the UI never freezes, nothing watchdogs it), missing
+  //   price history is primed from the GitHub repo in the background as it
+  //   goes, and progress checkpoints to IndexedDB every chunk — so even a
+  //   page reload RESUMES the same day's scan where it left off instead of
+  //   starting over.
+  // ============================================================
+  let candidates = rows.filter(r => {
     const cls = (typeof classifyAsset === 'function') ? classifyAsset(r.ticker) : 'equity';
     return r.price > 0 && !['fx', 'index'].includes(cls);
   });
 
-  // Tickers already bet today (none same-day duplicates)
+  // Root of the decision tree: classify today's market regime ONCE per scan.
+  const regime = botAssessRegime();
+  console.log(`[bot] regime: ${regime.mode} — ${regime.evidence}`);
+
+  // Resume checkpoint: same-day partial scan picks up where it stopped.
+  let startIdx = 0;
+  let scored = [];
+  try {
+    const ckpt = await idbGet('botScanCheckpoint');
+    if (ckpt && ckpt.date === today && Array.isArray(ckpt.scored) && ckpt.index > 0) {
+      startIdx = Math.min(ckpt.index, candidates.length);
+      scored = ckpt.scored;
+      console.log(`[bot] resuming scan at ${startIdx}/${candidates.length} (${scored.length} qualifying so far)`);
+    }
+  } catch {}
+
+  // Tickers already bet today (no same-day duplicates)
   const betToday = new Set(bot.bets.filter(b => b.entryDate === today).map(b => b.ticker));
 
-  // Score candidates (cap the work — score a rotating slice if huge)
-  const scored = [];
-  for (const r of candidates) {
-    if (betToday.has(r.ticker)) continue;
-    const s = await botScoreTicker(r.ticker).catch(() => null);
-    if (s && s.confidence >= BOT_CONVICTION_THRESHOLD) scored.push(s);
+  // Regime-adjusted conviction bar: choppy/risk-off raises it (sit out more).
+  const effThreshold = BOT_CONVICTION_THRESHOLD + (regime.thresholdMod || 0);
+
+  const CHUNK = 10;
+  for (let i = startIdx; i < candidates.length; i += CHUNK) {
+    const chunk = candidates.slice(i, i + CHUNK);
+    // Prime missing history from the GitHub repo for this chunk (parallel, in
+    // the background of the scan) so every ticker scores with REAL data
+    // instead of being skipped for lack of history.
+    try {
+      const missing = chunk.filter(r => !(typeof getHistoryForTicker === 'function' && getHistoryForTicker(r.ticker)));
+      if (missing.length && typeof fetchGitHubHistory === 'function') {
+        await Promise.all(missing.map(r => fetchGitHubHistory(r.ticker).catch(() => null)));
+      }
+    } catch {}
+    for (const r of chunk) {
+      if (betToday.has(r.ticker)) continue;
+      const s = await botScoreTicker(r.ticker).catch(() => null);
+      if (s && s.confidence >= effThreshold) scored.push(s);
+    }
+    // Yield to the browser + checkpoint + status. The yield is what makes
+    // "runs however long it needs" safe — rendering and input stay live.
+    const done = Math.min(i + CHUNK, candidates.length);
+    if (typeof updateBotStatus === 'function') { try { updateBotStatus(`Scanning ${done}/${candidates.length} · ${scored.length} qualify · regime ${regime.mode}`); } catch {} }
+    try { await idbSet('botScanCheckpoint', { date: today, index: done, scored }); } catch {}
+    await new Promise(res => setTimeout(res, 0));
   }
+  try { await idbDel('botScanCheckpoint'); } catch {}
+  console.log(`[bot] scan complete: ${candidates.length} candidates → ${scored.length} above the ${(effThreshold * 100).toFixed(0)}% bar`);
 
   // Rank by confidence (absolute conviction), take top N
   scored.sort((a, b) => b.confidence - a.confidence);
@@ -33461,6 +34213,7 @@ async function botDailyRun(force = false) {
       confidence: +p.confidence.toFixed(3),
       rationale: p.rationale,
       components: p.components,
+      decisionPath: p.decisionPath || null,   // the tree path that produced this bet
       // Horizon: stronger conviction → willing to hold longer; default 20 sessions
       horizonDays: confidenceHorizonDays(p.confidence),
       status: 'open',
@@ -33535,7 +34288,11 @@ function botMarkToMarket() {
       }
     }
   }
-  if (changed) saveBotState(bot);
+  if (changed) {
+    saveBotState(bot);
+    // Bets just settled → fold their outcomes into the learned signal weights.
+    try { if (typeof botRetrain === 'function') botRetrain(); } catch {}
+  }
   return bot;
 }
 
@@ -35433,7 +36190,7 @@ function findConcentratedExposures() {
 function _chainGetPriceHistory(ticker) {
   if (!ticker) return null;
   try {
-    const cached = JSON.parse(localStorage.getItem(SHEET_CACHE_KEY) || 'null');
+    const cached = getSheetCacheObj();
     const sheetHistory = cached?.data?.priceHistory;
     if (sheetHistory?.[ticker]?.length >= 2) return sheetHistory[ticker];
   } catch {}
