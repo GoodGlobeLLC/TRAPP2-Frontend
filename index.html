@@ -6655,6 +6655,12 @@
   }
   .home-action-btn:active { transform: scale(0.98); }
   .home-action-btn svg { color: currentColor; }
+
+    /* Company tab containers — explicit visibility + scroll so a layout
+       collapse can never blank the tab (added with the 2026-06 diagnostics). */
+    .company-content { display: block; min-height: 200px; overflow-y: auto; }
+    .company-ctab { display: block; }
+    .company-ctab[style*="display:none"], .company-ctab[style*="display: none"] { display: none; }
 </style>
 </head>
 <body>
@@ -7356,6 +7362,10 @@
     </section>
 
   </div>
+  </div><!-- /val-subpanel[ta] — this close was MISSING: the Company subpanel was
+       nested INSIDE the TA subpanel, so hiding TA (which happens whenever you
+       open Company) hid Company with it. The weeks-long blank-Company-tab bug
+       was this one div. -->
 
   <!-- COMPANY INFORMATION SUB-PANEL -->
   <div class="val-subpanel" data-subpanel="company" style="display:none">
@@ -8542,6 +8552,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260530b"></script>
+<script src="app.js?v=20260612d"></script>
 </body>
 </html>
