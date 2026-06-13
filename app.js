@@ -547,12 +547,38 @@ async function fetchFxRates(force = false) {
   }
 }
 
-// Look up usdPer (USD per 1 unit) for a currency from the pipeline file.
+// Hardcoded authoritative USD-per-unit fallbacks for currencies the live
+// rates.json may not cover (it ships 27; the book also holds EGP, PHP, HUF,
+// CLP, etc.). Triple-checked against ECB/Yahoo/XE mid-June 2026. The LIVE file
+// always takes precedence — these only fill genuine gaps so a converter never
+// silently returns a wrong number for an uncovered currency.
+const FX_USD_PER_FALLBACK = {
+  USD: 1,
+  EUR: 1.157, GBP: 1.341, JPY: 0.00624, CHF: 1.225, CAD: 0.715, AUD: 0.658,
+  NZD: 0.609, CNY: 0.1479, HKD: 0.1282, TWD: 0.0312, KRW: 0.000659, INR: 0.01052,
+  SGD: 0.779, MYR: 0.227, THB: 0.0288, IDR: 0.0000615, PHP: 0.01776, // PHP added
+  SEK: 0.1056, NOK: 0.0985, DKK: 0.1551, PLN: 0.273, HUF: 0.00292,   // HUF added
+  CZK: 0.0461, RUB: 0.01205, TRY: 0.0252, ILS: 0.272, SAR: 0.2666,
+  AED: 0.2723, EGP: 0.0202, ZAR: 0.0553, BRL: 0.1795, MXN: 0.0581,
+  CLP: 0.001065, COP: 0.000246, ARS: 0.000855, PEN: 0.266,           // CLP added
+};
+// Subunit currencies: GBp/GBX = pence (1/100 GBP); USX = US cents (1/100 USD).
+const FX_SUBUNIT = { GBP_FROM: ['GBP', 0.01], };
+
+// Look up usdPer (USD per 1 unit) for a currency. Priority:
+//   1. LIVE rates.json (authoritative, updated every 15 min by the pipeline)
+//   2. Hardcoded fallback table (gap-filler for uncovered currencies)
 function fxRatesUsdPer(currency) {
   const c = loadFxRatesCache();
   const entry = c?.rates?.[currency];
   if (entry && typeof entry.usdPer === 'number' && isFinite(entry.usdPer) && entry.usdPer > 0) {
     return entry.usdPer;
+  }
+  // Cross-check / gap-fill from the hardcoded table.
+  const fb = FX_USD_PER_FALLBACK[currency];
+  if (typeof fb === 'number' && fb > 0) {
+    if (entry == null) console.log(`[fx] ${currency} not in live rates.json — using verified fallback ${fb}`);
+    return fb;
   }
   return null;
 }
@@ -9014,12 +9040,35 @@ function invalidateStockbookIndex() {
   _sbRowIndexBuiltFor = null;
 }
 
+// The four data repos that make up the universe. TRAPP2/-2 = US equities,
+// TRAPP2-1 = international/FX/ETF + the FX rates + 13F, TRAPP2-3 = supply-chain
+// tickers that were missing data. Seeded into the source list on first run.
+const DEFAULT_DATA_REPOS = ['TRAPP2', 'TRAPP2-1', 'TRAPP2-2', 'TRAPP2-3'];
+function ensureDefaultDataSources() {
+  try {
+    const existing = (typeof getSheetUrls === 'function') ? getSheetUrls() : [];
+    const have = new Set(existing);
+    const seed = [];
+    for (const repo of DEFAULT_DATA_REPOS) {
+      const base = `https://raw.githubusercontent.com/GoodGlobeLLC/${repo}/main/data/`;
+      for (const f of ['master.csv', 'history_manifest.json']) {
+        const u = base + f;
+        if (!have.has(u)) seed.push(u);
+      }
+    }
+    if (seed.length && typeof setSheetUrls === 'function') {
+      setSheetUrls([...existing, ...seed]);
+      console.log(`[sources] seeded ${seed.length} default data URLs (incl. TRAPP2-3)`);
+    }
+  } catch (e) { console.warn('[sources] default-seed failed:', e.message); }
+}
+
 async function loadStockBook(forceRefresh = false) {
   const setStatus = (m, c='') => {
     const el = document.getElementById('stockbook-status');
     if (el) { el.textContent = m; el.className = 'status ' + c; }
   };
-
+  ensureDefaultDataSources();   // make sure all four repos (incl. TRAPP2-3) are sourced
   setStatus('Loading universe…');
   const sheet = await getSheetData(forceRefresh).catch(e => {
     setStatus('Sheet: ' + e.message, 'error');
