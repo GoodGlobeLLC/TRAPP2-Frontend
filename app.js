@@ -12578,6 +12578,44 @@ function deleteLeadershipPerson(slug) {
   }
 }
 
+// Names removed by the human editor, per ticker. Removal of a pipeline-sourced
+// person can't delete them from the repo data — it suppresses them everywhere
+// the accessor below is used (company preview, founders, engine signal).
+function getRemovedLeadership(ticker) {
+  const store = loadLeadershipOverrides();
+  return (store.removed && store.removed[ticker]) || [];
+}
+function setRemovedLeadership(ticker, names) {
+  const store = loadLeadershipOverrides();
+  if (!store.removed) store.removed = {};
+  if (names.length) store.removed[ticker] = names; else delete store.removed[ticker];
+  saveLeadershipOverrides(store);
+}
+
+// THE leadership read path: wikidata lists, minus human-removed names, plus
+// human-added people from the leadership override store (the SAME store the
+// Leadership subtab edits) — so an edit made anywhere shows everywhere.
+function getEffectiveLeadership(ticker, wd) {
+  const removed = new Set(getRemovedLeadership(ticker).map(n => n.toLowerCase()));
+  const keep = p => !removed.has(String(p.name || p).toLowerCase());
+  const out = {
+    executives: (wd?.executives || []).filter(keep).slice(),
+    board: (wd?.board || []).filter(keep).slice(),
+    founders: (wd?.founders || []).filter(keep).slice(),
+  };
+  for (const p of getOverridePeopleForTicker(ticker)) {
+    if (!keep(p)) continue;
+    const group = (p.sourceFieldByTicker?.[ticker]) || 'executives';
+    const role = p.assignedRoleByTicker?.[ticker] || p.role || '';
+    const bucket = out[group] || out.executives;
+    if (!bucket.some(x => String(x.name || x).toLowerCase() === p.name.toLowerCase())) {
+      bucket.push({ name: p.name, role, _humanAdded: true });
+    }
+  }
+  return out;
+}
+if (typeof window !== 'undefined') window.getEffectiveLeadership = getEffectiveLeadership;
+
 // Given a ticker, return all override people whose assignedTickers include it.
 function getOverridePeopleForTicker(ticker) {
   const store = loadLeadershipOverrides();
@@ -18660,6 +18698,16 @@ const OVERRIDES_STORAGE = 'valuatio.overrides.v1';
 // intentionally excluded EXCEPT currency (per user). Everything else about a
 // company is editable here as a last-resort authoritative source.
 const OVERRIDABLE_FIELDS = {
+  'Contact': [
+    { key: 'ceo', label: 'CEO', type: 'text' },
+    { key: 'phone', label: 'Phone', type: 'text' },
+    { key: 'address', label: 'Address', type: 'text' },
+    { key: 'city', label: 'City', type: 'text' },
+    { key: 'state', label: 'State', type: 'text' },
+    { key: 'website', label: 'Website', type: 'text' },
+    { key: 'web_url', label: 'Website (legacy field)', type: 'text' },
+    { key: 'headquarters', label: 'Headquarters', type: 'text' },
+  ],
   'Identity': [
     { key: 'name', label: 'Company Name', type: 'text' },
     { key: 'description', label: 'Description', type: 'textarea' },
@@ -26335,6 +26383,32 @@ async function enrichCompanyData(ticker, baseStock) {
     enriched._wikidataProducts = wd.products;
   }
 
+  // ---- Human product edits fold into the canonical lists (display + engine) ----
+  try {
+    if (typeof getOverride === 'function') {
+      const rem = getOverride(ticker, 'productsRemoved') || [];
+      const add = getOverride(ticker, 'productsAdded') || [];
+      if (rem.length) {
+        enriched._wikidataProducts = (enriched._wikidataProducts || []).filter(p => !rem.includes(p.name || p));
+        enriched._products = (enriched._products || []).filter(p => !rem.includes(p));
+      }
+      // Human additions are authoritative — prepend so chain matching / display
+      // treat them as known products, marked verified (not heuristic).
+      if (add.length) enriched._humanProducts = add.slice();
+    }
+  } catch {}
+
+  // ---- Human leadership edits fold into facts so the engine's leadership read
+  // and the company preview share one record ----
+  try {
+    if (wd && typeof getEffectiveLeadership === 'function') {
+      const eff = getEffectiveLeadership(ticker, wd);
+      wd.executives = eff.executives;
+      wd.board = eff.board;
+      wd.founders = eff.founders;
+    }
+  } catch {}
+
   console.log(`[enrichCompany] ${ticker} final:`, {
     hasDescription: !!enriched.description,
     hasWikidata: !!wd,
@@ -26722,7 +26796,7 @@ async function renderCompanyOverview() {
   try {
     identitySection = `
       <div class="company-card">
-        <h4>Identity ${srcBadge}</h4>
+        <h4>Identity ${srcBadge} <button class="btn btn-ghost" style="font-size:9px;padding:1px 7px;float:right" onclick="openContactEditor('${escapeHtml(s.ticker)}')">✎ contact</button></h4>
         <div class="company-kv">
           <div class="company-kv-label">Legal Name</div>     <div class="company-kv-value">${escapeHtml(merged.name)}</div>
           <div class="company-kv-label">Ticker</div>         <div class="company-kv-value" style="color:var(--amber);font-weight:700">${escapeHtml(s.ticker)}</div>
@@ -26778,13 +26852,14 @@ async function renderCompanyOverview() {
   `;
 
   let foundersSection = '';
-  if (wd?.founders?.length) {
+  const _effFounders = (typeof getEffectiveLeadership === 'function') ? getEffectiveLeadership(s.ticker, wd).founders : (wd?.founders || []);
+  if (_effFounders.length) {
     try {
       foundersSection = `
         <div class="company-card">
           <h4>Founders</h4>
           <div style="display:flex;flex-wrap:wrap;gap:6px">
-            ${wd.founders.map(f => `<span class="company-tag">${escapeHtml(f.name || f)}</span>`).join('')}
+            ${_effFounders.map(f => `<span class="company-tag">${escapeHtml(f.name || f)}${f._humanAdded ? ' ✎' : ''}</span>`).join('')}
           </div>
         </div>
       `;
@@ -26838,9 +26913,10 @@ async function renderCompanyOverview() {
   // doesn't need to click into the Leadership subtab to see who runs the company.
   let leadershipPreviewSection = '';
   try {
-    const execs = (wd?.executives || []).slice(0, 5);
-    const board = (wd?.board || []).slice(0, 5);
-    const founders = (wd?.founders || []).slice(0, 3);
+    const eff = (typeof getEffectiveLeadership === 'function') ? getEffectiveLeadership(s.ticker, wd) : { executives: wd?.executives || [], board: wd?.board || [], founders: wd?.founders || [] };
+    const execs = eff.executives.slice(0, 6);
+    const board = eff.board.slice(0, 5);
+    const founders = eff.founders.slice(0, 3);
     if (execs.length || board.length || founders.length) {
       const renderList = (label, people) => people.length ? `
         <div style="margin-bottom:14px">
@@ -26852,7 +26928,7 @@ async function renderCompanyOverview() {
       ` : '';
       leadershipPreviewSection = `
         <div class="company-card">
-          <h4>Leadership <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· top tracked individuals · click Leadership subtab for full career profiles</span></h4>
+          <h4>Leadership <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· top tracked individuals · click Leadership subtab for full career profiles</span> <button class="btn btn-ghost" style="font-size:9px;padding:1px 7px;float:right" onclick="openLeadershipEditor('${escapeHtml(s.ticker)}')">✎ edit</button></h4>
           ${renderList('Executives', execs)}
           ${renderList('Board Members', board)}
           ${renderList('Founders', founders)}
@@ -26921,7 +26997,11 @@ async function renderCompanyOverview() {
   // INFERRED so the user knows not to trust them blindly.
   let productsSection = '';
   try {
-    const wdProducts = enriched._wikidataProducts || [];
+    const _pRemoved = getOverride(s.ticker, 'productsRemoved') || [];
+    const _pAdded = getOverride(s.ticker, 'productsAdded') || [];
+    const wdProducts = (enriched._wikidataProducts || []).filter(p => !_pRemoved.includes(p.name || p));
+    // human additions come from enrichment now (so they also feed the engine)
+    if (enriched._humanProducts?.length) _pAdded.push(...enriched._humanProducts.filter(p => !_pAdded.includes(p)));
     const chainRoles = (enriched._chainMatches || []).flatMap(m => m.roles || []);
     const extracted  = enriched._products || [];
 
@@ -26960,11 +27040,21 @@ async function renderCompanyOverview() {
       </div>
     ` : '';
 
-    // Only render the card if at least one subsection has content
-    if (wdProductsHtml || chainRolesHtml || extractedHtml) {
+    const addedHtml = _pAdded.length ? `
+      <div style="margin-bottom:14px">
+        <div style="font-family:var(--mono);font-size:10px;color:var(--amber);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:6px">Human-Added · ${_pAdded.length}</div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px">
+          ${_pAdded.map(p => `<span class="company-tag" style="border-left:2px solid var(--amber)">${escapeHtml(p)} ✎</span>`).join('')}
+        </div>
+      </div>` : '';
+
+    // Render whenever ANY source OR a human addition exists, so the manage
+    // button (and added products) are always reachable.
+    if (wdProductsHtml || chainRolesHtml || extractedHtml || addedHtml) {
       productsSection = `
         <div class="company-card">
-          <h4>Products & Segments <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· multi-source · click Products subtab for full detail</span></h4>
+          <h4>Products & Segments <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· multi-source · click Products subtab for full detail</span> <button class="btn btn-ghost" style="font-size:9px;padding:1px 7px;float:right" onclick="openProductsEditor('${escapeHtml(s.ticker)}')">✎ manage</button></h4>
+          ${addedHtml}
           ${wdProductsHtml}
           ${chainRolesHtml}
           ${extractedHtml}
@@ -28243,6 +28333,172 @@ function applyArticleFix(article) {
 //   sentiment, impact. Saved as a durable fix (keyed by URL) that overrides
 //   the pulled article on every refresh — and travels through XTRAPP.
 // ============================================================
+// ---- Shared tiny modal scaffold for company-tab editors ----
+function _companyModal(title, bodyHtml) {
+  document.getElementById('company-edit-modal')?.remove();
+  const wrap = document.createElement('div');
+  wrap.id = 'company-edit-modal';
+  wrap.style.cssText = 'position:fixed;inset:0;z-index:99998;background:rgba(0,0,0,0.65);display:flex;align-items:center;justify-content:center;padding:16px';
+  wrap.innerHTML = `<div style="background:var(--bg-panel,#16181d);border:1px solid var(--rule);border-radius:8px;max-width:560px;width:100%;max-height:88vh;overflow-y:auto;padding:16px">
+    <div style="font-family:var(--mono);font-size:10px;color:#7faaca;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:10px">${title}</div>
+    ${bodyHtml}
+  </div>`;
+  wrap.addEventListener('click', e => { if (e.target === wrap) wrap.remove(); });
+  document.body.appendChild(wrap);
+  return wrap;
+}
+const _ceLbl = 'font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.05em;margin:8px 0 3px;display:block';
+const _ceInp = 'width:100%;background:var(--bg-card);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:11px;padding:6px;border-radius:4px;box-sizing:border-box';
+
+// ===== CONTACT EDITOR — writes time-boxed-capable row overrides (the same
+// override store as the Editor tab), so corrections persist, travel through
+// XTRAPP, and every reader of the row sees them. =====
+function openContactEditor(tic) {
+  const row = (state.stockbook?.rows || []).find(r => r.ticker === tic) || {};
+  const fields = [['ceo','CEO'],['phone','Phone'],['address','Address'],['city','City'],['state','State'],['website','Website'],['headquarters','Headquarters']];
+  const body = fields.map(([k, l]) => `
+    <label style="${_ceLbl}">${l}</label>
+    <input id="ce-${k}" style="${_ceInp}" value="${escapeHtml(String(row[k] ?? row[k === 'website' ? 'web_url' : ''] ?? ''))}">`).join('') + `
+    <div style="display:flex;gap:6px;margin-top:14px">
+      <button class="btn" id="ce-save" style="font-size:11px;background:var(--pos)">Save (durable override)</button>
+      <button class="btn btn-ghost" id="ce-cancel" style="font-size:11px">Cancel</button>
+    </div>
+    <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:8px">Saved as field overrides — blank a field to fall back to pipeline data. Rides along in the XTRAPP export.</div>`;
+  const wrap = _companyModal(`✎ Contact — ${escapeHtml(tic)}`, body);
+  wrap.querySelector('#ce-cancel').addEventListener('click', () => wrap.remove());
+  wrap.querySelector('#ce-save').addEventListener('click', () => {
+    for (const [k] of fields) {
+      const v = wrap.querySelector('#ce-' + k).value.trim();
+      const current = String(row[k] ?? '');
+      if (v !== current) setOverride(tic, k, v || null, { source: 'company-tab' });
+      if (k === 'website' && v) setOverride(tic, 'web_url', v, { source: 'company-tab' });
+    }
+    if (row.ticker) { delete row._preOverride; applyOverridesToRow(row); }
+    wrap.remove();
+    if (typeof renderCompanyOverview === 'function') { try { renderCompanyOverview(); } catch {} }
+    if (typeof flashStatus === 'function') flashStatus('Contact updated — override saved', 'success');
+  });
+}
+
+// ===== LEADERSHIP EDITOR — writes into the SAME people store the Leadership
+// subtab uses (saveLeadershipPerson / assignedTickers), so an edit here shows
+// in career profiles, and vice versa. Removals suppress pipeline people via
+// the shared removed-list that getEffectiveLeadership applies everywhere. =====
+function openLeadershipEditor(tic) {
+  const wd = state.company?._factsCache?.[tic] || null;
+  const eff = getEffectiveLeadership(tic, wd);
+  const renderGroup = (label, key) => `
+    <label style="${_ceLbl}">${label}</label>
+    <div id="le-${key}">
+      ${(eff[key] || []).map(p => `
+        <div style="display:flex;align-items:center;gap:6px;padding:3px 0;border-bottom:1px dotted var(--rule)" data-name="${escapeHtml(p.name || p)}">
+          <span style="font-size:11px;color:var(--ink);flex:1">${escapeHtml(p.name || p)}${p._humanAdded ? ' <span style="color:var(--amber);font-size:9px">✎ added</span>' : ''}</span>
+          <span style="font-size:10px;color:var(--ink-dim)">${escapeHtml(p.role || '')}</span>
+          <button class="btn btn-ghost le-rm" style="font-size:10px;padding:1px 6px" title="Remove (suppressed everywhere, reversible by re-adding)">✕</button>
+        </div>`).join('') || '<div style="font-size:10px;color:var(--ink-faint)">none</div>'}
+    </div>`;
+  const body = renderGroup('Executives', 'executives') + renderGroup('Board', 'board') + renderGroup('Founders', 'founders') + `
+    <label style="${_ceLbl}">Add person</label>
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      <input id="le-name" placeholder="Name" style="${_ceInp};flex:2;min-width:140px">
+      <input id="le-role" placeholder="Role (e.g. CFO)" style="${_ceInp};flex:2;min-width:120px">
+      <select id="le-group" style="${_ceInp};flex:1;min-width:110px">
+        <option value="executives">Executive</option><option value="board">Board</option><option value="founders">Founder</option>
+      </select>
+      <button class="btn" id="le-add" style="font-size:11px">+ Add</button>
+    </div>
+    <div style="display:flex;gap:6px;margin-top:14px">
+      <button class="btn btn-ghost" id="le-close" style="font-size:11px">Done</button>
+    </div>
+    <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:8px">Edits write to the shared leadership store — the Leadership subtab, founders card, and the engine's leadership signal all read the same record. Adding a CEO also updates the row's CEO field.</div>`;
+  const wrap = _companyModal(`✎ Leadership — ${escapeHtml(tic)}`, body);
+  const rerender = () => { wrap.remove(); openLeadershipEditor(tic); if (typeof renderCompanyOverview === 'function') { try { renderCompanyOverview(); } catch {} } };
+  wrap.querySelector('#le-close').addEventListener('click', () => {
+    wrap.remove();
+    if (typeof renderCompanyOverview === 'function') { try { renderCompanyOverview(); } catch {} }
+  });
+  wrap.querySelectorAll('.le-rm').forEach(b => b.addEventListener('click', () => {
+    const name = b.parentElement.dataset.name;
+    const removed = getRemovedLeadership(tic);
+    if (!removed.includes(name)) removed.push(name);
+    setRemovedLeadership(tic, removed);
+    rerender();
+  }));
+  wrap.querySelector('#le-add').addEventListener('click', () => {
+    const name = wrap.querySelector('#le-name').value.trim();
+    const role = wrap.querySelector('#le-role').value.trim();
+    const group = wrap.querySelector('#le-group').value;
+    if (!name) return;
+    // un-remove if previously suppressed
+    setRemovedLeadership(tic, getRemovedLeadership(tic).filter(n => n.toLowerCase() !== name.toLowerCase()));
+    saveLeadershipPerson({
+      name,
+      assignedTickers: [tic],
+      assignedRoleByTicker: { [tic]: role },
+      sourceFieldByTicker: { [tic]: group },
+    });
+    if (/chief executive|^ceo$/i.test(role)) {
+      setOverride(tic, 'ceo', name, { source: 'company-tab' });
+      const row = (state.stockbook?.rows || []).find(r => r.ticker === tic);
+      if (row) { delete row._preOverride; applyOverridesToRow(row); }
+    }
+    rerender();
+  });
+}
+
+// ===== PRODUCTS EDITOR — add/remove products; removals suppress pipeline
+// (Wikidata) entries, additions render in their own human-added subsection. =====
+function openProductsEditor(tic) {
+  const wd = state.company?._factsCache?.[tic] || null;
+  const removed = getOverride(tic, 'productsRemoved') || [];
+  const added = getOverride(tic, 'productsAdded') || [];
+  const wdProducts = (wd?.products || []).map(p => p.name || p);
+  const body = `
+    <label style="${_ceLbl}">Pipeline products (✕ to remove from display + engine)</label>
+    <div>${wdProducts.map(p => `
+      <div style="display:flex;align-items:center;gap:6px;padding:3px 0;border-bottom:1px dotted var(--rule)" data-name="${escapeHtml(p)}">
+        <span style="font-size:11px;color:${removed.includes(p) ? 'var(--ink-faint)' : 'var(--ink)'};flex:1;${removed.includes(p) ? 'text-decoration:line-through' : ''}">${escapeHtml(p)}</span>
+        <button class="btn btn-ghost pe-toggle" style="font-size:10px;padding:1px 6px">${removed.includes(p) ? '↩ restore' : '✕'}</button>
+      </div>`).join('') || '<div style="font-size:10px;color:var(--ink-faint)">none from pipeline</div>'}</div>
+    <label style="${_ceLbl}">Human-added products</label>
+    <div>${added.map(p => `
+      <div style="display:flex;align-items:center;gap:6px;padding:3px 0;border-bottom:1px dotted var(--rule)" data-name="${escapeHtml(p)}">
+        <span style="font-size:11px;color:var(--ink);flex:1">${escapeHtml(p)} <span style="color:var(--amber);font-size:9px">✎</span></span>
+        <button class="btn btn-ghost pe-del" style="font-size:10px;padding:1px 6px">✕</button>
+      </div>`).join('') || '<div style="font-size:10px;color:var(--ink-faint)">none yet</div>'}</div>
+    <div style="display:flex;gap:6px;margin-top:8px">
+      <input id="pe-name" placeholder="Product / segment name" style="${_ceInp};flex:1">
+      <button class="btn" id="pe-add" style="font-size:11px">+ Add</button>
+    </div>
+    <div style="display:flex;gap:6px;margin-top:14px">
+      <button class="btn btn-ghost" id="pe-close" style="font-size:11px">Done</button>
+    </div>`;
+  const wrap = _companyModal(`✎ Products — ${escapeHtml(tic)}`, body);
+  const save = (rem, add) => {
+    setOverride(tic, 'productsRemoved', rem.length ? rem : null, { source: 'company-tab' });
+    setOverride(tic, 'productsAdded', add.length ? add : null, { source: 'company-tab' });
+    wrap.remove(); openProductsEditor(tic);
+    if (typeof renderCompanyOverview === 'function') { try { renderCompanyOverview(); } catch {} }
+  };
+  wrap.querySelector('#pe-close').addEventListener('click', () => {
+    wrap.remove();
+    if (typeof renderCompanyOverview === 'function') { try { renderCompanyOverview(); } catch {} }
+  });
+  wrap.querySelectorAll('.pe-toggle').forEach(b => b.addEventListener('click', () => {
+    const name = b.parentElement.dataset.name;
+    const rem = removed.includes(name) ? removed.filter(x => x !== name) : [...removed, name];
+    save(rem, added);
+  }));
+  wrap.querySelectorAll('.pe-del').forEach(b => b.addEventListener('click', () => {
+    save(removed, added.filter(x => x !== b.parentElement.dataset.name));
+  }));
+  wrap.querySelector('#pe-add').addEventListener('click', () => {
+    const name = wrap.querySelector('#pe-name').value.trim();
+    if (name && !added.includes(name)) save(removed, [...added, name]);
+  });
+}
+if (typeof window !== 'undefined') { window.openContactEditor = openContactEditor; window.openLeadershipEditor = openLeadershipEditor; window.openProductsEditor = openProductsEditor; }
+
 function openArticleEditor(key) {
   const article = (state.news?.items || []).find(a => articleKey(a) === key)
     || (() => {
@@ -33919,6 +34175,7 @@ function _buildXtrappPayload() {
     // sheet URLs: XTRAPP is a public repo, secrets stay out of the export.
     personalBook: _lsJson('valuatio.personalBook.v1'),
     overrides: _lsJson('valuatio.overrides.v1'),
+    leadershipOverrides: _lsJson('valuatio.leadership.v1'),
     portfolio: _lsJson('valuatio.portfolio.v1'),
     transactions: _lsJson('valuatio.transactions.v1'),
     cashPosition: _lsJson('valuatio.cashPosition.v1'),
@@ -34153,6 +34410,7 @@ async function fetchXtrappData() {
     for (const [field, lsKey] of [
       ['personalBook', 'valuatio.personalBook.v1'],
       ['overrides', 'valuatio.overrides.v1'],
+      ['leadershipOverrides', 'valuatio.leadership.v1'],
       ['portfolio', 'valuatio.portfolio.v1'],
       ['transactions', 'valuatio.transactions.v1'],
       ['cashPosition', 'valuatio.cashPosition.v1'],
