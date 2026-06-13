@@ -6077,6 +6077,28 @@ async function loadValuation(savedRecord = null) {
     const raw = await fetchStock(ticker);
     const stock = normalizeStock(raw);
     state.stock = stock;
+    // Merge any richer fetched financial fields back into the stockbook row so
+    // the Research tab gains coverage from what valuation pulled (foreign ADRs
+    // especially gain fields here). Fill-only: never overwrite an existing
+    // value, never clobber a human override.
+    try {
+      const _sbRow = (typeof getStockbookRow === 'function') ? getStockbookRow(stock.ticker) : null;
+      if (_sbRow && stock) {
+        const fin = ['returnOnEquity','returnOnAssets','grossMargin','operatingMargin','profitMargin',
+          'revenueGrowth','earningsGrowth','revenue','ebitda','freeCashFlow','netIncome','priceToBook',
+          'evToEbitda','evToRevenue','totalDebt','totalEquity','totalAssets','cash','stockBasedComp',
+          'marketCap','dividendYield','pe','eps'];
+        let gained = 0;
+        for (const f of fin) {
+          const v = stock[f];
+          const cur = _sbRow[f];
+          if (v != null && v !== '' && isFinite(+v) && (cur == null || cur === '' || !isFinite(+cur))) {
+            _sbRow[f] = +v; gained++;
+          }
+        }
+        if (gained) { _researchCache = null; console.log(`[research] +${gained} fields for ${stock.ticker} from valuation fetch`); }
+      }
+    } catch {}
     // CRITICAL: write the canonical normalized stock back into the stockbook row
     // so every other tab (Stock Book, Portfolio, Probability, Risk, TA) sees the
     // same numbers. This is the single source of truth — no more discrepancies
@@ -33595,15 +33617,33 @@ function renderResearchDetail(data, ticker) {
   const t = data.byTicker[ticker];
   if (!t) return `<div style="padding:20px;color:var(--ink-faint)">No data for ${escapeHtml(ticker)}</div>`;
 
+  // The live row, for computing any metric value the rank tables missed.
+  const liveRow = (state.stockbook?.rows || []).find(r => r.ticker === ticker) || null;
+  const backendRanks = _backendResearch?.byTicker?.[ticker]?.ranks || null;
+
   // Group ranks by category
   const cats = [...new Set(RESEARCH_METRICS.map(x => x.cat))];
   const catBlocks = cats.map(cat => {
     const metrics = RESEARCH_METRICS.filter(x => x.cat === cat);
     const rowsHtml = metrics.map(m => {
-      const rk = t.ranks[m.key];
+      let rk = t.ranks[m.key];
+      // Fallback 1: backend's rank for this metric (computed server-side).
+      if (!rk && backendRanks && backendRanks[m.key]) rk = backendRanks[m.key];
+      // Fallback 2: no rank anywhere, but the row HAS the value — show the raw
+      // number (unranked) rather than a misleading "n/a". This is what makes
+      // every metric with real data appear even before ranking catches up.
+      if (!rk && liveRow) {
+        const v = m.get(liveRow);
+        if (v != null && isFinite(v)) {
+          return `<tr><td style="font-size:11px;color:var(--ink-dim)">${escapeHtml(m.label)}</td>
+            <td style="text-align:right;font-family:var(--mono);font-size:12px;font-weight:700">${m.fmt(v)}</td>
+            <td style="text-align:right;font-family:var(--mono);font-size:9px;color:var(--ink-faint)">unranked</td>
+            <td style="text-align:right"></td></tr>`;
+        }
+      }
       if (!rk) {
         return `<tr><td style="font-size:11px;color:var(--ink-dim)">${escapeHtml(m.label)}</td>
-          <td style="text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-faint)">n/a · not ranked</td>
+          <td style="text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-faint)">no data</td>
           <td style="text-align:right"></td><td style="text-align:right"></td></tr>`;
       }
       const pctColor = rk.pct >= 70 ? 'var(--pos)' : rk.pct >= 40 ? 'var(--data-amber)' : 'var(--neg)';
