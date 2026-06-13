@@ -2817,6 +2817,10 @@ document.addEventListener('DOMContentLoaded', () => {
   if (typeof loadSecFilings === 'function') loadSecFilings().catch(() => {});
   // Warm the XTRAPP lexicon + posts so the Calls/Review brain reflects prior training.
   if (typeof fetchXtrappData === 'function') fetchXtrappData().catch(() => {});
+  // Analytics backend: research grades for the verification layer + the
+  // backend-pulled news corpus (live API calls become the supplement).
+  if (typeof loadBackendResearch === 'function') loadBackendResearch().catch(() => {});
+  if (typeof loadRepoNews === 'function') setTimeout(() => loadRepoNews().catch(() => {}), 4000);
   // Auto-run the bot's daily scan once per day on startup (after stockbook loads)
   setTimeout(() => {
     if (typeof botDailyRun === 'function' && typeof state !== 'undefined' && state.stockbook?.rows?.length) {
@@ -19277,8 +19281,26 @@ const _ROW_FIELD_ALIASES = {
   total_debt: 'totalDebt', total_equity: 'totalEquity', total_assets: 'totalAssets',
   net_income: 'netIncome', stock_based_comp: 'stockBasedComp',
 };
+// Every numeric field a row can carry. CSV-parsed rows arrive with STRING
+// values ("0.347" not 0.347) and _num()/the Research metrics rightly reject
+// strings — this was why most metrics showed blank. Coerced here, once, for
+// every row entering the app. Whitelist (not a blanket pass) so text fields
+// like phone numbers and zip codes are never mangled.
+const _NUMERIC_ROW_FIELDS = [
+  'price','marketcap','marketCap','volume','volumeavg','avgVolume','priceopen','open',
+  'low','high','close','change','changepct','changesPercentage','closeyest','priorClose',
+  'high52','low52','beta','shares','pe','eps','dividend_yield','dividendYield',
+  'returnOnEquity','returnOnAssets','grossMargin','operatingMargin','profitMargin',
+  'revenueGrowth','earningsGrowth','revenue','ebitda','freeCashFlow','netIncome',
+  'priceToBook','evToEbitda','evToRevenue','totalDebt','totalEquity','totalAssets',
+  'cash','stockBasedComp','goodwill','intangibleAssets','intangibles','employees',
+];
 function normalizeRowFields(row) {
   if (!row) return row;
+  for (const f of _NUMERIC_ROW_FIELDS) {
+    const v = row[f];
+    if (typeof v === 'string' && v.trim() !== '' && !isNaN(+v)) row[f] = +v;
+  }
   for (const [snake, camel] of Object.entries(_ROW_FIELD_ALIASES)) {
     if (row[snake] != null && row[snake] !== '' && (row[camel] == null || row[camel] === '')) {
       let v = row[snake];
@@ -26990,6 +27012,63 @@ async function renderCompanyOverview() {
     console.error('[company-overview] supplyChainSection build failed:', e.message);
   }
 
+  // ===== Connected Companies =====
+  // The actual counterparties, not just chain names: for every chain this
+  // ticker is in, list the OTHER companies by tier with their verified roles.
+  // For AAPL this answers "who makes their chips" directly — TSM (foundry),
+  // ASML (litho equipment), etc. Every chip is clickable to value that
+  // company; these same links feed the engine's supplyChain signal (peer
+  // momentum moves conviction) — display and engine read ONE dataset.
+  let connectedSection = '';
+  try {
+    const matches = enriched._chainMatches || [];
+    if (matches.length) {
+      const me = (typeof _normalizeTickerForChainLookup === 'function') ? _normalizeTickerForChainLookup(enriched.ticker) : enriched.ticker;
+      const tierMeta = {
+        upstream:   { label: 'Suppliers & equipment',   note: 'upstream — they supply into this chain', color: 'var(--pos)' },
+        midstream:  { label: 'Manufacturing & foundry', note: 'midstream — they make/process it',       color: '#7faaca' },
+        downstream: { label: 'Customers & designers',   note: 'downstream — they buy/design on it',     color: 'var(--data-amber)' },
+      };
+      const blocks = [];
+      for (const m of matches) {
+        const tierHtml = ['upstream', 'midstream', 'downstream'].map(tk => {
+          const entries = (m.chain[tk] || []).filter(e => {
+            const et = (typeof _normalizeTickerForChainLookup === 'function') ? _normalizeTickerForChainLookup(e.ticker) : e.ticker;
+            return et !== me;
+          }).slice(0, 10);
+          if (!entries.length) return '';
+          const meta = tierMeta[tk];
+          const chips = entries.map(e => {
+            const conf = e.confidence === 'verified' ? '✓' : e.confidence === 'disclosed' ? '◐' : '?';
+            const nm = e.name ? ` <span style="color:var(--ink-faint)">${escapeHtml(e.name)}</span>` : '';
+            return `<div style="display:flex;align-items:baseline;gap:6px;padding:3px 0;border-bottom:1px dotted var(--rule)">
+              <a href="#" onclick="event.preventDefault();openTickerInValuation('${escapeHtml(e.ticker)}')" style="font-family:var(--mono);font-weight:700;font-size:11px;color:${meta.color};text-decoration:none;min-width:64px">${escapeHtml(e.ticker)}</a>
+              <span style="font-size:10px;color:var(--ink-dim);flex:1">${escapeHtml(e.role || '')}${nm}</span>
+              <span title="${e.confidence || 'inferred'}" style="font-family:var(--mono);font-size:9px;color:var(--ink-faint)">${conf}</span>
+            </div>`;
+          }).join('');
+          return `<div style="margin-bottom:10px">
+            <div style="font-family:var(--mono);font-size:9px;letter-spacing:0.06em;text-transform:uppercase;color:${meta.color};margin-bottom:3px" title="${meta.note}">${meta.label}</div>
+            ${chips}
+          </div>`;
+        }).join('');
+        if (tierHtml) blocks.push(`<div style="margin-bottom:12px">
+          <div style="font-family:var(--mono);font-size:10px;color:var(--amber);margin-bottom:6px">${escapeHtml(m.chain.name)}</div>
+          ${tierHtml}
+        </div>`);
+      }
+      if (blocks.length) {
+        connectedSection = `
+          <div class="company-card">
+            <h4>Connected Companies <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· ✓ verified filings · ◐ disclosed · tap any ticker to value it · these links feed the engine's supply-chain signal</span></h4>
+            ${blocks.join('')}
+          </div>`;
+      }
+    }
+  } catch (e) {
+    console.error('[company-overview] connectedSection build failed:', e.message);
+  }
+
   // ===== Cross-Asset Context =====
   // Surfaces the cross-asset signals relevant to THIS ticker's sector. The
   // mapping is intentional: a Materials stock cares more about industrial
@@ -27121,6 +27200,7 @@ async function renderCompanyOverview() {
     descriptionSection +
     productsSection +
     supplyChainSection +
+    connectedSection +
     crossAssetSection +
     tickerNewsSection +
     leadershipPreviewSection +
@@ -32693,6 +32773,68 @@ function researchROTCE(r) {
 let _researchCache = null;
 let _researchCacheStamp = 0;
 
+// ============================================================
+//   BACKEND RESEARCH — backend computes, frontend VERIFIES.
+//
+//   The TRAPP2-ANALYTICS repo computes the same 23 metrics / percentiles /
+//   grades nightly across all three books (data/research_grades.json). The
+//   app loads it, keeps its own local computation as the cross-check, and
+//   flags every ticker where the two disagree — a divergence means the data
+//   the backend saw differs from the data this browser sees (stale cache,
+//   missed field, source drift), which is exactly what should surface.
+// ============================================================
+const ANALYTICS_BASE = 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-ANALYTICS/main/data/';
+let _backendResearch = null;          // { generatedAt, byTicker, ... } | null
+let _backendResearchFetched = false;
+async function loadBackendResearch() {
+  if (_backendResearchFetched) return _backendResearch;
+  _backendResearchFetched = true;
+  try {
+    const j = await fetchJsonMaybeGz(ANALYTICS_BASE + 'research_grades.json');
+    if (j?.byTicker) {
+      const ageH = (Date.now() - new Date(j.generatedAt).getTime()) / 3600000;
+      j._ageHours = Math.round(ageH);
+      j._fresh = ageH < 48;
+      _backendResearch = j;
+      console.log(`[analytics] research grades loaded: ${Object.keys(j.byTicker).length} tickers, ${j._ageHours}h old${j._fresh ? '' : ' (STALE — using local only)'}`);
+      idbSet('backendResearch', j);
+      if (typeof renderResearchTab === 'function' && document.querySelector('.research-row')) { try { renderResearchTab(); } catch {} }
+    }
+  } catch (e) {
+    console.warn('[analytics] research grades unavailable:', e.message);
+    try { const cached = await idbGet('backendResearch'); if (cached) { cached._fresh = false; _backendResearch = cached; } } catch {}
+  }
+  return _backendResearch;
+}
+if (typeof window !== 'undefined') window.loadBackendResearch = loadBackendResearch;
+
+// Repo news corpus: backend-pulled articles merge in by URL (trusted per-ticker
+// pulls). Live API calls become the supplement, not the workhorse.
+async function loadRepoNews() {
+  try {
+    const j = await fetchJsonMaybeGz(ANALYTICS_BASE + 'news/latest.json');
+    if (!Array.isArray(j?.items) || !j.items.length) return 0;
+    const cache = _newsMemCache || { fetchedAt: Date.now(), items: [] };
+    const have = new Set(cache.items.map(a => a.url));
+    let added = 0;
+    for (const a of j.items) {
+      if (a?.url && !have.has(a.url)) { cache.items.push(a); have.add(a.url); added++; }
+    }
+    if (added) {
+      _newsMemCache = cache;
+      idbSetDebounced('newsCache', () => _newsMemCache);
+      if (typeof state !== 'undefined' && state.news?.items) {
+        const liveHave = new Set(state.news.items.map(x => x.url));
+        for (const a of j.items) if (a?.url && !liveHave.has(a.url)) state.news.items.push(a);
+        if (typeof renderNewsFeed === 'function' && document.getElementById('news-feed')) { try { renderNewsFeed(); } catch {} }
+      }
+      console.log(`[analytics] merged ${added} backend articles (corpus ${j.count}, generated ${j.generatedAt})`);
+    }
+    return added;
+  } catch (e) { console.warn('[analytics] repo news unavailable:', e.message); return 0; }
+}
+if (typeof window !== 'undefined') window.loadRepoNews = loadRepoNews;
+
 function computeResearchRankings(force = false) {
   // Cache for 30s so re-renders don't recompute on every interaction
   if (!force && _researchCache && (Date.now() - _researchCacheStamp) < 30000) return _researchCache;
@@ -32750,7 +32892,28 @@ function computeResearchRankings(force = false) {
     };
   }
 
-  _researchCache = { perMetric, byTicker, universeSize: equities.length };
+  // ---- Backend verification layer ----
+  // Compare the backend's nightly grades against what this browser computes
+  // from its own data. Disagreement ≥ 8 grade-score points (≈ one letter step)
+  // gets flagged — surfaced, never silently averaged away.
+  let backend = null, diverged = 0;
+  if (_backendResearch?._fresh && _backendResearch.byTicker) {
+    backend = { generatedAt: _backendResearch.generatedAt, ageHours: _backendResearch._ageHours };
+    for (const t of Object.keys(byTicker)) {
+      const be = _backendResearch.byTicker[t];
+      if (!be || be.gradeScore == null || byTicker[t].gradeScore == null) continue;
+      byTicker[t].backendGrade = be.grade;
+      byTicker[t].backendScore = be.gradeScore;
+      const delta = Math.abs(be.gradeScore - byTicker[t].gradeScore);
+      byTicker[t].diverged = delta >= 8;
+      byTicker[t].divergence = +delta.toFixed(1);
+      if (byTicker[t].diverged) diverged++;
+    }
+    backend.divergedCount = diverged;
+    if (diverged) console.warn(`[analytics] ${diverged} tickers diverge ≥8pts between backend and local grades — check data freshness for those names`);
+  }
+
+  _researchCache = { perMetric, byTicker, universeSize: equities.length, backend };
   _researchCacheStamp = Date.now();
   return _researchCache;
 }
@@ -32895,23 +33058,60 @@ function renderResearchGrades(data) {
       <td style="font-family:var(--mono);font-weight:700">${escapeHtml(t.ticker)}</td>
       <td style="font-size:11px;color:var(--ink-dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(t.name)}</td>
       <td style="text-align:center"><span style="font-family:var(--mono);font-size:15px;font-weight:700;color:${researchGradeColor(t.grade)}">${t.grade}</span></td>
+      <td style="text-align:center">${t.backendGrade ? `<span style="font-family:var(--mono);font-size:12px;font-weight:700;color:${researchGradeColor(t.backendGrade)}" title="Backend (TRAPP2-ANALYTICS nightly) grade">${t.backendGrade}</span>${t.diverged ? `<span style="font-family:var(--mono);font-size:9px;color:var(--neg);margin-left:4px" title="Backend and local grades disagree by ${t.divergence} pts — data drift between what the backend saw and what this browser sees">Δ${t.divergence.toFixed(0)}</span>` : ''}` : '<span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint)">—</span>'}</td>
       <td style="text-align:right;font-family:var(--mono);font-size:11px">${t.gradeScore.toFixed(0)}<span style="color:var(--ink-faint);font-size:9px">/100</span></td>
       <td style="text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${t.coverage}/${t.coverageTotal} metrics</td>
     </tr>`).join('');
 
+  const be = data.backend;
+  // ---- Non-equity cohort (backend-graded on conduct, not fundamentals) ----
+  let nonEqHtml = '';
+  const neData = _backendResearch?._fresh && _backendResearch.nonEquity ? _backendResearch.nonEquity : null;
+  if (neData) {
+    const ne = Object.values(neData).filter(x => x.gradeScore != null).sort((a, b) => b.gradeScore - a.gradeScore);
+    if (ne.length) {
+      const clsColor = c => c === 'etf/fund' ? '#7faaca' : c?.includes('fx') ? 'var(--data-amber)' : 'var(--ink-dim)';
+      const neRows = ne.map((t, i) => `
+        <tr class="research-row" data-ticker="${t.ticker}" style="cursor:pointer">
+          <td style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);text-align:right">${i + 1}</td>
+          <td style="font-family:var(--mono);font-weight:700">${escapeHtml(t.ticker)}</td>
+          <td style="font-size:11px;color:var(--ink-dim);max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(t.name)}</td>
+          <td><span style="padding:1px 6px;border:1px solid ${clsColor(t.assetClass)};color:${clsColor(t.assetClass)};border-radius:2px;font-family:var(--mono);font-size:8px;text-transform:uppercase;letter-spacing:0.05em">${escapeHtml(t.assetClass || 'non-equity')}</span></td>
+          <td style="text-align:center"><span style="font-family:var(--mono);font-size:15px;font-weight:700;color:${researchGradeColor(t.grade)}">${t.grade}</span></td>
+          <td style="text-align:right;font-family:var(--mono);font-size:11px">${t.gradeScore.toFixed(0)}<span style="color:var(--ink-faint);font-size:9px">/100</span></td>
+          <td style="text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${t.coverage}/${t.coverageTotal}</td>
+        </tr>`).join('');
+      nonEqHtml = `
+        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);margin:18px 0 8px;line-height:1.6">
+          <strong style="color:var(--ink)">Non-Equity Grades</strong> — ETFs, leveraged ETFs, FX, metals, bonds, crypto are graded on a DIFFERENT basis than equities: risk-adjusted conduct (1y &amp; 3m return, Sharpe, volatility/conservativeness, max drawdown, trend consistency), ranked only against other non-equities. They have no ROE — they have behavior. The badge marks the asset class so a grade is never mistaken for a fundamentals grade. Computed nightly by the analytics backend from full repo history.
+        </div>
+        <div class="company-card" style="margin:0">
+          <table class="sb-table" style="width:100%">
+            <thead><tr>
+              <th style="text-align:right">#</th><th>Ticker</th><th>Name</th><th>Class</th>
+              <th style="text-align:center">Grade</th><th style="text-align:right">Score</th><th style="text-align:right">Coverage</th>
+            </tr></thead>
+            <tbody>${neRows}</tbody>
+          </table>
+        </div>`;
+    }
+  }
+
   return `
     <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);margin-bottom:12px;line-height:1.6">
+      ${be ? `<span style="color:var(--pos)">● Backend verified</span> — grades cross-checked against the analytics backend (computed ${be.ageHours}h ago, all three books).${be.divergedCount ? ` <span style="color:var(--neg)">${be.divergedCount} divergence${be.divergedCount > 1 ? 's' : ''} flagged (Δ)</span> — backend and this browser disagree on those names; usually stale data on one side.` : ' All grades agree.'}<br>` : `<span style="color:var(--ink-faint)">○ Backend grades unavailable — showing local computation only.</span><br>`}
       Composite grade = average percentile across all metrics a company has data for (equal-weighted). Click any company for its full per-category breakdown and rank in each. Companies are graded only on metrics they actually report.
     </div>
     <div class="company-card" style="margin:0">
       <table class="sb-table" style="width:100%">
         <thead><tr>
           <th style="text-align:right">#</th><th>Ticker</th><th>Company</th>
-          <th style="text-align:center">Grade</th><th style="text-align:right">Score</th><th style="text-align:right">Coverage</th>
+          <th style="text-align:center">Grade</th><th style="text-align:center" title="Computed nightly by the analytics backend across all three books">Backend</th><th style="text-align:right">Score</th><th style="text-align:right">Coverage</th>
         </tr></thead>
         <tbody>${rowsHtml}</tbody>
       </table>
-    </div>`;
+    </div>
+    ${nonEqHtml}`;
 }
 
 function wireResearchGrades() {
@@ -33759,6 +33959,41 @@ async function fetchJsonMaybeGz(url) {
 }
 if (typeof window !== 'undefined') window.fetchJsonMaybeGz = fetchJsonMaybeGz;
 
+// ---- Shared default API keys (for friends opening the URL fresh) ----
+// Optional file: TRAPP2-1/data/app_keys.json, e.g.
+//   { "finnhub": "...", "fmp": "...", "polygon": "...", "alphavantage": "...",
+//     "twelvedata": "...", "fcs": "..." }
+// Loaded at boot, FILL-IF-MISSING only — a personal key typed into settings
+// always wins, and removing the file stops new seeding. BE CLEAR-EYED: that
+// repo is public, so any key in it is public, shares ONE rate limit across
+// every visitor, and should be a throwaway free-tier key you're fine exposing.
+// Repo-served data (quotes, history, news, grades) stays keyless either way —
+// shared users get the full app even with no keys at all.
+async function loadSharedKeys() {
+  try {
+    const j = await fetchJsonMaybeGz('https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-1/main/data/app_keys.json');
+    if (!j) return 0;
+    const slots = {
+      finnhub: FINNHUB_KEY_STORAGE, fmp: FMP_KEY_STORAGE, alphavantage: AV_KEY_STORAGE,
+      twelvedata: TWELVE_KEY_STORAGE, polygon: POLYGON_KEY_STORAGE, fcs: FCS_KEY_STORAGE,
+    };
+    let seeded = 0;
+    for (const [field, slot] of Object.entries(slots)) {
+      if (j[field] && !localStorage.getItem(slot)) { localStorage.setItem(slot, String(j[field]).trim()); seeded++; }
+    }
+    if (seeded) {
+      console.log(`[keys] seeded ${seeded} shared API key(s) from TRAPP2-1/data/app_keys.json (public repo — public keys)`);
+      // A fresh/wiped browser just got its keys back — say so, so "keys gone
+      // again?" is never a mystery: they reseed from the repo on every boot.
+      setTimeout(() => { if (typeof flashStatus === 'function') { try { flashStatus(`${seeded} API key(s) restored from repo — no re-entry needed`, 'success'); } catch {} } }, 1500);
+    }
+    return seeded;
+  } catch { return 0; }
+}
+// Kick off at PARSE time — earliest possible — so keys are usually in place
+// before the first key-dependent fetch even on a completely wiped browser.
+const _sharedKeysReady = (typeof fetch !== 'undefined') ? loadSharedKeys() : Promise.resolve(0);
+
 const XTRAPP_BASE = 'https://raw.githubusercontent.com/GoodGlobeLLC/XTRAPP/main/data/';
 // ============================================================
 //   PUSH TO XTRAPP — commit xtrapp_data.json straight from the app.
@@ -33825,6 +34060,34 @@ async function pushXtrappToGitHub() {
 }
 if (typeof window !== 'undefined') { window.pushXtrappToGitHub = pushXtrappToGitHub; window.setGitHubToken = setGitHubToken; }
 
+// ---- AUTO-PUSH ----
+// With a token stored, "closing out loses data" stops being possible: every
+// 15 minutes (and when the tab is hidden) the app pushes to XTRAPP if — and
+// only if — the payload actually changed since the last push. A wiped browser
+// then restores itself from the repo on next load. No token → no auto-push
+// (the manual buttons remain).
+const _XTRAPP_HASH_KEY = 'valuatio.xtrapp.lastPushHash';
+function _xtrappPayloadHash(json) {
+  let h = 5381;
+  for (let i = 0; i < json.length; i += 7) h = ((h << 5) + h + json.charCodeAt(i)) | 0;  // sampled djb2 — cheap on MB payloads
+  return json.length + ':' + h;
+}
+async function _xtrappAutoPush(trigger) {
+  try {
+    if (!localStorage.getItem(GH_TOKEN_KEY)) return;
+    const json = JSON.stringify(_buildXtrappPayload());
+    const hash = _xtrappPayloadHash(json);
+    if (hash === localStorage.getItem(_XTRAPP_HASH_KEY)) return;   // nothing new
+    await pushXtrappToGitHub();
+    localStorage.setItem(_XTRAPP_HASH_KEY, hash);
+    console.log(`[xtrapp] auto-pushed (${trigger})`);
+  } catch (e) { console.warn('[xtrapp] auto-push failed:', e.message); }
+}
+setInterval(() => _xtrappAutoPush('15min'), 15 * 60 * 1000);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') _xtrappAutoPush('tab-hidden');
+});
+
 async function fetchXtrappData() {
   try {
     const j = await fetchJsonMaybeGz(XTRAPP_BASE + 'xtrapp_data.json');
@@ -33886,6 +34149,7 @@ async function fetchXtrappData() {
     // Personal data: FILL-IF-MISSING only. The repo seeds a fresh browser, but
     // never clobbers live local edits (your current device is the live truth;
     // the repo is the parachute).
+    let _xtrappSeeded = 0;
     for (const [field, lsKey] of [
       ['personalBook', 'valuatio.personalBook.v1'],
       ['overrides', 'valuatio.overrides.v1'],
@@ -33898,8 +34162,12 @@ async function fetchXtrappData() {
         if (j[field] != null && localStorage.getItem(lsKey) == null) {
           localStorage.setItem(lsKey, JSON.stringify(j[field]));
           console.log(`[xtrapp] seeded ${field} from repo (fresh browser)`);
+          _xtrappSeeded++;
         }
       } catch {}
+    }
+    if (_xtrappSeeded && typeof flashStatus === 'function') {
+      try { flashStatus(`Fresh browser detected — ${_xtrappSeeded} dataset(s) (portfolio, book, valuations…) restored from XTRAPP`, 'success'); } catch {}
     }
     if (Array.isArray(j.reviewQueue) && typeof loadReviewQueue === 'function' && typeof saveReviewQueue === 'function') {
       try {
@@ -34144,6 +34412,18 @@ async function botScoreTicker(ticker) {
   // 3. Price trend (slope + R² → conviction in trend direction)
   let history = null;
   try { history = (typeof getHistoryForTicker === 'function') ? getHistoryForTicker(t) : null; } catch {}
+  // FAST PATH: when this browser has no cached history, use the analytics
+  // backend's nightly per-ticker technicals (computed from the SAME repo
+  // history files). This is what lets a full-universe scan run with ZERO
+  // network calls — pure in-memory math, no timeouts.
+  const _bt = (!history || history.length < 30) && _backendResearch?.tech ? _backendResearch.tech[t] : null;
+  if (_bt) {
+    if (_bt.trendSigned != null) add('trend', _bt.trendSigned, 0.18,
+      _bt.trendSigned > 0 ? `Uptrend (backend, R²=${(_bt.trendR2 ?? 0).toFixed(2)})` : `Downtrend (backend, R²=${(_bt.trendR2 ?? 0).toFixed(2)})`);
+    if (_bt.momentum01 != null) add('momentum', (_bt.momentum01 - 0.5) * 2, 0.14, null);
+    if (_bt.meanRev01 != null) add('meanReversion', (_bt.meanRev01 - 0.5) * 2, 0.06, null);
+    decisionPath.push('tech:backend-precomputed');
+  }
   if (history && history.length >= 30) {
     try {
       const trend = featureTrendStrength(history);
@@ -34348,6 +34628,9 @@ async function botDailyRun(force = false) {
     return r.price > 0 && !['fx', 'index'].includes(cls);
   });
 
+  // Backend technicals must be in before scoring (one fetch, cached) — the
+  // scan's zero-network guarantee depends on it.
+  try { if (typeof loadBackendResearch === 'function') await loadBackendResearch(); } catch {}
   // Root of the decision tree: classify today's market regime ONCE per scan.
   const regime = botAssessRegime();
   console.log(`[bot] regime: ${regime.mode} — ${regime.evidence}`);
@@ -34373,15 +34656,10 @@ async function botDailyRun(force = false) {
   const CHUNK = 10;
   for (let i = startIdx; i < candidates.length; i += CHUNK) {
     const chunk = candidates.slice(i, i + CHUNK);
-    // Prime missing history from the GitHub repo for this chunk (parallel, in
-    // the background of the scan) so every ticker scores with REAL data
-    // instead of being skipped for lack of history.
-    try {
-      const missing = chunk.filter(r => !(typeof getHistoryForTicker === 'function' && getHistoryForTicker(r.ticker)));
-      if (missing.length && typeof fetchGitHubHistory === 'function') {
-        await Promise.all(missing.map(r => fetchGitHubHistory(r.ticker).catch(() => null)));
-      }
-    } catch {}
+    // NO per-ticker network here — that was hundreds of fetches that stalled
+    // phones and killed scans. Tickers without cached history score from the
+    // backend's precomputed technicals (loaded once at boot); the scan is now
+    // pure in-memory math.
     for (const r of chunk) {
       if (betToday.has(r.ticker)) continue;
       const s = await botScoreTicker(r.ticker).catch(() => null);
@@ -36333,6 +36611,19 @@ function chainMomentumForTicker(ticker) {
   // Scale: a 10% average peer move maps to ~1.0 conviction; clamp to [-1, 1].
   return { signed: Math.max(-1, Math.min(1, avgPct / 10)), avgPct, peerCount: n };
 }
+
+// Load any ticker into the valuation flow (used by Connected Companies chips,
+// derivative links, etc.) — fills the input and triggers Fetch & Value.
+function openTickerInValuation(t) {
+  try {
+    const inp = document.getElementById('ticker');
+    if (!inp) return;
+    inp.value = String(t || '').toUpperCase();
+    if (typeof switchTab === 'function') { try { switchTab('valuation'); } catch {} }
+    document.getElementById('fetch-btn')?.click();
+  } catch (e) { console.warn('[openTickerInValuation]', e.message); }
+}
+if (typeof window !== 'undefined') window.openTickerInValuation = openTickerInValuation;
 
 function findChainsForTicker(ticker) {
   const norm = _normalizeTickerForChainLookup(ticker);
