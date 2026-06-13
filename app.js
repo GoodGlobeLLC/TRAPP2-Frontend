@@ -33281,6 +33281,13 @@ function computeResearchRankings(force = false) {
   if (!force && _researchCache && (Date.now() - _researchCacheStamp) < 30000) return _researchCache;
 
   const rows = (typeof state !== 'undefined' && state.stockbook?.rows) ? state.stockbook.rows : [];
+  // Guarantee every row is normalized (string→number coercion + field aliasing)
+  // BEFORE metrics read it. This is the safety net for the "0 companies / 5 of 23"
+  // bug: if a row reached here straight from a cache or a load path that skipped
+  // enrichment, its CSV string values are coerced now so metrics resolve.
+  if (typeof normalizeRowFields === 'function') {
+    for (const r of rows) { try { normalizeRowFields(r); } catch {} }
+  }
   // Only true equities are rankable on fundamentals. Row-aware classifier so an
   // Editor/Research re-classification (IMST → ETF) moves the ticker out of the
   // equity grades into the non-equity table.
@@ -33433,7 +33440,7 @@ function researchGradeColor(grade) {
 // ============================================================
 //   RESEARCH TAB RENDERER
 // ============================================================
-const RESEARCH_STATE = { view: 'filter', metric: 'roe', side: 'top', gradeSort: 'grade', detailTicker: null };
+const RESEARCH_STATE = { view: 'filter', metric: 'roe', side: 'top', gradeSort: 'grade', detailTicker: null, minCoverage: 0 };
 
 function renderResearchTab() {
   const body = document.getElementById('research-body');
@@ -33443,7 +33450,7 @@ function renderResearchTab() {
     body.innerHTML = `<div style="padding:40px;text-align:center;color:var(--ink-dim);font-family:var(--mono);font-size:12px">No stockbook loaded. Configure a data source first.</div>`;
     return;
   }
-  const data = computeResearchRankings();
+  const data = computeResearchRankings(true);  // always fresh — never serve a pre-normalization empty cache
 
   // View toggle
   const head = `
@@ -33538,8 +33545,13 @@ function wireResearchScreener() {
 
 function renderResearchGrades(data) {
   // All companies sorted by grade score (desc). Show grade + coverage + top categories.
-  const all = Object.values(data.byTicker).filter(t => t.gradeScore != null);
+  const minCov = RESEARCH_STATE.minCoverage || 0;
+  const allUnfiltered = Object.values(data.byTicker).filter(t => t.gradeScore != null);
+  // Coverage filter: hide grades built on too few metrics (likely unreliable),
+  // so you can focus on names with strong data coverage.
+  const all = allUnfiltered.filter(t => (t.coverage || 0) >= minCov);
   all.sort((a, b) => b.gradeScore - a.gradeScore);
+  const hiddenCount = allUnfiltered.length - all.length;
 
   const rowsHtml = all.map((t, i) => `
     <tr class="research-row" data-ticker="${t.ticker}" style="cursor:pointer">
@@ -33592,6 +33604,13 @@ function renderResearchGrades(data) {
 
   return `
     <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);margin-bottom:12px;line-height:1.6">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+        <label style="font-family:var(--mono);font-size:10px;color:var(--ink-dim)">Min coverage:</label>
+        <select id="research-mincov" class="heat-filter-select" style="font-size:10px;padding:2px 6px">
+          ${[0,5,8,10,12,15,18].map(n => `<option value="${n}" ${minCov===n?'selected':''}>${n===0?'All':n+'+ metrics'}</option>`).join('')}
+        </select>
+        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${all.length} shown${hiddenCount?` · ${hiddenCount} hidden (sparse data)`:''}</span>
+      </div>
       ${be ? `<span style="color:var(--pos)">● Backend verified</span> — grades cross-checked against the analytics backend (computed ${be.ageHours}h ago, all three books).${be.divergedCount ? ` <span style="color:var(--neg)">${be.divergedCount} divergence${be.divergedCount > 1 ? 's' : ''} flagged (Δ)</span> — backend and this browser disagree on those names; usually stale data on one side.` : ' All grades agree.'}<br>` : `<span style="color:var(--ink-faint)">○ Backend grades unavailable — showing local computation only.</span><br>`}
       Composite grade = average percentile across all metrics a company has data for (equal-weighted). Click any company for its full per-category breakdown and rank in each. Companies are graded only on metrics they actually report.
     </div>
@@ -33611,11 +33630,84 @@ function wireResearchGrades() {
   document.querySelectorAll('.research-row').forEach(r => r.addEventListener('click', () => {
     RESEARCH_STATE.detailTicker = r.dataset.ticker; renderResearchTab();
   }));
+  const mc = document.getElementById('research-mincov');
+  if (mc) mc.addEventListener('change', () => { RESEARCH_STATE.minCoverage = +mc.value; renderResearchTab(); });
 }
 
+// Non-equity detail card (conduct metrics: return/Sharpe/vol/drawdown/trend).
+function renderNonEquityDetail(t, ticker) {
+  const labels = { ret1y: '1-Year Return', ret3m: '3-Month Return', sharpe: 'Sharpe Ratio',
+    volAnn: 'Annualized Volatility', maxDD: 'Max Drawdown', trendR2: 'Trend Consistency (R²)' };
+  const fmtv = (k, r) => {
+    if (!r || r.pct == null) return null;
+    return `<tr>
+      <td style="font-size:11px;color:var(--ink-dim)">${labels[k] || k}</td>
+      <td style="text-align:right;font-family:var(--mono);font-size:11px;color:${r.pct>=70?'var(--pos)':r.pct>=40?'var(--data-amber)':'var(--neg)'};font-weight:700">${r.pct}<span style="font-size:8px">%ile</span></td>
+    </tr>`;
+  };
+  const rowsHtml = Object.keys(labels).map(k => fmtv(k, t.ranks?.[k])).filter(Boolean).join('')
+    || '<tr><td colspan="2" style="padding:14px;color:var(--ink-faint);font-size:11px">No conduct metrics computed yet — needs cached price history.</td></tr>';
+  return `
+    <button class="btn btn-ghost" onclick="RESEARCH_STATE.detailTicker=null;renderResearchTab()" style="margin-bottom:14px;font-size:11px">← Back to grades</button>
+    <div class="company-card" style="border-left:3px solid ${researchGradeColor(t.grade)};margin:0 0 14px">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+        <div>
+          <h3 style="font-family:var(--serif);font-size:24px;margin:0">${escapeHtml(ticker)} <span style="font-size:13px;color:var(--ink-dim);font-weight:400">${escapeHtml(t.name||'')}</span></h3>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-top:4px">
+            <span style="padding:1px 6px;border:1px solid #7faaca;color:#7faaca;border-radius:2px;text-transform:uppercase;letter-spacing:0.05em">${escapeHtml(t.assetClass||'non-equity')}</span>
+            · graded on risk-adjusted CONDUCT, not fundamentals (ETFs/FX/bonds have no ROE)
+          </div>
+        </div>
+        <div style="text-align:center">
+          <div style="font-family:var(--mono);font-size:48px;font-weight:700;line-height:1;color:${researchGradeColor(t.grade)}">${t.grade||'—'}</div>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-top:2px">${t.gradeScore!=null?t.gradeScore.toFixed(0):'—'}/100</div>
+        </div>
+      </div>
+      <div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn" style="font-size:10px;background:var(--pos)" onclick="openResearchEditor('${ticker}')">✎ Edit / reclassify</button>
+        <button class="btn btn-ghost" style="font-size:10px" onclick="reportTickerForReview('${ticker}')">⚑ Report for review</button>
+        <button class="btn btn-ghost" style="font-size:10px" onclick="document.getElementById('ticker').value='${ticker}';switchTab('valuation');setTimeout(()=>document.getElementById('fetch-btn')?.click(),100)">Open in Valuation →</button>
+      </div>
+    </div>
+    <div class="company-card" style="margin:0">
+      <h4>Conduct Metrics</h4>
+      <table class="sb-table" style="width:100%;min-width:0"><tbody>${rowsHtml}</tbody></table>
+    </div>`;
+}
+
+// Report a ticker for human review — queues it so its grade/data can be checked,
+// and offers the override editor. Feeds the same review queue the news fixer uses.
+function reportTickerForReview(ticker) {
+  try {
+    if (typeof loadReviewQueue === 'function' && typeof saveReviewQueue === 'function') {
+      const q = loadReviewQueue();
+      if (!q.some(x => x.type === 'grade' && x.ticker === ticker)) {
+        q.unshift({ id: `rev-grade-${Date.now()}`, type: 'grade', ticker,
+          reason: 'flagged from Research for data/grade review', queuedAt: new Date().toISOString() });
+        saveReviewQueue(q);
+      }
+    }
+    if (typeof flashStatus === 'function') flashStatus(`${ticker} reported — queued for review. Use ✎ Edit to override its values now.`, 'success');
+  } catch (e) { console.warn('[report]', e.message); }
+}
+if (typeof window !== 'undefined') { window.reportTickerForReview = reportTickerForReview; window.renderNonEquityDetail = renderNonEquityDetail; }
+
 function renderResearchDetail(data, ticker) {
-  const t = data.byTicker[ticker];
-  if (!t) return `<div style="padding:20px;color:var(--ink-faint)">No data for ${escapeHtml(ticker)}</div>`;
+  let t = data.byTicker[ticker];
+  // Reclassified to a non-equity (ETF/fund/FX/etc.)? Show its non-equity grade
+  // card instead of "No data" — the ticker just moved scales, it didn't vanish.
+  if (!t) {
+    const ne = (data.nonEquityLocal && data.nonEquityLocal[ticker])
+      || (_backendResearch?.nonEquity && _backendResearch.nonEquity[ticker]) || null;
+    if (ne) return renderNonEquityDetail(ne, ticker);
+    return `<div style="padding:20px;color:var(--ink-faint)">
+      <button class="btn btn-ghost" onclick="RESEARCH_STATE.detailTicker=null;renderResearchTab()" style="font-size:11px;margin-bottom:12px">← Back</button>
+      <div>No grade yet for ${escapeHtml(ticker)}. ${' '}
+      <button class="btn btn-ghost" style="font-size:10px" onclick="openResearchEditor('${escapeHtml(ticker)}')">✎ Edit / classify</button>
+      <button class="btn btn-ghost" style="font-size:10px" onclick="reportTickerForReview('${escapeHtml(ticker)}')">⚑ Report for review</button></div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-top:8px">If this is an ETF/fund/FX/bond, set its classification in the editor and it'll grade on the non-equity scale.</div>
+    </div>`;
+  }
 
   // The live row, for computing any metric value the rank tables missed.
   const liveRow = (state.stockbook?.rows || []).find(r => r.ticker === ticker) || null;
