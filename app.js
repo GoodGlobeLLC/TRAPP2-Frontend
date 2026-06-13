@@ -32960,7 +32960,7 @@ async function fn13F(ticker) {
         <h3 style="font-family:var(--serif);font-size:20px;margin:0">${escapeHtml(doc.institution)}</h3>
         <span style="font-family:var(--mono);font-size:10px;color:var(--ink-dim)">${doc.positionCount} positions · $${(doc.totalValue / 1e9).toFixed(2)}B · period ${doc.period || '—'}${doc.prevPeriod ? ` (vs ${doc.prevPeriod})` : ''}</span>
       </div>
-      <table class="sb-table" style="width:100%;min-width:640px">
+      <table class="sb-table" style="width:100%;min-width:0">
         <thead><tr><th>Issuer</th><th>CUSIP</th><th style="text-align:right">Market Value</th><th style="text-align:right">Shares</th><th>Q/Q Change</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
@@ -33094,7 +33094,19 @@ const RESEARCH_METRICS = [
   { key: 'totalAssets',label: 'Total Assets',            cat: 'Scale',         higher: true,  fmt: v => _fmtBig(v), get: r => _num(r.totalAssets) },
 ];
 
-function _num(v) { return (typeof v === 'number' && isFinite(v)) ? v : null; }
+function _num(v) {
+  if (typeof v === 'number') return isFinite(v) ? v : null;
+  // Coerce numeric strings ("1.41471" from CSV-parsed rows) — this is the
+  // foundation fix for "0 companies have this metric": even if a row reaches a
+  // metric getter un-normalized, its string values now resolve to numbers.
+  if (typeof v === 'string') {
+    const s = v.trim();
+    if (s === '' || s === '#N/A' || s === 'N/A' || s === '-') return null;
+    const n = +s.replace(/,/g, '');
+    return isFinite(n) ? n : null;
+  }
+  return null;
+}
 function _fmtBig(v) {
   if (v == null) return '—';
   if (typeof fmt$ === 'function') return fmt$(v);
@@ -33429,13 +33441,15 @@ function renderResearchScreener(data) {
       <span style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${pm.total} companies have this metric ${m.higher ? '· higher = better' : '· lower = better'}</span>
     </div>
     <div class="company-card" style="margin:0">
-      <table class="sb-table" style="width:100%">
+      <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%">
+      <table class="sb-table" style="width:100%;min-width:0">
         <thead><tr>
           <th style="text-align:right">Rank</th><th>Ticker</th><th>Company</th>
           <th style="text-align:right">${escapeHtml(m.label)}</th><th style="text-align:right">Percentile</th><th style="text-align:center">Grade</th>
         </tr></thead>
         <tbody>${rowsHtml || '<tr><td colspan="6" style="padding:20px;text-align:center;color:var(--ink-faint)">No companies have this metric</td></tr>'}</tbody>
       </table>
+      </div>
     </div>`;
 }
 

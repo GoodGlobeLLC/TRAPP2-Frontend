@@ -6715,6 +6715,33 @@
       /* Connected-companies rows stay readable */
       .company-card h4 { line-height: 1.5; }
     }
+
+    /* ============================================================
+       FITS-TO-SCREEN GUARD (any zoom) — the page must never exceed the
+       viewport width regardless of zoom level or a stray wide child.
+       ============================================================ */
+    html, body { max-width: 100vw; overflow-x: hidden !important; }
+    /* Any direct structural container is clamped to the viewport. */
+    .masthead, .control-bar, .tabs, .tab-nav, .section, .tab-panel,
+    #research-body, #valuation-body, #company-overview-body, #bets-body,
+    #review-body, #regime-body, #macro-body, #stockbook-body, #probability-body,
+    #bonds-body, #risk-body { max-width: 100vw; box-sizing: border-box; }
+    /* Tables never force page width — they scroll inside their own box. */
+    .sb-table, .proj-table, .financials-table, .corr-matrix-table {
+      min-width: 0 !important;
+    }
+    /* The header status cluster (regime / data source / clock) wraps and stays
+       on-screen instead of being clipped at the right edge. */
+    .masthead { flex-wrap: wrap; row-gap: 4px; }
+    .masthead-status, .header-status, .regime-status, .masthead-right {
+      max-width: 100vw; flex-wrap: wrap; justify-content: flex-end;
+      white-space: normal !important; overflow: visible;
+    }
+    /* The ticker input row: input flexes, button stays put, nothing overflows. */
+    .control-bar { max-width: 100vw; flex-wrap: wrap; box-sizing: border-box; }
+    .control-bar > input, #ticker { min-width: 0; flex: 1 1 200px; }
+    /* Generic: long mono strings (rationales, tags) wrap rather than push width. */
+    .company-tag { white-space: normal; word-break: break-word; }
 </style>
 </head>
 <body>
@@ -8606,6 +8633,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260613g"></script>
+<script src="app.js?v=20260613h"></script>
 </body>
 </html>
