@@ -19450,14 +19450,25 @@ function normalizeRowFields(row) {
       row[camel] = v;
     }
   }
-  // dividend_yield arrives as a PERCENT in this pipeline (KO=2.54 meaning
-  // 2.54%) — but the app treats dividendYield as a DECIMAL (0.0254). Convert
-  // only when we mapped it FROM the snake_case source this pass (tracked via
-  // the raw field still being present and the camel value matching it), so we
-  // never double-divide a value that arrived already-decimal from a valuation.
-  if (row.dividend_yield != null && row.dividend_yield !== '' &&
-      row.dividendYield === (typeof row.dividend_yield === 'string' ? +row.dividend_yield : row.dividend_yield)) {
-    row.dividendYield = row.dividendYield / 100;
+  // dividend_yield arrives as a PERCENT in this pipeline (KO=2.54 → 2.54%,
+  // AAPL=0.37 → 0.37%). The app's dividendYield is a DECIMAL (0.0254). Convert
+  // percent→decimal exactly ONCE, tracked by a flag so repeated normalize calls
+  // (this runs at load AND in the bot/research) never double-divide. The old
+  // ">1" heuristic wrongly left sub-1% yields (AAPL 0.37) as 0.37 → displayed 37%.
+  if (!row._divYieldNormalized) {
+    let dy = row.dividend_yield;
+    if (typeof dy === 'string' && dy.trim() !== '') dy = +dy;
+    if (typeof dy === 'number' && isFinite(dy) && dy > 0) {
+      // Source is percent if it's a plausible percent (0–40). Convert to decimal.
+      row.dividendYield = dy > 0 && dy <= 40 ? dy / 100 : null;
+      row._divYieldNormalized = true;
+    } else if (typeof row.dividendYield === 'number' && row.dividendYield > 1 && row.dividendYield <= 40) {
+      // No snake source but camel looks like a percent — convert.
+      row.dividendYield = row.dividendYield / 100;
+      row._divYieldNormalized = true;
+    } else {
+      row._divYieldNormalized = true;  // already decimal or absent; leave as-is
+    }
   }
   return row;
 }
@@ -25512,6 +25523,11 @@ function evaluateProfitability(s) {
 function evaluateValuation(s) {
   const checks = [];
   let score = 50;
+  // Coerce numeric-stringy financials so .toFixed() never throws (CSV rows that
+  // reached here un-normalized used to crash this with "pe.toFixed is not a function").
+  const _n = v => { const x = +v; return isFinite(x) ? x : null; };
+  s = { ...s, pe: _n(s.pe), priceToBook: _n(s.priceToBook), pegRatio: _n(s.pegRatio),
+        evToEbitda: _n(s.evToEbitda), priceToSales: _n(s.priceToSales) };
   if (s.pe != null && s.pe > 0) {
     if (s.pe < 12)      { score += 15; checks.push(`P/E ${s.pe.toFixed(1)} (cheap)`); }
     else if (s.pe < 20) { score += 5;  checks.push(`P/E ${s.pe.toFixed(1)} (reasonable)`); }
@@ -33126,11 +33142,22 @@ async function fn13F(ticker) {
 // have no fundamentals); the extractor returns null for those and they're
 // excluded per-metric automatically.
 function _researchDivYield(r) {
+  // After normalizeRowFields, dividendYield is a DECIMAL (0.0257 = 2.57%).
+  // Prefer that. If the row wasn't normalized (rare), fall back to the raw
+  // percent field and convert. This keeps research, valuation, and the bot all
+  // showing the SAME yield from the SAME normalized field.
   let v = _num(r.dividendYield);
-  if (v == null || v <= 0) { const raw = _num(r.dividend_yield); if (raw != null && raw > 0) v = raw; }
-  if (v == null || v <= 0) return null;
-  if (v > 1) v = v / 100;
-  return (v > 0 && v < 1) ? v : null;
+  if (v != null && v > 0) {
+    // Already-decimal (normalized): plausible range 0–0.5 (0–50%).
+    if (v < 0.5) return v;
+    // Looks like a percent that wasn't normalized (e.g. 2.57) — convert.
+    if (v <= 40) return v / 100;
+    return null;
+  }
+  // Fall back to the raw snake_case percent field.
+  const raw = _num(r.dividend_yield);
+  if (raw != null && raw > 0 && raw <= 40) return raw / 100;
+  return null;
 }
 
 const RESEARCH_METRICS = [
@@ -34867,7 +34894,7 @@ if (typeof window !== 'undefined') { window.botRetrain = botRetrain; window.load
 const BOT_STARTING_BANKROLL = 1000;
 const BOT_MAX_BETS_PER_DAY = 4;
 const BOT_MIN_BETS_PER_DAY = 0;   // can sit out entirely
-const BOT_CONVICTION_THRESHOLD = 0.62;  // below this absolute conviction → no bet
+const BOT_CONVICTION_THRESHOLD = 0.45;  // below this absolute conviction → no bet
 
 function loadBotState() {
   try {
@@ -34975,6 +35002,14 @@ async function botScoreTicker(ticker) {
   const t = ticker.toUpperCase();
   const row = (typeof getStockbookRow === 'function') ? getStockbookRow(t) : null;
   if (!row) return null;
+  // CRITICAL: normalize the row first. The engine's fundamental signals
+  // (financialReasoningChain, computeCompanyHealth) read camelCase NUMBERS
+  // (marketCap, pe, returnOnEquity). CSV rows arrive as snake_case STRINGS
+  // (marketcap="...", pe="36.16"), which made financialReasoningChain return
+  // null conviction ("no market-cap data") and made computeCompanyHealth throw
+  // on pe.toFixed(). Both silently zeroed the fundamental signals — which is
+  // why NO ticker could ever clear the conviction bar and the bot placed no bets.
+  if (typeof normalizeRowFields === 'function') { try { normalizeRowFields(row); } catch {} }
 
   // Skip non-tradeable-as-equity instruments for the core engine (FX/index).
   // Derivatives/ETFs are allowed (the bot can use them to express/hedge views).
@@ -35279,24 +35314,53 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
   // Regime-adjusted conviction bar: choppy/risk-off raises it (sit out more).
   const effThreshold = BOT_CONVICTION_THRESHOLD + (regime.thresholdMod || 0);
 
+  // ---- PASS 1: fundamentals-only scan over the whole universe (in-memory,
+  // no network). Establishes a conviction ranking from financials alone. ----
   const CHUNK = 10;
+  const pass1 = [];
   for (let i = startIdx; i < candidates.length; i += CHUNK) {
     const chunk = candidates.slice(i, i + CHUNK);
-    // NO per-ticker network here — that was hundreds of fetches that stalled
-    // phones and killed scans. Tickers without cached history score from the
-    // backend's precomputed technicals (loaded once at boot); the scan is now
-    // pure in-memory math.
     for (const r of chunk) {
       if (betToday.has(r.ticker)) continue;
       const s = await botScoreTicker(r.ticker).catch(() => null);
-      if (s && s.confidence >= effThreshold) scored.push(s);
+      if (s) pass1.push(s);
     }
-    // Yield to the browser + checkpoint + status. The yield is what makes
-    // "runs however long it needs" safe — rendering and input stay live.
     const done = Math.min(i + CHUNK, candidates.length);
-    if (typeof updateBotStatus === 'function') { try { updateBotStatus(`Scanning ${done}/${candidates.length} · ${scored.length} qualify · regime ${regime.mode}`); } catch {} }
-    try { await idbSet('botScanCheckpoint', { date: today, index: done, scored }); } catch {}
+    if (typeof updateBotStatus === 'function') { try { updateBotStatus(`Scanning ${done}/${candidates.length} · regime ${regime.mode}`); } catch {} }
+    try { await idbSet('botScanCheckpoint', { date: today, index: done, scored: pass1 }); } catch {}
     await new Promise(res => setTimeout(res, 0));
+  }
+
+  // ---- PASS 2: for the strongest fundamental names (and anything already
+  // close to the bar), LOAD price history so trend/momentum/mean-reversion
+  // signals fire, then re-score. Bounded to the top 40 with limited concurrency
+  // so it's fast and never stalls — this is what lets strong names clear the
+  // bar that fundamentals alone can't quite reach. ----
+  pass1.sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+  const primeList = pass1.slice(0, 40).map(s => s.ticker);
+  if (primeList.length && typeof fetchGitHubHistory === 'function') {
+    if (typeof updateBotStatus === 'function') { try { updateBotStatus(`Loading history for top ${primeList.length} candidates…`); } catch {} }
+    const LIMIT = 6;
+    for (let i = 0; i < primeList.length; i += LIMIT) {
+      const batch = primeList.slice(i, i + LIMIT);
+      await Promise.all(batch.map(tk => {
+        // Skip if history already cached.
+        const have = (typeof getHistoryForTicker === 'function') && getHistoryForTicker(tk);
+        return have ? Promise.resolve() : fetchGitHubHistory(tk).catch(() => null);
+      }));
+      await new Promise(res => setTimeout(res, 0));
+    }
+  }
+  // Re-score the primed names (now with history) + keep the rest from pass 1.
+  const primedSet = new Set(primeList);
+  const rescored = {};
+  for (const tk of primeList) {
+    const s = await botScoreTicker(tk).catch(() => null);
+    if (s) rescored[tk] = s;
+  }
+  for (const s of pass1) {
+    const final = primedSet.has(s.ticker) ? (rescored[s.ticker] || s) : s;
+    if (final && final.confidence >= effThreshold) scored.push(final);
   }
   try { await idbDel('botScanCheckpoint'); } catch {}
   console.log(`[bot] ■ scan complete: ${candidates.length} candidates scored → ${scored.length} above the ${(effThreshold * 100).toFixed(0)}% conviction bar`);
