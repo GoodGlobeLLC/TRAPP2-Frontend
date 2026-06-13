@@ -250,6 +250,28 @@ const KNOWN_ETF_PATTERN = /^(SPY|QQQ|DIA|IWM|VOO|VTI|VEA|VWO|XL[A-Z]|EFA|EEM|TLT
 // Foreign / world indexes (^MERV, ^GSPTSE, ^FTSE, ^N225, ^HSI, ^STOXX50E, ^GDAXI, ^BSESN)
 // go to FX per user's preference for a unified "global markets" view.
 const US_INDEX_PATTERN = /^\^(VIX|VIX9D|SPX|GSPC|DJI|IXIC|NDX|RUT|TNX|TYX|FVX|IRX|OEX|XSP|MID|XAX|SOX|HGX|XOI|XAU|VXN|MOVE|BPSPX)$/;
+function classifyAssetRow(row) {
+  if (!row) return 'equity';
+  const ov = (typeof getOverride === 'function') ? getOverride : () => null;
+  const fn = (ov(row.ticker, 'function') || row.function || row.assetClass || row.asset_class || '').toString().toLowerCase();
+  if (fn) {
+    if (/etf/.test(fn)) return 'etf';
+    if (/fund|mutual/.test(fn)) return 'mutual';
+    if (/crypto/.test(fn)) return 'crypto';
+    if (/futures?|commodit/.test(fn)) return 'future';
+    if (/\bfx\b|forex|currency/.test(fn)) return 'fx';
+    if (/bond|treasur|fixed.?income/.test(fn)) return 'bond';
+    if (/\bindex\b/.test(fn)) return 'index';
+    if (/equity|stock|common/.test(fn)) return 'equity';
+  }
+  const isetf = (ov(row.ticker, 'isetf') ?? row.isetf);
+  const isfund = (ov(row.ticker, 'isfund') ?? row.isfund);
+  if (String(isetf).toLowerCase() === 'true' || isetf === true || isetf === 1) return 'etf';
+  if (String(isfund).toLowerCase() === 'true' || isfund === true || isfund === 1) return 'mutual';
+  return classifyAsset(row.ticker);
+}
+if (typeof window !== 'undefined') window.classifyAssetRow = classifyAssetRow;
+
 function classifyAsset(raw) {
   if (!raw) return 'equity';
   const t = String(raw).trim().toUpperCase();
@@ -28353,6 +28375,78 @@ const _ceInp = 'width:100%;background:var(--bg-card);border:1px solid var(--rule
 // ===== CONTACT EDITOR — writes time-boxed-capable row overrides (the same
 // override store as the Editor tab), so corrections persist, travel through
 // XTRAPP, and every reader of the row sees them. =====
+function openResearchEditor(tic) {
+  const row = (state.stockbook?.rows || []).find(r => r.ticker === tic) || { ticker: tic };
+  // The fields that drive the 23 research metrics + the classification control.
+  const fields = [
+    ['function', 'Classification (equity / etf / fund / bond / fx / future / crypto / index)', 'text'],
+    ['returnOnEquity', 'Return on Equity (decimal, e.g. 0.31)', 'number'],
+    ['returnOnAssets', 'Return on Assets (decimal)', 'number'],
+    ['grossMargin', 'Gross Margin (decimal)', 'number'],
+    ['operatingMargin', 'Operating Margin (decimal)', 'number'],
+    ['profitMargin', 'Net Margin (decimal)', 'number'],
+    ['revenueGrowth', 'Revenue Growth (decimal)', 'number'],
+    ['earningsGrowth', 'Earnings Growth (decimal)', 'number'],
+    ['pe', 'P/E', 'number'],
+    ['priceToBook', 'Price / Book', 'number'],
+    ['evToEbitda', 'EV / EBITDA', 'number'],
+    ['evToRevenue', 'EV / Revenue', 'number'],
+    ['totalDebt', 'Total Debt', 'number'],
+    ['totalEquity', 'Total Equity', 'number'],
+    ['cash', 'Cash', 'number'],
+    ['dividendYield', 'Dividend Yield (DECIMAL — 0.0184 for 1.84%)', 'number'],
+    ['revenue', 'Revenue', 'number'],
+    ['netIncome', 'Net Income', 'number'],
+    ['ebitda', 'EBITDA', 'number'],
+    ['freeCashFlow', 'Free Cash Flow', 'number'],
+    ['marketCap', 'Market Cap', 'number'],
+    ['totalAssets', 'Total Assets', 'number'],
+  ];
+  const body = fields.map(([k, l, ty]) => `
+    <label style="${_ceLbl}">${l}</label>
+    <input id="re-${k}" type="${ty === 'number' ? 'text' : 'text'}" style="${_ceInp}" value="${escapeHtml(String(row[k] ?? ''))}">`).join('') + `
+    <div style="display:flex;gap:6px;margin-top:14px">
+      <button class="btn" id="re-save" style="font-size:11px;background:var(--pos)">Save (durable override)</button>
+      <button class="btn btn-ghost" id="re-clear" style="font-size:11px">Clear all overrides for ${escapeHtml(tic)}</button>
+      <button class="btn btn-ghost" id="re-cancel" style="font-size:11px">Cancel</button>
+    </div>
+    <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:8px">These write the SAME override store the Editor tab and valuation use — change once, it shows everywhere. Dividend yield is a decimal (0.0184 = 1.84%). Re-typing Classification as "etf" moves this ticker to the non-equity grades. Blank a field to fall back to source data.</div>`;
+  const wrap = _companyModal(`✎ Research — ${escapeHtml(tic)}`, body);
+  wrap.querySelector('#re-cancel').addEventListener('click', () => wrap.remove());
+  wrap.querySelector('#re-clear').addEventListener('click', () => {
+    if (typeof clearOverrides === 'function') clearOverrides(tic);
+    const r = (state.stockbook?.rows || []).find(x => x.ticker === tic);
+    if (r) { delete r._preOverride; applyOverridesToRow(r); }
+    wrap.remove();
+    _afterResearchEdit(tic);
+  });
+  wrap.querySelector('#re-save').addEventListener('click', () => {
+    for (const [k, , ty] of fields) {
+      let v = wrap.querySelector('#re-' + k).value.trim();
+      if (ty === 'number' && v !== '') { if (isNaN(+v)) continue; v = +v; }
+      const current = row[k];
+      if (v === '' || v == null) { if (typeof clearOverrideField === 'function') clearOverrideField(tic, k); }
+      else if (v !== current) setOverride(tic, k, v, { source: 'research-editor' });
+    }
+    const r = (state.stockbook?.rows || []).find(x => x.ticker === tic);
+    if (r) { delete r._preOverride; applyOverridesToRow(r); if (typeof normalizeRowFields === 'function') normalizeRowFields(r); }
+    wrap.remove();
+    _afterResearchEdit(tic);
+  });
+}
+// One place to refresh everything an edit touches — research recompute, the
+// open valuation if it's this ticker, and the bot's cached score.
+function _afterResearchEdit(tic) {
+  _researchCache = null;            // force recompute with new overrides
+  if (typeof renderResearchTab === 'function') { try { renderResearchTab(); } catch {} }
+  // If this ticker is currently shown in valuation, refresh its financials too.
+  try {
+    if (state.stock?.ticker === tic && typeof renderCompanyOverview === 'function') renderCompanyOverview();
+  } catch {}
+  if (typeof flashStatus === 'function') flashStatus(`${tic}: overrides saved — research, valuation & editor now match`, 'success');
+}
+if (typeof window !== 'undefined') window.openResearchEditor = openResearchEditor;
+
 function openContactEditor(tic) {
   const row = (state.stockbook?.rows || []).find(r => r.ticker === tic) || {};
   const fields = [['ceo','CEO'],['phone','Phone'],['address','Address'],['city','City'],['state','State'],['website','Website'],['headquarters','Headquarters']];
@@ -32960,6 +33054,14 @@ async function fn13F(ticker) {
 // higherIsBetter, format(v)→string. Only EQUITIES are ranked (FX/index/futures
 // have no fundamentals); the extractor returns null for those and they're
 // excluded per-metric automatically.
+function _researchDivYield(r) {
+  let v = _num(r.dividendYield);
+  if (v == null || v <= 0) { const raw = _num(r.dividend_yield); if (raw != null && raw > 0) v = raw; }
+  if (v == null || v <= 0) return null;
+  if (v > 1) v = v / 100;
+  return (v > 0 && v < 1) ? v : null;
+}
+
 const RESEARCH_METRICS = [
   // --- Profitability / Quality ---
   { key: 'roe',        label: 'Return on Equity',        cat: 'Profitability', higher: true,  fmt: v => (v*100).toFixed(1)+'%', get: r => _num(r.returnOnEquity) },
@@ -32982,7 +33084,7 @@ const RESEARCH_METRICS = [
   { key: 'debtEquity', label: 'Debt / Equity',           cat: 'Balance Sheet', higher: false, fmt: v => v.toFixed(2), get: r => { const d=_num(r.totalDebt), e=_num(r.totalEquity); return (d!=null&&e&&e>0)? d/e : null; } },
   { key: 'cashRatio',  label: 'Cash / Market Cap',       cat: 'Balance Sheet', higher: true,  fmt: v => (v*100).toFixed(1)+'%', get: r => { const c=_num(r.cash), m=_num(r.marketCap); return (c!=null&&m&&m>0)? c/m : null; } },
   // --- Income ---
-  { key: 'divYield',   label: 'Dividend Yield',          cat: 'Income',        higher: true,  fmt: v => (v*100).toFixed(2)+'%', get: r => { const v=_num(r.dividendYield); return (v!=null&&v>0)?v:null; } },
+  { key: 'divYield',   label: 'Dividend Yield',          cat: 'Income',        higher: true,  fmt: v => (v*100).toFixed(2)+'%', get: r => _researchDivYield(r) },
   // --- Scale (absolute size — informational ranking) ---
   { key: 'revenue',    label: 'Revenue',                 cat: 'Scale',         higher: true,  fmt: v => _fmtBig(v), get: r => _num(r.revenue) },
   { key: 'netIncome',  label: 'Net Income',              cat: 'Scale',         higher: true,  fmt: v => _fmtBig(v), get: r => _num(r.netIncome) },
@@ -33096,11 +33198,11 @@ function computeResearchRankings(force = false) {
   if (!force && _researchCache && (Date.now() - _researchCacheStamp) < 30000) return _researchCache;
 
   const rows = (typeof state !== 'undefined' && state.stockbook?.rows) ? state.stockbook.rows : [];
-  // Only equities are rankable on fundamentals
-  const equities = rows.filter(r => {
-    const cls = (typeof classifyAsset === 'function') ? classifyAsset(r.ticker) : 'equity';
-    return !['fx', 'index', 'future', 'crypto'].includes(cls);
-  });
+  // Only true equities are rankable on fundamentals. Row-aware classifier so an
+  // Editor/Research re-classification (IMST → ETF) moves the ticker out of the
+  // equity grades into the non-equity table.
+  const equities = rows.filter(r => classifyAssetRow(r) === 'equity');
+  const nonEquityRows = rows.filter(r => classifyAssetRow(r) !== 'equity');
 
   const perMetric = {};
   for (const m of RESEARCH_METRICS) {
@@ -33169,7 +33271,53 @@ function computeResearchRankings(force = false) {
     if (diverged) console.warn(`[analytics] ${diverged} tickers diverge ≥8pts between backend and local grades — check data freshness for those names`);
   }
 
-  _researchCache = { perMetric, byTicker, universeSize: equities.length, backend };
+  // ---- Local non-equity grading (conduct, from cached history) ----
+  // Mirrors the backend's non-equity basis so reclassified tickers grade
+  // instantly. Uses whatever price history this browser has cached.
+  let nonEquityLocal = null;
+  try {
+    const phc = (typeof loadPriceHistCache === 'function') ? loadPriceHistCache() : {};
+    const neMetrics = [['ret1y', true], ['ret3m', true], ['volAnn', false], ['maxDD', true], ['trendR2', true]];
+    const techOf = (t) => {
+      const h = phc[t]?.data;
+      if (!Array.isArray(h) || h.length < 30) return null;
+      const px = h.map(p => (Array.isArray(p) ? p[1] : (p.close ?? p.price))).filter(v => v > 0);
+      if (px.length < 30) return null;
+      const last = px[px.length - 1];
+      const rets = []; for (let i = 1; i < px.length; i++) rets.push((px[i] - px[i - 1]) / px[i - 1]);
+      const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
+      const vol = Math.sqrt(rets.reduce((a, b) => a + (b - mean) ** 2, 0) / rets.length) * Math.sqrt(252);
+      let peak = px[0], dd = 0; for (const v of px) { peak = Math.max(peak, v); dd = Math.min(dd, v / peak - 1); }
+      const w = px.slice(-60); const m = w.length, mx = (m - 1) / 2, my = w.reduce((a, b) => a + b, 0) / m;
+      let cov = 0, vx = 0; w.forEach((y, x) => { cov += (x - mx) * (y - my); vx += (x - mx) ** 2; });
+      const slope = cov / (vx || 1); const pred = w.map((_, x) => my + slope * (x - mx));
+      const ssr = w.reduce((a, y, x) => a + (y - pred[x]) ** 2, 0), sst = w.reduce((a, y) => a + (y - my) ** 2, 0) || 1;
+      return { ret1y: px.length >= 200 ? last / px[0] - 1 : null, ret3m: px.length >= 64 ? last / px[px.length - 63] - 1 : null,
+               volAnn: vol, maxDD: dd, trendR2: Math.max(0, 1 - ssr / sst) };
+    };
+    const vals = {};
+    for (const r of nonEquityRows) { const t = techOf(r.ticker); if (t) vals[r.ticker] = t; }
+    if (Object.keys(vals).length) {
+      const pm = {};
+      for (const [key, higher] of neMetrics) {
+        const arr = Object.entries(vals).filter(([, v]) => v[key] != null).map(([t, v]) => [t, v[key]]);
+        arr.sort((a, b) => higher ? b[1] - a[1] : a[1] - b[1]);
+        pm[key] = {}; arr.forEach(([t], i) => pm[key][t] = arr.length > 1 ? Math.round((1 - i / (arr.length - 1)) * 100) : 100);
+      }
+      nonEquityLocal = {};
+      for (const t of Object.keys(vals)) {
+        let s = 0, c = 0; const ranks = {};
+        for (const [key] of neMetrics) { const p = pm[key]?.[t]; if (p != null) { ranks[key] = { pct: p }; s += p; c++; } }
+        const score = c ? s / c : null;
+        const row = nonEquityRows.find(r => r.ticker === t);
+        nonEquityLocal[t] = { ticker: t, name: row?.name || t, assetClass: classifyAssetRow(row),
+          gradeScore: score != null ? +score.toFixed(2) : null, grade: researchGradeLetter(score),
+          coverage: c, coverageTotal: neMetrics.length, ranks };
+      }
+    }
+  } catch (e) { console.warn('[research] local non-equity grading failed:', e.message); }
+
+  _researchCache = { perMetric, byTicker, universeSize: equities.length, backend, nonEquityLocal };
   _researchCacheStamp = Date.now();
   return _researchCache;
 }
@@ -33322,7 +33470,11 @@ function renderResearchGrades(data) {
   const be = data.backend;
   // ---- Non-equity cohort (backend-graded on conduct, not fundamentals) ----
   let nonEqHtml = '';
-  const neData = _backendResearch?._fresh && _backendResearch.nonEquity ? _backendResearch.nonEquity : null;
+  // Prefer backend non-equity grades; fall back to LOCAL grading (from cached
+  // price history) so a just-reclassified ticker (IMST → ETF) shows in this
+  // table immediately, before tonight's backend run.
+  let neData = _backendResearch?._fresh && _backendResearch.nonEquity ? _backendResearch.nonEquity : null;
+  if (!neData && typeof data.nonEquityLocal === 'object') neData = data.nonEquityLocal;
   if (neData) {
     const ne = Object.values(neData).filter(x => x.gradeScore != null).sort((a, b) => b.gradeScore - a.gradeScore);
     if (ne.length) {
@@ -33422,7 +33574,10 @@ function renderResearchDetail(data, ticker) {
           <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-top:2px">${t.gradeScore.toFixed(0)}/100 composite</div>
         </div>
       </div>
-      <div style="margin-top:10px"><button class="btn btn-ghost" style="font-size:10px" onclick="document.getElementById('ticker').value='${t.ticker}';switchTab('valuation');setTimeout(()=>document.getElementById('fetch-btn')?.click(),100)">Open in Valuation →</button></div>
+      <div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn" style="font-size:10px;background:var(--pos)" onclick="openResearchEditor('${t.ticker}')">✎ Edit metrics &amp; classification</button>
+        <button class="btn btn-ghost" style="font-size:10px" onclick="document.getElementById('ticker').value='${t.ticker}';switchTab('valuation');setTimeout(()=>document.getElementById('fetch-btn')?.click(),100)">Open in Valuation →</button>
+      </div>
     </div>
     ${catBlocks}`;
 }
@@ -34238,6 +34393,10 @@ async function loadSharedKeys() {
     for (const [field, slot] of Object.entries(slots)) {
       if (j[field] && !localStorage.getItem(slot)) { localStorage.setItem(slot, String(j[field]).trim()); seeded++; }
     }
+    // FED_API_KEY belongs to the BACKEND pipeline (FRED), not the frontend — it
+    // has no client data slot and is correctly ignored here; put it in the data
+    // repo's Actions SECRETS, not app_keys.json.
+    if (j.FED_API_KEY || j.FRED_API_KEY) console.log('[keys] note: FRED/FED key in app_keys.json is ignored by the frontend — it goes in the data repo Actions secrets');
     if (seeded) {
       console.log(`[keys] seeded ${seeded} shared API key(s) from TRAPP2-1/data/app_keys.json (public repo — public keys)`);
       // A fresh/wiped browser just got its keys back — say so, so "keys gone
@@ -34674,7 +34833,7 @@ async function botScoreTicker(ticker) {
   // backend's nightly per-ticker technicals (computed from the SAME repo
   // history files). This is what lets a full-universe scan run with ZERO
   // network calls — pure in-memory math, no timeouts.
-  const _bt = (!history || history.length < 30) && _backendResearch?.tech ? _backendResearch.tech[t] : null;
+  const _bt = (!history || history.length < 30) && _backendResearch && _backendResearch.tech ? _backendResearch.tech[t] : null;
   if (_bt) {
     if (_bt.trendSigned != null) add('trend', _bt.trendSigned, 0.18,
       _bt.trendSigned > 0 ? `Uptrend (backend, R²=${(_bt.trendR2 ?? 0).toFixed(2)})` : `Downtrend (backend, R²=${(_bt.trendR2 ?? 0).toFixed(2)})`);
@@ -34860,15 +35019,29 @@ async function botScoreTicker(ticker) {
 
 // ---- Daily run: score the universe, pick the best 3-4, place permanent bets ----
 async function botDailyRun(force = false) {
+  console.log('[bot] ▶ scan starting (force=' + force + ')');
   const bot = loadBotState();
   const today = new Date().toISOString().slice(0, 10);
   if (!force && bot.lastRunDate === today) {
-    console.log('[bot] already ran today', today);
+    console.log('[bot] already ran today', today, '— pass force=true to re-run');
     return bot;
   }
-
   const rows = (typeof state !== 'undefined' && state.stockbook?.rows) ? state.stockbook.rows : [];
-  if (!rows.length) { console.warn('[bot] no stockbook rows — skipping run'); return bot; }
+  if (!rows.length) {
+    console.warn('[bot] no stockbook rows — skipping run');
+    if (typeof flashStatus === 'function') flashStatus('Bot: Stock Book not loaded yet — open the Stock Book tab first', 'error');
+    return bot;
+  }
+  try {
+  return await _botDailyRunInner(bot, today, rows, force);
+  } catch (e) {
+    console.error('[bot] ✖ scan crashed:', e);
+    if (typeof flashStatus === 'function') flashStatus('Bot scan error: ' + e.message + ' (see console)', 'error');
+    try { await idbDel('botScanCheckpoint'); } catch {}   // clear any poisoned checkpoint
+    return bot;
+  }
+}
+async function _botDailyRunInner(bot, today, rows, force = false) {
 
   // ============================================================
   //   FULL-UNIVERSE BACKGROUND SCAN — no cap, no timeout, resumable
@@ -34931,7 +35104,11 @@ async function botDailyRun(force = false) {
     await new Promise(res => setTimeout(res, 0));
   }
   try { await idbDel('botScanCheckpoint'); } catch {}
-  console.log(`[bot] scan complete: ${candidates.length} candidates → ${scored.length} above the ${(effThreshold * 100).toFixed(0)}% bar`);
+  console.log(`[bot] ■ scan complete: ${candidates.length} candidates scored → ${scored.length} above the ${(effThreshold * 100).toFixed(0)}% conviction bar`);
+  if (!scored.length) {
+    console.log('[bot] nothing cleared the bar today — no new bets (this is a valid outcome, not an error)');
+    if (typeof flashStatus === 'function') flashStatus(`Bot scanned ${candidates.length} tickers — none cleared the ${(effThreshold * 100).toFixed(0)}% conviction bar today`, 'success');
+  }
 
   // Rank by confidence (absolute conviction), take top N
   scored.sort((a, b) => b.confidence - a.confidence);
