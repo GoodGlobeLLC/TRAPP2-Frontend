@@ -6661,6 +6661,60 @@
     .company-content { display: block; min-height: 200px; overflow-y: auto; }
     .company-ctab { display: block; }
     .company-ctab[style*="display:none"], .company-ctab[style*="display: none"] { display: none; }
+
+    /* ============================================================
+       MOBILE (≤640px) — fixes "punched together" layout + subtab scroll.
+       Principles: every tab strip scrolls horizontally instead of wrapping
+       into a pile; every panel scrolls vertically with momentum; grids
+       collapse to 1–2 columns; tables get horizontal scroll instead of
+       crushing columns.
+       ============================================================ */
+    @media (max-width: 640px) {
+      /* Subtab strips (Overview / Financials / TA / Company) — swipe sideways */
+      .val-subtabs, .company-tabs, .tabs, .news-filters {
+        display: flex !important;
+        flex-wrap: nowrap !important;
+        overflow-x: auto !important;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: none;
+        gap: 4px;
+        padding-bottom: 4px;
+      }
+      .val-subtabs::-webkit-scrollbar, .company-tabs::-webkit-scrollbar, .tabs::-webkit-scrollbar { display: none; }
+      .val-subtabs > *, .company-tabs > *, .tabs > * { flex: 0 0 auto !important; white-space: nowrap; }
+
+      /* Panels scroll vertically with momentum — the "can't scroll on tabs" fix */
+      .val-subpanel, .company-content, .company-ctab, .tab-panel {
+        overflow-y: auto !important;
+        -webkit-overflow-scrolling: touch;
+        max-width: 100vw;
+      }
+
+      /* Grids stop punching together: collapse to one/two columns */
+      .company-grid-two { display: block !important; }
+      .company-grid-two > * { margin-bottom: 10px; }
+      .stats-grid, .metric-grid, .ta-analytics-grid, .portfolio-stats {
+        grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+        gap: 6px !important;
+      }
+      .news-item-stats { display: flex !important; flex-wrap: wrap !important; gap: 6px 14px !important; }
+      .news-item-header { flex-wrap: wrap !important; row-gap: 3px; }
+
+      /* Control bar + buttons wrap cleanly instead of overflowing */
+      .control-bar, .sb-controls { flex-wrap: wrap !important; gap: 6px !important; }
+      .control-bar input, .control-bar select { max-width: 46vw; }
+
+      /* Tables: scroll sideways, never crush */
+      .company-card { overflow-x: auto; }
+      .sb-table { min-width: 560px; }
+
+      /* Tap targets + readable floors */
+      .btn { min-height: 32px; }
+      body { -webkit-text-size-adjust: 100%; }
+
+      /* Connected-companies rows stay readable */
+      .company-card h4 { line-height: 1.5; }
+    }
 </style>
 </head>
 <body>
@@ -8552,6 +8606,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260612f"></script>
+<script src="app.js?v=20260613d"></script>
 </body>
 </html>
