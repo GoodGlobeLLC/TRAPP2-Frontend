@@ -262,6 +262,10 @@ function classifyAssetRow(row) {
     if (/\bfx\b|forex|currency/.test(fn)) return 'fx';
     if (/bond|treasur|fixed.?income/.test(fn)) return 'bond';
     if (/\bindex\b/.test(fn)) return 'index';
+    // International equity: grades on the EQUITY scale (it has P/E, yield, market
+    // cap), but the tag is preserved so the UI can show it as international and
+    // flag that fundamental coverage is often sparse for foreign listings.
+    if (/international|foreign/.test(fn)) return 'equity';
     if (/equity|stock|common/.test(fn)) return 'equity';
   }
   const isetf = (ov(row.ticker, 'isetf') ?? row.isetf);
@@ -482,6 +486,52 @@ function _tickerLocalCurrency(ticker) {
   const m = String(ticker || '').toUpperCase().match(/\.([A-Z]{1,3})$/);
   if (!m) return null;
   return EXCHANGE_SUFFIX_CURRENCY[m[1]] || null;
+}
+
+// For an FX-pair row (RUB=X, JPY=X, EURUSD=X, GBPUSD=X), return how many USD one
+// unit of the FOREIGN currency is worth — the intuitive "value against the
+// dollar". This is what the Stock Book price column should show for currencies
+// (RUB=X → $0.0138, not "$72.46"). Uses the authoritative rate resolver, which
+// reads the dedicated rates.json + FX history, so it's correct WITHOUT the user
+// having to open each pair. Returns { usd, foreignCcy, raw } or null if not FX.
+function fxRowUsdValue(row) {
+  if (!row || !row.ticker) return null;
+  const t = String(row.ticker).toUpperCase();
+  if (!t.endsWith('=X')) return null;
+  const body = t.replace('=X', '');
+  let base, quote;
+  if (body.length === 6) { base = body.slice(0, 3); quote = body.slice(3, 6); }
+  else if (body.length === 3) { base = 'USD'; quote = body; }  // Yahoo shorthand USD/<ccy>
+  else return null;
+  // The foreign currency is whichever side isn't USD.
+  const foreignCcy = base === 'USD' ? quote : base;
+  if (!foreignCcy || foreignCcy === 'USD') {
+    // USD/USD or unparseable — value is 1.
+    return { usd: 1, foreignCcy: quote || base, raw: row.price };
+  }
+  // Authoritative USD-per-foreign-unit (handles all pair conventions + history).
+  const usd = (typeof _fxRateToUSD === 'function') ? _fxRateToUSD(foreignCcy) : null;
+  if (usd != null && isFinite(usd) && usd > 0) {
+    return { usd, foreignCcy, raw: row.price };
+  }
+  // Fallback: derive from this row's own raw quote when the resolver can't.
+  // base=USD (e.g. JPY=X, RUB=X): raw is foreign-per-USD → USD-per-foreign = 1/raw.
+  // quote=USD (e.g. EURUSD=X): raw is USD-per-foreign directly.
+  const raw = +row._localPrice || +row.price;
+  if (isFinite(raw) && raw > 0) {
+    const v = (base === 'USD') ? 1 / raw : raw;
+    return { usd: v, foreignCcy, raw };
+  }
+  return null;
+}
+
+// Format a small USD value with enough significant figures (FX values can be
+// tiny: $0.0138 for RUB). Always shows a leading $ since this IS a USD value.
+function fmtFxUsd(v) {
+  if (v == null || !isFinite(v)) return '—';
+  if (v >= 1) return '$' + v.toFixed(4);
+  if (v >= 0.01) return '$' + v.toFixed(4);
+  return '$' + v.toPrecision(4);
 }
 
 // Look up how many USD one unit of `currency` is worth, using FX pairs loaded
@@ -3731,12 +3781,16 @@ async function getPriceHistory(ticker, opts = {}) {
   // portfolio chart saw nothing — exactly the bug the user reported.
   const persist = (data) => {
     if (!data || data.length < 2) return data;
+    // Normalize to the canonical shape (both .price and .close) BEFORE caching,
+    // so whatever reads this cache later — Overview, TA, correlations — gets a
+    // consistent series regardless of which upstream source produced it.
+    const norm = (typeof normalizeHistorySeries === 'function') ? normalizeHistorySeries(data) : data;
     try {
       const c = loadPriceHistCache();
-      c[TIC] = { t: Date.now(), data };
+      c[TIC] = { t: Date.now(), data: norm };
       savePriceHistCache(c);
     } catch {}
-    return data;
+    return norm;
   };
 
   // 1. Try sheet first
@@ -9557,8 +9611,8 @@ function renderStockBook() {
   };
 
   // Sections without per-share fundamentals: crypto, futures, fx (derivatives already excludes PE)
-  const hidePE = ['derivatives', 'crypto', 'futures', 'fx'].includes(sb.section);
-  const hideBeta = ['crypto', 'futures', 'fx'].includes(sb.section);
+  const hidePE = ['derivatives', 'crypto', 'futures', 'fx', 'currencies', 'commodities', 'metals'].includes(sb.section);
+  const hideBeta = ['crypto', 'futures', 'fx', 'currencies', 'commodities', 'metals'].includes(sb.section);
 
   content.innerHTML = `
     <div class="sb-columns-toolbar">
@@ -9618,10 +9672,18 @@ function renderStockBook() {
             const countryCell = tdIf('country', `<td class="sb-sector" style="white-space:nowrap">${countryCellContent}</td>`);
             // Normalize foreign price/marketcap to USD on demand
             if (typeof ensureRowNormalized === 'function') ensureRowNormalized(r);
-            const priceCell = r._currencyUnconverted
+            // FX PAIRS: show the USD value of one unit of the foreign currency
+            // (RUB=X → $0.0138), computed from the authoritative rate so it's
+            // correct without opening each pair. Market cap is N/A for FX.
+            const _fxVal = (sb.section === 'currencies' && typeof fxRowUsdValue === 'function') ? fxRowUsdValue(r) : null;
+            const priceCell = _fxVal
+              ? `<td title="1 ${_fxVal.foreignCcy} = ${fmtFxUsd(_fxVal.usd)} USD (raw quote ${_fxVal.raw != null ? (+_fxVal.raw).toFixed(4) : '—'})">${fmtFxUsd(_fxVal.usd)} <span style="color:var(--ink-faint);font-size:9px">/ ${escapeHtml(_fxVal.foreignCcy)}</span></td>`
+              : r._currencyUnconverted
               ? `<td title="No FX rate loaded for ${r._localCurrency} — showing local currency. Add ${r._localCurrency}=X to convert."><span style="color:#e0b04c">⚠ ${r.price != null ? fmt$H(r.price) : '—'}</span></td>`
               : `<td>${r.price != null ? fmt$H(r.price) : '—'}</td>`;
-            const mcapCell = r._currencyUnconverted
+            const mcapCell = _fxVal
+              ? `<td><span style="color:var(--ink-faint)">—</span></td>`
+              : r._currencyUnconverted
               ? `<td title="Unconverted ${r._localCurrency} market cap"><span style="color:#e0b04c">⚠ ${r.marketCap != null ? fmt$H(r.marketCap) : '—'}</span></td>`
               : `<td>${r.marketCap != null ? fmt$H(r.marketCap) : '—'}</td>`;
             return `
@@ -10443,7 +10505,9 @@ async function loadPriceChart(ticker) {
     return;
   }
   state.priceChart.ticker = ticker;
-  state.priceChart.history = history;
+  // Normalize to the canonical shape so renderPriceChart's .price reads always
+  // resolve, even when the series came from a source that only had .close.
+  state.priceChart.history = (typeof normalizeHistorySeries === 'function') ? normalizeHistorySeries(history) : history;
   renderPriceChart();
 }
 
@@ -10540,12 +10604,26 @@ function renderPriceChart() {
     ctx.fillText(label, padL - 8, py + 3);
   }
 
-  // ----- Area fill under the line (TradingView-style) -----
+  // ----- Area fill under the line (flashy gradient) -----
   const firstPrice = data[0].price;
   const lastPrice = data[data.length - 1].price;
   const isUp = lastPrice >= firstPrice;
-  const lineColor = isUp ? 'var(--pos)' : 'var(--neg)';
-  const fillColor = isUp ? 'rgba(91, 138, 114, 0.15)' : 'rgba(165, 100, 90, 0.15)';
+  // Brighter, more saturated colors than the muted defaults.
+  const lineColorHi = isUp ? '#3ddc84' : '#ff5c5c';
+  const lineColorLo = isUp ? '#1a9e5c' : '#c93838';
+  const glowColor = isUp ? 'rgba(61, 220, 132, 0.55)' : 'rgba(255, 92, 92, 0.5)';
+
+  // Vertical gradient area fill: bright near the line, fading to transparent.
+  const areaGrad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+  if (isUp) {
+    areaGrad.addColorStop(0, 'rgba(61, 220, 132, 0.38)');
+    areaGrad.addColorStop(0.5, 'rgba(61, 220, 132, 0.12)');
+    areaGrad.addColorStop(1, 'rgba(61, 220, 132, 0.01)');
+  } else {
+    areaGrad.addColorStop(0, 'rgba(255, 92, 92, 0.34)');
+    areaGrad.addColorStop(0.5, 'rgba(255, 92, 92, 0.10)');
+    areaGrad.addColorStop(1, 'rgba(255, 92, 92, 0.01)');
+  }
 
   ctx.beginPath();
   data.forEach((d, i) => {
@@ -10556,18 +10634,44 @@ function renderPriceChart() {
   ctx.lineTo(x(data.length - 1), padT + plotH);
   ctx.lineTo(x(0), padT + plotH);
   ctx.closePath();
-  ctx.fillStyle = fillColor;
+  ctx.fillStyle = areaGrad;
   ctx.fill();
 
-  // ----- Line -----
-  ctx.strokeStyle = lineColor;
-  ctx.lineWidth = 1.8;
+  // ----- Line (glowing, horizontal gradient stroke) -----
+  const lineGrad = ctx.createLinearGradient(padL, 0, padL + plotW, 0);
+  lineGrad.addColorStop(0, lineColorLo);
+  lineGrad.addColorStop(1, lineColorHi);
+  ctx.save();
+  ctx.shadowColor = glowColor;
+  ctx.shadowBlur = 12;
+  ctx.strokeStyle = lineGrad;
+  ctx.lineWidth = 2.4;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
   ctx.beginPath();
   data.forEach((d, i) => {
     const px = x(i), py = y(d.price);
     if (i === 0) ctx.moveTo(px, py);
     else ctx.lineTo(px, py);
   });
+  ctx.stroke();
+  ctx.restore();
+
+  // Bright endpoint dot with a glow — the "live price" marker.
+  const lastX = x(data.length - 1), lastY = y(lastPrice);
+  ctx.save();
+  ctx.shadowColor = glowColor;
+  ctx.shadowBlur = 14;
+  ctx.fillStyle = lineColorHi;
+  ctx.beginPath();
+  ctx.arc(lastX, lastY, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+  // Outer ring pulse
+  ctx.strokeStyle = glowColor;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(lastX, lastY, 7, 0, Math.PI * 2);
   ctx.stroke();
 
   // ----- X-axis date labels (3-5 evenly spaced) -----
@@ -10991,20 +11095,36 @@ async function fnDES(ticker) {
     <div class="fn-section">
       <h3>Key Statistics</h3>
       <div class="fn-kv-grid">
-        <div><div class="l">Sector</div><div class="v">${merged.sector || '—'}</div></div>
-        <div><div class="l">Industry</div><div class="v">${merged.industry || '—'}</div></div>
-        <div><div class="l">Last Price</div><div class="v">${merged.price != null ? fmt$(merged.price) : '—'}</div></div>
-        <div><div class="l">Market Cap</div><div class="v">${merged.marketCap != null ? formatHumanNumber(merged.marketCap) : '—'}</div></div>
-        ${merged.fmpMarketCap && merged.fmpMarketCap !== merged.marketCap ?
-          `<div><div class="l">FMP Market Cap</div><div class="v" style="color:var(--data-amber)">${formatHumanNumber(merged.fmpMarketCap)}</div></div>` : ''}
-        <div><div class="l">P/E</div><div class="v">${merged.pe != null ? merged.pe.toFixed(2) : '—'}</div></div>
-        <div><div class="l">EPS</div><div class="v">${merged.eps != null ? fmt$(merged.eps) : '—'}</div></div>
-        <div><div class="l">Beta</div><div class="v">${merged.beta != null ? merged.beta.toFixed(2) : '—'}</div></div>
-        <div><div class="l">52W High</div><div class="v">${merged.high52 != null ? fmt$(merged.high52) : '—'}</div></div>
-        <div><div class="l">52W Low</div><div class="v">${merged.low52 != null ? fmt$(merged.low52) : '—'}</div></div>
-        <div><div class="l">Dividend Yield</div><div class="v">${(() => {
-          // The pipeline emits dividend yield as a PERCENT number (0.37 = 0.37%).
-          // Normalize to decimal first (÷100) so the ×100 below yields 0.37%, not 37%.
+        ${(() => {
+          // FX pairs are not companies — they have no P/E, EPS, beta, or market
+          // cap. Show the USD exchange rate and suppress the equity-only stats so
+          // the page never displays a fabricated P/E or a $ sign on a raw quote.
+          const _isFx = /=X$/.test((merged.ticker || '').toUpperCase());
+          if (_isFx && typeof fxRowUsdValue === 'function') {
+            const fx = fxRowUsdValue(merged);
+            if (fx) {
+              return `
+                <div><div class="l">Type</div><div class="v" style="color:var(--amber)">Currency pair</div></div>
+                <div><div class="l">1 ${escapeHtml(fx.foreignCcy)} =</div><div class="v">${fmtFxUsd(fx.usd)} USD</div></div>
+                <div><div class="l">1 USD =</div><div class="v">${fx.usd > 0 ? (1 / fx.usd).toFixed(4) : '—'} ${escapeHtml(fx.foreignCcy)}</div></div>
+                <div><div class="l">Raw quote</div><div class="v">${fx.raw != null ? (+fx.raw).toFixed(4) : '—'}</div></div>`;
+            }
+          }
+          return `
+            <div><div class="l">Sector</div><div class="v">${merged.sector || '—'}</div></div>
+            <div><div class="l">Industry</div><div class="v">${merged.industry || '—'}</div></div>
+            <div><div class="l">Last Price</div><div class="v">${merged.price != null ? fmt$(merged.price) : '—'}</div></div>
+            <div><div class="l">Market Cap</div><div class="v">${merged.marketCap != null ? formatHumanNumber(merged.marketCap) : '—'}</div></div>
+            ${merged.fmpMarketCap && merged.fmpMarketCap !== merged.marketCap ?
+              `<div><div class="l">FMP Market Cap</div><div class="v" style="color:var(--data-amber)">${formatHumanNumber(merged.fmpMarketCap)}</div></div>` : ''}
+            <div><div class="l">P/E</div><div class="v">${merged.pe != null ? merged.pe.toFixed(2) : '—'}</div></div>
+            <div><div class="l">EPS</div><div class="v">${merged.eps != null ? fmt$(merged.eps) : '—'}</div></div>
+            <div><div class="l">Beta</div><div class="v">${merged.beta != null ? merged.beta.toFixed(2) : '—'}</div></div>
+            <div><div class="l">52W High</div><div class="v">${merged.high52 != null ? fmt$(merged.high52) : '—'}</div></div>
+            <div><div class="l">52W Low</div><div class="v">${merged.low52 != null ? fmt$(merged.low52) : '—'}</div></div>
+            <div><div class="l">Dividend Yield</div><div class="v">${(() => {
+              // The pipeline emits dividend yield as a PERCENT number (0.37 = 0.37%).
+              // Normalize to decimal first (÷100) so the ×100 below yields 0.37%, not 37%.
           let dy = merged.dividendYield;
           if (dy == null) return '—';
           dy = +dy;
@@ -11015,8 +11135,9 @@ async function fnDES(ticker) {
           const pct = dy < 0.001 ? dy * 100 : dy;
           return pct.toFixed(2) + '%';
         })()}</div></div>
-        ${merged.isEtf === true || merged.isEtf === 'TRUE' ? `<div><div class="l">Type</div><div class="v" style="color:var(--amber)">ETF</div></div>` : ''}
-        ${merged.isFund === true || merged.isFund === 'TRUE' ? `<div><div class="l">Type</div><div class="v" style="color:var(--amber)">Fund</div></div>` : ''}
+            ${merged.isEtf === true || merged.isEtf === 'TRUE' ? `<div><div class="l">Type</div><div class="v" style="color:var(--amber)">ETF</div></div>` : ''}
+            ${merged.isFund === true || merged.isFund === 'TRUE' ? `<div><div class="l">Type</div><div class="v" style="color:var(--amber)">Fund</div></div>` : ''}`;
+        })()}
       </div>
     </div>
     <div class="fn-section">
@@ -20208,17 +20329,50 @@ function annualizedReturn(history, lookbackDays = 252) {
 }
 
 // Get history for a ticker from any available source (sheet / cache).
+// Canonical history-point normalizer. History flows in from THREE shapes:
+//   • arrays   [["2026-06-13", 291.13, 1200000]]   (build_history / per-ticker)
+//   • {close}  [{date, close, volume}]              (fetch_history pipeline)
+//   • {price}  [{date, price}]                      (Twelve Data / FMP mappers)
+// The Overview chart reads .price; the TA chart reads .close. Historically each
+// only got one shape, so a chart would render in one tab and be blank in the
+// other depending on which source resolved. This normalizer guarantees EVERY
+// point carries BOTH .price and .close (plus .volume/.date), so both charts —
+// and correlations, the bot, probability models — read the same data. This is
+// the single source of truth for a history series' shape.
+function normalizeHistorySeries(h) {
+  if (!Array.isArray(h) || !h.length) return [];
+  const out = [];
+  for (const pt of h) {
+    let date, close, volume = null;
+    if (Array.isArray(pt)) { date = pt[0]; close = +pt[1]; volume = pt[2] != null ? +pt[2] : null; }
+    else if (pt && typeof pt === 'object') {
+      date = pt.date || pt.d || pt.t;
+      close = +(pt.close != null ? pt.close : (pt.price != null ? pt.price : pt.c));
+      volume = pt.volume != null ? +pt.volume : (pt.v != null ? +pt.v : null);
+    }
+    if (date && isFinite(close)) out.push({ date, close, price: close, volume });
+  }
+  return out;
+}
+if (typeof window !== 'undefined') window.normalizeHistorySeries = normalizeHistorySeries;
+
 function getHistoryForTicker(ticker) {
   let sheetHistory = null;
   try {
     const cached = getSheetCacheObj();
     sheetHistory = cached?.data?.priceHistory;
   } catch {}
-  if (sheetHistory?.[ticker]?.length >= 2) return sheetHistory[ticker];
-  // Fall back to external cache (includes in-memory GitHub manifest history)
-  const ext = loadPriceHistCache()[ticker];
-  if (ext?.data?.length >= 2) return ext.data;
-  return null;
+  let raw = null;
+  if (sheetHistory?.[ticker]?.length >= 2) raw = sheetHistory[ticker];
+  else {
+    const ext = loadPriceHistCache()[ticker];
+    if (ext?.data?.length >= 2) raw = ext.data;
+  }
+  if (!raw) return null;
+  // Return the canonical shape so every consumer (charts, correlations, bot,
+  // probability) reads the same .date/.close/.price/.volume regardless of which
+  // source filled the cache.
+  return (typeof normalizeHistorySeries === 'function') ? normalizeHistorySeries(raw) : raw;
 }
 
 // Lazy on-demand single-ticker history fetch.
@@ -24267,19 +24421,16 @@ async function taEnsureHistory(ticker) {
   if (!h && typeof fetchGitHubHistory === 'function') {
     try { await fetchGitHubHistory(ticker); h = getHistoryForTicker(ticker); } catch {}
   }
-  // NORMALIZE to {date, close, volume} objects. History can arrive as arrays
-  // ([["2026-06-13", 291.13]] from build_history) OR objects ([{date, close}]).
-  // The TA chart's range filter reads .date/.close, so an array-format history
-  // silently produced a BLANK chart — even though the Overview tab (which reads
-  // arrays directly) showed it. This makes TA accept either shape.
-  if (Array.isArray(h) && h.length) {
-    h = h.map(pt => {
-      if (Array.isArray(pt)) return { date: pt[0], close: +pt[1], volume: pt[2] != null ? +pt[2] : null };
-      if (pt && typeof pt === 'object') return { date: pt.date, close: +(pt.close ?? pt.price), volume: pt.volume != null ? +pt.volume : null };
-      return null;
-    }).filter(p => p && p.date && isFinite(p.close));
+  // If the sync sources (sheet + cache + GitHub) still came up empty, fall back
+  // to the SAME rich loader the Overview chart uses (getPriceHistory: Twelve
+  // Data / FMP / etc.). This is what closes the "shows in Overview but not TA"
+  // gap — both tabs now reach every source, not a subset.
+  if ((!h || h.length < 2) && typeof getPriceHistory === 'function') {
+    try { h = await getPriceHistory(ticker); } catch {}
   }
-  state.ta.histCache[ticker] = h || [];
+  // Canonical shape (both .date/.close/.price/.volume) so the TA range filter,
+  // RSI, volume, and MA readouts all work regardless of the upstream source.
+  state.ta.histCache[ticker] = (typeof normalizeHistorySeries === 'function') ? normalizeHistorySeries(h || []) : (h || []);
   return state.ta.histCache[ticker];
 }
 
@@ -24799,13 +24950,41 @@ function taRenderChart() {
   if (state.ta.activeTools.has('pe') && effectiveMode === 'price') {
     const row = (typeof getStockbookRow === 'function') ? getStockbookRow(primary) : null;
     const pe = row?.pe, eps = row?.eps, px = row?.price;
-    if (pe != null && isFinite(pe) && pe > 0) {
-      // Mark the current price level (which embeds the current P/E) and label it.
+    if (pe != null && isFinite(pe) && pe > 0 && eps != null && isFinite(eps) && eps !== 0 && primarySeries.length > 2) {
+      // Reconstruct a P/E HISTORY line: at each date, P/E ≈ price(date) / EPS.
+      // We hold trailing EPS constant (we don't have historical EPS per day), so
+      // this line shows how the multiple moved PURELY from price — which is the
+      // dominant driver between earnings dates anyway. Drawn as its own curve
+      // scaled to a secondary axis on the right, with min/max/current labels so
+      // the multiple's range over the window is visible (not a flat line).
+      const peSeries = primarySeries.map(p => ({ date: p.date, pe: (p._raw ?? p.price) / eps })).filter(d => isFinite(d.pe) && d.pe > 0);
+      if (peSeries.length > 2) {
+        const peVals = peSeries.map(d => d.pe);
+        let peMin = Math.min(...peVals), peMax = Math.max(...peVals);
+        const pad = (peMax - peMin) * 0.1 || 1;
+        peMin -= pad; peMax += pad;
+        const peY = v => margin.top + plotH - ((v - peMin) / (peMax - peMin)) * plotH;
+        let d = '';
+        peSeries.forEach((pt, i) => {
+          const xx = xScale(pt.date).toFixed(1), yy = peY(pt.pe).toFixed(1);
+          d += (i === 0 ? `M${xx},${yy}` : `L${xx},${yy}`);
+        });
+        peHtml += `<path d="${d}" fill="none" stroke="var(--data-amber)" stroke-width="1.6" opacity="0.9"/>`;
+        // Right-axis labels for the P/E scale (min / current / max).
+        const cur = peVals[peVals.length - 1];
+        const labelX = W - margin.right + 4;
+        peHtml += `<text x="${labelX}" y="${(peY(peMax) + 4).toFixed(1)}" fill="var(--data-amber)" font-family="var(--mono)" font-size="9">P/E ${(peMax - pad).toFixed(1)}</text>`;
+        peHtml += `<text x="${labelX}" y="${(peY(peMin) - 2).toFixed(1)}" fill="var(--data-amber)" font-family="var(--mono)" font-size="9">${(peMin + pad).toFixed(1)}</text>`;
+        peHtml += `<text x="${labelX}" y="${(peY(cur) + 3).toFixed(1)}" fill="var(--data-amber)" font-family="var(--mono)" font-size="10" font-weight="700">${cur.toFixed(1)}×</text>`;
+        // Header note.
+        peHtml += `<text x="${margin.left + 4}" y="${margin.top - 4}" fill="var(--data-amber)" font-family="var(--mono)" font-size="9">P/E history (price ÷ trailing EPS $${eps.toFixed(2)}) · range ${(peMin + pad).toFixed(1)}–${(peMax - pad).toFixed(1)}×</text>`;
+      }
+    } else if (pe != null && isFinite(pe) && pe > 0) {
+      // No EPS to reconstruct history — fall back to the labeled current level.
       const lastV = primarySeries[primarySeries.length - 1]._v;
       const yLine = yScale(lastV);
       peHtml += `<line x1="${margin.left}" y1="${yLine}" x2="${W - margin.right}" y2="${yLine}" stroke="var(--data-amber)" stroke-width="1" stroke-dasharray="6 3" opacity="0.8"/>`;
-      peHtml += `<rect x="${margin.left + 4}" y="${yLine - 26}" width="148" height="22" rx="3" fill="var(--bg-card)" stroke="var(--data-amber)" stroke-width="0.8" opacity="0.95"/>`;
-      peHtml += `<text x="${margin.left + 10}" y="${yLine - 11}" fill="var(--data-amber)" font-family="var(--mono)" font-size="10" font-weight="700">P/E ${pe.toFixed(1)}${eps != null ? ` · EPS $${eps.toFixed(2)}` : ''}</text>`;
+      peHtml += `<text x="${margin.left + 10}" y="${yLine - 6}" fill="var(--data-amber)" font-family="var(--mono)" font-size="10" font-weight="700">P/E ${pe.toFixed(1)} (no EPS history)</text>`;
     }
   }
 
@@ -25021,7 +25200,38 @@ function taWireHover(svg, primarySeries, compareSeries, xScale, yScale, margin, 
       }
       extraParts.push(`${c.ticker}: ${val}`);
     });
-    extraEl.textContent = extraParts.join(' · ').slice(0, 70);
+
+    // Show the value of any ACTIVE indicator at the hovered date — so when RSI,
+    // volume, VWAP, or a moving average is selected, hovering reveals its number,
+    // not just the price. This is what makes the hover "show all selected data".
+    try {
+      const at = state.ta.activeTools;
+      // RSI value at this point (primarySeries carries .price via spread)
+      if (at && at.has('rsi') && typeof taComputeRSI === 'function') {
+        const rsiSeries = taComputeRSI(primarySeries, 14);
+        const r = rsiSeries.find(s => s.date === p.date);
+        if (r && r.rsi != null) extraParts.push(`RSI ${r.rsi.toFixed(0)}`);
+      }
+      // Volume at this point
+      if (at && at.has('volume') && p.volume) {
+        const v = p.volume;
+        const vStr = v >= 1e9 ? (v / 1e9).toFixed(1) + 'B' : v >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : v >= 1e3 ? (v / 1e3).toFixed(0) + 'K' : String(v);
+        extraParts.push(`Vol ${vStr}`);
+      }
+      // Moving-average values at this point
+      const maWins = [];
+      if (at && at.has('ma50')) maWins.push(50);
+      if (at && at.has('ma100')) maWins.push(100);
+      if (at && at.has('ma200')) maWins.push(200);
+      for (const w of maWins) {
+        if (nearestIdx >= w - 1) {
+          let sum = 0; for (let k = nearestIdx - w + 1; k <= nearestIdx; k++) sum += (primarySeries[k]?.price ?? 0);
+          const ma = sum / w;
+          if (isFinite(ma) && ma > 0) extraParts.push(`MA${w} ${fmt$(ma)}`);
+        }
+      }
+    } catch {}
+    extraEl.textContent = extraParts.join(' · ').slice(0, 90);
 
     // Position tooltip — try right of cursor, flip to left if too close to edge
     const tooltipW = 160;
@@ -30356,8 +30566,29 @@ window.reportAndRetryArticle = async function(articleId) {
   const article = (state.news?.items || []).find(a => articleKey(a) === articleId);
   if (!article) return;
   setArticleState(article, 'reported', { reason: 'user reported, retrying' });
+  // ROUTE TO THE HUMAN LOOP: queue this report into Review so a human can
+  // confirm/fix/delete the ticker association. This is what makes "Report &
+  // Retry" actually feed the review pipeline (and ride into XTRAPP).
+  try {
+    if (typeof flagForReview === 'function') {
+      flagForReview('newsReport', {
+        key: article.url || articleId,
+        ticker: article.ticker || null,
+        label: `Reported article: ${article.ticker || '?'} — "${(article.headline || '').slice(0, 80)}"`,
+        detail: 'User flagged this article as wrong/irrelevant and requested a retry. Confirm the ticker, fix it, or remove the article.',
+        headline: article.headline || '',
+        value: article.ticker || null,
+        confidence: article._confidence != null ? article._confidence : null,
+        options: [
+          { label: `Keep ${article.ticker || 'ticker'}`, action: 'newsReportKeep' },
+          { label: 'Fix ticker…', action: 'newsReportFix' },
+          { label: 'Remove article', action: 'newsReportRemove' },
+        ],
+      });
+    }
+  } catch (e) { console.warn('[news] flagForReview failed:', e.message); }
   renderNewsFeed();
-  updateNewsStatus(`Retrying ${article.ticker} from alternate source…`);
+  updateNewsStatus(`Reported ${article.ticker} → sent to Review · retrying from alternate source…`);
   try {
     // Try the OTHER news source than what's currently configured
     const hasFinnhub = !!localStorage.getItem('valuatio.finnhub.key');
@@ -33721,7 +33952,7 @@ function researchGradeColor(grade) {
 // ============================================================
 //   RESEARCH TAB RENDERER
 // ============================================================
-const RESEARCH_STATE = { view: 'filter', metric: 'roe', side: 'top', gradeSort: 'grade', detailTicker: null, minCoverage: 0 };
+const RESEARCH_STATE = { view: 'grade', metric: 'roe', side: 'top', gradeSort: 'grade', detailTicker: null, minCoverage: 0, filters: [] };
 
 function renderResearchTab() {
   const body = document.getElementById('research-body');
@@ -33737,8 +33968,8 @@ function renderResearchTab() {
   const head = `
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:16px 0 18px">
       <div class="seg-control">
-        <button class="seg-btn ${RESEARCH_STATE.view==='filter'?'active':''}" data-rview="filter">Screener</button>
         <button class="seg-btn ${RESEARCH_STATE.view==='grade'?'active':''}" data-rview="grade">Grades</button>
+        <button class="seg-btn ${RESEARCH_STATE.view==='filter'?'active':''}" data-rview="filter">Screener</button>
       </div>
       <span style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-left:auto">${data.universeSize} equities ranked across ${RESEARCH_METRICS.length} metrics</span>
     </div>`;
@@ -33762,65 +33993,141 @@ function renderResearchTab() {
 }
 
 function renderResearchScreener(data) {
-  const m = RESEARCH_METRICS.find(x => x.key === RESEARCH_STATE.metric) || RESEARCH_METRICS[0];
-  const pm = data.perMetric[m.key];
-  const side = RESEARCH_STATE.side;
-  // Top 100 = best (already sorted best-first); Bottom 100 = worst (tail, reversed)
-  let list = pm.ranked;
-  let shown = side === 'top' ? list.slice(0, 100) : list.slice(-100).reverse();
+  // ===== Multi-metric screener =====
+  // Build a set of filter rows (metric + operator + threshold). A company must
+  // pass ALL active filters. Every metric we compute is screenable, and the
+  // result rows are clickable → jump straight to valuing that ticker.
+  const allRows = Object.values(data.byTicker);
 
-  // Metric picker grouped by category
+  // Metric options grouped by category, reused by every filter row.
   const cats = [...new Set(RESEARCH_METRICS.map(x => x.cat))];
-  const metricOptions = cats.map(cat =>
+  const metricOptionsFor = (sel) => cats.map(cat =>
     `<optgroup label="${cat}">` +
     RESEARCH_METRICS.filter(x => x.cat === cat).map(x =>
-      `<option value="${x.key}" ${x.key===m.key?'selected':''}>${x.label}</option>`).join('') +
+      `<option value="${x.key}" ${x.key === sel ? 'selected' : ''}>${x.label}</option>`).join('') +
     `</optgroup>`
   ).join('');
 
-  const rowsHtml = shown.map(e => {
-    const tk = data.byTicker[e.ticker];
-    return `<tr class="research-row" data-ticker="${e.ticker}" style="cursor:pointer">
-      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);text-align:right">#${e.rank}</td>
-      <td style="font-family:var(--mono);font-weight:700">${escapeHtml(e.ticker)}</td>
-      <td style="font-size:11px;color:var(--ink-dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(e.name)}</td>
-      <td style="font-family:var(--mono);font-size:12px;font-weight:700;text-align:right">${m.fmt(e.value)}</td>
-      <td style="text-align:right"><span style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${e.pct}%ile</span></td>
-      <td style="text-align:center">${tk?.grade ? `<span style="font-family:var(--mono);font-weight:700;color:${researchGradeColor(tk.grade)}">${tk.grade}</span>` : '—'}</td>
+  // Ensure at least one filter row exists.
+  if (!RESEARCH_STATE.filters || !RESEARCH_STATE.filters.length) {
+    RESEARCH_STATE.filters = [{ metric: 'roe', op: 'gte', val: '' }];
+  }
+
+  // Helper: read a metric's raw numeric value for a ticker (from perMetric ranked).
+  const metricVal = (metricKey, ticker) => {
+    const pm = data.perMetric[metricKey];
+    if (!pm) return null;
+    const hit = pm.ranked.find(r => r.ticker === ticker);
+    return hit ? hit.value : null;
+  };
+
+  // Apply all active filters (those with a numeric threshold).
+  const active = RESEARCH_STATE.filters.filter(f => f.val !== '' && isFinite(+f.val));
+  let results = allRows.filter(t => {
+    for (const f of active) {
+      const v = metricVal(f.metric, t.ticker);
+      if (v == null || !isFinite(v)) return false;
+      const thr = +f.val;
+      if (f.op === 'gte' && !(v >= thr)) return false;
+      if (f.op === 'lte' && !(v <= thr)) return false;
+      if (f.op === 'gt' && !(v > thr)) return false;
+      if (f.op === 'lt' && !(v < thr)) return false;
+    }
+    return true;
+  });
+  // Sort by grade score desc (best first) when no single metric is the focus.
+  results.sort((a, b) => (b.gradeScore || 0) - (a.gradeScore || 0));
+  const shown = results.slice(0, 200);
+
+  // Filter-row UI.
+  const opLabel = { gte: '≥', lte: '≤', gt: '>', lt: '<' };
+  const filterRowsHtml = RESEARCH_STATE.filters.map((f, i) => {
+    const mObj = RESEARCH_METRICS.find(x => x.key === f.metric) || RESEARCH_METRICS[0];
+    return `
+    <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px" data-filter-row="${i}">
+      <select class="heat-filter-select rf-metric" data-i="${i}" style="min-width:200px">${metricOptionsFor(f.metric)}</select>
+      <select class="heat-filter-select rf-op" data-i="${i}" style="width:64px">
+        <option value="gte" ${f.op === 'gte' ? 'selected' : ''}>≥</option>
+        <option value="lte" ${f.op === 'lte' ? 'selected' : ''}>≤</option>
+        <option value="gt" ${f.op === 'gt' ? 'selected' : ''}>&gt;</option>
+        <option value="lt" ${f.op === 'lt' ? 'selected' : ''}>&lt;</option>
+      </select>
+      <input class="rf-val" data-i="${i}" value="${f.val}" placeholder="value" inputmode="decimal"
+        style="width:90px;background:var(--bg-card);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:11px;padding:5px 8px;border-radius:3px">
+      <span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint)">${mObj.higher ? 'higher=better' : 'lower=better'}${mObj.key.includes('Margin') || mObj.key === 'roe' || mObj.key === 'roa' ? ' · decimal (0.2=20%)' : ''}</span>
+      <button class="btn btn-ghost rf-del" data-i="${i}" style="font-size:11px;padding:2px 8px" title="Remove filter">✕</button>
+    </div>`;
+  }).join('');
+
+  const rowsHtml = shown.map((t, idx) => {
+    // Show each active filter's value for this ticker, plus grade.
+    const filterCells = active.map(f => {
+      const mObj = RESEARCH_METRICS.find(x => x.key === f.metric);
+      const v = metricVal(f.metric, t.ticker);
+      return `<td style="text-align:right;font-family:var(--mono);font-size:11px">${v != null && mObj ? mObj.fmt(v) : '—'}</td>`;
+    }).join('');
+    return `<tr class="research-screen-row" data-ticker="${escapeHtml(t.ticker)}" style="cursor:pointer">
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);text-align:right">${idx + 1}</td>
+      <td style="font-family:var(--mono);font-weight:700">${escapeHtml(t.ticker)}</td>
+      <td style="font-size:11px;color:var(--ink-dim);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(t.name)}</td>
+      <td style="text-align:center"><span style="font-family:var(--mono);font-weight:700;color:${researchGradeColor(t.grade)}">${t.grade || '—'}</span></td>
+      <td style="text-align:right;font-family:var(--mono);font-size:11px">${t.gradeScore != null ? t.gradeScore.toFixed(0) : '—'}</td>
+      ${filterCells}
+      <td style="text-align:center;font-family:var(--mono);font-size:9px;color:var(--amber)">value →</td>
     </tr>`;
   }).join('');
 
+  const filterHeaderCols = active.map(f => {
+    const mObj = RESEARCH_METRICS.find(x => x.key === f.metric);
+    return `<th style="text-align:right">${mObj ? escapeHtml(mObj.label) : ''}</th>`;
+  }).join('');
+
   return `
-    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px">
-      <select id="research-metric" class="heat-filter-select" style="min-width:240px">${metricOptions}</select>
-      <div class="seg-control">
-        <button class="seg-btn ${side==='top'?'active':''}" data-rside="top">Top 100</button>
-        <button class="seg-btn ${side==='bottom'?'active':''}" data-rside="bottom">Bottom 100</button>
+    <div class="company-card" style="margin:0 0 14px">
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:10px">Screen — companies must pass ALL filters</div>
+      ${filterRowsHtml}
+      <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+        <button class="btn btn-ghost" id="rf-add" style="font-size:10px">+ Add filter</button>
+        <button class="btn" id="rf-apply" style="font-size:10px;background:var(--pos)">Apply</button>
+        <button class="btn btn-ghost" id="rf-clear" style="font-size:10px">Clear all</button>
+        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-left:auto;align-self:center">${results.length} match${results.length === 1 ? '' : 'es'}${results.length > 200 ? ' (showing 200)' : ''}</span>
       </div>
-      <span style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${pm.total} companies have this metric ${m.higher ? '· higher = better' : '· lower = better'}</span>
     </div>
     <div class="company-card" style="margin:0">
       <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%">
       <table class="sb-table" style="width:100%;min-width:0">
         <thead><tr>
-          <th style="text-align:right">Rank</th><th>Ticker</th><th>Company</th>
-          <th style="text-align:right">${escapeHtml(m.label)}</th><th style="text-align:right">Percentile</th><th style="text-align:center">Grade</th>
+          <th style="text-align:right">#</th><th>Ticker</th><th>Company</th>
+          <th style="text-align:center">Grade</th><th style="text-align:right">Score</th>
+          ${filterHeaderCols}
+          <th></th>
         </tr></thead>
-        <tbody>${rowsHtml || '<tr><td colspan="6" style="padding:20px;text-align:center;color:var(--ink-faint)">No companies have this metric</td></tr>'}</tbody>
+        <tbody>${rowsHtml || `<tr><td colspan="${6 + active.length}" style="padding:20px;text-align:center;color:var(--ink-faint)">No companies match these filters. Loosen a threshold.</td></tr>`}</tbody>
       </table>
       </div>
     </div>`;
 }
 
 function wireResearchScreener() {
-  document.getElementById('research-metric')?.addEventListener('change', e => {
-    RESEARCH_STATE.metric = e.target.value; renderResearchTab();
-  });
-  document.querySelectorAll('[data-rside]').forEach(b => b.addEventListener('click', () => {
-    RESEARCH_STATE.side = b.dataset.rside; renderResearchTab();
+  const syncFromInputs = () => {
+    document.querySelectorAll('.rf-metric').forEach(el => { const i = +el.dataset.i; if (RESEARCH_STATE.filters[i]) RESEARCH_STATE.filters[i].metric = el.value; });
+    document.querySelectorAll('.rf-op').forEach(el => { const i = +el.dataset.i; if (RESEARCH_STATE.filters[i]) RESEARCH_STATE.filters[i].op = el.value; });
+    document.querySelectorAll('.rf-val').forEach(el => { const i = +el.dataset.i; if (RESEARCH_STATE.filters[i]) RESEARCH_STATE.filters[i].val = el.value.trim(); });
+  };
+  document.getElementById('rf-add')?.addEventListener('click', () => { syncFromInputs(); RESEARCH_STATE.filters.push({ metric: 'grossMargin', op: 'gte', val: '' }); renderResearchTab(); });
+  document.getElementById('rf-apply')?.addEventListener('click', () => { syncFromInputs(); renderResearchTab(); });
+  document.getElementById('rf-clear')?.addEventListener('click', () => { RESEARCH_STATE.filters = [{ metric: 'roe', op: 'gte', val: '' }]; renderResearchTab(); });
+  document.querySelectorAll('.rf-del').forEach(b => b.addEventListener('click', () => {
+    syncFromInputs(); const i = +b.dataset.i; RESEARCH_STATE.filters.splice(i, 1);
+    if (!RESEARCH_STATE.filters.length) RESEARCH_STATE.filters = [{ metric: 'roe', op: 'gte', val: '' }];
+    renderResearchTab();
   }));
-  document.querySelectorAll('.research-row').forEach(r => r.addEventListener('click', () => {
-    RESEARCH_STATE.view = 'grade'; RESEARCH_STATE.detailTicker = r.dataset.ticker; renderResearchTab();
+  // Apply on Enter in any value field.
+  document.querySelectorAll('.rf-val').forEach(el => el.addEventListener('keydown', e => { if (e.key === 'Enter') { syncFromInputs(); renderResearchTab(); } }));
+  // CLICK A RESULT → value that ticker (the connection the user asked for).
+  document.querySelectorAll('.research-screen-row').forEach(r => r.addEventListener('click', () => {
+    const tk = r.dataset.ticker;
+    if (tk && typeof executeCommand === 'function') executeCommand(tk);
   }));
 }
 
@@ -33935,6 +34242,7 @@ function _renderResearchBulkBar() {
       <option value="fx">FX / currency</option>
       <option value="future">Future / commodity</option>
       <option value="index">Index</option>
+      <option value="international">International equity (grades on available data)</option>
       <option value="equity">Equity (back to fundamentals)</option>
     </select>
     <button class="btn" id="research-bulk-apply" style="font-size:10px;background:var(--pos)">Apply to ${sel.length}</button>
@@ -34653,8 +34961,11 @@ function renderReviewHub() {
 
   const pendingSection = queue.length ? `
     <div style="margin-bottom:20px">
-      <div class="regime-section-title">PENDING REVIEW · ${queue.length}</div>
-      <div class="gt-section-sub">The system is unsure about these. Your call retrains the model so it recognizes the phrasing next time.</div>
+      <div class="regime-section-title" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+        <span>PENDING REVIEW · ${queue.length}</span>
+        <button class="btn" style="font-size:9px;background:var(--pos);padding:3px 10px" onclick="reviewAutoApproveAll()" title="Accept the system's current value for every pending item at once">✓✓ Auto-approve all (${queue.length})</button>
+      </div>
+      <div class="gt-section-sub">The system is unsure about these. Your call retrains the model so it recognizes the phrasing next time. Or auto-approve all to accept the current values in bulk.</div>
       ${sentimentItems.map(itemCard).join('')}
       ${tickerItems.map(itemCard).join('')}
       ${newsItems.map(newsCard).join('')}
@@ -34740,6 +35051,43 @@ function reviewDismiss(id) {
   saveReviewQueue(loadReviewQueue().filter(x => x.id !== id));
   renderReviewHub();
 }
+
+// Auto-approve everything pending: accept the system's CURRENT value for each
+// item (confirm sentiment/ticker/thesis/news as-is), then clear the queue. The
+// confirmations still retrain the model + ride into XTRAPP, same as one-by-one.
+function reviewAutoApproveAll() {
+  const queue = loadReviewQueue();
+  if (!queue.length) return;
+  if (typeof confirm === 'function' && !confirm(`Auto-approve all ${queue.length} pending items, accepting the current value for each?`)) return;
+  let approved = 0;
+  for (const q of [...queue]) {
+    try {
+      if (q.type === 'sentiment' && typeof reviewConfirm === 'function') {
+        // Accept the brain's guessed sentiment as-is.
+        const dir = (q.brainGuess === 'bullish' || q.brainGuess === 'bearish') ? q.brainGuess : 'neutral';
+        reviewConfirm(q.id, dir);
+      }
+      else if (q.type === 'ticker' && typeof reviewResolveTicker === 'function' && q.tickers && q.tickers.length) {
+        // Accept the top-ranked ticker candidate.
+        reviewResolveTicker(q.id, q.tickers[0].ticker);
+      }
+      else if (q.type === 'news' && typeof reviewNewsConfirm === 'function') reviewNewsConfirm(q.id);
+      else if (q.type === 'thesis' && typeof reviewThesisConfirm === 'function') reviewThesisConfirm(q.id);
+      else {
+        // Generic item: run its first option if present (usually "keep/confirm"),
+        // else just dismiss it as accepted.
+        if (q.options && q.options.length && typeof reviewGenericOption === 'function') reviewGenericOption(q.id, 0);
+        else saveReviewQueue(loadReviewQueue().filter(x => x.id !== q.id));
+      }
+      approved++;
+    } catch (e) { console.warn('[review] auto-approve failed for', q.id, e.message); }
+  }
+  // Belt-and-suspenders: clear anything that didn't self-remove.
+  saveReviewQueue([]);
+  renderReviewHub();
+  if (typeof flashStatus === 'function') flashStatus(`Auto-approved ${approved} review item(s) — model retrained, changes queued for XTRAPP`, 'success');
+}
+if (typeof window !== 'undefined') window.reviewAutoApproveAll = reviewAutoApproveAll;
 
 // --- News review handlers: write a DURABLE fix (survives news refresh) ---
 function _findQueuedArticle(id) {
@@ -35115,14 +35463,43 @@ async function fetchXtrappData() {
         }
       } catch (e) { console.warn('[xtrapp] article merge failed:', e.message); }
     }
-    // Personal data: FILL-IF-MISSING only. The repo seeds a fresh browser, but
-    // never clobbers live local edits (your current device is the live truth;
-    // the repo is the parachute).
+    // ===== OVERRIDES & HUMAN CORRECTIONS: XTRAPP WINS ON LOAD =====
+    // These are deliberate human corrections committed to the shared repo. On
+    // load they must TRUMP whatever this browser has locally — that's the whole
+    // point of the repo being the source of truth for fixes. (Previously these
+    // were fill-if-missing, so any device that had ever set a local override
+    // silently ignored the repo — the bug you were seeing.)
+    // We merge per-key: repo entries overwrite local, local-only entries that
+    // the repo hasn't seen yet are preserved (so unsynced local work isn't lost).
+    const _mergeRepoWins = (field, lsKey) => {
+      try {
+        if (j[field] == null) return false;
+        let local = {};
+        try { local = JSON.parse(localStorage.getItem(lsKey) || '{}'); } catch {}
+        // If both are plain objects, key-merge with repo winning. Otherwise the
+        // repo value replaces wholesale (arrays, primitives).
+        let merged;
+        if (local && typeof local === 'object' && !Array.isArray(local) &&
+            j[field] && typeof j[field] === 'object' && !Array.isArray(j[field])) {
+          merged = { ...local, ...j[field] };
+        } else {
+          merged = j[field];
+        }
+        localStorage.setItem(lsKey, JSON.stringify(merged));
+        return true;
+      } catch (e) { console.warn(`[xtrapp] ${field} merge failed:`, e.message); return false; }
+    };
+    let _xtrappApplied = 0;
+    // Field overrides (Editor changes, reclassifications) — repo wins.
+    if (_mergeRepoWins('overrides', 'valuatio.overrides.v1')) { _xtrappApplied++; console.log('[xtrapp] applied field overrides (repo wins)'); }
+    // Leadership overrides — repo wins.
+    if (_mergeRepoWins('leadershipOverrides', 'valuatio.leadership.v1')) _xtrappApplied++;
+
+    // Personal/portfolio data: still FILL-IF-MISSING (your live device is truth
+    // for YOUR holdings; the repo is only a parachute for a fresh browser).
     let _xtrappSeeded = 0;
     for (const [field, lsKey] of [
       ['personalBook', 'valuatio.personalBook.v1'],
-      ['overrides', 'valuatio.overrides.v1'],
-      ['leadershipOverrides', 'valuatio.leadership.v1'],
       ['portfolio', 'valuatio.portfolio.v1'],
       ['transactions', 'valuatio.transactions.v1'],
       ['cashPosition', 'valuatio.cashPosition.v1'],
@@ -35136,9 +35513,20 @@ async function fetchXtrappData() {
         }
       } catch {}
     }
-    if (_xtrappSeeded && typeof flashStatus === 'function') {
-      try { flashStatus(`Fresh browser detected — ${_xtrappSeeded} dataset(s) (portfolio, book, valuations…) restored from XTRAPP`, 'success'); } catch {}
+    if ((_xtrappSeeded || _xtrappApplied) && typeof flashStatus === 'function') {
+      try { flashStatus(`XTRAPP synced — ${_xtrappApplied} correction set(s) applied, ${_xtrappSeeded} dataset(s) restored`, 'success'); } catch {}
     }
+    // After applying overrides, re-normalize loaded rows so the corrections take
+    // effect immediately across research/valuation/bot (single source of truth).
+    try {
+      if (state.stockbook?.rows?.length) {
+        for (const r of state.stockbook.rows) {
+          if (typeof applyOverridesToRow === 'function') applyOverridesToRow(r);
+          if (typeof normalizeRowFields === 'function') normalizeRowFields(r);
+        }
+        _researchCache = null;  // force research recompute with the applied overrides
+      }
+    } catch {}
     if (Array.isArray(j.reviewQueue) && typeof loadReviewQueue === 'function' && typeof saveReviewQueue === 'function') {
       try {
         const localQ = loadReviewQueue();
@@ -35875,14 +36263,21 @@ function botMarkToMarket() {
     const rawPct = bet.entryPrice > 0 ? (px - bet.entryPrice) / bet.entryPrice : 0;
     // Directional return (short profits when price falls), times leverage
     const dirPct = (bet.direction === 'long' ? rawPct : -rawPct) * (bet.leverage || 1);
-    let pnl = bet.dollars * dirPct;
+    // Exposure base: prefer the explicit `dollars` (post-leverage). Fall back to
+    // notional×leverage, then shares×entryPrice, so a bet missing one field never
+    // produces NaN P&L (which would silently corrupt the compounding bankroll).
+    let exposure = bet.dollars;
+    if (!isFinite(exposure)) exposure = (bet.notional || 0) * (bet.leverage || 1);
+    if (!isFinite(exposure) || exposure === 0) exposure = (bet.shares || 0) * (bet.entryPrice || 0) * (bet.leverage || 1);
+    let pnl = exposure * dirPct;
+    if (!isFinite(pnl)) pnl = 0;
     // SHORT negative carry: deduct the owed dividend, prorated by days held.
     // This is a genuine cost that makes shorts on high-yielders expensive to hold.
     if (bet.direction === 'short') {
       const heldDays = Math.max(0, Math.round((new Date(today) - new Date(bet.entryDate)) / 86400000));
       const carry = (typeof shortDividendCarry === 'function')
-        ? shortDividendCarry(bet.ticker, bet.dollars * (bet.leverage || 1), heldDays) : 0;
-      if (carry > 0) {
+        ? shortDividendCarry(bet.ticker, exposure, heldDays) : 0;
+      if (carry > 0 && isFinite(carry)) {
         pnl -= carry;
         bet.dividendCarry = +carry.toFixed(2);   // surfaced in the ledger
       }
@@ -38421,10 +38816,82 @@ function onSupplyChainTabActive() {
 document.addEventListener('DOMContentLoaded', () => {
   const fab = document.getElementById('global-add-fab');
   if (!fab) return;
-  fab.addEventListener('click', () => {
+
+  // ---- Draggable FAB ----
+  // The button can be picked up and moved anywhere on screen, so it never
+  // permanently blocks content underneath it. Position persists across sessions.
+  // A click that doesn't move is still treated as a click (opens the add modal);
+  // a drag relocates it without triggering the modal.
+  let dragging = false, moved = false, startX = 0, startY = 0, originLeft = 0, originTop = 0;
+  const POS_KEY = 'valuatio.fab.pos';
+
+  // Restore saved position.
+  try {
+    const saved = JSON.parse(localStorage.getItem(POS_KEY) || 'null');
+    if (saved && typeof saved.left === 'number' && typeof saved.top === 'number') {
+      // Clamp into the current viewport in case the window got smaller.
+      const left = Math.max(4, Math.min(window.innerWidth - 60, saved.left));
+      const top = Math.max(4, Math.min(window.innerHeight - 60, saved.top));
+      fab.style.left = left + 'px';
+      fab.style.top = top + 'px';
+      fab.style.right = 'auto';
+      fab.style.bottom = 'auto';
+    }
+  } catch {}
+
+  const onDown = (clientX, clientY) => {
+    dragging = true; moved = false;
+    startX = clientX; startY = clientY;
+    const r = fab.getBoundingClientRect();
+    originLeft = r.left; originTop = r.top;
+    fab.style.transition = 'none';
+    fab.style.cursor = 'grabbing';
+  };
+  const onMove = (clientX, clientY) => {
+    if (!dragging) return;
+    const dx = clientX - startX, dy = clientY - startY;
+    if (Math.abs(dx) > 4 || Math.abs(dy) > 4) moved = true;
+    let left = originLeft + dx, top = originTop + dy;
+    left = Math.max(4, Math.min(window.innerWidth - fab.offsetWidth - 4, left));
+    top = Math.max(4, Math.min(window.innerHeight - fab.offsetHeight - 4, top));
+    fab.style.left = left + 'px';
+    fab.style.top = top + 'px';
+    fab.style.right = 'auto';
+    fab.style.bottom = 'auto';
+  };
+  const onUp = () => {
+    if (!dragging) return;
+    dragging = false;
+    fab.style.transition = '';
+    fab.style.cursor = '';
+    if (moved) {
+      const r = fab.getBoundingClientRect();
+      try { localStorage.setItem(POS_KEY, JSON.stringify({ left: r.left, top: r.top })); } catch {}
+    }
+  };
+
+  // Mouse
+  fab.addEventListener('mousedown', e => { e.preventDefault(); onDown(e.clientX, e.clientY); });
+  window.addEventListener('mousemove', e => onMove(e.clientX, e.clientY));
+  window.addEventListener('mouseup', onUp);
+  // Touch
+  fab.addEventListener('touchstart', e => { onDown(e.touches[0].clientX, e.touches[0].clientY); }, { passive: true });
+  window.addEventListener('touchmove', e => { if (dragging) { onMove(e.touches[0].clientX, e.touches[0].clientY); } }, { passive: true });
+  window.addEventListener('touchend', onUp);
+
+  // Double-click resets to the default corner.
+  fab.addEventListener('dblclick', e => {
+    e.preventDefault();
+    fab.style.left = ''; fab.style.top = ''; fab.style.right = ''; fab.style.bottom = '';
+    try { localStorage.removeItem(POS_KEY); } catch {}
+  });
+
+  fab.addEventListener('click', (e) => {
+    if (moved) { moved = false; return; }  // was a drag, not a click
     if (typeof openAddPositionModal === 'function') openAddPositionModal();
     else console.warn('[fab] openAddPositionModal not available');
   });
+  fab.title = 'Add position · ticker · option · future · FX · import — drag to move, double-click to reset';
 });
 
 // ============================================================
@@ -38678,7 +39145,63 @@ function renderHomeStats() {
       <div class="home-stat-card-value">${escapeHtml(String(s.val))}</div>
     </div>
   `).join('');
+
+  // ---- Tickers needing backend addition ----
+  // A ticker is "backend-covered" if the analytics backend computed grades for
+  // it (i.e. it lives in one of the data repos' master.csv). Tickers in the
+  // Stock Book or portfolio that AREN'T in the backend only have whatever data
+  // the app could pull live — they lack the nightly fundamentals/history/grades.
+  // Surfacing them here tells the user exactly what to add to the repos for
+  // deeper research.
+  renderBackendCoverageGaps();
 }
+
+function renderBackendCoverageGaps() {
+  let host = document.getElementById('home-backend-gaps');
+  // Create the section if the HTML doesn't already have it (graceful inject).
+  if (!host) {
+    const grid = document.getElementById('home-stats-grid');
+    if (!grid || !grid.parentNode) return;
+    host = document.createElement('div');
+    host.id = 'home-backend-gaps';
+    host.style.cssText = 'margin-top:18px';
+    grid.parentNode.insertBefore(host, grid.nextSibling);
+  }
+
+  const backend = _backendResearch?.byTicker || null;
+  const sbRows = state.stockbook?.rows || [];
+  const portfolio = (typeof loadPortfolio === 'function') ? loadPortfolio() : [];
+  // Build the set of tickers the user cares about.
+  const watched = new Set();
+  for (const r of sbRows) if (r.ticker) watched.add(r.ticker.toUpperCase());
+  for (const p of portfolio) if (p.ticker) watched.add(p.ticker.toUpperCase());
+
+  if (!backend) {
+    host.innerHTML = `<div class="home-section-title" style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:8px">Backend Coverage</div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">Backend grades not loaded yet — open Research once, then revisit.</div>`;
+    return;
+  }
+
+  const missing = [...watched].filter(t => !backend[t]).sort();
+  const covered = watched.size - missing.length;
+
+  if (!missing.length) {
+    host.innerHTML = `<div class="home-section-title" style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:8px">Backend Coverage</div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--pos)">✓ All ${watched.size} of your tickers are in the backend — full research available.</div>`;
+    return;
+  }
+
+  host.innerHTML = `
+    <div class="home-section-title" style="font-family:var(--mono);font-size:11px;color:var(--amber);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:8px">Tickers Needing Backend Addition (${missing.length})</div>
+    <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);line-height:1.6;margin-bottom:10px">
+      ${covered} of ${watched.size} of your tickers have full backend research. The ${missing.length} below are NOT in any data repo — the app shows only live-pulled data for them, with no nightly fundamentals, history, or grades. Add them to a repo's <span style="color:var(--amber)">data/tickers.txt</span> (and the master fetch) for deep research.
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px">
+      ${missing.map(t => `<span style="font-family:var(--mono);font-size:10px;font-weight:700;padding:3px 8px;border:1px solid var(--amber);color:var(--amber);border-radius:3px;cursor:pointer" onclick="navigator.clipboard&&navigator.clipboard.writeText('${escapeHtml(t)}')" title="Click to copy">${escapeHtml(t)}</span>`).join('')}
+    </div>
+    <button class="btn btn-ghost" style="font-size:10px;margin-top:10px" onclick="(function(){const list=${JSON.stringify(missing)}.join('\\n');navigator.clipboard&&navigator.clipboard.writeText(list);if(typeof flashStatus==='function')flashStatus('${missing.length} tickers copied — paste into tickers.txt','success');})()">Copy all ${missing.length} for tickers.txt</button>`;
+}
+if (typeof window !== 'undefined') window.renderBackendCoverageGaps = renderBackendCoverageGaps;
 
 // Storage usage breakdown — surfaces what's taking space so user knows
 // what they can safely clear.
@@ -39068,6 +39591,11 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('home-drawer-backdrop').style.display = '';
     renderHomeStats();
     renderStorageStats();
+    // Ensure backend grades are loaded so the "needs backend addition" list is
+    // accurate, then refresh that section once they arrive.
+    if (typeof loadBackendResearch === 'function') {
+      loadBackendResearch().then(() => { try { renderBackendCoverageGaps(); } catch {} }).catch(() => {});
+    }
     // Sync active prefs to the controls
     const p = loadPrefs();
     document.querySelectorAll('#pref-theme-seg .seg-btn').forEach(b => b.classList.toggle('active', b.dataset.val === (p.theme || 'dark')));

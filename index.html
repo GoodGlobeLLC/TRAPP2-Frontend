@@ -8033,18 +8033,18 @@
 -->
 <div class="tab-panel" data-panel="supplychain">
 
-  <div class="news-header">
-    <div>
+  <div class="news-header" style="flex-wrap:nowrap;align-items:flex-start">
+    <div style="min-width:0;flex:1">
       <h2 class="news-title">Supply Chain Map</h2>
       <p class="news-subtitle">Upstream → midstream → downstream linkages · cross-portfolio exposure discovery · verified vs inferred clearly tagged</p>
     </div>
-    <div class="news-controls">
+    <div class="news-controls" style="flex-shrink:0;display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end">
       <select class="news-filter" id="sc-view-mode">
         <option value="bychain" selected>Browse by Chain</option>
         <option value="byticker">Find by Ticker</option>
         <option value="portfolio">My Portfolio Exposure</option>
       </select>
-      <input type="text" class="news-filter" id="sc-search" placeholder="Search ticker, company, or chain…" style="min-width:220px"/>
+      <input type="text" class="news-filter" id="sc-search" placeholder="Search ticker, company, or chain…" style="min-width:200px"/>
     </div>
   </div>
 
@@ -8633,6 +8633,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260614a"></script>
+<script src="app.js?v=20260614f"></script>
 </body>
 </html>
