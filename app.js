@@ -33303,6 +33303,7 @@ async function loadRepoNews() {
 }
 if (typeof window !== 'undefined') window.loadRepoNews = loadRepoNews;
 
+let _researchSparseHealAttempted = false;
 function computeResearchRankings(force = false) {
   // Cache for 30s so re-renders don't recompute on every interaction
   if (!force && _researchCache && (Date.now() - _researchCacheStamp) < 30000) return _researchCache;
@@ -33366,6 +33367,37 @@ function computeResearchRankings(force = false) {
       ranks,
     };
   }
+
+  // DIAGNOSTIC: log what the compute actually sees, so a coverage problem is
+  // immediately attributable to sparse rows (stale stockbook cache) vs display.
+  try {
+    const sample = equities.find(r => r.ticker === 'AAPL') || equities[0];
+    if (sample) {
+      let direct = 0; const missing = [];
+      for (const m of RESEARCH_METRICS) { const v = m.get(sample); if (v != null && isFinite(v)) direct++; else missing.push(m.key); }
+      console.log(`[research] ${equities.length} equities · sample ${sample.ticker} coverage=${direct}/${RESEARCH_METRICS.length}` +
+        (direct < 10 ? ` ⚠ SPARSE — stockbook rows are missing financial fields (likely a stale cached stockbook; use Stock Book → Refresh All)` : '') +
+        (missing.length && direct >= 10 ? ` (lacks: ${missing.join(',')})` : ''));
+      if (direct < 10) {
+        console.log('[research] sample row fields:', Object.keys(sample).filter(k => sample[k] != null && sample[k] !== '').slice(0, 30).join(', '));
+        // SELF-HEAL: sparse rows usually mean a stale cached stockbook. Force one
+        // fresh fetch from source, then recompute. Guarded so it runs at most once.
+        if (!_researchSparseHealAttempted && typeof getSheetData === 'function') {
+          _researchSparseHealAttempted = true;
+          console.log('[research] sparse data detected — forcing a fresh stockbook fetch from source…');
+          (async () => {
+            try {
+              await getSheetData(true);          // bypass cache
+              if (typeof loadStockBook === 'function') await loadStockBook(true);
+              _researchCache = null;
+              if (typeof renderResearchTab === 'function') renderResearchTab();
+              if (typeof flashStatus === 'function') flashStatus('Research data was stale — refreshed from source', 'success');
+            } catch (e) { console.warn('[research] self-heal fetch failed:', e.message); }
+          })();
+        }
+      }
+    }
+  } catch {}
 
   // ---- Backend verification layer ----
   // Compare the backend's nightly grades against what this browser computes
@@ -33582,6 +33614,7 @@ function renderResearchGrades(data) {
 
   const rowsHtml = all.map((t, i) => `
     <tr class="research-row" data-ticker="${t.ticker}" style="cursor:pointer">
+      <td style="text-align:center;width:28px" onclick="event.stopPropagation()"><input type="checkbox" class="research-select" data-ticker="${escapeHtml(t.ticker)}" ${RESEARCH_SELECTED.has(t.ticker)?'checked':''} style="cursor:pointer"></td>
       <td style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);text-align:right">${i+1}</td>
       <td style="font-family:var(--mono);font-weight:700">${escapeHtml(t.ticker)}</td>
       <td style="font-size:11px;color:var(--ink-dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(t.name)}</td>
@@ -33605,6 +33638,7 @@ function renderResearchGrades(data) {
       const clsColor = c => c === 'etf/fund' ? '#7faaca' : c?.includes('fx') ? 'var(--data-amber)' : 'var(--ink-dim)';
       const neRows = ne.map((t, i) => `
         <tr class="research-row" data-ticker="${t.ticker}" style="cursor:pointer">
+          <td style="text-align:center;width:28px" onclick="event.stopPropagation()"><input type="checkbox" class="research-select" data-ticker="${escapeHtml(t.ticker)}" ${RESEARCH_SELECTED.has(t.ticker)?'checked':''} style="cursor:pointer"></td>
           <td style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);text-align:right">${i + 1}</td>
           <td style="font-family:var(--mono);font-weight:700">${escapeHtml(t.ticker)}</td>
           <td style="font-size:11px;color:var(--ink-dim);max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(t.name)}</td>
@@ -33620,6 +33654,7 @@ function renderResearchGrades(data) {
         <div class="company-card" style="margin:0">
           <table class="sb-table" style="width:100%">
             <thead><tr>
+              <th style="text-align:center;width:28px"></th>
               <th style="text-align:right">#</th><th>Ticker</th><th>Name</th><th>Class</th>
               <th style="text-align:center">Grade</th><th style="text-align:right">Score</th><th style="text-align:right">Coverage</th>
             </tr></thead>
@@ -33644,6 +33679,7 @@ function renderResearchGrades(data) {
     <div class="company-card" style="margin:0">
       <table class="sb-table" style="width:100%">
         <thead><tr>
+          <th style="text-align:center;width:28px"><input type="checkbox" id="research-select-all" title="Select all shown" style="cursor:pointer"></th>
           <th style="text-align:right">#</th><th>Ticker</th><th>Company</th>
           <th style="text-align:center">Grade</th><th style="text-align:center" title="Computed nightly by the analytics backend across all three books">Backend</th><th style="text-align:right">Score</th><th style="text-align:right">Coverage</th>
         </tr></thead>
@@ -33653,12 +33689,85 @@ function renderResearchGrades(data) {
     ${nonEqHtml}`;
 }
 
+// Persisted selection across re-renders.
+const RESEARCH_SELECTED = new Set();
+
+// The bulk-action bar shown when ≥1 ticker is selected — reclassify many at once.
+function _renderResearchBulkBar() {
+  document.getElementById('research-bulk-bar')?.remove();
+  if (!RESEARCH_SELECTED.size) return;
+  const bar = document.createElement('div');
+  bar.id = 'research-bulk-bar';
+  bar.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);bottom:16px;z-index:9000;background:var(--bg-panel,#16181d);border:1px solid var(--amber);border-radius:8px;padding:10px 14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;box-shadow:0 4px 20px rgba(0,0,0,0.5);max-width:94vw';
+  const sel = [...RESEARCH_SELECTED];
+  bar.innerHTML = `
+    <span style="font-family:var(--mono);font-size:11px;color:var(--amber);font-weight:700">${sel.length} selected</span>
+    <span style="font-family:var(--mono);font-size:10px;color:var(--ink-dim)">Set classification →</span>
+    <select id="research-bulk-class" style="font-family:var(--mono);font-size:10px;padding:3px 6px;background:var(--bg-card);border:1px solid var(--rule);color:var(--ink);border-radius:4px">
+      <option value="">— choose —</option>
+      <option value="etf">ETF</option>
+      <option value="etf_leveraged">ETF (leveraged)</option>
+      <option value="fund">Mutual fund</option>
+      <option value="bond">Bond / fixed income</option>
+      <option value="crypto">Crypto</option>
+      <option value="fx">FX / currency</option>
+      <option value="future">Future / commodity</option>
+      <option value="index">Index</option>
+      <option value="equity">Equity (back to fundamentals)</option>
+    </select>
+    <button class="btn" id="research-bulk-apply" style="font-size:10px;background:var(--pos)">Apply to ${sel.length}</button>
+    <button class="btn btn-ghost" id="research-bulk-clear" style="font-size:10px">Clear</button>`;
+  document.body.appendChild(bar);
+  bar.querySelector('#research-bulk-clear').addEventListener('click', () => {
+    RESEARCH_SELECTED.clear(); _renderResearchBulkBar();
+    document.querySelectorAll('.research-select').forEach(cb => cb.checked = false);
+    const sa = document.getElementById('research-select-all'); if (sa) sa.checked = false;
+  });
+  bar.querySelector('#research-bulk-apply').addEventListener('click', () => {
+    const fn = bar.querySelector('#research-bulk-class').value;
+    if (!fn) { if (typeof flashStatus === 'function') flashStatus('Pick a classification first', 'error'); return; }
+    let n = 0;
+    for (const tk of sel) {
+      // Write the same override store the editor + valuation use, so the change
+      // is durable and shows everywhere. 'function' drives classifyAssetRow.
+      if (typeof setOverride === 'function') { setOverride(tk, 'function', fn, { source: 'research-bulk' }); n++; }
+      const r = (state.stockbook?.rows || []).find(x => x.ticker === tk);
+      if (r) { delete r._preOverride; if (typeof applyOverridesToRow === 'function') applyOverridesToRow(r); if (typeof normalizeRowFields === 'function') normalizeRowFields(r); }
+    }
+    RESEARCH_SELECTED.clear();
+    _researchCache = null;                 // force recompute so they move tables
+    if (typeof renderResearchTab === 'function') renderResearchTab();
+    if (typeof flashStatus === 'function') flashStatus(`${n} ticker(s) reclassified to ${fn} — moved to the matching grade scale, saved durably`, 'success');
+  });
+}
+
 function wireResearchGrades() {
   document.querySelectorAll('.research-row').forEach(r => r.addEventListener('click', () => {
     RESEARCH_STATE.detailTicker = r.dataset.ticker; renderResearchTab();
   }));
   const mc = document.getElementById('research-mincov');
   if (mc) mc.addEventListener('change', () => { RESEARCH_STATE.minCoverage = +mc.value; renderResearchTab(); });
+
+  // Multi-select checkboxes — toggle selection without opening the detail.
+  document.querySelectorAll('.research-select').forEach(cb => {
+    cb.addEventListener('change', e => {
+      e.stopPropagation();
+      const tk = cb.dataset.ticker;
+      if (cb.checked) RESEARCH_SELECTED.add(tk); else RESEARCH_SELECTED.delete(tk);
+      _renderResearchBulkBar();
+    });
+  });
+  // Select-all toggles every checkbox currently shown.
+  const selAll = document.getElementById('research-select-all');
+  if (selAll) selAll.addEventListener('change', () => {
+    document.querySelectorAll('.research-select').forEach(cb => {
+      cb.checked = selAll.checked;
+      const tk = cb.dataset.ticker;
+      if (selAll.checked) RESEARCH_SELECTED.add(tk); else RESEARCH_SELECTED.delete(tk);
+    });
+    _renderResearchBulkBar();
+  });
+  _renderResearchBulkBar();   // restore the bar if a selection persisted
 }
 
 // Non-equity detail card (conduct metrics: return/Sharpe/vol/drawdown/trend).
@@ -34891,7 +35000,7 @@ function botRetrain() {
 }
 if (typeof window !== 'undefined') { window.botRetrain = botRetrain; window.loadBotWeights = loadBotWeights; }
 
-const BOT_STARTING_BANKROLL = 1000;
+const BOT_STARTING_BANKROLL = 100000;
 const BOT_MAX_BETS_PER_DAY = 4;
 const BOT_MIN_BETS_PER_DAY = 0;   // can sit out entirely
 const BOT_CONVICTION_THRESHOLD = 0.45;  // below this absolute conviction → no bet
@@ -35045,6 +35154,26 @@ async function botScoreTicker(ticker) {
         const signed = (chain.conviction - 50) / 50;  // -1..+1
         add('fundamentals', signed, 0.26, `Fundamentals: ${chain.verdict} (conviction ${chain.conviction.toFixed(0)})`);
       }
+    }
+  } catch {}
+
+  // 1b. Research grade — the cross-stockbook percentile ranking (the Research
+  // tab's letter grade). A high grade means the company ranks well on the 23
+  // metrics vs every other equity; that's a real, independent edge signal. Uses
+  // the backend grade if fresh, else the local compute. Grade score is 0–100
+  // (percentile), centered on 50 → signed -1..+1.
+  try {
+    let gScore = null, gLabel = '';
+    if (_backendResearch?._fresh && _backendResearch.byTicker?.[t]?.gradeScore != null) {
+      gScore = _backendResearch.byTicker[t].gradeScore; gLabel = _backendResearch.byTicker[t].grade || '';
+    } else if (typeof computeResearchRankings === 'function') {
+      const rr = computeResearchRankings();
+      const g = rr?.byTicker?.[t];
+      if (g?.gradeScore != null && (g.coverage || 0) >= 6) { gScore = g.gradeScore; gLabel = g.grade || ''; }
+    }
+    if (gScore != null) {
+      const signed = (gScore - 50) / 50;
+      add('researchGrade', signed, 0.16, `Research grade ${gLabel} (${gScore.toFixed(0)}/100 percentile)`);
     }
   } catch {}
 
@@ -35381,36 +35510,108 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
     bot.benchmarkStart = spy?.price || null;
   }
 
-  // Position sizing: by conviction, from current bankroll. Reserve so 4 bets
-  // can coexist; scale each by its share of conviction.
-  const convSum = picks.reduce((s, p) => s + p.confidence, 0) || 1;
-  for (const p of picks) {
-    const sizeFraction = (p.confidence / convSum) * 0.8;  // deploy up to 80% across picks
-    const dollars = bot.bankroll * sizeFraction * p.leverage;
+  // ===== POSITION SIZING — risk-based, correlation-aware =====
+  // Philosophy (mirrors the Risk Calculator's thinking):
+  //  • Size by RISK, not just conviction. A volatile name gets fewer dollars
+  //    for the same conviction so each position risks a similar amount.
+  //  • Cap any single position so one bad call can't wreck the book — UNLESS
+  //    conviction is exceptional (then concentration is allowed, as requested).
+  //  • Prefer uncorrelated bets when diversifying: if two picks are in the same
+  //    sector/asset class, the second is sized down (its risk overlaps the first).
+  //  • Deploy more capital when conviction is high across the slate; sit on cash
+  //    when it's thin.
+  const equity = bot.bankroll;                      // current capital
+  const MAX_SINGLE = 0.35;                           // ≤35% in one position normally
+  const MAX_SINGLE_HIGH_CONV = 0.60;                 // up to 60% if conviction ≥ 0.75
+  const MAX_GROSS = 0.90;                             // deploy ≤90% gross, keep some cash
+
+  // Per-pick RISK weight: conviction ÷ volatility (vol from history if available,
+  // else a regime-based default). Higher conviction + lower vol → bigger weight.
+  const _volOf = (p) => {
+    try {
+      const h = (typeof getHistoryForTicker === 'function') ? getHistoryForTicker(p.ticker) : null;
+      if (h && h.length >= 30) {
+        const px = h.map(x => Array.isArray(x) ? x[1] : (x.close ?? x.price)).filter(v => v > 0);
+        const rets = []; for (let i = 1; i < px.length; i++) rets.push((px[i] - px[i - 1]) / px[i - 1]);
+        const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
+        const sd = Math.sqrt(rets.reduce((a, b) => a + (b - mean) ** 2, 0) / rets.length) * Math.sqrt(252);
+        if (sd > 0.05) return sd;
+      }
+    } catch {}
+    // Defaults by asset class when no history: crypto/leveraged are volatile.
+    const cls = (typeof classifyAssetRow === 'function') ? classifyAssetRow({ ticker: p.ticker }) : 'equity';
+    if (cls === 'crypto') return 0.80;
+    if (/leverag/i.test(p.name || '')) return 0.60;
+    return 0.35;                                      // typical single-stock vol
+  };
+
+  // Correlation penalty: discount a pick's weight by how much it overlaps names
+  // already sized (same sector or asset class = correlated risk).
+  const usedGroups = {};
+  picks.sort((a, b) => b.confidence - a.confidence);  // size highest-conviction first
+  const rawWeights = picks.map(p => {
+    const vol = _volOf(p);
+    let w = p.confidence / vol;                        // risk-adjusted conviction
+    const group = (p.sector || '') + '|' + ((typeof classifyAssetRow === 'function') ? classifyAssetRow({ ticker: p.ticker }) : 'equity');
+    const overlap = usedGroups[group] || 0;
+    if (overlap > 0) w *= Math.pow(0.55, overlap);     // each correlated peer halves the next
+    usedGroups[group] = overlap + 1;
+    p._vol = vol; p._group = group;
+    return Math.max(0, w);
+  });
+  const wSum = rawWeights.reduce((a, b) => a + b, 0) || 1;
+
+  // Gross deployment scales with average conviction: thin slate → less capital.
+  const avgConf = picks.reduce((s, p) => s + p.confidence, 0) / (picks.length || 1);
+  const grossTarget = Math.min(MAX_GROSS, 0.45 + avgConf);  // 0.45..0.90
+
+  for (let i = 0; i < picks.length; i++) {
+    const p = picks[i];
+    let frac = (rawWeights[i] / wSum) * grossTarget;
+    // Per-position cap (relaxed when conviction is exceptional).
+    const cap = p.confidence >= 0.75 ? MAX_SINGLE_HIGH_CONV : MAX_SINGLE;
+    frac = Math.min(frac, cap);
+    const notional = equity * frac;                   // capital allocated
+    const dollars = notional * p.leverage;            // exposure (leverage applied)
+    // Risk-calculator-style stop: 2× the position's volatility below entry (long)
+    // / above (short), so the stop distance reflects the name's own noise.
+    const stopDist = Math.min(0.25, Math.max(0.06, p._vol * 0.5));
+    const stopPrice = p.direction === 'short'
+      ? +(p.price * (1 + stopDist)).toFixed(2)
+      : +(p.price * (1 - stopDist)).toFixed(2);
+    // Take-profit asymmetric to the stop (reward:risk ≈ 2:1).
+    const targetPrice = p.direction === 'short'
+      ? +(p.price * (1 - stopDist * 2)).toFixed(2)
+      : +(p.price * (1 + stopDist * 2)).toFixed(2);
+
     bot.bets.push({
-      id: `${p.ticker}-${today}-${Date.now()}`,
+      id: `${p.ticker}-${today}-${Date.now()}-${i}`,
       ticker: p.ticker,
       name: p.name,
       sector: p.sector,
       direction: p.direction,
       entryDate: today,
       entryPrice: p.price,
-      dollars: +dollars.toFixed(2),
+      shares: p.price > 0 ? +(notional / p.price).toFixed(4) : 0,
+      notional: +notional.toFixed(2),                 // capital committed (pre-leverage)
+      dollars: +dollars.toFixed(2),                   // exposure (post-leverage)
+      allocationPct: +(frac * 100).toFixed(1),        // % of book
       leverage: p.leverage,
       hedge: p.hedge,
+      volEstimate: +p._vol.toFixed(3),
+      stopPrice,
+      targetPrice,
       conviction: +p.conviction.toFixed(3),
       confidence: +p.confidence.toFixed(3),
       rationale: p.rationale,
       components: p.components,
-      decisionPath: p.decisionPath || null,   // the tree path that produced this bet
-      // Horizon: stronger conviction → willing to hold longer; default 20 sessions
+      decisionPath: p.decisionPath || null,
       horizonDays: confidenceHorizonDays(p.confidence),
       status: 'open',
       exitDate: null,
       exitPrice: null,
-      // Frozen forever — performance measured forward from here.
     });
-    console.log(`[bot] BET ${p.direction.toUpperCase()} ${p.ticker} $${dollars.toFixed(0)}${p.leverage > 1 ? ` (${p.leverage}x)` : ''} — conf ${(p.confidence * 100).toFixed(0)}%`);
+    console.log(`[bot] BET ${p.direction.toUpperCase()} ${p.ticker} $${notional.toFixed(0)} (${(frac * 100).toFixed(0)}% of book${p.leverage > 1 ? `, ${p.leverage}x → $${dollars.toFixed(0)} exposure` : ''}) — conf ${(p.confidence * 100).toFixed(0)}%, vol ${(p._vol * 100).toFixed(0)}%, stop $${stopPrice}`);
   }
 
   bot.lastRunDate = today;
@@ -35466,14 +35667,32 @@ function botMarkToMarket() {
     }
     bet.returnPct = +(dirPct * 100).toFixed(2);
     bet.pnl = +pnl.toFixed(2);
-    // Auto-close at horizon
+    // ===== EXIT LOGIC — close when the trade thesis resolves =====
+    // Three triggers, whichever comes first: stop-loss hit (thesis wrong),
+    // target hit (thesis paid off), or horizon reached (thesis had its time).
+    // This is what makes the bot close "whenever best applicable" rather than
+    // only at a fixed date.
     if (bet.status === 'open') {
       const ageDays = Math.round((new Date(today) - new Date(bet.entryDate)) / 86400000);
-      if (ageDays >= bet.horizonDays) {
+      let exitReason = null;
+      if (bet.stopPrice != null) {
+        const stopped = bet.direction === 'short' ? (px >= bet.stopPrice) : (px <= bet.stopPrice);
+        if (stopped) exitReason = 'stop-loss';
+      }
+      if (!exitReason && bet.targetPrice != null) {
+        const hit = bet.direction === 'short' ? (px <= bet.targetPrice) : (px >= bet.targetPrice);
+        if (hit) exitReason = 'target';
+      }
+      if (!exitReason && ageDays >= bet.horizonDays) exitReason = 'horizon';
+      if (exitReason) {
         bet.status = 'closed';
         bet.exitDate = today;
         bet.exitPrice = px;
+        bet.exitReason = exitReason;
+        // Realize P&L into the bankroll so the $100k compounds (or draws down).
+        bot.bankroll = +(bot.bankroll + (bet.pnl || 0)).toFixed(2);
         changed = true;
+        console.log(`[bot] CLOSE ${bet.direction.toUpperCase()} ${bet.ticker} @ $${px} — ${exitReason}, P&L ${bet.pnl >= 0 ? '+' : ''}$${(bet.pnl || 0).toFixed(0)} → bankroll $${bot.bankroll.toFixed(0)}`);
       }
     }
   }
@@ -35484,6 +35703,28 @@ function botMarkToMarket() {
   }
   return bot;
 }
+
+// ---- Position total / book value (open exposure + cash) ----
+function botBookValue() {
+  const bot = botMarkToMarket();
+  const open = bot.bets.filter(b => b.status === 'open');
+  const openNotional = open.reduce((s, b) => s + (b.notional || 0), 0);
+  const openExposure = open.reduce((s, b) => s + (b.dollars || 0), 0);
+  const openPnl = open.reduce((s, b) => s + (b.pnl || 0), 0);
+  // Cash = bankroll minus capital tied up in open positions (pre-leverage).
+  const cash = +(bot.bankroll - openNotional).toFixed(2);
+  return {
+    bankroll: bot.bankroll,
+    cash,
+    openPositions: open.length,
+    openNotional: +openNotional.toFixed(2),     // capital committed
+    openExposure: +openExposure.toFixed(2),     // post-leverage market exposure
+    openPnl: +openPnl.toFixed(2),               // unrealized
+    totalValue: +(bot.bankroll + openPnl).toFixed(2),  // mark-to-market book value
+    grossLeverage: bot.bankroll > 0 ? +(openExposure / bot.bankroll).toFixed(2) : 0,
+  };
+}
+if (typeof window !== 'undefined') window.botBookValue = botBookValue;
 
 // ---- Aggregate performance (optionally filtered to one ticker) ----
 function botPerformance(filterTicker = null) {
@@ -35542,6 +35783,7 @@ function renderBetsTab() {
     : `<span style="color:var(--neg);font-weight:700">▼ SHORT</span>`;
 
   // ---- Performance summary cards ----
+  const book = (typeof botBookValue === 'function') ? botBookValue() : null;
   const beatingYou = '';  // (user portfolio comparison wired separately)
   const vsSpyColor = (perf.spyReturn != null && perf.totalReturnPct != null)
     ? (perf.totalReturnPct > perf.spyReturn ? 'var(--pos)' : 'var(--neg)') : 'var(--ink-dim)';
@@ -35549,9 +35791,19 @@ function renderBetsTab() {
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:18px 0">
       <div class="company-card" style="margin:0;border-left:3px solid ${pnlColor(perf.totalPnl)}">
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Portfolio Value</div>
-        <div style="font-family:var(--mono);font-size:24px;font-weight:700;color:${pnlColor(perf.totalPnl)};margin-top:4px">$${perf.currentValue.toFixed(2)}</div>
-        <div style="font-family:var(--mono);font-size:9px;color:${pnlColor(perf.totalPnl)};margin-top:2px">${perf.totalReturnPct >= 0 ? '+' : ''}${perf.totalReturnPct}% from $1,000</div>
+        <div style="font-family:var(--mono);font-size:24px;font-weight:700;color:${pnlColor(perf.totalPnl)};margin-top:4px">$${(book ? book.totalValue : perf.currentValue).toLocaleString(undefined,{maximumFractionDigits:0})}</div>
+        <div style="font-family:var(--mono);font-size:9px;color:${pnlColor(perf.totalPnl)};margin-top:2px">${perf.totalReturnPct >= 0 ? '+' : ''}${perf.totalReturnPct}% from $100,000</div>
       </div>
+      ${book ? `<div class="company-card" style="margin:0;border-left:3px solid var(--amber)">
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Position Total</div>
+        <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:var(--ink);margin-top:4px">$${book.openNotional.toLocaleString(undefined,{maximumFractionDigits:0})}</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">${book.openPositions} open · $${book.openExposure.toLocaleString(undefined,{maximumFractionDigits:0})} exposure (${book.grossLeverage}× gross)</div>
+      </div>
+      <div class="company-card" style="margin:0">
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Cash</div>
+        <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:var(--ink);margin-top:4px">$${book.cash.toLocaleString(undefined,{maximumFractionDigits:0})}</div>
+        <div style="font-family:var(--mono);font-size:9px;color:${pnlColor(book.openPnl)};margin-top:2px">${book.openPnl >= 0 ? '+' : ''}$${book.openPnl.toLocaleString(undefined,{maximumFractionDigits:0})} unrealized</div>
+      </div>` : ''}
       <div class="company-card" style="margin:0">
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Total P/L</div>
         <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:${pnlColor(perf.totalPnl)};margin-top:4px">${fmtPnl(perf.totalPnl)}</div>
@@ -35566,11 +35818,6 @@ function renderBetsTab() {
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">vs SPY</div>
         <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:${vsSpyColor};margin-top:4px">${perf.spyReturn != null ? (perf.spyReturn >= 0 ? '+' : '') + perf.spyReturn + '%' : '—'}</div>
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">${perf.totalReturnPct != null && perf.spyReturn != null ? (perf.totalReturnPct > perf.spyReturn ? 'bot winning' : 'SPY winning') : 'benchmark'}</div>
-      </div>
-      <div class="company-card" style="margin:0">
-        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Total Bets</div>
-        <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:var(--ink);margin-top:4px">${perf.betCount}</div>
-        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">${perf.openCount} open · since ${perf.startedAt || '—'}</div>
       </div>
     </div>`;
 
@@ -38942,51 +39189,59 @@ document.addEventListener('DOMContentLoaded', () => {
 // equity market (so the user knows where to look for actionable exposure).
 // GDP is a placeholder — when we get the actual API integration, this can
 // be replaced with the latest published number.
+// Baseline GDP (nominal USD trillions). These are IMF WEO 2025 estimates — the
+// freshest figures shipped in-code as a fallback. At runtime loadGtFreshGdp()
+// overrides these with the live global_trade.json (also IMF, refreshed nightly),
+// so they stay current; the year + source are always labeled in the card.
 const GT_COUNTRIES = [
-  { code: 'us', iso: 'USA', name: 'United States',   flag: '🇺🇸', gdpRank: 1,  countryEtf: 'SPY',  gdpUsdT: 28.78, gdpYear: 2024 },
-  { code: 'cn', iso: 'CHN', name: 'China',           flag: '🇨🇳', gdpRank: 2,  countryEtf: 'MCHI', gdpUsdT: 18.53, gdpYear: 2024 },
-  { code: 'de', iso: 'DEU', name: 'Germany',         flag: '🇩🇪', gdpRank: 3,  countryEtf: 'EWG',  gdpUsdT: 4.59,  gdpYear: 2024 },
-  { code: 'jp', iso: 'JPN', name: 'Japan',           flag: '🇯🇵', gdpRank: 4,  countryEtf: 'EWJ',  gdpUsdT: 4.11,  gdpYear: 2024 },
-  { code: 'in', iso: 'IND', name: 'India',           flag: '🇮🇳', gdpRank: 5,  countryEtf: 'INDA', gdpUsdT: 3.94,  gdpYear: 2024 },
-  { code: 'gb', iso: 'GBR', name: 'United Kingdom',  flag: '🇬🇧', gdpRank: 6,  countryEtf: 'EWU',  gdpUsdT: 3.50,  gdpYear: 2024 },
-  { code: 'fr', iso: 'FRA', name: 'France',          flag: '🇫🇷', gdpRank: 7,  countryEtf: 'EWQ',  gdpUsdT: 3.13,  gdpYear: 2024 },
-  { code: 'br', iso: 'BRA', name: 'Brazil',          flag: '🇧🇷', gdpRank: 8,  countryEtf: 'EWZ',  gdpUsdT: 2.33,  gdpYear: 2024 },
-  { code: 'it', iso: 'ITA', name: 'Italy',           flag: '🇮🇹', gdpRank: 9,  countryEtf: 'EWI',  gdpUsdT: 2.30,  gdpYear: 2024 },
-  { code: 'ca', iso: 'CAN', name: 'Canada',          flag: '🇨🇦', gdpRank: 10, countryEtf: 'EWC',  gdpUsdT: 2.24,  gdpYear: 2024 },
-  { code: 'kr', iso: 'KOR', name: 'South Korea',     flag: '🇰🇷', gdpRank: 11, countryEtf: 'EWY',  gdpUsdT: 1.87,  gdpYear: 2024 },
-  { code: 'mx', iso: 'MEX', name: 'Mexico',          flag: '🇲🇽', gdpRank: 12, countryEtf: 'EWW',  gdpUsdT: 1.85,  gdpYear: 2024 },
+  { code: 'us', iso: 'USA', name: 'United States',   flag: '🇺🇸', gdpRank: 1,  countryEtf: 'SPY',  gdpUsdT: 30.34, gdpYear: 2025 },
+  { code: 'cn', iso: 'CHN', name: 'China',           flag: '🇨🇳', gdpRank: 2,  countryEtf: 'MCHI', gdpUsdT: 19.53, gdpYear: 2025 },
+  { code: 'de', iso: 'DEU', name: 'Germany',         flag: '🇩🇪', gdpRank: 3,  countryEtf: 'EWG',  gdpUsdT: 4.92,  gdpYear: 2025 },
+  { code: 'jp', iso: 'JPN', name: 'Japan',           flag: '🇯🇵', gdpRank: 4,  countryEtf: 'EWJ',  gdpUsdT: 4.39,  gdpYear: 2025 },
+  { code: 'in', iso: 'IND', name: 'India',           flag: '🇮🇳', gdpRank: 5,  countryEtf: 'INDA', gdpUsdT: 4.27,  gdpYear: 2025 },
+  { code: 'gb', iso: 'GBR', name: 'United Kingdom',  flag: '🇬🇧', gdpRank: 6,  countryEtf: 'EWU',  gdpUsdT: 3.73,  gdpYear: 2025 },
+  { code: 'fr', iso: 'FRA', name: 'France',          flag: '🇫🇷', gdpRank: 7,  countryEtf: 'EWQ',  gdpUsdT: 3.28,  gdpYear: 2025 },
+  { code: 'it', iso: 'ITA', name: 'Italy',           flag: '🇮🇹', gdpRank: 8,  countryEtf: 'EWI',  gdpUsdT: 2.46,  gdpYear: 2025 },
+  { code: 'ca', iso: 'CAN', name: 'Canada',          flag: '🇨🇦', gdpRank: 9,  countryEtf: 'EWC',  gdpUsdT: 2.33,  gdpYear: 2025 },
+  { code: 'br', iso: 'BRA', name: 'Brazil',          flag: '🇧🇷', gdpRank: 10, countryEtf: 'EWZ',  gdpUsdT: 2.31,  gdpYear: 2025 },
+  { code: 'kr', iso: 'KOR', name: 'South Korea',     flag: '🇰🇷', gdpRank: 11, countryEtf: 'EWY',  gdpUsdT: 1.95,  gdpYear: 2025 },
+  { code: 'mx', iso: 'MEX', name: 'Mexico',          flag: '🇲🇽', gdpRank: 12, countryEtf: 'EWW',  gdpUsdT: 1.85,  gdpYear: 2025 },
 ];
 
 // Top trade partners of the US (FY 2023 totals, in $B). When the FRED pipeline
 // integration lands, these will be replaced with live numbers.
 // Source: U.S. Census Bureau · Foreign Trade Division.
+// FY2024 full-year totals ($B), U.S. Census Bureau Foreign Trade (released
+// Feb 2025 — the freshest OFFICIAL annual trade data). The live US trade-
+// balance card above pulls monthly FRED data for the current trend; these are
+// the annual partner breakdown the monthly series doesn't provide.
 const GT_US_PARTNERS = [
-  { code: 'cn', name: 'China',          exports: 147.8, imports: 426.9, balance: -279.1, year: 2023 },
-  { code: 'mx', name: 'Mexico',         exports: 322.7, imports: 475.6, balance: -152.9, year: 2023 },
-  { code: 'ca', name: 'Canada',         exports: 354.4, imports: 418.6, balance: -64.2,  year: 2023 },
-  { code: 'de', name: 'Germany',        exports: 76.4,  imports: 163.0, balance: -86.6,  year: 2023 },
-  { code: 'jp', name: 'Japan',          exports: 75.7,  imports: 147.4, balance: -71.7,  year: 2023 },
-  { code: 'kr', name: 'South Korea',    exports: 65.1,  imports: 116.2, balance: -51.1,  year: 2023 },
-  { code: 'gb', name: 'United Kingdom', exports: 74.3,  imports: 64.2,  balance: 10.1,   year: 2023 },
-  { code: 'tw', name: 'Taiwan',         exports: 40.0,  imports: 87.8,  balance: -47.8,  year: 2023 },
-  { code: 'vn', name: 'Vietnam',        exports: 9.8,   imports: 114.4, balance: -104.6, year: 2023 },
-  { code: 'in', name: 'India',          exports: 40.1,  imports: 83.8,  balance: -43.7,  year: 2023 },
+  { code: 'mx', name: 'Mexico',         exports: 334.0, imports: 505.9, balance: -171.8, year: 2024 },
+  { code: 'cn', name: 'China',          exports: 143.5, imports: 438.9, balance: -295.4, year: 2024 },
+  { code: 'ca', name: 'Canada',         exports: 349.4, imports: 412.7, balance: -63.3,  year: 2024 },
+  { code: 'de', name: 'Germany',        exports: 75.3,  imports: 160.4, balance: -85.0,  year: 2024 },
+  { code: 'jp', name: 'Japan',          exports: 79.7,  imports: 148.2, balance: -68.5,  year: 2024 },
+  { code: 'kr', name: 'South Korea',    exports: 65.5,  imports: 131.5, balance: -66.0,  year: 2024 },
+  { code: 'vn', name: 'Vietnam',        exports: 13.1,  imports: 136.6, balance: -123.5, year: 2024 },
+  { code: 'tw', name: 'Taiwan',         exports: 42.3,  imports: 116.3, balance: -74.0,  year: 2024 },
+  { code: 'in', name: 'India',          exports: 41.8,  imports: 87.4,  balance: -45.7,  year: 2024 },
+  { code: 'gb', name: 'United Kingdom', exports: 79.9,  imports: 68.1,  balance: 11.9,   year: 2024 },
 ];
 const GT_PARTNER_FLAGS = { cn:'🇨🇳', mx:'🇲🇽', ca:'🇨🇦', de:'🇩🇪', jp:'🇯🇵', kr:'🇰🇷', gb:'🇬🇧', tw:'🇹🇼', vn:'🇻🇳', in:'🇮🇳', us:'🇺🇸', fr:'🇫🇷', it:'🇮🇹', br:'🇧🇷' };
 
 // Top global commodities + tradeable proxies. Production share is from USGS/
 // World Bank annual data — annual cadence so it's STALE most of the year.
 const GT_PRODUCTS = [
-  { name: 'Crude Oil',       proxy: 'USO',  unit: 'barrel',  topProducers: [['USA',13.4], ['Saudi Arabia',9.7], ['Russia',9.5]], dataYear: 2023 },
-  { name: 'Natural Gas',     proxy: 'UNG',  unit: 'BCF',     topProducers: [['USA',1035], ['Russia',583], ['Iran',259]], dataYear: 2023 },
-  { name: 'Copper',          proxy: 'CPER', unit: 'tonne',   topProducers: [['Chile',5.0], ['Peru',2.6], ['DR Congo',2.5]], dataYear: 2023 },
-  { name: 'Gold',            proxy: 'GLD',  unit: 'tonne',   topProducers: [['China',370], ['Russia',310], ['Australia',290]], dataYear: 2023 },
-  { name: 'Iron Ore',        proxy: 'PICK', unit: 'Mt',      topProducers: [['Australia',870], ['Brazil',440], ['China',280]], dataYear: 2023 },
-  { name: 'Wheat',           proxy: 'WEAT', unit: 'Mt',      topProducers: [['China',136], ['India',107], ['Russia',92]], dataYear: 2023 },
-  { name: 'Soybeans',        proxy: 'SOYB', unit: 'Mt',      topProducers: [['Brazil',153], ['USA',113], ['Argentina',48]], dataYear: 2023 },
-  { name: 'Semiconductors',  proxy: 'SOXX', unit: '$B sales', topProducers: [['Taiwan TSMC',95], ['South Korea Samsung',45], ['USA Intel',40]], dataYear: 2023 },
-  { name: 'Lithium',         proxy: 'LIT',  unit: 'kt',      topProducers: [['Australia',86], ['Chile',44], ['China',33]], dataYear: 2023 },
-  { name: 'Rare Earths',     proxy: 'REMX', unit: 'kt',      topProducers: [['China',240], ['USA',43], ['Myanmar',38]], dataYear: 2023 },
+  { name: 'Crude Oil',       proxy: 'USO',  unit: 'Mbbl/d', topProducers: [['USA',13.4], ['Saudi Arabia',9.6], ['Russia',9.2]], dataYear: 2024 },
+  { name: 'Natural Gas',     proxy: 'UNG',  unit: 'BCF',     topProducers: [['USA',1050], ['Russia',586], ['Iran',262]], dataYear: 2024 },
+  { name: 'Copper',          proxy: 'CPER', unit: 'Mt',      topProducers: [['Chile',5.3], ['DR Congo',3.3], ['Peru',2.6]], dataYear: 2024 },
+  { name: 'Gold',            proxy: 'GLD',  unit: 'tonne',   topProducers: [['China',380], ['Russia',310], ['Australia',290]], dataYear: 2024 },
+  { name: 'Iron Ore',        proxy: 'PICK', unit: 'Mt',      topProducers: [['Australia',880], ['Brazil',440], ['China',270]], dataYear: 2024 },
+  { name: 'Wheat',           proxy: 'WEAT', unit: 'Mt',      topProducers: [['China',140], ['India',113], ['Russia',82]], dataYear: 2024 },
+  { name: 'Soybeans',        proxy: 'SOYB', unit: 'Mt',      topProducers: [['Brazil',169], ['USA',119], ['Argentina',49]], dataYear: 2024 },
+  { name: 'Semiconductors',  proxy: 'SOXX', unit: '$B sales', topProducers: [['Taiwan TSMC',90], ['South Korea Samsung',44], ['USA Intel',38]], dataYear: 2024 },
+  { name: 'Lithium',         proxy: 'LIT',  unit: 'kt',      topProducers: [['Australia',88], ['Chile',49], ['China',40]], dataYear: 2024 },
+  { name: 'Rare Earths',     proxy: 'REMX', unit: 'kt',      topProducers: [['China',270], ['USA',45], ['Myanmar',31]], dataYear: 2024 },
 ];
 
 // Logistics proxies — these are LIVE, refreshed every time the user opens
@@ -39140,13 +39395,29 @@ function renderGlobalTradeCountries() {
     const etfRow = _gtGetRow(c.countryEtf);
     const etfPx = etfRow?.price;
     const etfPct = _gtSessionPct(c.countryEtf);
-    // Upgrade the static GDP baseline with live World Bank data when present.
+    // GDP priority: fresh IMF estimate (global_trade.json) > World Bank actual
+    // > baked-in baseline. Whichever is used, the year + source are labeled so
+    // the freshness tier is always honest.
     const wbRow = wb && c.iso ? wb[c.iso] : null;
-    let gdpDisplay, gdpYear, gdpTier, extraRows = '';
-    if (wbRow && wbRow.gdpUsd) {
+    let gdpDisplay, gdpYear, gdpTier, gdpSrc, extraRows = '';
+    if (c._freshGdpUsdT != null) {
+      gdpDisplay = c._freshGdpUsdT.toFixed(2);
+      gdpYear = c._freshGdpYear || c.gdpYear;
+      gdpTier = 'tier-quarterly';
+      gdpSrc = c._freshGdpTier || 'IMF';
+      // Still show WB exports/imports/growth detail rows when available.
+      if (wbRow) {
+        const exp = wbRow.exportsPctGdp, imp = wbRow.importsPctGdp, gr = wbRow.gdpGrowthPct;
+        extraRows = `
+          ${exp != null ? `<div class="gt-country-row"><span>Exports % GDP (${wbRow.exportsPctGdpYear})</span><strong>${exp.toFixed(1)}%</strong></div>` : ''}
+          ${imp != null ? `<div class="gt-country-row"><span>Imports % GDP (${wbRow.importsPctGdpYear})</span><strong>${imp.toFixed(1)}%</strong></div>` : ''}
+          ${gr != null ? `<div class="gt-country-row"><span>GDP growth (${wbRow.gdpGrowthPctYear})</span><strong style="color:${gr>=0?'var(--pos)':'var(--neg)'}">${gr>=0?'+':''}${gr.toFixed(1)}%</strong></div>` : ''}`;
+      }
+    } else if (wbRow && wbRow.gdpUsd) {
       gdpDisplay = (wbRow.gdpUsd / 1e12).toFixed(2);
       gdpYear = wbRow.gdpUsdYear || c.gdpYear;
-      gdpTier = 'tier-quarterly';  // annual, but freshest we have
+      gdpTier = 'tier-quarterly';
+      gdpSrc = 'World Bank';
       const exp = wbRow.exportsPctGdp, imp = wbRow.importsPctGdp, gr = wbRow.gdpGrowthPct;
       extraRows = `
         ${exp != null ? `<div class="gt-country-row"><span>Exports % GDP (${wbRow.exportsPctGdpYear})</span><strong>${exp.toFixed(1)}%</strong></div>` : ''}
@@ -39156,8 +39427,8 @@ function renderGlobalTradeCountries() {
       gdpDisplay = c.gdpUsdT.toFixed(2);
       gdpYear = c.gdpYear;
       gdpTier = 'tier-quarterly';
+      gdpSrc = 'baseline';
     }
-    const gdpSrc = wbRow && wbRow.gdpUsd ? 'World Bank' : 'baseline';
     return `
       <div class="gt-country-card" data-country="${c.code}">
         <div class="gt-country-head">
@@ -39393,6 +39664,38 @@ function renderGlobalTradeTab() {
 let _gtWorldBankData = null;
 let _gtTradeData = null;
 
+let _gtFreshGdp = null;
+// Load the IMF-estimate GDP file (global_trade.json) — fresher than World Bank
+// actuals (it carries current/next-year estimates). Read once, cached.
+async function loadGtFreshGdp() {
+  if (_gtFreshGdp) return _gtFreshGdp;
+  const base = (typeof DYNAMIC_DATA_BASE !== 'undefined') ? DYNAMIC_DATA_BASE
+    : 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-1/main/data/';
+  try {
+    const r = await fetch(base + 'global_trade.json', { cache: 'no-cache' });
+    if (r.ok) {
+      const j = await r.json();
+      _gtFreshGdp = j.gdp || {};
+      console.log(`[global-trade] fresh GDP loaded — ${Object.keys(_gtFreshGdp).length} countries (IMF/WB), generated ${j.generatedAt || '?'}`);
+      // Normalize into the app: stamp fresh GDP onto GT_COUNTRIES so EVERY
+      // consumer (country cards, any macro signal reading GT_COUNTRIES) sees
+      // the same up-to-date figure, not the baked-in 2024 baseline.
+      try {
+        if (typeof GT_COUNTRIES !== 'undefined') {
+          for (const c of GT_COUNTRIES) {
+            const f = c.iso && _gtFreshGdp[c.iso];
+            if (f && typeof f.gdpUsdT === 'number') {
+              c._freshGdpUsdT = f.gdpUsdT; c._freshGdpYear = f.gdpYear; c._freshGdpTier = f.tier;
+            }
+          }
+        }
+      } catch {}
+      return _gtFreshGdp;
+    }
+  } catch (e) { console.warn('[global-trade] fresh GDP load failed:', e.message); }
+  return null;
+}
+
 async function loadGtWorldBank() {
   if (_gtWorldBankData) return _gtWorldBankData;
   const base = (typeof DYNAMIC_DATA_BASE !== 'undefined') ? DYNAMIC_DATA_BASE
@@ -39471,6 +39774,13 @@ function loadGlobalTradeTab() {
     _gtWired = true;
   }
   renderGlobalTradeTab();
+  // Pull fresh IMF GDP first (it stamps GT_COUNTRIES), then re-render countries.
+  if (typeof loadGtFreshGdp === 'function') {
+    loadGtFreshGdp().then(() => {
+      const mode = document.getElementById('gt-view-mode')?.value || 'overview';
+      if (mode === 'countries') renderGlobalTradeCountries();
+    }).catch(() => {});
+  }
   // Pull live World Bank + FRED trade data, then re-render the affected views.
   if (typeof loadGtWorldBank === 'function') {
     loadGtWorldBank().then(() => {
