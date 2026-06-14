@@ -11002,7 +11002,19 @@ async function fnDES(ticker) {
         <div><div class="l">Beta</div><div class="v">${merged.beta != null ? merged.beta.toFixed(2) : '—'}</div></div>
         <div><div class="l">52W High</div><div class="v">${merged.high52 != null ? fmt$(merged.high52) : '—'}</div></div>
         <div><div class="l">52W Low</div><div class="v">${merged.low52 != null ? fmt$(merged.low52) : '—'}</div></div>
-        <div><div class="l">Dividend Yield</div><div class="v">${merged.dividendYield != null ? (merged.dividendYield * 100).toFixed(2) + '%' : '—'}</div></div>
+        <div><div class="l">Dividend Yield</div><div class="v">${(() => {
+          // The pipeline emits dividend yield as a PERCENT number (0.37 = 0.37%).
+          // Normalize to decimal first (÷100) so the ×100 below yields 0.37%, not 37%.
+          let dy = merged.dividendYield;
+          if (dy == null) return '—';
+          dy = +dy;
+          if (!isFinite(dy) || dy <= 0) return '—';
+          // Source is uniformly a percent number (AAPL 0.37→0.37%, KO 2.57→2.57%).
+          // So the displayed value IS the number itself with a % sign — no ×100.
+          // Guard against an already-decimal value (<0.001 = clearly a fraction).
+          const pct = dy < 0.001 ? dy * 100 : dy;
+          return pct.toFixed(2) + '%';
+        })()}</div></div>
         ${merged.isEtf === true || merged.isEtf === 'TRUE' ? `<div><div class="l">Type</div><div class="v" style="color:var(--amber)">ETF</div></div>` : ''}
         ${merged.isFund === true || merged.isFund === 'TRUE' ? `<div><div class="l">Type</div><div class="v" style="color:var(--amber)">Fund</div></div>` : ''}
       </div>
@@ -24255,6 +24267,18 @@ async function taEnsureHistory(ticker) {
   if (!h && typeof fetchGitHubHistory === 'function') {
     try { await fetchGitHubHistory(ticker); h = getHistoryForTicker(ticker); } catch {}
   }
+  // NORMALIZE to {date, close, volume} objects. History can arrive as arrays
+  // ([["2026-06-13", 291.13]] from build_history) OR objects ([{date, close}]).
+  // The TA chart's range filter reads .date/.close, so an array-format history
+  // silently produced a BLANK chart — even though the Overview tab (which reads
+  // arrays directly) showed it. This makes TA accept either shape.
+  if (Array.isArray(h) && h.length) {
+    h = h.map(pt => {
+      if (Array.isArray(pt)) return { date: pt[0], close: +pt[1], volume: pt[2] != null ? +pt[2] : null };
+      if (pt && typeof pt === 'object') return { date: pt.date, close: +(pt.close ?? pt.price), volume: pt.volume != null ? +pt.volume : null };
+      return null;
+    }).filter(p => p && p.date && isFinite(p.close));
+  }
   state.ta.histCache[ticker] = h || [];
   return state.ta.histCache[ticker];
 }
@@ -25554,25 +25578,80 @@ function evaluateValuation(s) {
 }
 
 function evaluateFinancialStrength(s) {
+  // Broken into three lenses so a single contradictory line (e.g. "net cash AND
+  // high D/E") doesn't muddy one number: (A) balance-sheet resilience,
+  // (B) how well capital is OPERATED (returns on capital), (C) how well it's
+  // INVESTED (reinvestment efficiency / FCF conversion). Net-cash names with
+  // gross debt now score correctly because we weigh NET debt, not just D/E.
+  const n = v => { const x = +v; return isFinite(x) ? x : null; };
   const checks = [];
-  let score = 50;
-  if (s.debtToEquity != null) {
-    if (s.debtToEquity < 0.3)   { score += 15; checks.push(`D/E ${s.debtToEquity.toFixed(2)} (very low leverage)`); }
-    else if (s.debtToEquity < 1) { score += 5;  checks.push(`D/E ${s.debtToEquity.toFixed(2)} (moderate leverage)`); }
-    else if (s.debtToEquity < 2) {              checks.push(`D/E ${s.debtToEquity.toFixed(2)} (high leverage)`); }
-    else                          { score -= 15; checks.push(`D/E ${s.debtToEquity.toFixed(2)} (very high leverage)`); }
+  let bsScore = 50, opScore = 50, invScore = 50;
+  let haveBS = false, haveOp = false, haveInv = false;
+
+  // ---- (A) Balance-sheet resilience ----
+  const cash = n(s.cash), debt = n(s.totalDebt), equity = n(s.totalEquity);
+  const de = n(s.debtToEquity) ?? ((debt != null && equity > 0) ? debt / equity : null);
+  if (cash != null && debt != null) {
+    haveBS = true;
+    const netDebt = debt - cash;
+    if (netDebt <= 0) { bsScore += 22; checks.push(`Net cash $${((cash - debt) / 1e9).toFixed(1)}B (debt fully covered)`); }
+    else {
+      const netDebtToEquity = equity > 0 ? netDebt / equity : null;
+      if (netDebtToEquity != null && netDebtToEquity < 0.5) { bsScore += 8; checks.push(`Net debt/equity ${netDebtToEquity.toFixed(2)} (modest)`); }
+      else if (netDebtToEquity != null && netDebtToEquity > 1.5) { bsScore -= 12; checks.push(`Net debt/equity ${netDebtToEquity.toFixed(2)} (leveraged)`); }
+    }
   }
-  if (s.currentRatio != null) {
-    if (s.currentRatio > 2)      { score += 10; checks.push(`Current ratio ${s.currentRatio.toFixed(2)} (strong liquidity)`); }
-    else if (s.currentRatio > 1) { score += 3;  checks.push(`Current ratio ${s.currentRatio.toFixed(2)} (adequate)`); }
-    else                          { score -= 15; checks.push(`Current ratio ${s.currentRatio.toFixed(2)} (liquidity risk)`); }
+  // Gross D/E still matters for covenant/refi risk, but as a secondary read.
+  if (de != null) {
+    haveBS = true;
+    if (de > 2) { bsScore -= 8; checks.push(`Gross D/E ${de.toFixed(2)} (high gross leverage)`); }
+    else if (de < 0.5) { bsScore += 4; checks.push(`Gross D/E ${de.toFixed(2)} (low)`); }
   }
-  if (s.cash != null && s.totalDebt != null && s.totalDebt > 0) {
-    if (s.cash > s.totalDebt) { score += 10; checks.push(`Cash > total debt (net cash position)`); }
+  const cr = n(s.currentRatio);
+  if (cr != null) {
+    haveBS = true;
+    // For a cash-rich large cap, a sub-1 current ratio is normal (they run lean
+    // on working capital), so penalize it less when net cash is positive.
+    const netCashPositive = (cash != null && debt != null && cash >= debt);
+    if (cr > 1.5) { bsScore += 8; checks.push(`Current ratio ${cr.toFixed(2)} (strong liquidity)`); }
+    else if (cr >= 1) { bsScore += 3; checks.push(`Current ratio ${cr.toFixed(2)} (adequate)`); }
+    else if (netCashPositive) { checks.push(`Current ratio ${cr.toFixed(2)} (lean, but net-cash offsets)`); }
+    else { bsScore -= 10; checks.push(`Current ratio ${cr.toFixed(2)} (liquidity watch)`); }
   }
-  if (checks.length === 0) return { score: null, verdict: 'unknown', reason: 'No balance sheet data available' };
-  score = Math.max(0, Math.min(100, score));
-  return { score, verdict: gradeFromScore(score).label.toLowerCase(), reason: checks.join(' · ') };
+
+  // ---- (B) How well capital is OPERATED — returns on capital ----
+  const roe = n(s.returnOnEquity) ?? n(s.roe);
+  const roa = n(s.returnOnAssets);
+  const opMargin = n(s.operatingMargin);
+  if (roe != null) { haveOp = true; if (roe > 0.20) { opScore += 18; checks.push(`ROE ${(roe * 100).toFixed(0)}% (excellent)`); } else if (roe > 0.12) { opScore += 8; checks.push(`ROE ${(roe * 100).toFixed(0)}% (good)`); } else if (roe < 0) { opScore -= 12; checks.push(`ROE ${(roe * 100).toFixed(0)}% (negative)`); } }
+  if (roa != null) { haveOp = true; if (roa > 0.10) { opScore += 10; checks.push(`ROA ${(roa * 100).toFixed(0)}% (efficient)`); } else if (roa < 0.02) { opScore -= 6; } }
+  if (opMargin != null) { haveOp = true; if (opMargin > 0.20) { opScore += 8; checks.push(`Op margin ${(opMargin * 100).toFixed(0)}%`); } else if (opMargin < 0) { opScore -= 10; checks.push(`Op margin ${(opMargin * 100).toFixed(0)}% (unprofitable ops)`); } }
+
+  // ---- (C) How well capital is INVESTED — FCF conversion / reinvestment ----
+  const fcf = n(s.freeCashFlow), netInc = n(s.netIncome), rev = n(s.revenue);
+  if (fcf != null && netInc != null && netInc > 0) {
+    haveInv = true;
+    const fcfConv = fcf / netInc;        // >1 means earnings convert to real cash
+    if (fcfConv > 1.0) { invScore += 16; checks.push(`FCF/NI ${fcfConv.toFixed(2)} (earnings are real cash)`); }
+    else if (fcfConv > 0.7) { invScore += 6; checks.push(`FCF/NI ${fcfConv.toFixed(2)} (solid conversion)`); }
+    else if (fcfConv < 0.3) { invScore -= 10; checks.push(`FCF/NI ${fcfConv.toFixed(2)} (weak cash conversion)`); }
+  }
+  if (fcf != null && rev != null && rev > 0) {
+    haveInv = true;
+    const fcfMargin = fcf / rev;
+    if (fcfMargin > 0.15) { invScore += 8; checks.push(`FCF margin ${(fcfMargin * 100).toFixed(0)}%`); }
+    else if (fcfMargin < 0) { invScore -= 12; checks.push(`FCF margin ${(fcfMargin * 100).toFixed(0)}% (burning cash)`); }
+  }
+
+  // Composite: average the lenses that have data.
+  const parts = [];
+  if (haveBS) parts.push(Math.max(0, Math.min(100, bsScore)));
+  if (haveOp) parts.push(Math.max(0, Math.min(100, opScore)));
+  if (haveInv) parts.push(Math.max(0, Math.min(100, invScore)));
+  if (!parts.length) return { score: null, verdict: 'unknown', reason: 'No balance sheet data available' };
+  const score = Math.round(parts.reduce((a, b) => a + b, 0) / parts.length);
+  return { score, verdict: gradeFromScore(score).label.toLowerCase(), reason: checks.join(' · '),
+           subScores: { balanceSheet: haveBS ? Math.round(bsScore) : null, operations: haveOp ? Math.round(opScore) : null, investment: haveInv ? Math.round(invScore) : null } };
 }
 
 function evaluateGrowth(s) {
@@ -25618,12 +25697,72 @@ function evaluateIncome(s) {
 function evaluateRisk(s) {
   const checks = [];
   let score = 50;
-  if (s.beta != null) {
-    if (s.beta < 0.7)     { score += 20; checks.push(`Beta ${s.beta.toFixed(2)} (defensive)`); }
-    else if (s.beta < 1.1) { score += 10; checks.push(`Beta ${s.beta.toFixed(2)} (market-like)`); }
-    else if (s.beta < 1.5) {              checks.push(`Beta ${s.beta.toFixed(2)} (more volatile)`); }
-    else                   { score -= 15; checks.push(`Beta ${s.beta.toFixed(2)} (highly volatile)`); }
+  const beta = s.beta != null ? +s.beta : null;
+
+  // Regime-aware beta interpretation. Beta alone is NOT risk — it's sensitivity
+  // to the market. In a risk-ON regime (market trending up), a beta near or above
+  // 1 is a TAILWIND and should score WELL; in a risk-OFF regime it's a headwind.
+  // This makes the same 1.09 beta grade very differently depending on the tape,
+  // so the score moves with conditions instead of being a static penalty.
+  let regimeRiskOn = null;
+  try {
+    if (typeof botAssessRegime === 'function') {
+      const reg = botAssessRegime();
+      if (reg && reg.mode) regimeRiskOn = (reg.mode === 'risk-on');
+      else if (reg && reg.thresholdMod != null) regimeRiskOn = reg.thresholdMod < 0;
+    }
+    // Fallback: SPY trend from cached history.
+    if (regimeRiskOn == null && typeof getHistoryForTicker === 'function') {
+      const spy = getHistoryForTicker('SPY') || getHistoryForTicker('^GSPC');
+      if (spy && spy.length >= 50) {
+        const px = spy.map(x => Array.isArray(x) ? x[1] : (x.close ?? x.price)).filter(v => v > 0);
+        const sma50 = px.slice(-50).reduce((a, b) => a + b, 0) / 50;
+        regimeRiskOn = px[px.length - 1] > sma50;
+      }
+    }
+  } catch {}
+
+  if (beta != null) {
+    if (regimeRiskOn === true) {
+      // Risk-on: higher beta = more upside capture = better (up to a point).
+      if (beta >= 1.5)       { score += 12; checks.push(`Beta ${beta.toFixed(2)} — high upside capture in a risk-on tape`); }
+      else if (beta >= 1.0)  { score += 22; checks.push(`Beta ${beta.toFixed(2)} — market tailwind, strong participation`); }
+      else if (beta >= 0.7)  { score += 10; checks.push(`Beta ${beta.toFixed(2)} — moderate participation`); }
+      else                   { score -= 5;  checks.push(`Beta ${beta.toFixed(2)} — defensive, lags an up-market`); }
+    } else if (regimeRiskOn === false) {
+      // Risk-off: lower beta = defensive = better.
+      if (beta < 0.7)        { score += 22; checks.push(`Beta ${beta.toFixed(2)} — defensive, cushions a down-market`); }
+      else if (beta < 1.1)   { score += 5;  checks.push(`Beta ${beta.toFixed(2)} — market-like, fully exposed`); }
+      else if (beta < 1.5)   { score -= 10; checks.push(`Beta ${beta.toFixed(2)} — amplifies a risk-off drawdown`); }
+      else                   { score -= 20; checks.push(`Beta ${beta.toFixed(2)} — high downside in a risk-off tape`); }
+    } else {
+      // Regime unknown: neutral beta read.
+      if (beta < 0.7)        { score += 12; checks.push(`Beta ${beta.toFixed(2)} (defensive)`); }
+      else if (beta < 1.1)   { score += 8;  checks.push(`Beta ${beta.toFixed(2)} (market-like)`); }
+      else if (beta < 1.5)   { score += 2;  checks.push(`Beta ${beta.toFixed(2)} (more volatile)`); }
+      else                   { score -= 10; checks.push(`Beta ${beta.toFixed(2)} (highly volatile)`); }
+    }
   }
+
+  // Realized volatility + drawdown from actual price history (dynamic, moves daily).
+  try {
+    if (typeof getHistoryForTicker === 'function') {
+      const h = getHistoryForTicker(s.ticker);
+      if (h && h.length >= 40) {
+        const px = h.map(x => Array.isArray(x) ? x[1] : (x.close ?? x.price)).filter(v => v > 0);
+        const rets = []; for (let i = 1; i < px.length; i++) rets.push((px[i] - px[i - 1]) / px[i - 1]);
+        const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
+        const vol = Math.sqrt(rets.reduce((a, b) => a + (b - mean) ** 2, 0) / rets.length) * Math.sqrt(252);
+        let peak = px[0], maxDD = 0; for (const v of px) { peak = Math.max(peak, v); maxDD = Math.min(maxDD, v / peak - 1); }
+        if (vol < 0.25)      { score += 8; checks.push(`Realized vol ${(vol * 100).toFixed(0)}% (calm)`); }
+        else if (vol < 0.45) { score += 2; checks.push(`Realized vol ${(vol * 100).toFixed(0)}% (normal)`); }
+        else                 { score -= 8; checks.push(`Realized vol ${(vol * 100).toFixed(0)}% (choppy)`); }
+        if (maxDD > -0.20)   { score += 5; checks.push(`Max drawdown ${(maxDD * 100).toFixed(0)}% (shallow)`); }
+        else if (maxDD < -0.40) { score -= 8; checks.push(`Max drawdown ${(maxDD * 100).toFixed(0)}% (deep)`); }
+      }
+    }
+  } catch {}
+
   if (checks.length === 0) return { score: null, verdict: 'unknown', reason: 'No risk data available' };
   score = Math.max(0, Math.min(100, score));
   return { score, verdict: gradeFromScore(score).label.toLowerCase(), reason: checks.join(' · ') };
@@ -25659,12 +25798,18 @@ function evaluateRisk(s) {
 //   what each headline metric does/doesn't include. Null if SBC is unavailable.
 // ============================================================
 function analyzeStockBasedComp(s) {
-  const num = (v) => (typeof v === 'number' && isFinite(v)) ? v : null;
+  // Coerce numeric strings (CSV rows) — was rejecting "12863000000" outright.
+  const num = (v) => { const x = +v; return isFinite(x) ? x : null; };
   const sbc = num(s.stockBasedComp);
   if (sbc == null || sbc <= 0) {
     return { available: false, sbc: sbc };
   }
-  const revenue = num(s.revenue);
+  let revenue = num(s.revenue);
+  // SANITY: revenue is always FAR larger than SBC (SBC is typically 1-15% of
+  // revenue). If "revenue" is smaller than SBC, it's the wrong field (e.g. a
+  // revenueGrowth fraction of 0.166 leaked in), which produced the absurd
+  // 7.7-trillion-% bug. Reject it so we don't divide by a fraction.
+  if (revenue != null && revenue < sbc) revenue = null;
   const ocf = num(s.operatingCashFlow);
   const fcf = num(s.freeCashFlow != null ? s.freeCashFlow : (ocf != null && s.capex != null ? ocf - s.capex : null));
   const netIncome = num(s.netIncome);
@@ -25937,6 +26082,80 @@ function normalizeEngineFields(s) {
   return out;
 }
 
+// Technical/price-action dimension — makes the composite MOVE with the market
+// (daily), not just on quarterly fundamentals. RSI, price vs 50/200-day moving
+// averages, momentum, and relative strength vs SPY. This is what gives the bot
+// fresh triggers: a great company breaking down technically should grade lower
+// today than it did last week, and vice versa.
+function evaluateTechnicals(s) {
+  const checks = [];
+  let score = 50;
+  let px = null;
+  try {
+    if (typeof getHistoryForTicker === 'function') {
+      const h = getHistoryForTicker(s.ticker);
+      if (h && h.length >= 30) px = h.map(x => Array.isArray(x) ? x[1] : (x.close ?? x.price)).filter(v => v > 0);
+    }
+  } catch {}
+  if (!px || px.length < 30) return { score: null, verdict: 'unknown', reason: 'No price history for technicals' };
+
+  const last = px[px.length - 1];
+
+  // RSI(14)
+  let gains = 0, losses = 0, cnt = 0;
+  for (let i = Math.max(1, px.length - 14); i < px.length; i++) {
+    const ch = px[i] - px[i - 1];
+    if (ch >= 0) gains += ch; else losses -= ch;
+    cnt++;
+  }
+  const rs = losses === 0 ? 100 : gains / losses;
+  const rsi = cnt ? (100 - 100 / (1 + rs)) : 50;
+  if (rsi < 30) { score += 8; checks.push(`RSI ${rsi.toFixed(0)} (oversold — potential bounce)`); }
+  else if (rsi > 70) { score -= 6; checks.push(`RSI ${rsi.toFixed(0)} (overbought)`); }
+  else if (rsi >= 45 && rsi <= 60) { score += 4; checks.push(`RSI ${rsi.toFixed(0)} (healthy)`); }
+  else checks.push(`RSI ${rsi.toFixed(0)}`);
+
+  // Price vs 50/200-day moving averages
+  const sma = (n) => px.length >= n ? px.slice(-n).reduce((a, b) => a + b, 0) / n : null;
+  const sma50 = sma(50), sma200 = sma(200);
+  if (sma50 != null) {
+    if (last > sma50) { score += 10; checks.push(`Above 50-day MA (uptrend)`); }
+    else { score -= 8; checks.push(`Below 50-day MA (downtrend)`); }
+  }
+  if (sma200 != null) {
+    if (last > sma200) { score += 8; checks.push(`Above 200-day MA (long-term bull)`); }
+    else { score -= 6; checks.push(`Below 200-day MA (long-term bear)`); }
+    if (sma50 != null && sma50 > sma200) { score += 4; checks.push(`Golden-cross posture`); }
+    else if (sma50 != null && sma50 < sma200) { score -= 4; checks.push(`Death-cross posture`); }
+  }
+
+  // 3-month momentum
+  if (px.length >= 63) {
+    const mom = last / px[px.length - 63] - 1;
+    if (mom > 0.10) { score += 8; checks.push(`+${(mom * 100).toFixed(0)}% 3mo momentum`); }
+    else if (mom < -0.10) { score -= 8; checks.push(`${(mom * 100).toFixed(0)}% 3mo momentum`); }
+  }
+
+  // Relative strength vs SPY (is it outperforming the market?)
+  try {
+    if (typeof getHistoryForTicker === 'function') {
+      const spyH = getHistoryForTicker('SPY') || getHistoryForTicker('^GSPC');
+      if (spyH && spyH.length >= 63 && px.length >= 63) {
+        const spy = spyH.map(x => Array.isArray(x) ? x[1] : (x.close ?? x.price)).filter(v => v > 0);
+        const myRet = last / px[px.length - 63] - 1;
+        const spyRet = spy[spy.length - 1] / spy[spy.length - 63] - 1;
+        const rel = myRet - spyRet;
+        if (rel > 0.05) { score += 10; checks.push(`Outperforming SPY by ${(rel * 100).toFixed(0)}pts (3mo)`); }
+        else if (rel < -0.05) { score -= 8; checks.push(`Lagging SPY by ${(-rel * 100).toFixed(0)}pts (3mo)`); }
+      }
+    }
+  } catch {}
+
+  score = Math.max(0, Math.min(100, score));
+  return { score, verdict: gradeFromScore(score).label.toLowerCase(), reason: checks.join(' · '),
+           rsi: +rsi.toFixed(0), aboveSMA50: sma50 != null ? last > sma50 : null, aboveSMA200: sma200 != null ? last > sma200 : null };
+}
+
 function computeCompanyHealth(s) {
   if (!s) return null;
   s = normalizeEngineFields(s);
@@ -25948,15 +26167,17 @@ function computeCompanyHealth(s) {
     growth:   evaluateGrowth(s),
     income:   evaluateIncome(s),
     risk:     evaluateRisk(s),
+    technical: evaluateTechnicals(s),
   };
   // Dynamic weights based on company stage
   const isGrowthCo = (s.revenueGrowth || 0) > 0.15 && (s.dividendYield || 0) < 0.01;
   const isDividendCo = (s.dividendYield || 0) > 0.02;
+  // Weights now include a TECHNICAL dimension so the grade moves with the tape.
   const weights = isGrowthCo
-    ? { scale: 0.10, profit: 0.10, value: 0.20, strength: 0.15, growth: 0.30, income: 0.05, risk: 0.10 }
+    ? { scale: 0.08, profit: 0.10, value: 0.16, strength: 0.14, growth: 0.24, income: 0.04, risk: 0.08, technical: 0.16 }
     : isDividendCo
-    ? { scale: 0.10, profit: 0.20, value: 0.15, strength: 0.20, growth: 0.10, income: 0.20, risk: 0.05 }
-    : { scale: 0.12, profit: 0.20, value: 0.18, strength: 0.15, growth: 0.15, income: 0.10, risk: 0.10 };
+    ? { scale: 0.08, profit: 0.18, value: 0.13, strength: 0.18, growth: 0.08, income: 0.17, risk: 0.05, technical: 0.13 }
+    : { scale: 0.10, profit: 0.18, value: 0.15, strength: 0.13, growth: 0.12, income: 0.08, risk: 0.09, technical: 0.15 };
   let totalScore = 0, totalWeight = 0;
   for (const [k, dim] of Object.entries(dims)) {
     if (dim.score != null) { totalScore += dim.score * weights[k]; totalWeight += weights[k]; }
@@ -25997,6 +26218,7 @@ async function renderCompanyHealthScore(s, wd) {
     { key: 'growth',   label: 'Growth' },
     { key: 'income',   label: 'Income' },
     { key: 'risk',     label: 'Risk Profile' },
+    { key: 'technical', label: 'Technical Posture' },
   ];
   const dimensionsHtml = dimOrder.map(({ key, label }) => {
     const d = health.dimensions[key];
