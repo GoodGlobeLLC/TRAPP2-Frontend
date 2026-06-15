@@ -7535,7 +7535,9 @@
 
   <div class="macro-toolbar">
     <button class="btn" id="macro-refresh-btn">Refresh Macro Data</button>
+    <button class="btn btn-ghost" id="macro-verify-btn" title="Compare the backend repo snapshot against a fresh FRED pull (needs a FRED key)">Verify vs FRED</button>
     <div class="status" id="macro-status">Click refresh to load · Cached 24h after first fetch</div>
+    <div id="macro-verify-result" style="margin-top:8px"></div>
   </div>
 
   <div class="macro-intro" id="macro-intro">
@@ -8335,6 +8337,12 @@
     </div>
 
     <div class="modal-section">
+      <div class="modal-label">FRED API Key (macro data — recommended)</div>
+      <input type="text" class="modal-input" id="fred-key-input" placeholder="Paste FRED key here">
+      <div class="modal-help">Free key: <a href="https://fred.stlouisfed.org/docs/api/api_key.html" target="_blank" style="color:var(--amber)">fred.stlouisfed.org</a>. Powers the Macro Quad, yield curve, and Treasuries. <strong>Without a key, FRED is fetched through public proxies that frequently fail</strong> (the "FRED unreachable" error). A key uses the official CORS-enabled API directly — reliable, unlimited.</div>
+    </div>
+
+    <div class="modal-section">
       <div class="modal-label">Alpha Vantage API Key (optional)</div>
       <input type="text" class="modal-input" id="av-key-input" placeholder="Paste AV key here">
       <div class="modal-help">Free key: <a href="https://www.alphavantage.co/support/#api-key" target="_blank" style="color:var(--amber)">alphavantage.co</a>. 25 calls/day.</div>
@@ -8633,6 +8641,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260614f"></script>
+<script src="app.js?v=20260614n"></script>
 </body>
 </html>

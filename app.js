@@ -146,6 +146,7 @@ const FMP_KEY_STORAGE = 'valuatio.fmp.key';
 const TWELVE_KEY_STORAGE = 'valuatio.twelvedata.key';
 const POLYGON_KEY_STORAGE = 'valuatio.polygon.key';
 const FCS_KEY_STORAGE = 'valuatio.fcs.key';
+const FRED_KEY_STORAGE = 'valuatio.fred.key';
 const SHEET_URL_STORAGE = 'valuatio.sheet.url';
 const SOURCE_PREF_STORAGE = 'valuatio.source.preference';
 const GITHUB_DATA_BASE_STORAGE = 'valuatio.githubData.baseUrl';
@@ -202,6 +203,11 @@ function getFcsKey() { return localStorage.getItem(FCS_KEY_STORAGE) || ''; }
 function setFcsKey(k) {
   if (k) localStorage.setItem(FCS_KEY_STORAGE, k.trim());
   else localStorage.removeItem(FCS_KEY_STORAGE);
+}
+function getFredKey() { return localStorage.getItem(FRED_KEY_STORAGE) || ''; }
+function setFredKey(k) {
+  if (k) localStorage.setItem(FRED_KEY_STORAGE, k.trim());
+  else localStorage.removeItem(FRED_KEY_STORAGE);
 }
 // ─────────────────────────────────────────────────────────────────────
 // TICKER VALIDATION & ASSET CLASSIFICATION
@@ -6113,6 +6119,66 @@ function getCanonicalStockData(ticker) {
   return getStockbookRow(ticker) || null;
 }
 
+// ============================================================
+//   ENGINE VALUE RESOLVER — the brain's single decision point for "what is the
+//   value of FIELD for TICKER?". Every consumer (charts, research, bot, company
+//   tab, valuation) should be able to ask the engine instead of reading raw row
+//   fields, so the same priority logic governs every value app-wide.
+//
+//   DECISION TREE (first match wins):
+//     1. VERIFIED override        — human-approved fixed/informational fact
+//                                   (name, sector, CEO, country, classification).
+//                                   Trumps everything, never expires.
+//     2. ACTIVE override          — any other unexpired override (Editor edits,
+//                                   time-boxed variable corrections). For variable
+//                                   fields this is bounded; once it lapses we fall
+//                                   through to fresh data.
+//     3. FRESH row value          — the normalized pipeline/live value.
+//     4. FALLBACK                 — opts.fallback (default null).
+//
+//   Returns { value, source, verified, expiresAt }. `source` is one of
+//   'verified-override' | 'override' | 'fresh' | 'fallback' so callers can show
+//   provenance (the epistemic-honesty requirement).
+// ============================================================
+function resolveFieldValue(ticker, field, opts = {}) {
+  const tk = String(ticker || '').toUpperCase();
+  const row = getStockbookRow(tk);
+  // --- Branch 1 & 2: overrides ---
+  try {
+    const all = (typeof loadOverrides === 'function') ? loadOverrides() : {};
+    const entry = all[tk]?.[field];
+    if (entry != null) {
+      const norm = _normalizeOverride(entry);
+      const active = _overrideActive(entry);
+      if (active && norm.value != null) {
+        const isVerified = norm.verified === true;
+        // Verified fixed fact, or any active override.
+        return {
+          value: norm.value,
+          source: isVerified ? 'verified-override' : 'override',
+          verified: isVerified,
+          expiresAt: norm.expiresAt ?? null,
+        };
+      }
+      // entry exists but expired (variable field past its window) → fall through.
+    }
+  } catch {}
+  // --- Branch 3: fresh row value ---
+  if (row && row[field] != null && row[field] !== '') {
+    return { value: row[field], source: 'fresh', verified: false, expiresAt: null };
+  }
+  // --- Branch 4: fallback ---
+  return { value: opts.fallback ?? null, source: 'fallback', verified: false, expiresAt: null };
+}
+// Convenience: just the value (most call sites only want the resolved value).
+function engineValue(ticker, field, fallback = null) {
+  return resolveFieldValue(ticker, field, { fallback }).value;
+}
+if (typeof window !== 'undefined') {
+  window.resolveFieldValue = resolveFieldValue;
+  window.engineValue = engineValue;
+}
+
 async function loadValuation(savedRecord = null) {
   const ticker = document.getElementById('ticker').value.toUpperCase().trim();
   if (!ticker) {
@@ -6274,6 +6340,8 @@ function openSourcesModal() {
   if (polyEl) polyEl.value = getPolygonKey();
   const fcsEl = document.getElementById('fcs-key-input');
   if (fcsEl) fcsEl.value = getFcsKey();
+  const fredEl = document.getElementById('fred-key-input');
+  if (fredEl) fredEl.value = getFredKey();
   document.getElementById('sheet-url-input').value = getSheetUrls().join('\n');
   const pref = getSourcePref();
   document.querySelectorAll('#source-pref-control .seg-btn').forEach(b => {
@@ -6361,6 +6429,7 @@ document.getElementById('sources-save').addEventListener('click', () => {
   const twelveKey = document.getElementById('twelve-key-input').value.trim();
   const polyKey = document.getElementById('polygon-key-input')?.value.trim() || '';
   const fcsKey = document.getElementById('fcs-key-input')?.value.trim() || '';
+  const fredKey = document.getElementById('fred-key-input')?.value.trim() || '';
   const raw = document.getElementById('sheet-url-input').value;
   const urls = raw.split(/\r?\n/).map(s => s.trim()).filter(s => s.length > 0);
   const pref = document.querySelector('#source-pref-control .seg-btn.active')?.dataset.val || 'auto';
@@ -6370,6 +6439,7 @@ document.getElementById('sources-save').addEventListener('click', () => {
   setTwelveKey(twelveKey);
   setPolygonKey(polyKey);
   setFcsKey(fcsKey);
+  setFredKey(fredKey);
   setSheetUrls(urls);
   setSourcePref(pref);
   closeSourcesModal();
@@ -7948,8 +8018,41 @@ function buildProxiedFredUrl(seriesId, proxyIdx) {
   return proxies[proxyIdx] ? { url: proxies[proxyIdx](target), wrapped: proxyIdx === 5 } : null;
 }
 
-// Fetch a FRED series and return [{date, value}] sorted oldest → newest
+// Fetch a FRED series and return [{date, value}] sorted oldest → newest.
+// STRATEGY:
+//   1. If a FRED API key is set, use the official api.stlouisfed.org JSON
+//      endpoint — it supports CORS directly (no proxy), so it's reliable and
+//      not rate-limited the way the public CORS proxies are. This is the fix
+//      for "FRED unreachable: proxy 0/1/2 failed" — the proxies are flaky, a
+//      key bypasses them entirely.
+//   2. Otherwise fall back to the public CORS-proxy chain over the CSV endpoint.
 async function fetchFredSeries(seriesId) {
+  // ---- Path 1: official keyed API (CORS-enabled, reliable) ----
+  const fredKey = (typeof getFredKey === 'function') ? getFredKey() : '';
+  if (fredKey) {
+    try {
+      const url = `https://api.stlouisfed.org/fred/series/observations` +
+        `?series_id=${encodeURIComponent(seriesId)}&api_key=${encodeURIComponent(fredKey)}` +
+        `&file_type=json&sort_order=asc`;
+      const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
+      if (r.ok) {
+        const j = await r.json();
+        const obs = Array.isArray(j?.observations) ? j.observations : [];
+        const rows = obs
+          .map(o => ({ date: o.date, value: parseFloat(o.value) }))
+          .filter(d => d.date && isFinite(d.value));  // FRED uses "." for missing
+        if (rows.length) {
+          console.log(`✓ FRED ${seriesId} loaded via official API key (${rows.length} obs)`);
+          return rows;
+        }
+      } else {
+        console.warn(`FRED API key request for ${seriesId} returned HTTP ${r.status} — falling back to proxies`);
+      }
+    } catch (e) {
+      console.warn(`FRED API key path failed for ${seriesId} (${e.message}) — falling back to proxies`);
+    }
+  }
+  // ---- Path 2: public CORS-proxy chain over the CSV endpoint ----
   let lastErr = null;
   const errors = [];
   for (let i = 0; i < 7; i++) {
@@ -7988,7 +8091,8 @@ async function fetchFredSeries(seriesId) {
     }
   }
   console.error(`FRED ${seriesId} failed:`, errors.join(' · '));
-  throw new Error('FRED unreachable: ' + errors.slice(0, 3).join(' · '));
+  const keyHint = fredKey ? '' : ' — add a free FRED API key in Data Sources for a reliable connection';
+  throw new Error('FRED unreachable: ' + errors.slice(0, 3).join(' · ') + keyHint);
 }
 
 // ---------- COMPUTE QUAD FROM RAW SERIES ----------
@@ -8046,6 +8150,81 @@ function buildQuadHistory(gdpYoY, cpiYoY, lookbackPeriods = 24) {
 //   1. Try TRAPP2 GitHub data/macro/*.json (CORS-safe, set by nightly pipeline)
 //   2. Fall back to FRED via public CORS proxies (flaky)
 //   3. Persist trimmed cache so quota doesn't burst
+// ===== INFLATION ADJUSTMENT (CPI deflation) =====
+// Groundwork for inflation-adjusted HISTORICAL analysis. Once 20-year history is
+// available, comparing a 2005 revenue figure to a 2025 figure in nominal dollars
+// is misleading — $1M in 2005 ≈ $1.6M in 2025 purchasing power. These helpers
+// convert nominal historical dollars into TODAY's dollars using the CPI series
+// the macro tab already fetches (CPIAUCSL), so growth trends reflect REAL growth,
+// not inflation. A company that grew revenue 3%/yr while inflation ran 3% didn't
+// actually grow — in real terms it was flat. This is essential for honest
+// long-history trend grading (blue chips especially "grew with inflation").
+//
+// Usage once history exists:
+//   const cpi = await getCpiIndex();                       // {date→indexValue}
+//   const realRev2005 = deflateToToday(rev2005, '2005-12-31', cpi);
+//   const realCagr = realCAGR(series, cpi);                // inflation-adjusted CAGR
+//
+// Returns null gracefully when CPI data isn't loaded, so callers degrade to
+// nominal rather than breaking.
+let _cpiIndexCache = null;
+async function getCpiIndex(forceRefresh = false) {
+  if (_cpiIndexCache && !forceRefresh) return _cpiIndexCache;
+  try {
+    const macro = await fetchMacroData(forceRefresh);
+    const cpiRaw = macro?.cpiRaw;
+    if (!Array.isArray(cpiRaw) || !cpiRaw.length) return null;
+    // Build a date→value map plus a sorted array for nearest-date lookup.
+    const map = new Map();
+    const sorted = [...cpiRaw].filter(o => o.date && isFinite(o.value)).sort((a, b) => a.date.localeCompare(b.date));
+    for (const o of sorted) map.set(o.date, o.value);
+    _cpiIndexCache = { map, sorted, latest: sorted[sorted.length - 1] };
+    return _cpiIndexCache;
+  } catch { return null; }
+}
+
+// CPI value at (or just before) a given date — CPI is monthly, so we find the
+// closest observation on/before the date.
+function _cpiAt(dateStr, cpi) {
+  if (!cpi || !cpi.sorted.length) return null;
+  const target = String(dateStr).slice(0, 10);
+  let best = null;
+  for (const o of cpi.sorted) {
+    if (o.date <= target) best = o; else break;
+  }
+  return best ? best.value : cpi.sorted[0].value;  // fall back to earliest if before series
+}
+
+// Convert a nominal dollar amount from `fromDate` into today's dollars.
+function deflateToToday(amount, fromDate, cpi) {
+  if (amount == null || !isFinite(amount) || !cpi) return amount;
+  const past = _cpiAt(fromDate, cpi);
+  const now = cpi.latest?.value;
+  if (!past || !now || past <= 0) return amount;
+  return amount * (now / past);
+}
+
+// Inflation-adjusted CAGR from a {date,value} series: deflate every point to
+// today's dollars first, then compute the compound annual growth rate. This is
+// the REAL growth rate — the honest number for long-history trend grading.
+function realCAGR(series, cpi) {
+  if (!Array.isArray(series) || series.length < 2) return null;
+  const s = [...series].filter(p => p.date && isFinite(p.value) && p.value > 0).sort((a, b) => a.date.localeCompare(b.date));
+  if (s.length < 2) return null;
+  const first = s[0], last = s[s.length - 1];
+  const realFirst = deflateToToday(first.value, first.date, cpi);
+  const realLast = deflateToToday(last.value, last.date, cpi);  // last≈today so ≈ unchanged
+  if (!realFirst || realFirst <= 0) return null;
+  const years = (new Date(last.date) - new Date(first.date)) / (365.25 * 86400000);
+  if (years < 0.5) return null;
+  return Math.pow(realLast / realFirst, 1 / years) - 1;
+}
+if (typeof window !== 'undefined') {
+  window.getCpiIndex = getCpiIndex;
+  window.deflateToToday = deflateToToday;
+  window.realCAGR = realCAGR;
+}
+
 async function fetchMacroData(forceRefresh = false) {
   if (!forceRefresh) {
     const cached = loadMacroCache();
@@ -8146,6 +8325,58 @@ async function fetchMacroFromGitHub(setStatus) {
     fedRaw: fedRows || [],
   };
 }
+
+// Verify the BACKEND macro snapshot against a fresh keyed-FRED pull. For each
+// series it compares the most recent overlapping observation and reports the
+// delta, so you can confirm the committed repo data matches the authoritative
+// source (and catch a stale pipeline). Requires a FRED API key; returns a list
+// of { series, label, backendDate, backendValue, fredValue, deltaPct, status }.
+async function verifyMacroAgainstFred() {
+  if (!getFredKey()) {
+    return { ok: false, reason: 'no-key', message: 'Add a FRED API key in Data Sources to verify backend values against the live source.' };
+  }
+  const gh = await fetchMacroFromGitHub(null);
+  if (!gh) {
+    return { ok: false, reason: 'no-backend', message: 'No backend macro snapshot found to verify (the GitHub data/macro/ files are missing).' };
+  }
+  const series = [
+    { id: FRED_SERIES.gdp, label: 'Real GDP', backend: gh.gdpRaw },
+    { id: FRED_SERIES.cpi, label: 'CPI', backend: gh.cpiRaw },
+    { id: FRED_SERIES.tsy10, label: '10Y Treasury', backend: gh.tsyRaw },
+    { id: FRED_SERIES.fedFunds, label: 'Fed Funds', backend: gh.fedRaw },
+  ];
+  const results = [];
+  for (const s of series) {
+    if (!s.backend || !s.backend.length) {
+      results.push({ series: s.id, label: s.label, status: 'no-backend-data' });
+      continue;
+    }
+    let fred = [];
+    try { fred = await fetchFredSeries(s.id); } catch (e) {
+      results.push({ series: s.id, label: s.label, status: 'fred-fetch-failed', error: e.message });
+      continue;
+    }
+    // Compare on the latest date the backend has (FRED may be slightly newer).
+    const backendLast = s.backend[s.backend.length - 1];
+    const fredMatch = fred.find(f => f.date === backendLast.date) || fred[fred.length - 1];
+    if (!fredMatch) {
+      results.push({ series: s.id, label: s.label, status: 'no-fred-match' });
+      continue;
+    }
+    const deltaPct = backendLast.value !== 0 ? ((fredMatch.value - backendLast.value) / Math.abs(backendLast.value)) * 100 : (fredMatch.value === backendLast.value ? 0 : 100);
+    // Tolerance: <0.5% delta = match (rounding/revision noise); else flag.
+    const status = Math.abs(deltaPct) < 0.5 ? 'match' : (Math.abs(deltaPct) < 3 ? 'minor-diff' : 'mismatch');
+    results.push({
+      series: s.id, label: s.label,
+      backendDate: backendLast.date, backendValue: backendLast.value,
+      fredDate: fredMatch.date, fredValue: fredMatch.value,
+      deltaPct: +deltaPct.toFixed(2), status,
+    });
+  }
+  const mismatches = results.filter(r => r.status === 'mismatch').length;
+  return { ok: true, results, mismatches, checked: results.length };
+}
+if (typeof window !== 'undefined') window.verifyMacroAgainstFred = verifyMacroAgainstFred;
 
 // ---------- SECTOR ETF FETCH (Stooq, no API key) ----------
 async function fetchSectorPerf() {
@@ -9046,6 +9277,38 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 });
 
 document.getElementById('macro-refresh-btn').addEventListener('click', () => loadMacroTab(true));
+document.getElementById('macro-verify-btn')?.addEventListener('click', async () => {
+  const host = document.getElementById('macro-verify-result');
+  if (host) host.innerHTML = '<div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">Verifying backend vs FRED…</div>';
+  try {
+    const v = await verifyMacroAgainstFred();
+    if (!v.ok) {
+      if (host) host.innerHTML = `<div style="font-family:var(--mono);font-size:10px;color:var(--amber)">${escapeHtml(v.message)}</div>`;
+      return;
+    }
+    const statusColor = { match: 'var(--pos)', 'minor-diff': 'var(--amber)', mismatch: 'var(--neg)' };
+    const statusLabel = { match: '✓ match', 'minor-diff': '~ minor diff', mismatch: '✗ mismatch', 'no-backend-data': 'no backend data', 'fred-fetch-failed': 'FRED fetch failed', 'no-fred-match': 'no FRED match' };
+    const rows = v.results.map(r => {
+      const c = statusColor[r.status] || 'var(--ink-faint)';
+      const detail = (r.backendValue != null && r.fredValue != null)
+        ? `backend ${r.backendValue} (${r.backendDate}) vs FRED ${r.fredValue} (${r.fredDate}) · Δ ${r.deltaPct}%`
+        : (r.error ? escapeHtml(r.error) : '');
+      return `<tr>
+        <td style="font-family:var(--mono);font-size:10px;font-weight:700">${escapeHtml(r.label)}</td>
+        <td style="font-family:var(--mono);font-size:10px;color:${c}">${statusLabel[r.status] || r.status}</td>
+        <td style="font-family:var(--mono);font-size:9px;color:var(--ink-dim)">${detail}</td>
+      </tr>`;
+    }).join('');
+    const summary = v.mismatches > 0
+      ? `<span style="color:var(--neg)">${v.mismatches} mismatch(es) — backend may be stale; re-run the macro pipeline</span>`
+      : `<span style="color:var(--pos)">✓ Backend matches FRED across ${v.checked} series</span>`;
+    if (host) host.innerHTML = `
+      <div style="font-family:var(--mono);font-size:10px;margin-bottom:6px">${summary}</div>
+      <table class="sb-table" style="width:100%"><tbody>${rows}</tbody></table>`;
+  } catch (e) {
+    if (host) host.innerHTML = `<div style="font-family:var(--mono);font-size:10px;color:var(--neg)">Verification failed: ${escapeHtml(e.message)}</div>`;
+  }
+});
 
 // On window resize, redraw the canvas charts so they stay sharp
 window.addEventListener('resize', () => {
@@ -11414,6 +11677,46 @@ async function fnHOLD(ticker) {
 }
 
 // --- FA: Financial Analysis (key ratios from current valuation inputs) ---
+
+// Fetch committed multi-year financial statements from the repo. The pipeline
+// (fetch_financials.py) writes data/financials/<TICKER>.json each earnings
+// season. US equities live in TRAPP2 / TRAPP2-2; we try the known data roots and
+// cache the result in-session so repeated company-tab opens don't re-fetch.
+const _repoFinancialsCache = {};
+async function fetchRepoFinancials(ticker) {
+  const tk = String(ticker || '').toUpperCase();
+  if (!tk) return null;
+  if (tk in _repoFinancialsCache) return _repoFinancialsCache[tk];
+  const bases = [];
+  // Prefer the configured data base, then the known equity repos.
+  const cfg = (typeof getGitHubDataBase === 'function') ? getGitHubDataBase() : null;
+  if (cfg) bases.push(cfg);
+  bases.push('https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2/main/data/');
+  bases.push('https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-2/main/data/');
+  bases.push('https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-1/main/data/');
+  let sawDefinite404 = false;  // a real "not found" (vs a transient network error)
+  let networkError = false;
+  for (const base of bases) {
+    try {
+      const r = await fetch(`${base}financials/${tk}.json`, { cache: 'no-cache' });
+      if (r.ok) {
+        const j = await r.json();
+        _repoFinancialsCache[tk] = j;
+        return j;
+      }
+      if (r.status === 404) sawDefinite404 = true;  // file genuinely absent in this repo
+    } catch { networkError = true; }  // fetch threw — transient, don't cache as "absent"
+  }
+  // Only negative-cache when we got a definitive 404 from at least one repo AND
+  // no transient network error muddied the result. A pure network failure leaves
+  // the cache empty so a later open (after the network recovers) can retry —
+  // otherwise one blip would hide financials for the whole session.
+  if (sawDefinite404 && !networkError) {
+    _repoFinancialsCache[tk] = null;
+  }
+  return null;
+}
+
 async function fnFA(ticker) {
   openFnOverlay('FA', ticker);
   if (!state.stock || state.stock.ticker !== ticker) {
@@ -11422,9 +11725,23 @@ async function fnFA(ticker) {
   }
   const s = state.stock;
 
-  // If FMP key is set, fetch real annual statements
+  // Financial statements: REPO FIRST, then FMP fallback.
+  // The pipeline (fetch_financials.py) commits multi-year statements to
+  // data/financials/<TICKER>.json each earnings season. Loading from the repo is
+  // free, precise, and consistent — no FMP quota to exhaust (which was why NVDA
+  // and others showed blank financials). FMP is only used if the repo file is
+  // absent (e.g. a brand-new ticker not yet in the pipeline).
   let fmpData = null;
-  if (getFmpKey()) {
+  let finSource = null;
+  try {
+    const repoFin = await fetchRepoFinancials(ticker);
+    if (repoFin && (repoFin.income?.length || repoFin.balance?.length || repoFin.cashflow?.length)) {
+      fmpData = { income: repoFin.income || [], balance: repoFin.balance || [], cashflow: repoFin.cashflow || [] };
+      finSource = `repo · ${repoFin.source || 'yahoo'}${repoFin.updated ? ' · ' + repoFin.updated.slice(0, 10) : ''}`;
+    }
+  } catch {}
+  // FMP fallback only when the repo had nothing.
+  if (!fmpData && getFmpKey()) {
     try {
       const [income, balance, cashflow] = await Promise.all([
         fetchFmpIncome(ticker, 'annual', 4),
@@ -11433,12 +11750,13 @@ async function fnFA(ticker) {
       ]);
       if (income?.length || balance?.length || cashflow?.length) {
         fmpData = { income, balance, cashflow };
+        finSource = 'FMP (live)';
       }
     } catch {}
   }
 
   if (!s && !fmpData) {
-    setFnOverlayBody('<div class="fn-section"><h3>Could not load financials</h3><p style="color:var(--ink-dim)">Add a Financial Modeling Prep key in Data Sources, or load this ticker on the Valuation tab first.</p></div>');
+    setFnOverlayBody('<div class="fn-section"><h3>Could not load financials</h3><p style="color:var(--ink-dim)">No committed statements found for this ticker in the repo (data/financials/), and no FMP fallback available. Add this ticker to the pipeline and run fetch_financials.py, or load it on the Valuation tab first for snapshot figures.</p></div>');
     return;
   }
 
@@ -11457,7 +11775,8 @@ async function fnFA(ticker) {
       `;
       fmpHtml += `
         <div class="fn-section">
-          <h3>Income Statement · Annual (FMP)</h3>
+          <h3>Income Statement · Annual</h3>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin:-6px 0 8px">source: ${escapeHtml(finSource || '—')}</div>
           <table class="fn-table">
             <thead><tr><th>Line Item</th>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead>
             <tbody>
@@ -11481,7 +11800,7 @@ async function fnFA(ticker) {
       `;
       fmpHtml += `
         <div class="fn-section">
-          <h3>Balance Sheet · Annual (FMP)</h3>
+          <h3>Balance Sheet · Annual</h3>
           <table class="fn-table">
             <thead><tr><th>Line Item</th>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead>
             <tbody>
@@ -11505,7 +11824,7 @@ async function fnFA(ticker) {
       `;
       fmpHtml += `
         <div class="fn-section">
-          <h3>Cash Flow Statement · Annual (FMP)</h3>
+          <h3>Cash Flow Statement · Annual</h3>
           <table class="fn-table">
             <thead><tr><th>Line Item</th>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead>
             <tbody>
@@ -18997,7 +19316,33 @@ function _normalizeOverride(entry) {
   return { value: entry, setAt: 0, expiresAt: null, source: 'legacy' };
 }
 
-// Is an override currently active (exists and not expired)?
+// ===== FIXED vs VARIABLE field classification =====
+// Per the data-integrity model: human-approved corrections to FIXED/informational
+// fields (name, sector, CEO, classification, country…) are VERIFIED truth and
+// trump every fresh data pull forever. Corrections to VARIABLE fields (price,
+// debt, revenue, cash, ratios — anything that legitimately changes over time)
+// are only honored for a bounded window, after which fresh pipeline data resumes,
+// because pinning a stale number on a moving quantity would mislead.
+const VARIABLE_OVERRIDE_FIELDS = new Set([
+  // Market/price data — changes constantly.
+  'price', 'priorClose', 'changePct', 'high52', 'low52', 'beta', 'marketCap',
+  'dividendYield', 'dividend_yield', 'pe', 'eps',
+  // Financial-statement amounts — change each reporting period.
+  'revenue', 'netIncome', 'ebitda', 'freeCashFlow', 'totalAssets',
+  'totalLiabilities', 'totalEquity', 'totalDebt', 'cash', 'stockBasedComp',
+  // Derived ratios — move with the underlying financials/price.
+  'priceToBook', 'returnOnEquity', 'returnOnAssets', 'grossMargin',
+  'operatingMargin', 'profitMargin', 'revenueGrowth', 'earningsGrowth',
+  'evToEbitda', 'evToRevenue', 'priceToSales', 'pegRatio', 'currentRatio',
+  'debtToEquity',
+]);
+// Default refresh window for a variable-field override (after which fresh data
+// resumes). Editable per-call via opts.durationMs.
+const VARIABLE_OVERRIDE_DEFAULT_MS = 14 * 24 * 60 * 60 * 1000;  // 14 days
+
+function isVariableField(field) { return VARIABLE_OVERRIDE_FIELDS.has(field); }
+
+// Is an override currently active (exists, not expired)?
 function _overrideActive(entry) {
   const n = _normalizeOverride(entry);
   if (!n) return false;
@@ -19011,12 +19356,30 @@ function setOverride(ticker, field, value, opts = {}) {
   if (value == null || value === '') {
     delete all[ticker][field];
   } else {
-    const durationMs = opts.durationMs;  // undefined = forever
+    // Verified = approved through the human review loop (or the Editor). These
+    // are treated as authoritative truth.
+    const verified = opts.verified === true || opts.source === 'review' || opts.source === 'review-bulk' || opts.source === 'editor';
+    const variable = isVariableField(field);
+    // Expiry policy:
+    //   • FIXED field  → never expires (verified truth trumps fresh data forever).
+    //   • VARIABLE field → bounded window; after it lapses, fresh pipeline data
+    //     resumes. An explicit opts.durationMs wins; otherwise the default window.
+    //     Passing opts.durationMs === null on a variable field is upgraded to the
+    //     default so we never pin a moving quantity permanently by accident.
+    let expiresAt;
+    if (variable) {
+      const dur = (opts.durationMs != null) ? opts.durationMs : VARIABLE_OVERRIDE_DEFAULT_MS;
+      expiresAt = Date.now() + dur;
+    } else {
+      expiresAt = (opts.durationMs != null) ? Date.now() + opts.durationMs : null;  // fixed → forever
+    }
     all[ticker][field] = {
       value,
       setAt: Date.now(),
-      expiresAt: (durationMs == null) ? null : Date.now() + durationMs,
+      expiresAt,
       source: opts.source || 'editor',
+      verified,
+      variable,
     };
   }
   if (Object.keys(all[ticker]).length === 0) delete all[ticker];
@@ -19191,20 +19554,31 @@ function wireEditor(tic) {
     const durVal = durSel?.value;
     const durationMs = (durVal === 'forever' || durVal == null) ? null : Number(durVal);
     let count = 0;
+    const _editChanges = [];  // collect before/after for the review audit trail
+    const _editRow = (typeof getStockbookRow === 'function') ? getStockbookRow(tic) : null;
     document.querySelectorAll('#editor-modal .editor-input').forEach(inp => {
       const field = inp.dataset.field;
       const raw = inp.value.trim();
       const fieldDef = Object.values(OVERRIDABLE_FIELDS).flat().find(f => f.key === field);
+      const oldVal = _editRow ? _editRow[field] : null;
       if (raw === '') {
         // Blank = clear any existing override for this field
         clearOverrideField(tic, field);
       } else {
         const value = fieldDef?.type === 'number' ? Number(raw) : raw;
         if (fieldDef?.type === 'number' && !isFinite(value)) return;
-        setOverride(tic, field, value, { durationMs, source: 'editor' });
-        count++;
+        // Only record/apply if actually changed.
+        if (String(oldVal ?? '') !== String(value)) {
+          setOverride(tic, field, value, { durationMs, source: 'editor' });
+          _editChanges.push({ field, label: fieldDef?.label || field, oldValue: oldVal, newValue: value });
+          count++;
+        }
       }
     });
+    // Log all changes to the Review hub with before→after context.
+    if (_editChanges.length && typeof queueFieldEditForReview === 'function') {
+      queueFieldEditForReview(tic, _editChanges, 'editor');
+    }
     // Re-apply to the live row + re-render
     const row = (typeof getStockbookRow === 'function') ? getStockbookRow(tic) : null;
     if (row) { delete row._preOverride; applyOverridesToRow(row); }
@@ -26289,6 +26663,33 @@ function normalizeEngineFields(s) {
     const dv = n(s.dividendsPaid), ni = n(s.netIncome);
     if (dv != null && ni != null && ni > 0) out.payoutRatio = Math.abs(dv) / ni;
   }
+  // Dividend yield MUST be a decimal here (0.0049 for 0.49%). The pipeline emits
+  // it as a percent (NVDA dividend_yield=0.49 meaning 0.49%), and evaluateIncome
+  // multiplies by 100 for display. Without this, a raw stock object that skipped
+  // normalizeRowFields would show "49%" yield (0.49×100). We detect the percent
+  // form and convert once. A genuine decimal yield is tiny (<0.4 ≈ <40%), and a
+  // percent-form value ≥0.4 would be an absurd 40%+ yield — so values that look
+  // like a plausible percent (the snake_case source, or a camel value >0.4) get
+  // divided by 100. Guarded by a flag so it never double-converts.
+  if (!out._divYieldNormalized) {
+    let dy = n(out.dividendYield);
+    const snake = n(s.dividend_yield);
+    // PRECEDENCE: if the camel value is already a plausible DECIMAL yield
+    // (0 < dy <= 0.4, i.e. <=40%), trust it — it was almost certainly already
+    // normalized (by normalizeRowFields or a manual override), and re-deriving
+    // from the raw snake_case percent would clobber it. Only fall back to the
+    // snake source when the camel value is absent or looks like a raw percent.
+    if (dy != null && dy > 0 && dy <= 0.4) {
+      // Already a decimal yield — leave as-is.
+    } else if (snake != null && snake > 0) {
+      // Snake source is a percent in this pipeline → decimal.
+      out.dividendYield = snake <= 40 ? snake / 100 : null;
+    } else if (dy != null && dy > 0.4 && dy <= 40) {
+      // Camel value too big to be a real decimal yield → it's a percent.
+      out.dividendYield = dy / 100;
+    }
+    out._divYieldNormalized = true;
+  }
   return out;
 }
 
@@ -28940,12 +29341,19 @@ function openResearchEditor(tic) {
     _afterResearchEdit(tic);
   });
   wrap.querySelector('#re-save').addEventListener('click', () => {
-    for (const [k, , ty] of fields) {
+    const _reChanges = [];
+    for (const [k, lbl, ty] of fields) {
       let v = wrap.querySelector('#re-' + k).value.trim();
       if (ty === 'number' && v !== '') { if (isNaN(+v)) continue; v = +v; }
       const current = row[k];
       if (v === '' || v == null) { if (typeof clearOverrideField === 'function') clearOverrideField(tic, k); }
-      else if (v !== current) setOverride(tic, k, v, { source: 'research-editor' });
+      else if (v !== current) {
+        setOverride(tic, k, v, { source: 'research-editor' });
+        _reChanges.push({ field: k, label: lbl || k, oldValue: current, newValue: v });
+      }
+    }
+    if (_reChanges.length && typeof queueFieldEditForReview === 'function') {
+      queueFieldEditForReview(tic, _reChanges, 'research-editor');
     }
     const r = (state.stockbook?.rows || []).find(x => x.ticker === tic);
     if (r) { delete r._preOverride; applyOverridesToRow(r); if (typeof normalizeRowFields === 'function') normalizeRowFields(r); }
@@ -29250,6 +29658,39 @@ function flagForReview(kind, payload) {
   });
   saveReviewQueue(q);
 }
+
+// Log a FIELD EDIT (from the Editor, Research editor, Contact editor, etc.) into
+// the Review hub with full BEFORE→AFTER context. The edit has ALREADY been
+// applied as an override so the UI reflects it immediately; this review item is
+// the audit trail. On approval it's re-written as a VERIFIED override (so it
+// trumps fresh data per the fixed/variable rules) and rides into XTRAPP. This is
+// what makes the human loop comprehensive — every change is visible and
+// authorizable, not just news-ticker fixes.
+//   changes: array of { field, label, oldValue, newValue }
+function queueFieldEditForReview(ticker, changes, source = 'editor') {
+  if (typeof loadReviewQueue !== 'function' || !ticker || !changes || !changes.length) return;
+  const q = loadReviewQueue();
+  const id = `rev-fieldedit-${ticker}-${Date.now()}`;
+  const fmtV = (v) => v == null || v === '' ? '—' : (typeof v === 'number' ? (Math.abs(v) < 1 && v !== 0 ? v.toPrecision(4) : v.toLocaleString()) : String(v));
+  q.unshift({
+    id,
+    type: 'fieldEdit',
+    ticker,
+    source,
+    changes: changes.map(c => ({
+      field: c.field,
+      label: c.label || c.field,
+      oldValue: c.oldValue != null ? c.oldValue : null,
+      newValue: c.newValue,
+      oldDisplay: fmtV(c.oldValue),
+      newDisplay: fmtV(c.newValue),
+    })),
+    queuedAt: new Date().toISOString(),
+  });
+  saveReviewQueue(q);
+  if (typeof updateReviewBadge === 'function') { try { updateReviewBadge(); } catch {} }
+}
+if (typeof window !== 'undefined') window.queueFieldEditForReview = queueFieldEditForReview;
 
 // Queue an imported THESIS into the Review hub so its ticker + direction can be
 // confirmed/corrected in-app. Carries the thesis id so corrections write back
@@ -33645,6 +34086,26 @@ const RESEARCH_METRICS = [
   { key: 'totalAssets',label: 'Total Assets',            cat: 'Scale',         higher: true,  fmt: v => _fmtBig(v), get: r => _num(r.totalAssets) },
 ];
 
+// ===== CATEGORY-WEIGHTED GRADING =====
+// The grade was a flat average of percentile ranks across all 23 metrics. That
+// over-weights whatever category has the MOST metrics: there are 8 Profitability
+// metrics but only 2 Growth and 1 Income, so a flat average is ~35% profitability
+// and barely 4% income — structurally penalizing growth companies and ignoring
+// dividend payers. And 6 "Scale" metrics (revenue, market cap, assets…) meant
+// bigger companies scored higher just for being big, which is backwards: size is
+// not quality. This config fixes both — each CATEGORY contributes a fixed share
+// of the grade regardless of how many metrics it contains, and Scale is excluded
+// from the grade entirely (still shown as context). Weights sum to 1.0.
+const RESEARCH_CATEGORY_WEIGHTS = {
+  'Profitability': 0.30,   // quality of the business (margins, returns on capital)
+  'Growth':        0.22,   // are revenue/earnings expanding — the thing growth stocks live on
+  'Valuation':     0.22,   // is it cheap relative to peers (P/E, EV/EBITDA…)
+  'Balance Sheet': 0.16,   // solvency / leverage / liquidity
+  'Income':        0.10,   // dividend yield for payers
+  // 'Scale' intentionally absent — size is context, not a grade input.
+};
+const RESEARCH_GRADED_CATEGORIES = new Set(Object.keys(RESEARCH_CATEGORY_WEIGHTS));
+
 function _num(v) {
   if (typeof v === 'number') return isFinite(v) ? v : null;
   // Coerce numeric strings ("1.41471" from CSV-parsed rows) — this is the
@@ -33790,25 +34251,67 @@ function computeResearchRankings(force = false) {
       entry.rank = i + 1;
       entry.pct = total > 1 ? Math.round((1 - i / (total - 1)) * 100) : 100;  // 100 = best
     });
-    perMetric[m.key] = { ranked: vals, total, metric: m };
+    // Index by ticker for O(1) lookup. Without this, the per-ticker grade loop
+    // below does perMetric[key].ranked.find() — an O(n) scan — for every ticker
+    // × every metric, which is O(n² × metrics). At 10k tickers that's ~11s of
+    // pure CPU per research pass; the Map makes it ~10ms.
+    const byTickerIdx = new Map();
+    for (const e of vals) byTickerIdx.set(e.ticker, e);
+    perMetric[m.key] = { ranked: vals, total, metric: m, byTicker: byTickerIdx };
   }
 
   // Build per-ticker grade from average percentile across metrics it HAS
   const byTicker = {};
   for (const r of equities) {
     const ranks = {};
-    let pctSum = 0, covered = 0;
+    // (category-weighted accumulation below replaces the old flat pctSum)
+    // Coverage = how many metrics this ticker actually HAS A VALUE for, counted
+    // DIRECTLY from the row via each metric's getter. This is independent of the
+    // ranking step: a ticker has coverage for a metric if its own data yields a
+    // finite value, full stop. (Previously coverage counted only metrics where
+    // the ticker landed in the ranked list, so if the equity universe loaded
+    // sparsely the count collapsed to a misleading "5/23" even when the row had
+    // the data. Counting from the row itself can't be confused that way.)
+    let covered = 0;
+    // Category-weighted grade: accumulate each graded category's average
+    // percentile separately, then combine by fixed category weights. This keeps
+    // one over-populated category (8 Profitability metrics) from dominating, and
+    // ensures Growth/Income actually move the grade. Scale metrics are recorded
+    // for display but NOT folded into the grade.
+    const _catPctSum = {};   // category → sum of percentiles
+    const _catCount = {};    // category → how many metrics contributed
     for (const m of RESEARCH_METRICS) {
+      const ownVal = m.get(r);
+      const hasOwn = ownVal != null && isFinite(ownVal);
+      if (hasOwn) covered++;
       const pm = perMetric[m.key];
-      const entry = pm.ranked.find(e => e.ticker === r.ticker);
+      const entry = pm.byTicker.get(r.ticker);  // O(1) instead of O(n) scan
       if (entry) {
         ranks[m.key] = { rank: entry.rank, total: pm.total, pct: entry.pct, value: entry.value };
-        pctSum += entry.pct; covered++;
+        // Only graded categories contribute to the score (Scale is excluded).
+        if (RESEARCH_GRADED_CATEGORIES.has(m.cat)) {
+          _catPctSum[m.cat] = (_catPctSum[m.cat] || 0) + entry.pct;
+          _catCount[m.cat] = (_catCount[m.cat] || 0) + 1;
+        }
       } else {
-        ranks[m.key] = null;  // n/a · not ranked
+        ranks[m.key] = null;  // n/a · not ranked (no peers, or value absent)
       }
     }
-    const gradeScore = covered > 0 ? pctSum / covered : null;
+    // Combine category averages by weight. Re-normalize over the categories the
+    // ticker actually has data for, so a company missing one category (e.g. no
+    // dividend → no Income) isn't unfairly dragged down or up.
+    let weightedSum = 0, weightUsed = 0;
+    const categoryScores = {};
+    for (const cat of RESEARCH_GRADED_CATEGORIES) {
+      if (_catCount[cat] > 0) {
+        const catAvg = _catPctSum[cat] / _catCount[cat];
+        categoryScores[cat] = Math.round(catAvg);
+        const w = RESEARCH_CATEGORY_WEIGHTS[cat] || 0;
+        weightedSum += catAvg * w;
+        weightUsed += w;
+      }
+    }
+    const gradeScore = weightUsed > 0 ? weightedSum / weightUsed : null;
     byTicker[r.ticker] = {
       ticker: r.ticker,
       name: r.name || r.ticker,
@@ -33817,6 +34320,7 @@ function computeResearchRankings(force = false) {
       grade: researchGradeLetter(gradeScore),
       coverage: covered,
       coverageTotal: RESEARCH_METRICS.length,
+      categoryScores,   // per-category percentile (Profitability/Growth/Valuation/Balance Sheet/Income)
       ranks,
     };
   }
@@ -34013,11 +34517,12 @@ function renderResearchScreener(data) {
     RESEARCH_STATE.filters = [{ metric: 'roe', op: 'gte', val: '' }];
   }
 
-  // Helper: read a metric's raw numeric value for a ticker (from perMetric ranked).
+  // Helper: read a metric's raw numeric value for a ticker (from perMetric).
   const metricVal = (metricKey, ticker) => {
     const pm = data.perMetric[metricKey];
     if (!pm) return null;
-    const hit = pm.ranked.find(r => r.ticker === ticker);
+    // O(1) via the byTicker Map (falls back to scan only for older cached data).
+    const hit = pm.byTicker ? pm.byTicker.get(ticker) : pm.ranked.find(r => r.ticker === ticker);
     return hit ? hit.value : null;
   };
 
@@ -34203,7 +34708,7 @@ function renderResearchGrades(data) {
         <span style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${all.length} shown${hiddenCount?` · ${hiddenCount} hidden (sparse data)`:''}</span>
       </div>
       ${be ? `<span style="color:var(--pos)">● Backend verified</span> — grades cross-checked against the analytics backend (computed ${be.ageHours}h ago, all three books).${be.divergedCount ? ` <span style="color:var(--neg)">${be.divergedCount} divergence${be.divergedCount > 1 ? 's' : ''} flagged (Δ)</span> — backend and this browser disagree on those names; usually stale data on one side.` : ' All grades agree.'}<br>` : `<span style="color:var(--ink-faint)">○ Backend grades unavailable — showing local computation only.</span><br>`}
-      Composite grade = average percentile across all metrics a company has data for (equal-weighted). Click any company for its full per-category breakdown and rank in each. Companies are graded only on metrics they actually report.
+      Composite grade = category-weighted percentile across the metrics a company reports. Categories carry fixed weights (Profitability 30% · Growth 22% · Valuation 22% · Balance Sheet 16% · Income 10%) so one over-populated category can't dominate, and a missing category is re-normalized away rather than penalized. Size/Scale metrics are shown as context but excluded from the grade — bigger isn't better. Click any company for its per-category breakdown.
     </div>
     <div class="company-card" style="margin:0">
       <table class="sb-table" style="width:100%">
@@ -34439,6 +34944,24 @@ function renderResearchDetail(data, ticker) {
         <button class="btn" style="font-size:10px;background:var(--pos)" onclick="openResearchEditor('${t.ticker}')">✎ Edit metrics &amp; classification</button>
         <button class="btn btn-ghost" style="font-size:10px" onclick="document.getElementById('ticker').value='${t.ticker}';switchTab('valuation');setTimeout(()=>document.getElementById('fetch-btn')?.click(),100)">Open in Valuation →</button>
       </div>
+      ${(() => {
+        // Category breakdown: shows how each WEIGHTED category scored (0-100
+        // percentile) and its weight, so the grade is explainable — you can see
+        // it's, say, a great grower that's expensive, not just a letter.
+        const cs = t.categoryScores || {};
+        const order = [['Profitability',0.30],['Growth',0.22],['Valuation',0.22],['Balance Sheet',0.16],['Income',0.10]];
+        const bars = order.filter(([c]) => cs[c] != null).map(([cat, w]) => {
+          const v = cs[cat];
+          const color = v >= 70 ? 'var(--pos)' : v >= 45 ? 'var(--amber)' : 'var(--neg)';
+          return `<div style="margin-bottom:5px">
+            <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px;color:var(--ink-dim);margin-bottom:2px">
+              <span>${escapeHtml(cat)} <span style="color:var(--ink-faint)">· ${Math.round(w*100)}% of grade</span></span><span style="color:${color};font-weight:700">${v}</span>
+            </div>
+            <div style="height:5px;background:var(--rule);border-radius:3px;overflow:hidden"><div style="height:100%;width:${v}%;background:${color}"></div></div>
+          </div>`;
+        }).join('');
+        return bars ? `<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--rule)"><div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">Category breakdown (percentile vs peers)</div>${bars}</div>` : '';
+      })()}
     </div>
     ${catBlocks}`;
 }
@@ -34882,14 +35405,40 @@ function renderReviewHub() {
   const tickerItems = queue.filter(q => q.type === 'ticker');
   const newsItems = queue.filter(q => q.type === 'news');
   const thesisItems = queue.filter(q => q.type === 'thesis');
+  const fieldEditItems = queue.filter(q => q.type === 'fieldEdit');
   // Anything else queued via flagForReview() (derivative links, FX, etc.)
-  const knownTypes = new Set(['sentiment', 'ticker', 'news', 'thesis']);
+  const knownTypes = new Set(['sentiment', 'ticker', 'news', 'thesis', 'fieldEdit']);
   const genericItems = queue.filter(q => !knownTypes.has(q.type));
+
+  // Field-edit card — shows every changed field as BEFORE → AFTER for a ticker,
+  // from the Editor / Research editor / Contact editor. Approving marks the
+  // override VERIFIED; rejecting reverts it to the pre-edit (fresh) value.
+  const fieldEditCard = (q) => `
+    <div class="company-card" style="border-left:3px solid var(--pos);margin:0 0 10px;position:relative" data-rev="${q.id}">
+      <label style="position:absolute;top:8px;right:8px;display:flex;align-items:center;gap:4px;cursor:pointer"><input type="checkbox" class="review-select" data-rev="${q.id}" style="cursor:pointer"><span style="font-family:var(--mono);font-size:8px;color:var(--ink-faint)">select</span></label>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--pos);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">✎ Edit · ${escapeHtml(q.source || 'editor')} · ${escapeHtml(q.ticker || '')}</div>
+      <div style="margin-bottom:8px">
+        ${(q.changes || []).map(c => `
+          <div style="font-family:var(--mono);font-size:11px;color:var(--ink);margin-bottom:3px">
+            <span style="color:var(--ink-dim)">${escapeHtml(c.label)}:</span>
+            <span style="color:var(--neg)">${escapeHtml(c.oldDisplay)}</span>
+            <span style="color:var(--ink-faint)"> → </span>
+            <span style="color:var(--pos)">${escapeHtml(c.newDisplay)}</span>
+          </div>`).join('')}
+      </div>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-bottom:8px">Approving marks ${(q.changes||[]).length} change(s) VERIFIED — they'll trump fresh data (fixed fields forever, variable fields for the refresh window) and ride into XTRAPP.</div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn" style="font-size:10px;background:var(--pos)" onclick="reviewFieldEditApprove('${q.id}')">✓ Approve (verify)</button>
+        <button class="btn" style="font-size:10px;background:var(--neg)" onclick="reviewFieldEditReject('${q.id}')">✕ Revert to source</button>
+        <button class="btn btn-ghost" style="font-size:10px" onclick="reviewDismiss('${q.id}')">Keep as-is (skip)</button>
+      </div>
+    </div>`;
 
   // Generic doubt card — for anything flagForReview() queued. Shows the label,
   // detail, and any options the flagging code supplied; otherwise a confirm/skip.
   const genericCard = (q) => `
-    <div class="company-card" style="border-left:3px solid var(--data-amber);margin:0 0 10px" data-rev="${q.id}">
+    <div class="company-card" style="border-left:3px solid var(--data-amber);margin:0 0 10px;position:relative" data-rev="${q.id}">
+      <label style="position:absolute;top:8px;right:8px;display:flex;align-items:center;gap:4px;cursor:pointer"><input type="checkbox" class="review-select" data-rev="${q.id}" style="cursor:pointer"><span style="font-family:var(--mono);font-size:8px;color:var(--ink-faint)">select</span></label>
       <div style="font-family:var(--mono);font-size:9px;color:var(--data-amber);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px">⚑ ${escapeHtml(q.type)} ${q.confidence!=null?'· conf '+q.confidence:''}</div>
       <div style="font-family:var(--mono);font-size:12px;color:var(--ink);margin-bottom:4px">${escapeHtml(q.label || 'Value in doubt')}</div>
       ${q.detail?`<div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-bottom:8px">${escapeHtml(q.detail)}${q.ticker?' · '+escapeHtml(q.ticker):''}${q.value!=null?' · '+escapeHtml(String(q.value)):''}</div>`:''}
@@ -34903,7 +35452,8 @@ function renderReviewHub() {
   // Thesis review card: confirm or correct the ticker + direction of an
   // imported probability thesis. Corrections write back to the real thesis.
   const thesisCard = (q) => `
-    <div class="company-card" style="border-left:3px solid #9a7aa0;margin:0 0 10px" data-rev="${q.id}">
+    <div class="company-card" style="border-left:3px solid #9a7aa0;margin:0 0 10px;position:relative" data-rev="${q.id}">
+      <label style="position:absolute;top:8px;right:8px;display:flex;align-items:center;gap:4px;cursor:pointer"><input type="checkbox" class="review-select" data-rev="${q.id}" style="cursor:pointer"><span style="font-family:var(--mono);font-size:8px;color:var(--ink-faint)">select</span></label>
       <div style="font-family:var(--mono);font-size:9px;color:#9a7aa0;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px">🎯 Thesis check${q.confidence!=null?' · brain conf '+q.confidence:''}</div>
       ${q.sourceText?`<div style="font-family:var(--mono);font-size:11px;color:var(--ink);margin-bottom:6px">"${escapeHtml(q.sourceText)}"</div>`:''}
       <div style="font-family:var(--mono);font-size:11px;color:var(--ink-dim);margin-bottom:8px">
@@ -34923,7 +35473,8 @@ function renderReviewHub() {
 
   // News review card: confirm the matched ticker, fix it, or mark the article bad.
   const newsCard = (q) => `
-    <div class="company-card" style="border-left:3px solid #7faaca;margin:0 0 10px" data-rev="${q.id}">
+    <div class="company-card" style="border-left:3px solid #7faaca;margin:0 0 10px;position:relative" data-rev="${q.id}">
+      <label style="position:absolute;top:8px;right:8px;display:flex;align-items:center;gap:4px;cursor:pointer"><input type="checkbox" class="review-select" data-rev="${q.id}" style="cursor:pointer"><span style="font-family:var(--mono);font-size:8px;color:var(--ink-faint)">select</span></label>
       <div style="font-family:var(--mono);font-size:9px;color:#7faaca;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px">📰 News ticker check${q.source?' · '+escapeHtml(q.source):''}</div>
       <div style="font-family:var(--serif);font-size:13px;color:var(--ink);margin-bottom:6px">${escapeHtml(q.headline)}</div>
       <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-bottom:8px">
@@ -34931,17 +35482,18 @@ function renderReviewHub() {
         ${q.url?` · <a href="${escapeHtml(q.url)}" target="_blank" rel="noopener" style="color:var(--amber)">read ↗</a>`:''}
       </div>
       <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
-        <button class="btn" style="font-size:10px;background:var(--pos)" onclick="reviewNewsConfirm('${q.id}')">✓ Ticker is right</button>
-        <input id="newsfix-${q.id}" placeholder="correct ticker(s), comma-sep" style="background:var(--bg-card);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:10px;padding:4px 6px;border-radius:3px;width:170px;text-transform:uppercase">
-        <button class="btn btn-ghost" style="font-size:10px" onclick="reviewNewsFix('${q.id}')">Fix ticker</button>
-        <button class="btn btn-ghost" style="font-size:10px" onclick="openArticleEditor('${escapeHtml(q.articleKey)}')">✎ Full editor</button>
-        <button class="btn" style="font-size:10px;background:var(--neg)" onclick="reviewNewsBad('${q.id}')">✕ Bad article (hide)</button>
+        <button class="btn" style="font-size:10px;background:var(--pos)" onclick="reviewNewsConfirm('${q.id}')">✓ All correct</button>
+        <button class="btn" style="font-size:10px;background:#7faaca;color:#000" onclick="openArticleEditor('${escapeHtml(q.articleKey)}')" title="Edit ticker, headline, description, sentiment, AND impact — fix anything wrong about this article">✎ Fix article (any field)</button>
+        <input id="newsfix-${q.id}" placeholder="quick ticker fix" style="background:var(--bg-card);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:10px;padding:4px 6px;border-radius:3px;width:130px;text-transform:uppercase">
+        <button class="btn btn-ghost" style="font-size:10px" onclick="reviewNewsFix('${q.id}')">↳ ticker only</button>
+        <button class="btn" style="font-size:10px;background:var(--neg)" onclick="reviewNewsBad('${q.id}')">✕ Bad article</button>
         <button class="btn btn-ghost" style="font-size:10px" onclick="reviewDismiss('${q.id}')">Skip</button>
       </div>
     </div>`;
 
   const itemCard = (q) => `
-    <div class="company-card" style="border-left:3px solid var(--data-amber);margin:0 0 10px" data-rev="${q.id}">
+    <div class="company-card" style="border-left:3px solid var(--data-amber);margin:0 0 10px;position:relative" data-rev="${q.id}">
+      <label style="position:absolute;top:8px;right:8px;display:flex;align-items:center;gap:4px;cursor:pointer"><input type="checkbox" class="review-select" data-rev="${q.id}" style="cursor:pointer"><span style="font-family:var(--mono);font-size:8px;color:var(--ink-faint)">select</span></label>
       <div style="font-family:var(--mono);font-size:12px;color:var(--ink);margin-bottom:6px">"${escapeHtml(q.text)}"</div>
       <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-bottom:8px">
         ${escapeHtml(q.author)} · ${q.primaryTicker ? 'ticker ' + escapeHtml(q.primaryTicker) : 'no ticker'} ${q.priceTarget!=null?'· target $'+q.priceTarget:''}
@@ -34961,14 +35513,18 @@ function renderReviewHub() {
 
   const pendingSection = queue.length ? `
     <div style="margin-bottom:20px">
-      <div class="regime-section-title" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+      <div class="regime-section-title" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
         <span>PENDING REVIEW · ${queue.length}</span>
-        <button class="btn" style="font-size:9px;background:var(--pos);padding:3px 10px" onclick="reviewAutoApproveAll()" title="Accept the system's current value for every pending item at once">✓✓ Auto-approve all (${queue.length})</button>
+        <span style="display:flex;gap:6px">
+          <button class="btn btn-ghost" style="font-size:9px;padding:3px 10px" onclick="reviewApproveSelected()" title="Approve only the items you've checked">✓ Approve selected</button>
+          <button class="btn" style="font-size:9px;background:var(--pos);padding:3px 10px" onclick="reviewAutoApproveAll()" title="Accept the system's current value for every pending item at once">✓✓ Auto-approve all (${queue.length})</button>
+        </span>
       </div>
-      <div class="gt-section-sub">The system is unsure about these. Your call retrains the model so it recognizes the phrasing next time. Or auto-approve all to accept the current values in bulk.</div>
+      <div class="gt-section-sub">The system is unsure about these. Your call retrains the model so it recognizes the phrasing next time. Check one or more and "Approve selected", or "Auto-approve all" to accept every current value at once.</div>
       ${sentimentItems.map(itemCard).join('')}
       ${tickerItems.map(itemCard).join('')}
       ${newsItems.map(newsCard).join('')}
+      ${fieldEditItems.map(fieldEditCard).join('')}
       ${thesisItems.map(thesisCard).join('')}
       ${genericItems.map(genericCard).join('')}
     </div>` : `
@@ -35052,35 +35608,97 @@ function reviewDismiss(id) {
   renderReviewHub();
 }
 
+// Approve a field-edit review item: re-write each change as a VERIFIED override
+// (so it trumps fresh data per the fixed/variable rules), then dequeue.
+function reviewFieldEditApprove(id) {
+  const q = loadReviewQueue().find(x => x.id === id);
+  if (!q || q.type !== 'fieldEdit') { reviewDismiss(id); return; }
+  let n = 0;
+  for (const c of (q.changes || [])) {
+    try {
+      if (typeof setOverride === 'function') { setOverride(q.ticker, c.field, c.newValue, { source: 'review', verified: true }); n++; }
+    } catch (e) { console.warn('[review] field-edit approve failed:', c.field, e.message); }
+  }
+  // Re-apply to the row so the verified value is live.
+  try {
+    const r = (state.stockbook?.rows || []).find(x => x.ticker === q.ticker);
+    if (r) { delete r._preOverride; if (typeof applyOverridesToRow === 'function') applyOverridesToRow(r); if (typeof normalizeRowFields === 'function') normalizeRowFields(r); }
+    _researchCache = null;
+  } catch {}
+  saveReviewQueue(loadReviewQueue().filter(x => x.id !== id));
+  renderReviewHub();
+  if (typeof flashStatus === 'function') flashStatus(`Verified ${n} change(s) for ${q.ticker} — now trumps fresh data + queued for XTRAPP`, 'success');
+}
+if (typeof window !== 'undefined') window.reviewFieldEditApprove = reviewFieldEditApprove;
+
+// Reject a field-edit: clear the override(s) so the field reverts to pulled
+// (fresh) data, then dequeue.
+function reviewFieldEditReject(id) {
+  const q = loadReviewQueue().find(x => x.id === id);
+  if (!q || q.type !== 'fieldEdit') { reviewDismiss(id); return; }
+  for (const c of (q.changes || [])) {
+    try { if (typeof clearOverrideField === 'function') clearOverrideField(q.ticker, c.field); } catch {}
+  }
+  try {
+    const r = (state.stockbook?.rows || []).find(x => x.ticker === q.ticker);
+    if (r) { delete r._preOverride; if (typeof applyOverridesToRow === 'function') applyOverridesToRow(r); if (typeof normalizeRowFields === 'function') normalizeRowFields(r); }
+    _researchCache = null;
+  } catch {}
+  saveReviewQueue(loadReviewQueue().filter(x => x.id !== id));
+  renderReviewHub();
+  if (typeof flashStatus === 'function') flashStatus(`Reverted ${q.ticker} to source data`, 'success');
+}
+if (typeof window !== 'undefined') window.reviewFieldEditReject = reviewFieldEditReject;
+
 // Auto-approve everything pending: accept the system's CURRENT value for each
 // item (confirm sentiment/ticker/thesis/news as-is), then clear the queue. The
 // confirmations still retrain the model + ride into XTRAPP, same as one-by-one.
+// Approve a single queued item by accepting the system's current value. Shared
+// by both "auto-approve all" and "approve selected" so behavior is identical.
+function _reviewApproveOne(q) {
+  try {
+    if (q.type === 'fieldEdit' && typeof reviewFieldEditApprove === 'function') {
+      reviewFieldEditApprove(q.id);
+    } else if (q.type === 'sentiment' && typeof reviewConfirm === 'function') {
+      const dir = (q.brainGuess === 'bullish' || q.brainGuess === 'bearish') ? q.brainGuess : 'neutral';
+      reviewConfirm(q.id, dir);
+    } else if (q.type === 'ticker' && typeof reviewResolveTicker === 'function' && q.tickers && q.tickers.length) {
+      reviewResolveTicker(q.id, q.tickers[0].ticker);
+    } else if (q.type === 'news' && typeof reviewNewsConfirm === 'function') {
+      reviewNewsConfirm(q.id);
+    } else if (q.type === 'thesis' && typeof reviewThesisConfirm === 'function') {
+      reviewThesisConfirm(q.id);
+    } else if (q.options && q.options.length && typeof reviewGenericOption === 'function') {
+      reviewGenericOption(q.id, 0);
+    } else {
+      saveReviewQueue(loadReviewQueue().filter(x => x.id !== q.id));
+    }
+    return true;
+  } catch (e) { console.warn('[review] approve failed for', q.id, e.message); return false; }
+}
+
+// Approve only the checked items (1 or more). The rest stay pending.
+function reviewApproveSelected() {
+  const checked = [...document.querySelectorAll('.review-select:checked')].map(c => c.dataset.rev);
+  if (!checked.length) { if (typeof flashStatus === 'function') flashStatus('Select at least one item to approve', 'error'); return; }
+  const queue = loadReviewQueue();
+  let approved = 0;
+  for (const id of checked) {
+    const q = queue.find(x => x.id === id);
+    if (q && _reviewApproveOne(q)) approved++;
+  }
+  renderReviewHub();
+  if (typeof flashStatus === 'function') flashStatus(`Approved ${approved} selected item(s) — verified + queued for XTRAPP`, 'success');
+}
+if (typeof window !== 'undefined') window.reviewApproveSelected = reviewApproveSelected;
+
 function reviewAutoApproveAll() {
   const queue = loadReviewQueue();
   if (!queue.length) return;
   if (typeof confirm === 'function' && !confirm(`Auto-approve all ${queue.length} pending items, accepting the current value for each?`)) return;
   let approved = 0;
   for (const q of [...queue]) {
-    try {
-      if (q.type === 'sentiment' && typeof reviewConfirm === 'function') {
-        // Accept the brain's guessed sentiment as-is.
-        const dir = (q.brainGuess === 'bullish' || q.brainGuess === 'bearish') ? q.brainGuess : 'neutral';
-        reviewConfirm(q.id, dir);
-      }
-      else if (q.type === 'ticker' && typeof reviewResolveTicker === 'function' && q.tickers && q.tickers.length) {
-        // Accept the top-ranked ticker candidate.
-        reviewResolveTicker(q.id, q.tickers[0].ticker);
-      }
-      else if (q.type === 'news' && typeof reviewNewsConfirm === 'function') reviewNewsConfirm(q.id);
-      else if (q.type === 'thesis' && typeof reviewThesisConfirm === 'function') reviewThesisConfirm(q.id);
-      else {
-        // Generic item: run its first option if present (usually "keep/confirm"),
-        // else just dismiss it as accepted.
-        if (q.options && q.options.length && typeof reviewGenericOption === 'function') reviewGenericOption(q.id, 0);
-        else saveReviewQueue(loadReviewQueue().filter(x => x.id !== q.id));
-      }
-      approved++;
-    } catch (e) { console.warn('[review] auto-approve failed for', q.id, e.message); }
+    if (_reviewApproveOne(q)) approved++;
   }
   // Belt-and-suspenders: clear anything that didn't self-remove.
   saveReviewQueue([]);
