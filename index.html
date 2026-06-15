@@ -7153,6 +7153,7 @@
   <button class="val-subtab" data-subtab="financials">Financials</button>
   <button class="val-subtab" data-subtab="ta">Technical Analysis</button>
   <button class="val-subtab" data-subtab="company">Company</button>
+  <button class="val-subtab" data-subtab="activity">Activity</button>
 </div>
 
 <main class="workspace" id="workspace">
@@ -7517,6 +7518,23 @@
       </section>
     </div>
 
+  </div>
+
+  <!-- ACTIVITY SUB-PANEL: news + social media for this ticker -->
+  <div class="val-subpanel" data-subpanel="activity" style="display:none">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:16px 0 14px">
+      <div class="seg-control" id="activity-toggle">
+        <button class="seg-btn active" data-activity="news">News</button>
+        <button class="seg-btn" data-activity="social">Social</button>
+      </div>
+      <button class="btn btn-ghost" id="activity-refresh" style="font-size:10px" title="Reload activity for this ticker">↻ Refresh</button>
+      <span id="activity-ticker-label" style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)"></span>
+    </div>
+    <div id="activity-body">
+      <div class="empty-state" style="padding:40px;text-align:center;color:var(--ink-dim);font-family:var(--mono);font-size:11px">
+        Load a ticker to see news &amp; social activity
+      </div>
+    </div>
   </div>
 
 </main>
@@ -7909,7 +7927,9 @@
     </div>
     <div style="display:flex;gap:8px;align-items:center">
       <input id="bets-filter" placeholder="filter by ticker" style="background:var(--bg-elev);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:11px;padding:6px 10px;border-radius:3px;width:140px">
+      <button class="btn btn-ghost" id="bets-refresh-btn" title="Fetch fresh live prices for open positions (Stooq/Finnhub), USD-converted">Refresh Prices</button>
       <button class="btn btn-ghost" id="bets-run-btn" title="Run today's signal scan now">Run Scan</button>
+      <button class="btn btn-ghost" id="bets-retrain-btn" title="Retrain signal weights from settled bets — learns from wins and losses">Retrain</button>
     </div>
   </div>
   <div id="bets-body" style="padding:0 32px 60px;overflow-x:auto"></div>
@@ -8641,6 +8661,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260614n"></script>
+<script src="app.js?v=20260614w"></script>
 </body>
 </html>

@@ -929,6 +929,59 @@ const KNOWN_VEHICLE_UNDERLYING = {
   AAPD: { underlying: 'AAPL', multiplier: -1 },
 };
 
+// ============================================================
+//   LEVERAGED-ETF PLAYBOOK — single-stock bull/bear ETFs the bot can use to
+//   express a high-conviction directional view with built-in leverage but
+//   WITHOUT the time-decay/assignment risk of an option. Per the request: if
+//   the bot strongly likes TSLA long, TSLL (2x TSLA bull) is a cleaner lever
+//   than a call. Built by reversing KNOWN_VEHICLE_UNDERLYING into
+//   underlying → { bull, bear } and adding more known single-stock pairs.
+//   The bot only substitutes one of these when the ticker is actually a member
+//   of the universe (so it has a price/row); otherwise it falls back to an
+//   option or leveraged shares.
+// ============================================================
+const LEVERAGED_ETF_PLAYBOOK = (() => {
+  const m = {};
+  const add = (underlying, etf, mult) => {
+    const u = underlying.toUpperCase();
+    m[u] = m[u] || { bull: null, bear: null };
+    if (mult > 0 && !m[u].bull) m[u].bull = { etf: etf.toUpperCase(), multiplier: mult };
+    if (mult < 0 && !m[u].bear) m[u].bear = { etf: etf.toUpperCase(), multiplier: mult };
+  };
+  // Seed from the existing vehicle map.
+  for (const [etf, info] of Object.entries(KNOWN_VEHICLE_UNDERLYING)) {
+    if (info.underlying && info.multiplier) add(info.underlying, etf, info.multiplier);
+  }
+  // Expand with widely-traded single-stock leveraged ETFs (GraniteShares/Direxion/T-Rex).
+  add('TSLA', 'TSLL', 2);  add('TSLA', 'TSLQ', -1);
+  add('NVDA', 'NVDL', 2);  add('NVDA', 'NVD', -1);
+  add('AAPL', 'AAPU', 2);  add('AAPL', 'AAPD', -1);
+  add('MSFT', 'MSFU', 2);  add('MSFT', 'MSFD', -1);
+  add('AMZN', 'AMZU', 2);  add('AMZN', 'AMZD', -1);
+  add('GOOGL', 'GGLL', 2); add('GOOGL', 'GGLS', -1);
+  add('META', 'METU', 2);  add('META', 'METD', -1);
+  add('AMD',  'AMDL', 2);  add('AMD',  'AMDD', -1);
+  add('COIN', 'CONL', 2);
+  add('MSTR', 'MSTU', 2);  add('MSTR', 'MSTZ', -1);
+  add('PLTR', 'PLTU', 2);
+  add('NFLX', 'NFXL', 2);
+  return m;
+})();
+
+// Return the leveraged ETF to express a directional view on `underlying`, or
+// null if none is known / not in the tradeable universe.
+function leveragedEtfFor(underlying, direction) {
+  const entry = LEVERAGED_ETF_PLAYBOOK[String(underlying || '').toUpperCase()];
+  if (!entry) return null;
+  const pick = direction === 'short' ? entry.bear : entry.bull;
+  if (!pick) return null;
+  // Only use it if it's a real, priced member of the universe.
+  const row = (typeof getStockbookRow === 'function') ? getStockbookRow(pick.etf) : null;
+  if (!row || !isFinite(row.price) || row.price <= 0) return null;
+  return { etf: pick.etf, multiplier: pick.multiplier, price: row.price };
+}
+if (typeof window !== 'undefined') window.leveragedEtfFor = leveragedEtfFor;
+
 function detectDerivativeRelationship(tickerOrRow) {
   const row = (typeof tickerOrRow === 'string')
     ? (typeof getStockbookRow === 'function' ? getStockbookRow(tickerOrRow) : null)
@@ -1125,6 +1178,19 @@ function recordInGoodGlobeIndex(ticker, flag, opts = {}) {
   const assetType = opts.assetType
     || (typeof subClassifyAsset === 'function' ? subClassifyAsset(tic) : 'equity');
 
+  // Capture the price the moment this ticker enters the index. This is the
+  // basis for its contribution to the equal-weighted index performance — every
+  // member's return is measured from ITS OWN entry price, and the index
+  // compounds the equal-weighted period returns (see goodGlobeIndexPerformance).
+  let entryPrice = opts.entryPrice;
+  if (entryPrice == null) {
+    try {
+      const row = (typeof getStockbookRow === 'function') ? getStockbookRow(tic) : null;
+      if (row && isFinite(row.price)) entryPrice = row.price;
+      else if (typeof state !== 'undefined' && state.stock?.ticker === tic && isFinite(state.stock.price)) entryPrice = state.stock.price;
+    } catch {}
+  }
+
   if (!existing) {
     idx[tic] = {
       ticker: tic,
@@ -1134,12 +1200,20 @@ function recordInGoodGlobeIndex(ticker, flag, opts = {}) {
       flags: [flag],
       source: opts.source || 'modal',
       notes: opts.notes || null,
+      // Index-tracking fields:
+      entryPrice: entryPrice != null && isFinite(entryPrice) ? +entryPrice : null,
+      entryDate: now,
     };
   } else {
     existing.lastFlaggedAt = now;
     if (!existing.flags.includes(flag)) existing.flags.push(flag);
     if (opts.notes && !existing.notes) existing.notes = opts.notes;
     if (opts.assetType && !existing.assetType) existing.assetType = opts.assetType;
+    // Backfill entry price/date if this ticker was added before we tracked them.
+    if (existing.entryPrice == null && entryPrice != null && isFinite(entryPrice)) {
+      existing.entryPrice = +entryPrice;
+      if (!existing.entryDate) existing.entryDate = existing.firstFlaggedAt || now;
+    }
   }
   saveGoodGlobeIndex(idx);
 }
@@ -1150,6 +1224,164 @@ function getGoodGlobeIndexEntries() {
   return Object.values(idx).sort((a, b) =>
     (b.lastFlaggedAt || '').localeCompare(a.lastFlaggedAt || '')
   );
+}
+
+// ============================================================
+//   GOODGLOBE INDEX — EQUAL-WEIGHTED PERFORMANCE (S&P-style, equal weight)
+//
+//   The index is equal-weighted: every member contributes equally to each
+//   period's return, regardless of when it was added. A newly-added member
+//   does NOT retroactively change past performance — it joins at the current
+//   index level and participates equally GOING FORWARD. The index level
+//   compounds the daily equal-weighted member returns.
+//
+//   This matches the requested behavior: if 2 members each rise 50% in a month,
+//   the index is +50% that month; if 2 more are added and the next month the
+//   original 2 rise 50% while the new 2 are flat, that month is +25% (the equal-
+//   weighted average of 50,50,0,0), and the index compounds to 1.50 × 1.25 =
+//   +87.5% over the two months.
+//
+//   Mechanism: once per day we snapshot each member's price. The index's daily
+//   return = average of (today/yesterday − 1) across members present BOTH days
+//   (so a member added today doesn't distort today's return — it starts
+//   contributing tomorrow, from the level it joined at). The compounded series
+//   is the index level; performance % = level/100 − 1.
+// ============================================================
+const GOODGLOBE_INDEX_CURVE_KEY = 'valuatio.goodglobe.index.curve.v1';
+
+function loadIndexCurve() {
+  try { const raw = localStorage.getItem(GOODGLOBE_INDEX_CURVE_KEY); return raw ? JSON.parse(raw) : { level: [], priceSnaps: {} }; }
+  catch { return { level: [], priceSnaps: {} }; }
+}
+function saveIndexCurve(c) {
+  try { localStorage.setItem(GOODGLOBE_INDEX_CURVE_KEY, JSON.stringify(c)); } catch (e) { console.warn('[goodglobe-curve] save failed', e.message); }
+}
+
+// Which index members count toward performance: tracked/traded names (not
+// pure "Avoid"). A member needs a resolvable current price to participate.
+function _indexPerformanceMembers() {
+  const entries = getGoodGlobeIndexEntries();
+  return entries.filter(e => {
+    const flags = e.flags || [];
+    // Exclude entries that are ONLY 'Avoid' — those aren't index holdings.
+    if (flags.length === 1 && flags[0] === 'Avoid') return false;
+    return true;
+  });
+}
+
+function _currentPriceFor(tic) {
+  try {
+    const row = (typeof getStockbookRow === 'function') ? getStockbookRow(tic) : null;
+    if (row && isFinite(row.price) && row.price > 0) return row.price;
+  } catch {}
+  return null;
+}
+
+// Record today's index snapshot + advance the compounded equal-weighted level.
+// Idempotent per day (updates today's point in place if prices moved).
+function updateGoodGlobeIndexSnapshot() {
+  const members = _indexPerformanceMembers();
+  if (!members.length) return null;
+  const today = new Date().toISOString().slice(0, 10);
+  const curve = loadIndexCurve();
+  if (!curve.priceSnaps) curve.priceSnaps = {};
+  if (!Array.isArray(curve.level)) curve.level = [];
+
+  // Gather today's prices for members that have one.
+  const todayPrices = {};
+  for (const m of members) {
+    const px = _currentPriceFor(m.ticker);
+    if (px != null) todayPrices[m.ticker] = px;
+  }
+  if (!Object.keys(todayPrices).length) return null;
+
+  const prevSnap = curve.priceSnaps._last || null;  // { date, prices: {ticker:px} }
+  let dailyReturn = 0;
+  if (prevSnap && prevSnap.date !== today) {
+    // Equal-weighted daily return across members present in BOTH snapshots.
+    const both = Object.keys(todayPrices).filter(t => prevSnap.prices[t] != null && prevSnap.prices[t] > 0);
+    if (both.length) {
+      let sum = 0;
+      for (const t of both) sum += (todayPrices[t] / prevSnap.prices[t]) - 1;
+      dailyReturn = sum / both.length;
+    }
+  }
+
+  // Advance the level.
+  const lastLevel = curve.level.length ? curve.level[curve.level.length - 1].level : 100;
+  const lastDate = curve.level.length ? curve.level[curve.level.length - 1].date : null;
+  let newLevel;
+  if (lastDate === today) {
+    // Update today's point in place: recompute from yesterday's level.
+    const baseLevel = curve.level.length >= 2 ? curve.level[curve.level.length - 2].level : 100;
+    newLevel = +(baseLevel * (1 + dailyReturn)).toFixed(4);
+    curve.level[curve.level.length - 1] = { date: today, level: newLevel, members: Object.keys(todayPrices).length };
+  } else {
+    newLevel = +(lastLevel * (1 + dailyReturn)).toFixed(4);
+    curve.level.push({ date: today, level: newLevel, members: Object.keys(todayPrices).length });
+    if (curve.level.length > 1500) curve.level = curve.level.slice(-1500);
+  }
+  // Store today's prices as the new "last" snapshot for tomorrow's return.
+  curve.priceSnaps._last = { date: today, prices: todayPrices };
+  saveIndexCurve(curve);
+  return curve;
+}
+
+// Compute index performance over a window. Returns level series + return %.
+// Also computes an INSTANTANEOUS equal-weighted return from each member's own
+// entry price → current price, as a since-inception cross-check that doesn't
+// depend on daily snapshots having been recorded (useful right after adding).
+function goodGlobeIndexPerformance(windowName = 'all') {
+  const curve = updateGoodGlobeIndexSnapshot() || loadIndexCurve();
+  const series = Array.isArray(curve.level) ? curve.level.slice() : [];
+
+  // Windowed slice.
+  const winDays = { week: 7, month: 30, quarter: 91, year: 365, all: null }[windowName] ?? null;
+  let pts = series;
+  if (winDays != null && series.length) {
+    const cutoff = Date.now() - winDays * 86400000;
+    pts = series.filter(p => new Date(p.date + 'T00:00:00Z').getTime() >= cutoff);
+    if (pts.length < 2) pts = series.slice(-2);
+  }
+
+  // Since-inception equal-weighted return computed directly from entry prices —
+  // the simple "each member's return from when it was added, averaged equally."
+  // This is the honest cross-check / fallback before a daily curve accrues.
+  const members = _indexPerformanceMembers();
+  const perMember = [];
+  for (const m of members) {
+    const cur = _currentPriceFor(m.ticker);
+    if (m.entryPrice != null && m.entryPrice > 0 && cur != null) {
+      perMember.push({ ticker: m.ticker, entryPrice: m.entryPrice, current: cur,
+        returnPct: +(((cur - m.entryPrice) / m.entryPrice) * 100).toFixed(2),
+        since: m.entryDate || m.firstFlaggedAt });
+    }
+  }
+  const equalWeightSinceAdd = perMember.length
+    ? +(perMember.reduce((s, x) => s + x.returnPct, 0) / perMember.length).toFixed(2)
+    : null;
+
+  const levelNow = series.length ? series[series.length - 1].level : 100;
+  const compoundedAllTime = +((levelNow / 100 - 1) * 100).toFixed(2);
+
+  let windowReturnPct = null;
+  if (pts.length >= 2) {
+    windowReturnPct = +(((pts[pts.length - 1].level - pts[0].level) / pts[0].level) * 100).toFixed(2);
+  }
+
+  return {
+    levelSeries: pts,
+    levelNow: +levelNow.toFixed(2),
+    compoundedAllTime,        // compounded equal-weighted, from the daily curve
+    windowReturnPct,          // return over the selected window
+    equalWeightSinceAdd,      // direct entry-price-based equal-weight (cross-check)
+    perMember,                // each member's return since its own add
+    memberCount: perMember.length,
+  };
+}
+if (typeof window !== 'undefined') {
+  window.goodGlobeIndexPerformance = goodGlobeIndexPerformance;
+  window.updateGoodGlobeIndexSnapshot = updateGoodGlobeIndexSnapshot;
 }
 
 // ============================================================
@@ -1984,14 +2216,67 @@ async function loadRegimeSnapshot(baseDir) {
       return;
     }
     const data = await r.json();
-    state.marketRegime = { ...data, loadedAt: Date.now() };
-    console.log(`✓ Regime loaded: ${data.regime} · confidence ${data.confidence}`);
+    // CONSISTENCY GUARD. This function is called from multiple places with
+    // different repo base dirs (manifest registration, regime-tab open, data-
+    // source seeding). Each repo may carry a DIFFERENT regime_current.json
+    // (computed at a different time, or one is stale/failing), so without a
+    // guard the LAST fetch to resolve wins — which is why the regime flipped
+    // between refreshes (e.g. "mixed 88% / 14 transitions" ↔ "expansion 98% /
+    // 22 transitions"; those were literally two different repo files racing).
+    //
+    // Rule: keep the BEST snapshot, not the last one. A candidate replaces the
+    // current state only if the current is empty, OR the candidate is strictly
+    // newer (later as_of/date), OR (same date) the candidate observed MORE
+    // transitions (a more-complete Markov estimate is more trustworthy). We
+    // never overwrite a good snapshot with an equal-or-staler one just because
+    // its fetch happened to land second.
+    const incoming = { ...data, loadedAt: Date.now(), _sourceUrl: url };
+    const cur = state.marketRegime;
+    const keyDate = (s) => s ? (s.as_of || s.asOf || s.date || s.generated_at || s.generatedAt || '') : '';
+    const obs = (s) => {
+      if (!s) return -1;
+      // Count of observed transitions, however the pipeline labels it.
+      return s.transitions_observed ?? s.transitionsObserved ?? s.n_transitions ??
+        (s.markov && (s.markov.transitions_observed ?? s.markov.n)) ?? -1;
+    };
+    let take = false;
+    if (!cur) take = true;
+    else {
+      const dNew = keyDate(incoming), dCur = keyDate(cur);
+      if (dNew && dCur && dNew !== dCur) take = dNew > dCur;        // strictly newer date wins
+      else if (obs(incoming) !== obs(cur)) take = obs(incoming) > obs(cur);  // same/again → more transitions wins
+      else take = false;                                            // truly equivalent → keep current (stable)
+    }
+    if (!take) {
+      console.log(`↩ Regime snapshot from ${url.slice(-48)} ignored — current (${keyDate(cur)}, ${obs(cur)} transitions) is as-good-or-better than candidate (${keyDate(incoming)}, ${obs(incoming)} transitions). Holding steady.`);
+      return;
+    }
+    state.marketRegime = incoming;
+    console.log(`✓ Regime loaded: ${data.regime} · confidence ${data.confidence} · ${obs(incoming)} transitions · ${keyDate(incoming) || 'no date'} (from ${url.slice(-48)})`);
     renderRegimeBadge();
     renderRegimeDashboard();
   } catch (e) {
     console.warn('Regime load failed:', e.message);
   }
 }
+// The ONE canonical regime source. The bot/badge/dashboard should all read the
+// same file so the regime is identical everywhere. Defaults to the analytics
+// repo (where compute_regime.py writes), overridable if the data base differs.
+const CANONICAL_REGIME_BASE = 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-ANALYTICS/main/data/';
+let _regimeLoadStarted = false;
+async function loadRegimeCanonical() {
+  // Load the regime ONCE from the canonical source. Idempotent — repeated tab
+  // switches / refreshes won't re-fetch or risk a flip. Falls back to the
+  // history-manifest base only if the canonical fetch yields nothing.
+  if (_regimeLoadStarted && state.marketRegime) return;
+  _regimeLoadStarted = true;
+  await loadRegimeSnapshot(CANONICAL_REGIME_BASE);
+  if (!state.marketRegime && state._historyManifest?.baseUrl) {
+    const baseDir = state._historyManifest.baseUrl.replace(/\/history\/?$/, '/');
+    await loadRegimeSnapshot(baseDir);
+  }
+}
+if (typeof window !== 'undefined') window.loadRegimeCanonical = loadRegimeCanonical;
 
 // ============================================================
 //   REGIME DASHBOARD — Phase 3 of TRAPP2 roadmap
@@ -2021,14 +2306,23 @@ function renderRegimeDashboard() {
   // Display computed_at in the USER'S LOCAL TIME (not UTC). Otherwise the timestamp
   // looks like the workflow ran in the user's afternoon when it actually ran at 4:30 UTC.
   let computed = '';
+  let _staleNote = '';
   if (r.computed_at) {
     try {
       const d = new Date(r.computed_at.endsWith('Z') ? r.computed_at : r.computed_at + 'Z');
       computed = d.toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' });
+      // Honest staleness flag: the regime pipeline runs nightly, so anything
+      // older than ~48h means the backend compute likely failed/skipped and the
+      // displayed regime is stale — say so rather than presenting an old call as
+      // current. This is the transparency the "be honest" ask is about.
+      const ageH = (Date.now() - d.getTime()) / 3600000;
+      if (ageH > 48) _staleNote = ` ⚠ ${Math.round(ageH / 24)}d old — backend may have failed; treat as stale`;
+      else if (ageH > 30) _staleNote = ' · >1 day old';
     } catch {
       computed = r.computed_at.replace('T', ' ').slice(0, 16);
     }
   }
+  if (_staleNote) computed += _staleNote;
 
   // Hero
   hero.innerHTML = `
@@ -2910,6 +3204,28 @@ document.addEventListener('DOMContentLoaded', () => {
     if (typeof renderBetsTab === 'function') renderBetsTab();
     if (typeof renderTodaysBetsBanner === 'function') renderTodaysBetsBanner();
   });
+  document.getElementById('bets-refresh-btn')?.addEventListener('click', async () => {
+    const btn = document.getElementById('bets-refresh-btn');
+    if (btn) { btn.textContent = 'Refreshing…'; btn.disabled = true; }
+    try { if (typeof botRefreshLiveQuotes === 'function') await botRefreshLiveQuotes(); }
+    catch (e) { console.warn('[bot] price refresh failed', e); }
+    if (btn) { btn.textContent = 'Refresh Prices'; btn.disabled = false; }
+  });
+  document.getElementById('bets-retrain-btn')?.addEventListener('click', () => {
+    if (typeof botRetrain !== 'function') return;
+    const w = botRetrain();
+    // Show what was learned: the top up/down-weighted signals.
+    try {
+      const entries = Object.entries(w || {}).filter(([,v]) => isFinite(v));
+      entries.sort((a, b) => b[1] - a[1]);
+      const top = entries.slice(0, 3).map(([k,v]) => `${k} ×${v.toFixed(2)}`).join(', ');
+      const bot = entries.slice(-3).map(([k,v]) => `${k} ×${v.toFixed(2)}`).join(', ');
+      if (typeof flashStatus === 'function' && entries.length) {
+        flashStatus(`Retrained. Most trusted: ${top}. Least: ${bot}`, 'success');
+      }
+    } catch {}
+    if (typeof renderBetsTab === 'function') renderBetsTab();
+  });
   let _betsFilterTimer = null;
   document.getElementById('bets-filter')?.addEventListener('input', () => {
     clearTimeout(_betsFilterTimer);
@@ -3131,11 +3447,34 @@ async function fetchHistoryManifest(url) {
     else if (Array.isArray(data?.tickers)) tickers = data.tickers;
     else if (data && typeof data === 'object') tickers = Object.keys(data);
     if (!Array.isArray(tickers) || tickers.length === 0) return null;
+    // Stash per-ticker coverage spans ({first,last,rows}) from the 20-year
+    // manifest so the app knows each ticker's real history depth — used to show
+    // coverage and to gate inflation-adjusted trend analysis (a ticker with only
+    // 2 years of data shouldn't get a "20-year trend" grade).
+    if (data?.by_ticker && typeof data.by_ticker === 'object') {
+      state._historyManifest = state._historyManifest || {};
+      state._historyManifest.spans = {};
+      for (const [t, span] of Object.entries(data.by_ticker)) {
+        state._historyManifest.spans[String(t).toUpperCase().trim()] = span;
+      }
+      if (data.years) state._historyManifest.years = data.years;
+    }
     return tickers.map(t => String(t).toUpperCase().trim()).filter(Boolean);
   } catch (e) {
     return null;
   }
 }
+
+// How many years of history do we actually have for a ticker (from the manifest
+// span)? Returns null if unknown. Used to decide whether long-trend analysis is
+// meaningful for this ticker.
+function tickerHistoryYears(ticker) {
+  const span = state._historyManifest?.spans?.[String(ticker || '').toUpperCase().trim()];
+  if (!span || !span.first || !span.last) return null;
+  const yrs = (new Date(span.last) - new Date(span.first)) / (365.25 * 86400000);
+  return isFinite(yrs) ? yrs : null;
+}
+if (typeof window !== 'undefined') window.tickerHistoryYears = tickerHistoryYears;
 
 async function fetchRawCsv(url) {
   const r = await fetchWithBranchFallback(url);
@@ -3222,10 +3561,10 @@ async function fetchAnyDataSource(url) {
         state._historyManifest.baseUrl = baseUrl;
         state._historyManifest.tickers = new Set(tickers);
         state._historyManifest.registeredUrl = url;
-        // Also try to fetch regime snapshot from the same directory.
-        // Runs in background — doesn't block manifest registration.
+        // Load the regime from its ONE canonical source (not this manifest's
+        // repo) so it's identical everywhere and can't flip between refreshes.
         setTimeout(() => {
-          loadRegimeSnapshot(manifestDir).catch(() => {});
+          loadRegimeCanonical().catch(() => {});
         }, 200);
         console.log(`✓ History manifest registered: ${tickers.length} tickers · base=${baseUrl}`);
         setTimeout(() => {
@@ -8225,6 +8564,84 @@ if (typeof window !== 'undefined') {
   window.realCAGR = realCAGR;
 }
 
+// ===== LONG-TERM PRICE TREND ANALYSIS (uses 20yr history + inflation) =====
+// Turns a ticker's long price history into a durability/trend read that the
+// grade and company tab can use. Computes NOMINAL and REAL (inflation-adjusted)
+// price CAGR over the available window, plus a consistency measure (how steady
+// the climb was vs. how much it round-tripped). This is the analysis that only
+// becomes meaningful with long history — and it's honest about young tickers:
+// if there's under ~3 years of data it returns {sufficient:false} so callers
+// don't fake a "20-year trend" for a recent IPO.
+//
+// Returns: { sufficient, years, nominalCAGR, realCAGR, maxDrawdown,
+//            consistency (0-1), trend ('strong-up'|'up'|'flat'|'down'),
+//            note }  — or { sufficient:false, years } when history is too short.
+async function analyzeLongTermTrend(ticker) {
+  const tk = String(ticker || '').toUpperCase();
+  const hist = (typeof getHistoryForTicker === 'function') ? getHistoryForTicker(tk) : null;
+  if (!hist || hist.length < 30) return { sufficient: false, years: 0, note: 'No history loaded' };
+  // Normalize to {date, value} using close.
+  const series = hist.map(p => ({ date: p.date, value: p.close ?? p.price })).filter(p => p.date && isFinite(p.value) && p.value > 0);
+  if (series.length < 30) return { sufficient: false, years: 0, note: 'Sparse history' };
+  series.sort((a, b) => a.date.localeCompare(b.date));
+  const years = (new Date(series[series.length - 1].date) - new Date(series[0].date)) / (365.25 * 86400000);
+  if (years < 3) return { sufficient: false, years: +years.toFixed(1), note: 'Under 3 years of history — long-term trend not meaningful (likely a recent IPO/listing)' };
+
+  // Nominal CAGR.
+  const first = series[0], last = series[series.length - 1];
+  const nominalCAGR = Math.pow(last.value / first.value, 1 / years) - 1;
+
+  // Real (inflation-adjusted) CAGR via CPI deflation.
+  let realCAGRVal = null;
+  try {
+    const cpi = await getCpiIndex();
+    if (cpi) realCAGRVal = realCAGR(series, cpi);
+  } catch {}
+
+  // Max drawdown over the window (peak-to-trough), a durability signal.
+  let peak = series[0].value, maxDD = 0;
+  for (const p of series) {
+    if (p.value > peak) peak = p.value;
+    const dd = (peak - p.value) / peak;
+    if (dd > maxDD) maxDD = dd;
+  }
+
+  // Consistency: fraction of the window spent making new highs vs. recovering.
+  // A steady climber spends most time at/near highs; a round-tripper doesn't.
+  let nearHighDays = 0;
+  peak = series[0].value;
+  for (const p of series) {
+    if (p.value > peak) peak = p.value;
+    if (p.value >= peak * 0.9) nearHighDays++;  // within 10% of running peak
+  }
+  const consistency = nearHighDays / series.length;
+
+  // Classify the trend on the REAL return when available (else nominal).
+  const c = realCAGRVal != null ? realCAGRVal : nominalCAGR;
+  let trend;
+  if (c > 0.10 && consistency > 0.5) trend = 'strong-up';
+  else if (c > 0.02) trend = 'up';
+  else if (c > -0.02) trend = 'flat';
+  else trend = 'down';
+
+  const pct = v => v == null ? '—' : (v * 100).toFixed(1) + '%';
+  const note = `${years.toFixed(0)}y · nominal ${pct(nominalCAGR)}/yr` +
+    (realCAGRVal != null ? ` · real ${pct(realCAGRVal)}/yr (inflation-adj)` : '') +
+    ` · max drawdown ${pct(maxDD)}`;
+
+  return {
+    sufficient: true,
+    years: +years.toFixed(1),
+    nominalCAGR: +nominalCAGR.toFixed(4),
+    realCAGR: realCAGRVal != null ? +realCAGRVal.toFixed(4) : null,
+    maxDrawdown: +maxDD.toFixed(4),
+    consistency: +consistency.toFixed(2),
+    trend,
+    note,
+  };
+}
+if (typeof window !== 'undefined') window.analyzeLongTermTrend = analyzeLongTermTrend;
+
 async function fetchMacroData(forceRefresh = false) {
   if (!forceRefresh) {
     const cached = loadMacroCache();
@@ -9190,10 +9607,9 @@ function switchTab(tabName) {
   // Auto-render regime dashboard on tab open (in case state was loaded before tab was visible)
   if (tabName === 'regime') {
     renderRegimeDashboard();
-    // If no regime data yet, try to load it now (sources might have come online after init)
-    if (!state.marketRegime && state._historyManifest?.baseUrl) {
-      const baseDir = state._historyManifest.baseUrl.replace(/\/history\/?$/, '/');
-      loadRegimeSnapshot(baseDir).catch(() => {});
+    // If no regime data yet, load it from the canonical source (idempotent).
+    if (!state.marketRegime) {
+      loadRegimeCanonical().catch(() => {});
     }
   }
 
@@ -16501,6 +16917,9 @@ document.querySelectorAll('.val-subtab').forEach(btn => {
       // Render the Company subpanel — pulls from state.stock + canonical stockbook row
       if (typeof onCompanyTabActive === 'function') onCompanyTabActive();
     }
+    if (subtab === 'activity') {
+      if (typeof onActivityTabActive === 'function') onActivityTabActive();
+    }
   });
 });
 
@@ -23320,6 +23739,15 @@ function wirePortfolioRowEvents() {
 // ============================================================
 function renderGoodGlobeIndexView(content, summary, subTabs) {
   const entries = (typeof getGoodGlobeIndexEntries === 'function') ? getGoodGlobeIndexEntries() : [];
+  // Per-member live return % since each was added (equal-weight index members).
+  // Built once here so each row can show its contribution to the index.
+  let _memberReturns = {};
+  try {
+    const _perf = (typeof goodGlobeIndexPerformance === 'function') ? goodGlobeIndexPerformance(state.goodglobeView?.perfWindow || 'all') : null;
+    if (_perf && Array.isArray(_perf.perMember)) {
+      for (const pm of _perf.perMember) _memberReturns[pm.ticker] = pm;
+    }
+  } catch {}
 
   // Tally counts
   const byAssetType = {};
@@ -23388,15 +23816,23 @@ function renderGoodGlobeIndexView(content, summary, subTabs) {
       ? `<span style="color:${plColor};font-weight:600">${e.realizedPL >= 0 ? '+' : ''}$${Math.abs(e.realizedPL) >= 1000 ? (e.realizedPL/1000).toFixed(1) + 'k' : e.realizedPL.toFixed(2)}</span>`
         + `<br><span style="font-size:8px;color:var(--ink-faint)">${e.tradeCount} trade${e.tradeCount === 1 ? '' : 's'}${e.winRate != null ? ` · ${Math.round(e.winRate * 100)}% win` : ''}</span>`
       : '<span style="color:var(--ink-faint)">—</span>';
+    // Live "% since added" — this member's contribution to the equal-weighted
+    // index, measured from its entry price to the current price.
+    const mr = _memberReturns[e.ticker];
+    const sinceColor = !mr ? 'var(--ink-faint)' : mr.returnPct >= 0 ? 'var(--pos)' : 'var(--neg)';
+    const sinceCell = mr
+      ? `<span style="color:${sinceColor};font-weight:700">${mr.returnPct >= 0 ? '+' : ''}${mr.returnPct}%</span>`
+        + `<br><span style="font-size:8px;color:var(--ink-faint)">$${mr.entryPrice} → $${mr.current}</span>`
+      : '<span style="color:var(--ink-faint)">—</span>';
     return `
       <tr>
-        <td><strong style="color:var(--amber);font-family:var(--mono)">${escapeHtml(e.ticker)}</strong></td>
+        <td><strong class="gg-ticker-link" data-tic="${escapeHtml(e.ticker)}" style="color:var(--amber);font-family:var(--mono);cursor:pointer;text-decoration:underline;text-decoration-style:dotted" title="Open ${escapeHtml(e.ticker)} in Valuation">${escapeHtml(e.ticker)}</strong></td>
         <td><span class="gg-asset-pill">${escapeHtml(e.assetType || 'equity')}</span></td>
         <td>${flagsBadges || '<span style="color:var(--ink-faint)">—</span>'}</td>
+        <td style="font-family:var(--mono);font-size:10px">${sinceCell}</td>
         <td style="font-family:var(--mono);font-size:10px">${plCell}</td>
         <td style="font-family:var(--mono);font-size:10px;color:var(--ink-dim)">${firstDate}</td>
         <td style="font-family:var(--mono);font-size:10px;color:var(--ink-dim)">${lastDate}</td>
-        <td style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${escapeHtml(e.source || '—')}</td>
         <td>
           <button class="btn btn-ghost gg-row-remove" data-tic="${escapeHtml(e.ticker)}" title="Remove from GoodGlobe Index (does NOT affect portfolio positions)">×</button>
         </td>
@@ -23405,6 +23841,48 @@ function renderGoodGlobeIndexView(content, summary, subTabs) {
   }).join('');
 
   content.innerHTML = summary + subTabs + `
+    ${(() => {
+      // ===== EQUAL-WEIGHTED INDEX PERFORMANCE PANEL =====
+      const perf = (typeof goodGlobeIndexPerformance === 'function') ? goodGlobeIndexPerformance(state.goodglobeView?.perfWindow || 'all') : null;
+      if (!perf || perf.memberCount === 0) {
+        return `<div class="company-card" style="margin:0 0 14px"><div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);padding:6px 0">Index performance tracks once members with an entry price are added. Add tickers via Tracking/Trading and a price is captured at add time; the equal-weighted index builds from there.</div></div>`;
+      }
+      const win = state.goodglobeView?.perfWindow || 'all';
+      const allTimePct = perf.compoundedAllTime != null && perf.levelSeries.length >= 2 ? perf.compoundedAllTime : perf.equalWeightSinceAdd;
+      const c = allTimePct == null ? 'var(--ink-dim)' : allTimePct >= 0 ? 'var(--pos)' : 'var(--neg)';
+      // Mini equity curve of the index level.
+      let chart = '';
+      const pts = perf.levelSeries;
+      if (pts.length >= 2) {
+        const vals = pts.map(p => p.level);
+        const lo = Math.min(...vals, 100), hi = Math.max(...vals, 100);
+        const pad = (hi - lo) * 0.1 || 5; const L = lo - pad, H = hi + pad;
+        const W = 600, HT = 90;
+        const x = i => pts.length > 1 ? (i / (pts.length - 1)) * W : 0;
+        const y = v => HT - ((v - L) / (H - L)) * HT;
+        const line = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(p.level).toFixed(1)}`).join(' ');
+        const baseY = y(100);
+        const up = pts[pts.length - 1].level >= 100;
+        chart = `<svg viewBox="0 0 ${W} ${HT}" preserveAspectRatio="none" style="width:100%;height:90px;display:block;margin-top:8px">
+          ${(100 >= L && 100 <= H) ? `<line x1="0" y1="${baseY.toFixed(1)}" x2="${W}" y2="${baseY.toFixed(1)}" stroke="var(--ink-faint)" stroke-width="1" stroke-dasharray="4,4" opacity="0.5"/><text x="4" y="${(baseY-3).toFixed(1)}" font-family="monospace" font-size="8" fill="var(--ink-faint)" opacity="0.7">100 base</text>` : ''}
+          <path d="${line}" fill="none" stroke="${up ? 'var(--pos)' : 'var(--neg)'}" stroke-width="2"/>
+        </svg>`;
+      }
+      return `<div class="company-card" style="margin:0 0 14px;border-left:3px solid ${c}">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+          <div>
+            <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">GoodGlobe Index · equal-weighted · ${perf.memberCount} members</div>
+            <div style="font-family:var(--mono);font-size:26px;font-weight:800;color:${c};margin-top:2px">${allTimePct >= 0 ? '+' : ''}${allTimePct}%<span style="font-size:12px;color:var(--ink-dim);font-weight:400"> all-time · level ${perf.levelNow}</span></div>
+            ${win !== 'all' && perf.windowReturnPct != null ? `<div style="font-family:var(--mono);font-size:11px;color:${perf.windowReturnPct>=0?'var(--pos)':'var(--neg)'}">${perf.windowReturnPct >= 0 ? '+' : ''}${perf.windowReturnPct}% this ${win}</div>` : ''}
+          </div>
+          <div class="seg-control" style="font-size:10px">
+            ${['week','month','quarter','year','all'].map(w => `<button class="seg-btn ${win===w?'active':''}" data-ggperfwin="${w}" style="font-size:10px;text-transform:capitalize">${w==='all'?'All':w==='week'?'1W':w==='month'?'1M':w==='quarter'?'1Q':'1Y'}</button>`).join('')}
+          </div>
+        </div>
+        ${chart}
+        <div style="font-family:var(--mono);font-size:8px;color:var(--ink-faint);margin-top:6px;opacity:0.8">Equal-weighted: every member counts the same; new members join at the current level (no retroactive effect) and compound forward. Direct entry-price average: ${perf.equalWeightSinceAdd >= 0 ? '+' : ''}${perf.equalWeightSinceAdd}%.</div>
+      </div>`;
+    })()}
     <div class="gg-toolbar">
       <input type="text" class="gg-search" id="gg-search" placeholder="Search tickers…" value="${escapeHtml(gv.search)}">
       ${flagDropdown}
@@ -23434,10 +23912,10 @@ function renderGoodGlobeIndexView(content, summary, subTabs) {
                 <th>Ticker</th>
                 <th>Asset Type</th>
                 <th>Flags</th>
+                <th title="Live return since this ticker entered the index (entry price → current). This is its contribution to the equal-weighted index.">Since Added</th>
                 <th title="Lifetime realized P/L from closed trades — shorts and options (premium × 100) included">Realized P/L</th>
                 <th>First Flagged</th>
                 <th>Last Flagged</th>
-                <th>Source</th>
                 <th></th>
               </tr>
             </thead>
@@ -23520,6 +23998,21 @@ function renderGoodGlobeIndexView(content, summary, subTabs) {
   });
 
   // Per-row remove
+  // Click a GoodGlobe Index ticker → open it in the Valuation tab.
+  document.querySelectorAll('.gg-ticker-link').forEach(el => {
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const tk = el.dataset.tic;
+      if (!tk) return;
+      if (typeof executeCommand === 'function') executeCommand(tk);
+      else {
+        const inp = document.getElementById('ticker');
+        if (inp) inp.value = tk;
+        if (typeof switchTab === 'function') switchTab('valuation');
+        setTimeout(() => document.getElementById('fetch-btn')?.click(), 100);
+      }
+    });
+  });
   document.querySelectorAll('.gg-row-remove').forEach(btn => {
     btn.addEventListener('click', () => {
       const tic = btn.dataset.tic;
@@ -30119,6 +30612,336 @@ function saveNewsCache(items) {
 
 // Fetch news from Finnhub for a single ticker.
 // Finnhub already returns a summary field; we use it directly.
+// ============================================================
+//   SOCIAL ACTIVITY — live social-media sentiment for a ticker.
+//
+//   HONEST PLATFORM REALITY (why only some sources exist):
+//   • StockTwits — public JSON API, CORS-friendly, returns recent messages WITH
+//     each author's own bull/bear tag. This is the best signal for "cult
+//     following" (message volume) and crowd lean (bull:bear ratio). ✓ supported
+//   • Reddit — public JSON search API, CORS-friendly (rate-limited). ✓ supported
+//   • X/Twitter — API is paid ($100+/mo) and blocks browser calls. ✗ not possible
+//   • TikTok — no public API, blocks scraping. ✗ not possible
+//
+//   STORAGE: none. Social data is real-time and ephemeral, so it is fetched live
+//   when the user opens a ticker's Activity tab and discarded — never persisted
+//   to the front end. (A backend repo would only be needed to chart sentiment
+//   OVER TIME; that's a separate phase and not required for live display.)
+//
+//   Each fetcher returns a normalized array of activity items:
+//   { platform, author, text, url, datetime, sentiment, sentimentSource, likes }
+// ============================================================
+
+// StockTwits: recent messages for a symbol. Their API tags many messages with
+// the author's chosen bull/bear sentiment — we prefer that, falling back to our
+// lexicon for untagged messages.
+async function fetchStockTwits(ticker) {
+  const t = String(ticker || '').toUpperCase().replace(/\..*$/, '');  // ST uses bare US symbols
+  if (!t) return null;
+  const url = `https://api.stocktwits.com/api/2/streams/symbol/${encodeURIComponent(t)}.json`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) {
+      // 404 = no symbol stream; 429 = rate-limited. Either way, soft-fail.
+      return { platform: 'stocktwits', available: r.status !== 404, items: [], error: `HTTP ${r.status}` };
+    }
+    const j = await r.json();
+    const msgs = Array.isArray(j?.messages) ? j.messages : [];
+    const items = msgs.map(m => {
+      // StockTwits author sentiment: m.entities.sentiment.basic = "Bullish"|"Bearish"|null
+      const stSent = m?.entities?.sentiment?.basic;
+      let sentiment, sentimentSource;
+      if (stSent === 'Bullish') { sentiment = 'bullish'; sentimentSource = 'author'; }
+      else if (stSent === 'Bearish') { sentiment = 'bearish'; sentimentSource = 'author'; }
+      else {
+        // Untagged → score with our learnable lexicon.
+        const s = (typeof extractSentiment === 'function') ? extractSentiment(m.body || '') : { label: 'neutral' };
+        sentiment = s.label; sentimentSource = 'lexicon';
+      }
+      return {
+        platform: 'stocktwits',
+        author: m?.user?.username || 'anon',
+        authorFollowers: m?.user?.followers ?? null,
+        text: m?.body || '',
+        url: m?.id ? `https://stocktwits.com/message/${m.id}` : (m?.user?.username ? `https://stocktwits.com/${m.user.username}` : '#'),
+        datetime: m?.created_at ? new Date(m.created_at).getTime() : Date.now(),
+        sentiment,
+        sentimentSource,
+        likes: m?.likes?.total ?? 0,
+      };
+    });
+    return { platform: 'stocktwits', available: true, items, symbol: t };
+  } catch (e) {
+    return { platform: 'stocktwits', available: false, items: [], error: e.message };
+  }
+}
+
+// Reddit: search recent posts mentioning the ticker across investing subs.
+// Public .json endpoint; rate-limited but CORS-OK.
+async function fetchRedditMentions(ticker, companyName) {
+  const t = String(ticker || '').toUpperCase().replace(/\..*$/, '');
+  if (!t) return null;
+  // Search the big investing subs; cashtag OR name to catch both conventions.
+  const q = encodeURIComponent(`$${t} OR "${t}"${companyName ? ` OR "${companyName}"` : ''}`);
+  const subs = 'wallstreetbets+stocks+investing+StockMarket';
+  const url = `https://www.reddit.com/r/${subs}/search.json?q=${q}&restrict_sr=1&sort=new&limit=25&t=week`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return { platform: 'reddit', available: false, items: [], error: `HTTP ${r.status}` };
+    const j = await r.json();
+    const children = j?.data?.children || [];
+    const items = children.map(c => {
+      const d = c.data || {};
+      const text = `${d.title || ''} ${d.selftext || ''}`.trim();
+      const s = (typeof extractSentiment === 'function') ? extractSentiment(text) : { label: 'neutral' };
+      return {
+        platform: 'reddit',
+        author: d.author || 'anon',
+        subreddit: d.subreddit_name_prefixed || ('r/' + (d.subreddit || '')),
+        text: d.title || '',
+        body: (d.selftext || '').slice(0, 280),
+        url: d.permalink ? `https://www.reddit.com${d.permalink}` : (d.url || '#'),
+        datetime: d.created_utc ? d.created_utc * 1000 : Date.now(),
+        sentiment: s.label,
+        sentimentSource: 'lexicon',
+        likes: d.ups ?? 0,
+        comments: d.num_comments ?? 0,
+      };
+    });
+    return { platform: 'reddit', available: true, items };
+  } catch (e) {
+    return { platform: 'reddit', available: false, items: [], error: e.message };
+  }
+}
+
+// Aggregate social activity for a ticker across available platforms, compute the
+// crowd-sentiment summary, and derive a "social presence / cult-following" read.
+// This is the signal that matters for shorting: a huge, lopsidedly-bullish, loud
+// retail base (TSLA, GME, etc.) makes a short far more dangerous (squeeze risk),
+// regardless of fundamentals.
+async function fetchSocialActivity(ticker, companyName) {
+  const [st, rd] = await Promise.all([
+    fetchStockTwits(ticker).catch(() => null),
+    fetchRedditMentions(ticker, companyName).catch(() => null),
+  ]);
+  const items = [];
+  if (st?.items) items.push(...st.items);
+  if (rd?.items) items.push(...rd.items);
+  items.sort((a, b) => b.datetime - a.datetime);
+
+  // Sentiment tallies.
+  let bull = 0, bear = 0, neutral = 0;
+  for (const it of items) {
+    if (it.sentiment === 'bullish') bull++;
+    else if (it.sentiment === 'bearish') bear++;
+    else neutral++;
+  }
+  const directional = bull + bear;
+  const bullPct = directional ? Math.round((bull / directional) * 100) : null;
+
+  // Social presence score (0-100): volume + how lopsided the crowd is. High
+  // volume + lopsided bullish = the classic cult signature.
+  const volume = items.length;
+  const volumeScore = Math.min(100, (volume / 50) * 100);   // 50+ recent posts = max volume
+  const lopsided = directional ? Math.abs((bull - bear) / directional) : 0;  // 0 balanced, 1 one-sided
+  const presenceScore = Math.round(volumeScore * 0.6 + lopsided * 40);
+
+  // Cult flag: loud AND lopsided. Tuned to flag TSLA/GME-style bases.
+  const isCultLike = volume >= 25 && lopsided >= 0.5;
+  const cultDirection = bull >= bear ? 'bullish' : 'bearish';
+
+  return {
+    items,
+    counts: { bull, bear, neutral, total: volume },
+    bullPct,
+    presenceScore,
+    isCultLike,
+    cultDirection,
+    sources: {
+      stocktwits: st ? { available: st.available, count: st.items?.length || 0, error: st.error || null } : null,
+      reddit: rd ? { available: rd.available, count: rd.items?.length || 0, error: rd.error || null } : null,
+    },
+  };
+}
+if (typeof window !== 'undefined') {
+  window.fetchSocialActivity = fetchSocialActivity;
+  window.fetchStockTwits = fetchStockTwits;
+}
+
+// ============================================================
+//   ACTIVITY TAB — news + social for the currently-valuating ticker.
+//   Flips between News (existing per-ticker news) and Social (live StockTwits +
+//   Reddit). Nothing is persisted; social is fetched on open and on refresh.
+// ============================================================
+const ACTIVITY_STATE = { mode: 'news', ticker: null, social: null, socialLoading: false };
+
+// Small relative-time formatter for activity items ("3m", "5h", "2d").
+function timeAgo(ms) {
+  if (!ms || !isFinite(ms)) return '';
+  const s = Math.max(0, (Date.now() - ms) / 1000);
+  if (s < 60) return Math.floor(s) + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm';
+  if (s < 86400) return Math.floor(s / 3600) + 'h';
+  if (s < 86400 * 30) return Math.floor(s / 86400) + 'd';
+  return new Date(ms).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+function onActivityTabActive() {
+  const ticker = state.stock?.ticker || null;
+  const label = document.getElementById('activity-ticker-label');
+  if (label) label.textContent = ticker ? `${ticker} · ${ACTIVITY_STATE.mode === 'news' ? 'news' : 'social mentions'}` : '';
+  ACTIVITY_STATE.ticker = ticker;
+  // Wire the toggle + refresh once.
+  if (!ACTIVITY_STATE._wired) {
+    ACTIVITY_STATE._wired = true;
+    document.querySelectorAll('#activity-toggle [data-activity]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        ACTIVITY_STATE.mode = btn.dataset.activity;
+        document.querySelectorAll('#activity-toggle [data-activity]').forEach(b => b.classList.toggle('active', b === btn));
+        renderActivityTab();
+      });
+    });
+    document.getElementById('activity-refresh')?.addEventListener('click', () => {
+      if (ACTIVITY_STATE.mode === 'social') { ACTIVITY_STATE.social = null; }  // force re-fetch
+      renderActivityTab(true);
+    });
+  }
+  renderActivityTab();
+}
+
+function renderActivityTab(forceSocial = false) {
+  const body = document.getElementById('activity-body');
+  if (!body) return;
+  const ticker = state.stock?.ticker || null;
+  const label = document.getElementById('activity-ticker-label');
+  if (label) label.textContent = ticker ? `${ticker} · ${ACTIVITY_STATE.mode === 'news' ? 'news' : 'social mentions'}` : '';
+  if (!ticker) {
+    body.innerHTML = `<div class="empty-state" style="padding:40px;text-align:center;color:var(--ink-dim);font-family:var(--mono);font-size:11px">Load a ticker to see news &amp; social activity</div>`;
+    return;
+  }
+
+  if (ACTIVITY_STATE.mode === 'news') {
+    renderActivityNews(body, ticker);
+  } else {
+    renderActivitySocial(body, ticker, forceSocial);
+  }
+}
+
+// NEWS mode: reuse the per-ticker news already fetched for the company view.
+function renderActivityNews(body, ticker) {
+  let items = (state.news?.items || []).filter(a => a.ticker === ticker && !a._suppressed);
+  items.sort((a, b) => (b.datetime || 0) - (a.datetime || 0));
+  if (!items.length) {
+    body.innerHTML = `<div class="empty-state" style="padding:32px;text-align:center;color:var(--ink-dim);font-family:var(--mono);font-size:11px">
+      No news loaded for ${ticker} yet.${getFinnhubKey() ? ' Try refreshing — news loads from Finnhub per ticker.' : ' Add a Finnhub key in Data Sources to pull company news.'}
+    </div>`;
+    // Try to fetch this ticker's news on demand.
+    if (getFinnhubKey() && typeof fetchFinnhubNews === 'function') {
+      fetchFinnhubNews(ticker, 14).then(arr => {
+        if (arr && arr.length) {
+          const seen = new Set((state.news.items || []).map(a => a.id));
+          for (const a of arr) { if (!seen.has(a.id)) { applyArticleFix?.(a); state.news.items.push(a); } }
+          if (state.valSubtab === 'activity' && ACTIVITY_STATE.mode === 'news') renderActivityTab();
+        }
+      }).catch(() => {});
+    }
+    return;
+  }
+  const rows = items.slice(0, 40).map(a => {
+    const when = a.datetime ? timeAgo(a.datetime) : '';
+    const sentBadge = a.sentiment
+      ? `<span style="font-family:var(--mono);font-size:8px;color:${a.sentiment==='bullish'?'var(--pos)':a.sentiment==='bearish'?'var(--neg)':'var(--ink-faint)'}">${a.sentiment==='bullish'?'▲':a.sentiment==='bearish'?'▼':'·'} ${a.sentiment}</span>`
+      : '';
+    return `<a href="${escapeHtml(a.url||'#')}" target="_blank" rel="noopener" style="display:block;padding:12px 0;border-bottom:1px solid var(--rule);text-decoration:none">
+      <div style="display:flex;justify-content:space-between;gap:12px;align-items:baseline">
+        <span style="color:var(--ink);font-size:13px;line-height:1.4;flex:1">${escapeHtml(a.headline||'')}</span>
+        ${sentBadge}
+      </div>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:4px">${escapeHtml(a.source||'')} · ${when}</div>
+      ${a.summary ? `<div style="color:var(--ink-dim);font-size:11px;line-height:1.5;margin-top:6px">${escapeHtml(a.summary.slice(0,200))}${a.summary.length>200?'…':''}</div>` : ''}
+    </a>`;
+  }).join('');
+  body.innerHTML = `<div style="max-width:760px">${rows}</div>`;
+}
+
+// SOCIAL mode: live StockTwits + Reddit, with the cult-following read up top.
+function renderActivitySocial(body, ticker, force) {
+  // Fetch once per ticker unless forced.
+  if (force || !ACTIVITY_STATE.social || ACTIVITY_STATE.social._ticker !== ticker) {
+    if (!ACTIVITY_STATE.socialLoading) {
+      ACTIVITY_STATE.socialLoading = true;
+      body.innerHTML = `<div class="empty-state" style="padding:40px;text-align:center;color:var(--ink-dim);font-family:var(--mono);font-size:11px">Loading social activity for ${ticker}…</div>`;
+      const name = state.stock?.name || null;
+      fetchSocialActivity(ticker, name).then(res => {
+        res._ticker = ticker;
+        ACTIVITY_STATE.social = res;
+        ACTIVITY_STATE.socialLoading = false;
+        if (state.valSubtab === 'activity' && ACTIVITY_STATE.mode === 'social') renderActivitySocial(body, ticker, false);
+      }).catch(() => {
+        ACTIVITY_STATE.socialLoading = false;
+        body.innerHTML = `<div class="empty-state" style="padding:32px;text-align:center;color:var(--neg);font-family:var(--mono);font-size:11px">Social fetch failed. The platforms may be rate-limiting or unreachable from the browser.</div>`;
+      });
+    }
+    return;
+  }
+
+  const s = ACTIVITY_STATE.social;
+  const stOk = s.sources?.stocktwits?.available;
+  const rdOk = s.sources?.reddit?.available;
+
+  // Cult / presence header.
+  const presenceColor = s.presenceScore >= 70 ? 'var(--amber)' : s.presenceScore >= 40 ? 'var(--ink)' : 'var(--ink-dim)';
+  const cultBanner = s.isCultLike
+    ? `<div style="background:rgba(224,176,76,0.12);border:1px solid var(--amber);border-radius:6px;padding:10px 12px;margin-bottom:14px;font-family:var(--mono);font-size:11px;color:var(--amber);line-height:1.5">
+        ⚡ <strong>Cult-like ${s.cultDirection} following detected.</strong> High social volume with a strongly one-sided crowd. ${s.cultDirection === 'bullish' ? 'For a SHORT, this is a squeeze-risk warning — a loud, loyal retail base can run a stock against fundamentals.' : 'Heavy bearish chatter — watch for capitulation or contrarian setups.'}
+      </div>`
+    : '';
+
+  const bullPct = s.bullPct;
+  const summary = `<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px">
+    <div class="company-card" style="margin:0;flex:1;min-width:130px">
+      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.05em">Social presence</div>
+      <div style="font-family:var(--mono);font-size:22px;font-weight:800;color:${presenceColor};margin-top:3px">${s.presenceScore}<span style="font-size:11px;color:var(--ink-faint)">/100</span></div>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">${s.counts.total} recent posts</div>
+    </div>
+    <div class="company-card" style="margin:0;flex:1;min-width:130px">
+      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.05em">Crowd lean</div>
+      <div style="font-family:var(--mono);font-size:22px;font-weight:800;margin-top:3px;color:${bullPct==null?'var(--ink-dim)':bullPct>=55?'var(--pos)':bullPct<=45?'var(--neg)':'var(--ink)'}">${bullPct==null?'—':bullPct+'%'}<span style="font-size:11px;color:var(--ink-faint)"> bull</span></div>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">▲ ${s.counts.bull} · ▼ ${s.counts.bear} · · ${s.counts.neutral}</div>
+    </div>
+  </div>`;
+
+  // Source availability note (honest about what loaded).
+  const srcNote = `<div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-bottom:12px">
+    Sources: StockTwits ${stOk ? `✓ ${s.sources.stocktwits.count}` : '✗ unavailable'} · Reddit ${rdOk ? `✓ ${s.sources.reddit.count}` : '✗ unavailable'} · X/Twitter & TikTok not accessible from browser
+  </div>`;
+
+  if (!s.items.length) {
+    body.innerHTML = cultBanner + summary + srcNote + `<div class="empty-state" style="padding:24px;text-align:center;color:var(--ink-dim);font-family:var(--mono);font-size:11px">No recent social posts found for ${ticker}.</div>`;
+    return;
+  }
+
+  const posts = s.items.slice(0, 60).map(it => {
+    const pColor = it.platform === 'stocktwits' ? '#6fb3e0' : '#ff6a4d';
+    const pName = it.platform === 'stocktwits' ? 'StockTwits' : (it.subreddit || 'Reddit');
+    const sentColor = it.sentiment === 'bullish' ? 'var(--pos)' : it.sentiment === 'bearish' ? 'var(--neg)' : 'var(--ink-faint)';
+    const sentMark = it.sentiment === 'bullish' ? '▲' : it.sentiment === 'bearish' ? '▼' : '·';
+    return `<a href="${escapeHtml(it.url)}" target="_blank" rel="noopener" style="display:block;padding:11px 0;border-bottom:1px solid var(--rule);text-decoration:none">
+      <div style="display:flex;justify-content:space-between;gap:10px;align-items:baseline">
+        <span style="font-family:var(--mono);font-size:9px;color:${pColor};font-weight:700">${pName}</span>
+        <span style="font-family:var(--mono);font-size:9px;color:${sentColor}">${sentMark} ${it.sentiment}${it.sentimentSource==='author'?' (author)':''}</span>
+      </div>
+      <div style="color:var(--ink);font-size:12px;line-height:1.5;margin-top:5px">${escapeHtml(it.text || it.body || '')}</div>
+      <div style="font-family:var(--mono);font-size:8px;color:var(--ink-faint);margin-top:5px">@${escapeHtml(it.author)} · ${timeAgo(it.datetime)}${it.likes?` · ♥ ${it.likes}`:''}${it.comments!=null?` · 💬 ${it.comments}`:''}</div>
+    </a>`;
+  }).join('');
+  body.innerHTML = cultBanner + summary + srcNote + `<div style="max-width:760px">${posts}</div>`;
+}
+if (typeof window !== 'undefined') {
+  window.onActivityTabActive = onActivityTabActive;
+  window.renderActivityTab = renderActivityTab;
+}
+
 async function fetchFinnhubNews(ticker, daysBack = 7) {
   const key = getFinnhubKey();
   if (!key) return null;
@@ -34106,6 +34929,29 @@ const RESEARCH_CATEGORY_WEIGHTS = {
 };
 const RESEARCH_GRADED_CATEGORIES = new Set(Object.keys(RESEARCH_CATEGORY_WEIGHTS));
 
+// Per-metric weight WITHIN its category. Default 1.0 (equal). Lowering a metric's
+// weight makes it count less toward its category's score. P/E is deliberately
+// dampened: in today's market a 25-35 P/E is normal (especially in tech), so a
+// moderately-high P/E shouldn't crater a grade. EV/EBITDA and EV/Revenue are
+// better, cleaner valuation signals, so they carry more of the Valuation weight.
+const RESEARCH_METRIC_WEIGHTS = {
+  pe:       0.5,   // P/E counts HALF — high P/E is common now and weakly predictive
+  pb:       0.8,   // price/book — useful but distorted for asset-light firms
+  evEbitda: 1.3,   // cleaner valuation signal → counts more
+  evRev:    1.2,   // useful for unprofitable/growth names where P/E is N/A
+};
+
+// Compress a metric's percentile toward the middle so extreme ranks matter less.
+// For P/E: a bottom-decile (expensive) P/E shouldn't score 5/100 and tank the
+// grade — in a market where high multiples are normal, we pull it toward ~35.
+// amount=0 → no change; amount=1 → fully flattened to 50. Applied only to metrics
+// listed in RESEARCH_METRIC_DAMPEN.
+const RESEARCH_METRIC_DAMPEN = { pe: 0.45 };
+function _dampenPct(pct, amount) {
+  if (!amount) return pct;
+  return pct + (50 - pct) * amount;
+}
+
 function _num(v) {
   if (typeof v === 'number') return isFinite(v) ? v : null;
   // Coerce numeric strings ("1.41471" from CSV-parsed rows) — this is the
@@ -34168,6 +35014,43 @@ let _researchCacheStamp = 0;
 const ANALYTICS_BASE = 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-ANALYTICS/main/data/';
 let _backendResearch = null;          // { generatedAt, byTicker, ... } | null
 let _backendResearchFetched = false;
+
+// Overlay backend grades onto the local research data, with the BACKEND WINNING.
+// The backend (analytics repo) grades nightly from the full clean dataset, so it
+// is the authoritative source; the local computation is only a fallback for
+// tickers the backend hasn't covered or when the backend file is missing/stale.
+// Mutates data.byTicker in place. Each row gets _gradeSource = 'backend'|'local'.
+function mergeBackendGradesOverLocal(data) {
+  if (!data || !data.byTicker) return data;
+  const be = _backendResearch;
+  // Only trust a backend that exists and isn't badly stale.
+  const beOk = be && be.byTicker && be._fresh !== false;
+  for (const tk of Object.keys(data.byTicker)) {
+    const local = data.byTicker[tk];
+    const beRow = beOk ? be.byTicker[tk] : null;
+    if (beRow && (beRow.grade != null || beRow.gradeScore != null)) {
+      // Backend wins for the headline grade + score. Keep the local per-metric
+      // ranks/categoryScores for the breakdown UI (backend may not ship those),
+      // but the GRADE the user sees is the backend's.
+      local._localGrade = local.grade;          // preserve for the divergence note
+      local._localGradeScore = local.gradeScore;
+      if (beRow.gradeScore != null) local.gradeScore = beRow.gradeScore;
+      if (beRow.grade != null) local.grade = beRow.grade;
+      else if (beRow.gradeScore != null) local.grade = researchGradeLetter(beRow.gradeScore);
+      // Surface backend coverage if it provides it (more authoritative count).
+      if (beRow.coverage != null) local.coverage = beRow.coverage;
+      if (beRow.coverageTotal != null) local.coverageTotal = beRow.coverageTotal;
+      if (beRow.categoryScores) local.categoryScores = beRow.categoryScores;
+      local._gradeSource = 'backend';
+      local._gradeDiverged = (local._localGrade != null && local._localGrade !== local.grade);
+    } else {
+      local._gradeSource = 'local';
+    }
+  }
+  return data;
+}
+if (typeof window !== 'undefined') window.mergeBackendGradesOverLocal = mergeBackendGradesOverLocal;
+
 async function loadBackendResearch() {
   if (_backendResearchFetched) return _backendResearch;
   _backendResearchFetched = true;
@@ -34218,6 +35101,7 @@ async function loadRepoNews() {
 if (typeof window !== 'undefined') window.loadRepoNews = loadRepoNews;
 
 let _researchSparseHealAttempted = false;
+let _researchSparseDataDetected = false;  // set when grading sees rows missing financial fields
 function computeResearchRankings(force = false) {
   // Cache for 30s so re-renders don't recompute on every interaction
   if (!force && _researchCache && (Date.now() - _researchCacheStamp) < 30000) return _researchCache;
@@ -34290,8 +35174,13 @@ function computeResearchRankings(force = false) {
         ranks[m.key] = { rank: entry.rank, total: pm.total, pct: entry.pct, value: entry.value };
         // Only graded categories contribute to the score (Scale is excluded).
         if (RESEARCH_GRADED_CATEGORIES.has(m.cat)) {
-          _catPctSum[m.cat] = (_catPctSum[m.cat] || 0) + entry.pct;
-          _catCount[m.cat] = (_catCount[m.cat] || 0) + 1;
+          // Dampen extreme percentiles for metrics like P/E (high P/E is normal
+          // now and shouldn't tank a grade), then apply the metric's intra-
+          // category weight so e.g. P/E counts half and EV/EBITDA counts more.
+          const dampened = _dampenPct(entry.pct, RESEARCH_METRIC_DAMPEN[m.key] || 0);
+          const w = RESEARCH_METRIC_WEIGHTS[m.key] != null ? RESEARCH_METRIC_WEIGHTS[m.key] : 1;
+          _catPctSum[m.cat] = (_catPctSum[m.cat] || 0) + dampened * w;
+          _catCount[m.cat] = (_catCount[m.cat] || 0) + w;  // weight-aware denominator
         }
       } else {
         ranks[m.key] = null;  // n/a · not ranked (no peers, or value absent)
@@ -34312,6 +35201,17 @@ function computeResearchRankings(force = false) {
       }
     }
     const gradeScore = weightUsed > 0 ? weightedSum / weightUsed : null;
+    // Momentum grade (price + volume, + social when fetched) is computable for
+    // nearly every ticker with history, so it ADDS to coverage — another metric
+    // beyond the fundamental set. Stored on the row so the screener/ranking and
+    // the grade detail can read it without recomputing.
+    let momentumGrade = null;
+    try {
+      if (typeof computeMomentumGrade === 'function') {
+        const mg = computeMomentumGrade(r.ticker);
+        if (mg && mg.label !== 'N/A') { momentumGrade = mg; covered++; }
+      }
+    } catch {}
     byTicker[r.ticker] = {
       ticker: r.ticker,
       name: r.name || r.ticker,
@@ -34319,8 +35219,9 @@ function computeResearchRankings(force = false) {
       gradeScore,
       grade: researchGradeLetter(gradeScore),
       coverage: covered,
-      coverageTotal: RESEARCH_METRICS.length,
+      coverageTotal: RESEARCH_METRICS.length + 1,   // +1 for the momentum grade
       categoryScores,   // per-category percentile (Profitability/Growth/Valuation/Balance Sheet/Income)
+      momentumGrade,    // { score, label, signed, note, components } | null
       ranks,
     };
   }
@@ -34337,6 +35238,10 @@ function computeResearchRankings(force = false) {
         (missing.length && direct >= 10 ? ` (lacks: ${missing.join(',')})` : ''));
       if (direct < 10) {
         console.log('[research] sample row fields:', Object.keys(sample).filter(k => sample[k] != null && sample[k] !== '').slice(0, 30).join(', '));
+        // VISIBLE banner so the user knows (not just console). Sparse rows almost
+        // always mean a stale cached stockbook — the committed data has the
+        // financial fields, this browser's cache doesn't.
+        _researchSparseDataDetected = true;
         // SELF-HEAL: sparse rows usually mean a stale cached stockbook. Force one
         // fresh fetch from source, then recompute. Guarded so it runs at most once.
         if (!_researchSparseHealAttempted && typeof getSheetData === 'function') {
@@ -34467,6 +35372,14 @@ function renderResearchTab() {
     return;
   }
   const data = computeResearchRankings(true);  // always fresh — never serve a pre-normalization empty cache
+  // BACKEND GRADES WIN. The analytics backend computes grades nightly from the
+  // full, clean dataset; the local computation can be wrong when this browser
+  // has stale/sparse rows (that's how BIGGQ showed A+ locally while the backend
+  // correctly had D+). So where the backend has a grade for a ticker, it
+  // overrides the local one — local stays only as a fallback for tickers the
+  // backend hasn't graded yet. Each overridden row is marked so the UI can note
+  // the source.
+  mergeBackendGradesOverLocal(data);
 
   // View toggle
   const head = `
@@ -34541,8 +35454,23 @@ function renderResearchScreener(data) {
     return true;
   });
   // Sort by grade score desc (best first) when no single metric is the focus.
-  results.sort((a, b) => (b.gradeScore || 0) - (a.gradeScore || 0));
-  const shown = results.slice(0, 200);
+  // When exactly one filter is active, sort by THAT metric so the screen reads
+  // like a ranking on the thing you filtered by.
+  if (active.length === 1) {
+    const fk = active[0].metric;
+    const mObj = RESEARCH_METRICS.find(x => x.key === fk);
+    const higher = mObj ? mObj.higher : true;
+    results.sort((a, b) => {
+      const va = metricVal(fk, a.ticker), vb = metricVal(fk, b.ticker);
+      if (va == null) return 1; if (vb == null) return -1;
+      return higher ? vb - va : va - vb;
+    });
+  } else {
+    results.sort((a, b) => (b.gradeScore || 0) - (a.gradeScore || 0));
+  }
+  // Show ALL matches (no 200 cap). At 10k tickers a filtered set is usually far
+  // smaller, and the user asked to see everything that passes.
+  const shown = results;
 
   // Filter-row UI.
   const opLabel = { gte: '≥', lte: '≤', gt: '>', lt: '<' };
@@ -34595,7 +35523,7 @@ function renderResearchScreener(data) {
         <button class="btn btn-ghost" id="rf-add" style="font-size:10px">+ Add filter</button>
         <button class="btn" id="rf-apply" style="font-size:10px;background:var(--pos)">Apply</button>
         <button class="btn btn-ghost" id="rf-clear" style="font-size:10px">Clear all</button>
-        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-left:auto;align-self:center">${results.length} match${results.length === 1 ? '' : 'es'}${results.length > 200 ? ' (showing 200)' : ''}</span>
+        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-left:auto;align-self:center">${results.length} match${results.length === 1 ? '' : 'es'}${active.length === 1 ? ' · ranked by ' + (RESEARCH_METRICS.find(x=>x.key===active[0].metric)?.label || '') : ''}</span>
       </div>
     </div>
     <div class="company-card" style="margin:0">
@@ -34699,6 +35627,9 @@ function renderResearchGrades(data) {
   }
 
   return `
+    ${_researchSparseDataDetected ? `<div style="background:rgba(224,176,76,0.15);border:1px solid var(--amber);border-radius:6px;padding:10px 12px;margin-bottom:12px;font-family:var(--mono);font-size:11px;color:var(--amber);line-height:1.5">
+      ⚠ <strong>Stale data detected.</strong> Your stockbook rows are missing financial fields (revenue, margins, debt…), so grades and coverage are unreliable. The committed data HAS these fields — your browser is serving a cached copy. Fix: <strong>Stock Book → Refresh All</strong>, or hard-refresh the page (Ctrl/Cmd-Shift-R). Grades will be accurate once fresh data loads.
+    </div>` : ''}
     <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);margin-bottom:12px;line-height:1.6">
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
         <label style="font-family:var(--mono);font-size:10px;color:var(--ink-dim)">Min coverage:</label>
@@ -34961,6 +35892,36 @@ function renderResearchDetail(data, ticker) {
           </div>`;
         }).join('');
         return bars ? `<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--rule)"><div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">Category breakdown (percentile vs peers)</div>${bars}</div>` : '';
+      })()}
+      ${(() => {
+        // PEER GRADE + REGIME GRADE + MOMENTUM GRADE — the market-condition-aware reads.
+        let pg = null, rg = null, mg = null;
+        try { if (typeof computePeerGrade === 'function') pg = computePeerGrade(t.ticker); } catch {}
+        try { if (typeof computeRegimeGrade === 'function') rg = computeRegimeGrade(t.ticker); } catch {}
+        try { if (typeof computeMomentumGrade === 'function') mg = computeMomentumGrade(t.ticker); } catch {}
+        if (!pg && !rg && !mg) return '';
+        const card = (title, g, sub) => {
+          if (!g) return '';
+          const color = g.score >= 70 ? 'var(--pos)' : g.score >= 45 ? 'var(--amber)' : 'var(--neg)';
+          return `<div style="flex:1;min-width:160px;background:var(--bg-card);border:1px solid var(--rule);border-radius:6px;padding:10px">
+            <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:3px">${title}</div>
+            <div style="display:flex;align-items:baseline;gap:8px">
+              <span style="font-size:22px;font-weight:800;color:${color};font-family:var(--mono)">${g.label}</span>
+              <span style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${g.score}/100</span>
+            </div>
+            <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:4px;line-height:1.4">${escapeHtml(g.note || '')}</div>
+            <div style="font-family:var(--mono);font-size:8px;color:var(--ink-faint);margin-top:3px;opacity:0.7">${sub}</div>
+          </div>`;
+        };
+        const momSub = mg && mg.hasSocial ? 'price + volume + social' : 'price + volume (open Activity→Social to add social)';
+        return `<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--rule)">
+          <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">Peer · regime · momentum grades</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            ${card('Peer Grade', pg, 'vs sector peers + sector ETF momentum')}
+            ${card('Regime Grade', rg, 'tailwind/headwind in the current regime')}
+            ${card('Momentum Grade', mg, momSub)}
+          </div>
+        </div>`;
       })()}
     </div>
     ${catBlocks}`;
@@ -36229,9 +37190,16 @@ function botRetrain() {
 if (typeof window !== 'undefined') { window.botRetrain = botRetrain; window.loadBotWeights = loadBotWeights; }
 
 const BOT_STARTING_BANKROLL = 100000;
-const BOT_MAX_BETS_PER_DAY = 4;
+const BETS_STATE = { perfWindow: 'all' };   // equity-curve window: week|month|year|all
+let _betsLiveQuotesPrimed = false;          // fires a one-time live-quote refresh on bets tab open
+const BOT_MAX_BETS_PER_DAY = 6;
 const BOT_MIN_BETS_PER_DAY = 0;   // can sit out entirely
-const BOT_CONVICTION_THRESHOLD = 0.45;  // below this absolute conviction → no bet
+const BOT_CONVICTION_THRESHOLD = 0.30;  // below this absolute conviction → no bet
+// Lowered 0.45 → 0.30 to get the bot REPS. The point of the paper account right
+// now is to accumulate trades to retrain on (wins AND losses), not to be right.
+// A lower bar = more, riskier trades = more training signal. We expect drawdowns
+// — that's the cost of learning. Raise it back once botRetrain() has enough
+// settled bets to sharpen the signal weights.
 
 function loadBotState() {
   try {
@@ -36325,15 +37293,279 @@ function botAssessRegime() {
 function _regimeProfile(mode, evidence) {
   const profiles = {
     'risk-on':  { mode, evidence, leverageOK: true,  thresholdMod: 0,     shortBar: 0.10, longBar: 0,
-                  weightMods: { trend: 1.3, momentum: 1.3, meanReversion: 0.7, health: 1.0, fundamentals: 1.0, crossAsset: 1.1 } },
+                  weightMods: { trend: 1.3, momentum: 1.3, meanReversion: 0.7, health: 1.0, fundamentals: 1.0, crossAsset: 1.1, regimeGrade: 1.4, peerGrade: 1.2, momentumGrade: 1.4 } },
     'risk-off': { mode, evidence, leverageOK: false, thresholdMod: 0.03,  shortBar: 0,    longBar: 0.10,
-                  weightMods: { trend: 0.7, momentum: 0.8, meanReversion: 1.0, health: 1.3, fundamentals: 1.3, fed: 1.2 } },
+                  weightMods: { trend: 0.7, momentum: 0.8, meanReversion: 1.0, health: 1.3, fundamentals: 1.3, fed: 1.2, regimeGrade: 1.5, peerGrade: 1.3, momentumGrade: 0.8 } },
     'choppy':   { mode, evidence, leverageOK: false, thresholdMod: 0.06,  shortBar: 0.05, longBar: 0.05,
-                  weightMods: { trend: 0.7, momentum: 0.8, meanReversion: 1.3, health: 1.1, fundamentals: 1.1 } },
+                  weightMods: { trend: 0.7, momentum: 0.8, meanReversion: 1.3, health: 1.1, fundamentals: 1.1, regimeGrade: 1.2, peerGrade: 1.1, momentumGrade: 1.0 } },
   };
   return profiles[mode] || profiles['choppy'];
 }
 if (typeof window !== 'undefined') window.botAssessRegime = botAssessRegime;
+
+// ============================================================
+//   PEER GRADE & REGIME GRADE — variable, market-condition-aware assessments
+//   that feed BOTH the research display and the bot's trade decisions.
+//
+//   PEER GRADE: how a stock stacks up against (a) its sector peers on the 23
+//   research metrics, and (b) its sector ETF's recent performance. A stock can
+//   have mediocre absolute numbers but be the best house in its neighborhood —
+//   or great numbers in a sector that's rolling over. Peer-relative captures
+//   what cross-sectional grading misses.
+//
+//   REGIME GRADE: whether the current market regime is a tailwind or headwind
+//   for this stock's sector. In a risk-on expansion, high-beta tech gets a
+//   tailwind; in risk-off, defensives do. Uses the regime the bot already
+//   assesses + the SECTOR_ETFS quad-favoring map.
+//
+//   Both return { score (0-100), label, signed (-1..+1), note } so they can be
+//   shown as letter grades AND fed into the bot as signed signals.
+// ============================================================
+
+// Peer grade: rank this ticker against same-sector equities on grade score, and
+// blend in the sector ETF's recent momentum (is the sector itself working?).
+function computePeerGrade(ticker) {
+  const t = String(ticker || '').toUpperCase();
+  const row = (typeof getStockbookRow === 'function') ? getStockbookRow(t) : null;
+  if (!row) return null;
+  const sector = row.sector || null;
+  if (!sector) return { score: 50, label: 'N/A', signed: 0, note: 'No sector — peer grade unavailable' };
+
+  let peerRankScore = null, peerNote = '';
+  try {
+    // Build the same-sector peer set from the research ranking and find this
+    // ticker's percentile WITHIN that sector (not the whole universe).
+    const rr = (typeof computeResearchRankings === 'function') ? computeResearchRankings() : null;
+    if (rr?.byTicker) {
+      const peers = Object.values(rr.byTicker).filter(x => x.sector === sector && x.gradeScore != null);
+      if (peers.length >= 3) {
+        peers.sort((a, b) => b.gradeScore - a.gradeScore);
+        const idx = peers.findIndex(x => x.ticker === t);
+        if (idx >= 0) {
+          peerRankScore = peers.length > 1 ? Math.round((1 - idx / (peers.length - 1)) * 100) : 50;
+          peerNote = `#${idx + 1} of ${peers.length} in ${sector}`;
+        }
+      }
+    }
+  } catch {}
+
+  // Sector ETF momentum: is the sector itself in favor right now?
+  let etfMomScore = null, etfNote = '';
+  try {
+    const etfTicker = SECTOR_TO_ETF[sector];
+    if (etfTicker) {
+      const h = (typeof getHistoryForTicker === 'function') ? getHistoryForTicker(etfTicker) : null;
+      if (h && h.length >= 60) {
+        const px = h.map(p => p.price ?? p.close).filter(Boolean);
+        const last = px[px.length - 1];
+        const ago3mo = px[Math.max(0, px.length - 63)];
+        const ret3mo = ago3mo > 0 ? (last - ago3mo) / ago3mo : 0;
+        // Map -15%..+15% 3-month sector return to 0..100.
+        etfMomScore = Math.max(0, Math.min(100, 50 + (ret3mo / 0.15) * 50));
+        etfNote = `${etfTicker} ${ret3mo >= 0 ? '+' : ''}${(ret3mo * 100).toFixed(1)}% 3mo`;
+      }
+    }
+  } catch {}
+
+  // Blend: 65% peer-rank (stock-specific), 35% sector ETF momentum (sector
+  // tailwind). If one is missing, use the other.
+  let score;
+  if (peerRankScore != null && etfMomScore != null) score = peerRankScore * 0.65 + etfMomScore * 0.35;
+  else if (peerRankScore != null) score = peerRankScore;
+  else if (etfMomScore != null) score = etfMomScore;
+  else return { score: 50, label: 'N/A', signed: 0, note: `${sector} — insufficient peer data` };
+
+  const note = [peerNote, etfNote].filter(Boolean).join(' · ');
+  return {
+    score: Math.round(score),
+    label: _gradeLetterFromScore(score),
+    signed: (score - 50) / 50,
+    note: note || sector,
+    sector,
+  };
+}
+
+// Regime grade: is the current market regime a tailwind or headwind for this
+// stock's sector? Uses the bot's regime assessment + SECTOR_ETFS quad-favoring.
+function computeRegimeGrade(ticker) {
+  const t = String(ticker || '').toUpperCase();
+  const row = (typeof getStockbookRow === 'function') ? getStockbookRow(t) : null;
+  if (!row) return null;
+  const sector = row.sector || null;
+
+  // Current quad (1-4) from the macro tab, and the bot's risk regime.
+  let quad = null;
+  try {
+    if (typeof getCurrentQuad === 'function') quad = getCurrentQuad();
+    else if (typeof state !== 'undefined' && state.macro?.currentQuad) quad = state.macro.currentQuad;
+  } catch {}
+  const regime = (typeof botAssessRegime === 'function') ? botAssessRegime() : null;
+  const mode = regime?.mode || 'choppy';
+
+  // Map the stock's sector to its ETF, then check whether the current quad
+  // favors or hurts that sector.
+  const etfTicker = sector ? SECTOR_TO_ETF[sector] : null;
+  const etfDef = etfTicker ? SECTOR_ETFS.find(e => e.ticker === etfTicker) : null;
+
+  let score = 50, factors = [];
+  if (etfDef && quad != null) {
+    if (etfDef.favors?.includes(quad)) { score += 22; factors.push(`Quad ${quad} favors ${etfDef.name}`); }
+    else if (etfDef.hurts?.includes(quad)) { score -= 22; factors.push(`Quad ${quad} hurts ${etfDef.name}`); }
+    else factors.push(`Quad ${quad} neutral for ${etfDef.name}`);
+  }
+
+  // Risk regime tilt: high-beta/cyclical sectors get a tailwind in risk-on, a
+  // headwind in risk-off; defensives the opposite.
+  const beta = (typeof _num === 'function' ? _num(row.beta) : parseFloat(row.beta)) || 1;
+  const isDefensive = /utilit|staple|consumer defensive|health/i.test(sector || '');
+  const isCyclical = /tech|consumer cyclical|discretionary|financ|industri|material|energy/i.test(sector || '');
+  if (mode === 'risk-on') {
+    if (isCyclical || beta > 1.1) { score += 14; factors.push('Risk-on favors cyclicals/high-beta'); }
+    else if (isDefensive) { score -= 8; factors.push('Risk-on: defensives lag'); }
+  } else if (mode === 'risk-off') {
+    if (isDefensive || beta < 0.9) { score += 14; factors.push('Risk-off favors defensives/low-beta'); }
+    else if (isCyclical || beta > 1.1) { score -= 16; factors.push('Risk-off: cyclicals/high-beta hit'); }
+  }
+
+  score = Math.max(0, Math.min(100, score));
+  return {
+    score: Math.round(score),
+    label: _gradeLetterFromScore(score),
+    signed: (score - 50) / 50,
+    note: factors.join(' · ') || `${mode} regime`,
+    regime: mode,
+    quad,
+  };
+}
+
+// ============================================================
+//   MOMENTUM GRADE — combines PRICE momentum, VOLUME momentum, and (when
+//   available) SOCIAL momentum into a 0-100 grade. Per the spec:
+//     • More post volume = bigger following (cult signal).
+//     • Bullish sentiment + high BUY volume (rising price on rising volume) =
+//       strong momentum.
+//     • Low/declining volume + bearish sentiment + falling price = WEAK momentum
+//       — which scores LOW (toward 0), never below 0. The grade floors at 0 so
+//       "negative momentum" just means a low grade, not a negative number.
+//
+//   Two components are always available (price + volume from history); the
+//   social component only enriches the grade when social data for this ticker
+//   has been fetched (cached by the Activity tab). Without social, the grade is
+//   the price+volume momentum alone — still a valid, universe-wide metric so it
+//   adds to EVERY ticker's coverage.
+// ============================================================
+function computeMomentumGrade(ticker) {
+  const t = String(ticker || '').toUpperCase();
+  const row = (typeof getStockbookRow === 'function') ? getStockbookRow(t) : null;
+  if (!row) return null;
+
+  // --- 1. PRICE MOMENTUM: 3-month return, mapped 0-100 (50 = flat). ---
+  let priceScore = null, priceNote = '';
+  try {
+    const hist = (typeof getHistoryForTicker === 'function') ? getHistoryForTicker(t) : null;
+    if (hist && hist.length >= 30) {
+      const px = hist.map(p => p.price ?? p.close).filter(v => isFinite(v));
+      if (px.length >= 30) {
+        const last = px[px.length - 1];
+        const ago = px[Math.max(0, px.length - 63)];   // ~3 months
+        const ret = ago > 0 ? (last - ago) / ago : 0;
+        // Map -20%..+20% over 3mo to 0..100.
+        priceScore = Math.max(0, Math.min(100, 50 + (ret / 0.20) * 50));
+        priceNote = `${ret >= 0 ? '+' : ''}${(ret * 100).toFixed(1)}% 3mo`;
+      }
+    }
+  } catch {}
+  // Fallback: today's % change if no history.
+  if (priceScore == null) {
+    const chg = _num(row.changepct ?? row.changePct);
+    if (chg != null) {
+      priceScore = Math.max(0, Math.min(100, 50 + (chg / 5) * 50));  // ±5% day → full swing
+      priceNote = `${chg >= 0 ? '+' : ''}${chg.toFixed(1)}% today`;
+    }
+  }
+
+  // --- 2. VOLUME MOMENTUM: recent volume vs its average. High relative volume
+  //         CONFIRMS a move (real participation); thin volume = weak. ---
+  let volScore = null, volNote = '';
+  try {
+    const vol = _num(row.volume), avg = _num(row.volumeavg ?? row.avgVolume);
+    if (vol != null && avg != null && avg > 0) {
+      const ratio = vol / avg;            // 1 = normal, >1 = elevated, <1 = quiet
+      // Map 0.5x..2x to 0..100 (normal volume = ~50).
+      volScore = Math.max(0, Math.min(100, ((ratio - 0.5) / 1.5) * 100));
+      volNote = `${ratio.toFixed(2)}× avg vol`;
+    }
+  } catch {}
+
+  // Direction-aware volume: elevated volume on a DOWN move is bearish momentum,
+  // not bullish. Blend volume toward the price direction.
+  if (volScore != null && priceScore != null) {
+    const up = priceScore >= 50;
+    // If price is down, high volume should drag momentum DOWN (distribution), so
+    // invert the volume contribution when the move is negative.
+    if (!up) volScore = 100 - volScore;
+  }
+
+  // --- 3. SOCIAL MOMENTUM (only if fetched for this ticker). post volume =
+  //         following; bull/bear lean = direction. ---
+  let socialScore = null, socialNote = '', socialPresence = null;
+  try {
+    const cached = (typeof ACTIVITY_STATE !== 'undefined' && ACTIVITY_STATE.social && ACTIVITY_STATE.social._ticker === t)
+      ? ACTIVITY_STATE.social : null;
+    if (cached) {
+      socialPresence = cached.presenceScore;
+      const bullPct = cached.bullPct;       // 0-100 or null
+      const vol = cached.counts.total;
+      // Volume component (following): 50+ posts = max.
+      const volComp = Math.min(100, (vol / 50) * 100);
+      // Direction component: bullPct directly (50 = balanced). Null → neutral 50.
+      const dirComp = bullPct == null ? 50 : bullPct;
+      // Social momentum = how loud AND how bullish. Loud+bullish = high;
+      // loud+bearish = low; quiet = pulled toward the middle (little signal).
+      const loudness = volComp / 100;       // 0..1
+      socialScore = 50 + (dirComp - 50) * loudness * 2;  // amplify lean by loudness
+      socialScore = Math.max(0, Math.min(100, socialScore));
+      socialNote = `${vol} posts · ${bullPct == null ? '—' : bullPct + '% bull'}${cached.isCultLike ? ' · cult-like' : ''}`;
+    }
+  } catch {}
+
+  // --- BLEND. Price and volume always count; social enriches when present. ---
+  const parts = [];
+  if (priceScore != null) parts.push({ s: priceScore, w: socialScore != null ? 0.45 : 0.6, label: 'price' });
+  if (volScore != null)   parts.push({ s: volScore,   w: socialScore != null ? 0.25 : 0.4, label: 'volume' });
+  if (socialScore != null) parts.push({ s: socialScore, w: 0.30, label: 'social' });
+  if (!parts.length) return { score: 50, label: 'N/A', signed: 0, note: 'No price/volume/social data', components: {} };
+
+  const wSum = parts.reduce((a, p) => a + p.w, 0);
+  let score = parts.reduce((a, p) => a + p.s * p.w, 0) / wSum;
+  score = Math.max(0, Math.min(100, Math.round(score)));   // floored at 0, capped at 100
+
+  const noteBits = [priceNote, volNote, socialNote].filter(Boolean);
+  return {
+    score,
+    label: _gradeLetterFromScore(score),
+    signed: (score - 50) / 50,
+    note: noteBits.join(' · ') || 'momentum',
+    components: {
+      price: priceScore != null ? Math.round(priceScore) : null,
+      volume: volScore != null ? Math.round(volScore) : null,
+      social: socialScore != null ? Math.round(socialScore) : null,
+    },
+    socialPresence,
+    hasSocial: socialScore != null,
+  };
+}
+if (typeof window !== 'undefined') window.computeMomentumGrade = computeMomentumGrade;
+
+// Shared letter-grade mapping for the peer/regime grades (same bands as research).
+function _gradeLetterFromScore(score) {
+  return (typeof researchGradeLetter === 'function') ? researchGradeLetter(score) :
+    (score >= 80 ? 'A' : score >= 60 ? 'B' : score >= 40 ? 'C' : score >= 20 ? 'D' : 'F');
+}
+if (typeof window !== 'undefined') {
+  window.computePeerGrade = computePeerGrade;
+  window.computeRegimeGrade = computeRegimeGrade;
+}
 
 async function botScoreTicker(ticker) {
   const t = ticker.toUpperCase();
@@ -36469,6 +37701,44 @@ async function botScoreTicker(ticker) {
     }
   } catch {}
 
+  // 6b. PEER GRADE — how the stock ranks vs sector peers + whether the sector
+  // ETF is working. Best-in-a-strong-sector is a real edge; best-in-a-dying-
+  // sector less so. This gives the bot a "different look" beyond absolute metrics.
+  try {
+    if (typeof computePeerGrade === 'function') {
+      const pg = computePeerGrade(t);
+      if (pg && isFinite(pg.signed) && pg.label !== 'N/A') {
+        add('peerGrade', pg.signed, 0.12, `Peer grade ${pg.label} (${pg.note})`);
+      }
+    }
+  } catch {}
+
+  // 6c. REGIME GRADE — is the CURRENT market regime a tailwind or headwind for
+  // this sector? This is the variable, market-condition-aware trigger: the same
+  // stock scores differently in risk-on vs risk-off, which changes whether the
+  // bot wants to be long, short, or sit out.
+  try {
+    if (typeof computeRegimeGrade === 'function') {
+      const rg = computeRegimeGrade(t);
+      if (rg && isFinite(rg.signed)) {
+        add('regimeGrade', rg.signed, 0.14, `Regime grade ${rg.label} (${rg.note})`);
+      }
+    }
+  } catch {}
+
+  // 6d. MOMENTUM GRADE — price + volume (+ social when fetched). Strong upward
+  // price momentum on real volume is a genuine tailwind for a long and a warning
+  // for a short. Social loudness amplifies it when available.
+  try {
+    if (typeof computeMomentumGrade === 'function') {
+      const mg = computeMomentumGrade(t);
+      if (mg && isFinite(mg.signed) && mg.label !== 'N/A') {
+        // A touch more weight when the social component is present (more signal).
+        add('momentumGrade', mg.signed, mg.hasSocial ? 0.13 : 0.10, `Momentum ${mg.label} (${mg.note})`);
+      }
+    }
+  } catch {}
+
   // 7. Fed rate tailwind/headwind for rate-sensitive sectors
   try {
     if (typeof fedRateExpectation === 'function') {
@@ -36587,6 +37857,46 @@ async function botScoreTicker(ticker) {
   const leverage = (confidence >= 0.8 && !hedge && regime.leverageOK) ? 2 : 1;
   decisionPath.push(leverage > 1 ? 'leverage:2x (strong + risk-on)' : hedge ? 'hedge:on (vol expanding)' : 'leverage:1x');
 
+  // INSTRUMENT SELECTION — how to EXPRESS the view: shares, leveraged shares, or
+  // an OPTION (call for bullish, put for bearish). The bot reaches for options
+  // when it wants defined-risk leverage on a high-conviction directional view,
+  // especially when volatility is elevated (a hedge flag) — that's exactly when
+  // a long option's capped downside beats a leveraged share position whose stop
+  // could gap through. Logic:
+  //   • Very strong conviction (≥0.78) + expanding vol → long option (call/put).
+  //     Defined risk, built-in leverage, survives a gap against the stop.
+  //   • Very strong conviction (≥0.85) even in calm vol → option to lever the
+  //     view with capped risk instead of margin leverage.
+  //   • Otherwise → shares (with the leverage flag above for the strong-calm case).
+  // Options are only used on names that plausibly HAVE a liquid options market
+  // (real equities with decent size); FX/index/micro-caps fall back to shares.
+  let instrument = 'shares';
+  let optionType = null;
+  let leveragedEtf = null;
+  const cls2 = (typeof classifyAsset === 'function') ? classifyAsset(t) : 'equity';
+  const optionable = (cls2 === 'equity' || cls2 === 'etf') && (row.marketCap == null || row.marketCap >= 2e9);
+  if (optionable) {
+    const strongVol = confidence >= 0.78 && hedge;       // strong view + risky tape
+    const strongCalm = confidence >= 0.85;               // very strong view, lever via option
+    if (strongVol || strongCalm) {
+      // PREFER A LEVERAGED ETF over a raw option when one exists for this name.
+      // Per the playbook: TSLL (2x TSLA bull) gives leveraged upside without an
+      // option's time-decay/assignment risk, so it's the cleaner high-conviction
+      // expression. Only used when the ETF is a real priced universe member.
+      const lev = (typeof leveragedEtfFor === 'function') ? leveragedEtfFor(t, direction) : null;
+      if (lev) {
+        instrument = 'leveraged_etf';
+        leveragedEtf = lev;
+        decisionPath.push(`instrument:leveraged_etf ${lev.etf} (${lev.multiplier}x ${direction === 'short' ? 'bear' : 'bull'} ${t} — cleaner lever than an option)`);
+      } else {
+        instrument = 'option';
+        optionType = direction === 'short' ? 'put' : 'call';
+        decisionPath.push(`instrument:option ${optionType} (${strongVol ? 'strong+vol→defined risk' : 'very strong→capped-risk leverage'}; no leveraged ETF for ${t})`);
+      }
+    }
+  }
+  if (instrument === 'shares') decisionPath.push('instrument:shares');
+
   return {
     decisionPath,
     ticker: t,
@@ -36598,6 +37908,9 @@ async function botScoreTicker(ticker) {
     direction,
     leverage,
     hedge,
+    instrument,            // 'shares' | 'option' | 'leveraged_etf'
+    optionType,            // 'call' | 'put' | null
+    leveragedEtf,          // { etf, multiplier, price } | null
     volRegime: volRegime != null ? +volRegime.toFixed(2) : null,
     rationale,
     components,
@@ -36804,13 +38117,23 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
     // Risk-calculator-style stop: 2× the position's volatility below entry (long)
     // / above (short), so the stop distance reflects the name's own noise.
     const stopDist = Math.min(0.25, Math.max(0.06, p._vol * 0.5));
-    const stopPrice = p.direction === 'short'
-      ? +(p.price * (1 + stopDist)).toFixed(2)
-      : +(p.price * (1 - stopDist)).toFixed(2);
+    // Stop/target are computed on the price of WHAT WE HOLD. For a leveraged ETF
+    // that's the ETF's price (and it's always held long — the leverage and
+    // direction are baked into which ETF). For a 2x ETF the same underlying
+    // stopDist implies ~2x the ETF move, so widen the ETF stop by the multiplier
+    // to keep the intended risk budget.
+    const isLevEtf = p.instrument === 'leveraged_etf' && p.leveragedEtf;
+    const markEntry = isLevEtf ? p.leveragedEtf.price : p.price;
+    const levMult = isLevEtf ? Math.abs(p.leveragedEtf.multiplier || 2) : 1;
+    const heldLong = isLevEtf ? true : (p.direction !== 'short');
+    const effDist = stopDist * levMult;
+    const stopPrice = heldLong
+      ? +(markEntry * (1 - effDist)).toFixed(2)
+      : +(markEntry * (1 + effDist)).toFixed(2);
     // Take-profit asymmetric to the stop (reward:risk ≈ 2:1).
-    const targetPrice = p.direction === 'short'
-      ? +(p.price * (1 - stopDist * 2)).toFixed(2)
-      : +(p.price * (1 + stopDist * 2)).toFixed(2);
+    const targetPrice = heldLong
+      ? +(markEntry * (1 + effDist * 2)).toFixed(2)
+      : +(markEntry * (1 - effDist * 2)).toFixed(2);
 
     bot.bets.push({
       id: `${p.ticker}-${today}-${Date.now()}-${i}`,
@@ -36818,17 +38141,55 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
       name: p.name,
       sector: p.sector,
       direction: p.direction,
+      instrument: p.instrument || 'shares',     // 'shares' | 'option' | 'leveraged_etf'
+      optionType: p.optionType || null,          // 'call' | 'put' | null
+      // For a leveraged-ETF expression, record the ETF we actually hold + its
+      // multiplier. Mark-to-market tracks the ETF's OWN price (the leverage is
+      // embedded in the ETF, so the bet.leverage multiplier stays 1 to avoid
+      // double-counting). entryPrice/markTicker point at the ETF.
+      leveragedEtf: p.leveragedEtf ? p.leveragedEtf.etf : null,
+      leveragedEtfMultiplier: p.leveragedEtf ? p.leveragedEtf.multiplier : null,
+      markTicker: p.instrument === 'leveraged_etf' && p.leveragedEtf ? p.leveragedEtf.etf : p.ticker,
       entryDate: today,
-      entryPrice: p.price,
-      shares: p.price > 0 ? +(notional / p.price).toFixed(4) : 0,
+      // Entry price tracks whatever we actually hold: the ETF for a leveraged-
+      // ETF bet, else the underlying. Exposure/notional stay the same dollars.
+      entryPrice: (p.instrument === 'leveraged_etf' && p.leveragedEtf) ? p.leveragedEtf.price : p.price,
+      shares: (() => {
+        const ep = (p.instrument === 'leveraged_etf' && p.leveragedEtf) ? p.leveragedEtf.price : p.price;
+        return ep > 0 ? +(notional / ep).toFixed(4) : 0;
+      })(),
       notional: +notional.toFixed(2),                 // capital committed (pre-leverage)
       dollars: +dollars.toFixed(2),                   // exposure (post-leverage)
       allocationPct: +(frac * 100).toFixed(1),        // % of book
-      leverage: p.leverage,
+      // A leveraged ETF embeds its own leverage in its price, so the position's
+      // explicit leverage multiplier is 1 (the ETF's daily move already reflects
+      // 2x). Using p.leverage here too would double-count.
+      leverage: p.instrument === 'leveraged_etf' ? 1 : p.leverage,
       hedge: p.hedge,
       volEstimate: +p._vol.toFixed(3),
       stopPrice,
       targetPrice,
+      // For an option expression: record the strike (~at-the-money), an
+      // estimated premium (rough: vol × price × sqrt(time), a Black-Scholes-ish
+      // ballpark), and an expiry ~ the bet horizon. The position's risk is capped
+      // at the premium paid — modeled in mark-to-market.
+      ...(p.instrument === 'option' ? (() => {
+        const horizon = confidenceHorizonDays(p.confidence);
+        const T = Math.max(0.02, horizon / 365);
+        const strike = +p.price.toFixed(2);                       // ATM
+        // Premium ≈ 0.4 × σ_annual × price × √T (a crude ATM approximation).
+        const sigAnnual = Math.max(0.2, (p._vol || 0.3) * Math.sqrt(252));
+        const premium = +(0.4 * sigAnnual * p.price * Math.sqrt(T)).toFixed(2);
+        const expiry = new Date(Date.now() + horizon * 86400000).toISOString().slice(0, 10);
+        const contracts = premium > 0 ? Math.max(1, Math.floor(notional / (premium * 100))) : 1;
+        return {
+          optionStrike: strike,
+          optionPremium: premium,           // per share
+          optionExpiry: expiry,
+          optionContracts: contracts,       // 100 shares each
+          maxLoss: +(premium * 100 * contracts).toFixed(2),   // defined risk
+        };
+      })() : {}),
       conviction: +p.conviction.toFixed(3),
       confidence: +p.confidence.toFixed(3),
       rationale: p.rationale,
@@ -36839,7 +38200,8 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
       exitDate: null,
       exitPrice: null,
     });
-    console.log(`[bot] BET ${p.direction.toUpperCase()} ${p.ticker} $${notional.toFixed(0)} (${(frac * 100).toFixed(0)}% of book${p.leverage > 1 ? `, ${p.leverage}x → $${dollars.toFixed(0)} exposure` : ''}) — conf ${(p.confidence * 100).toFixed(0)}%, vol ${(p._vol * 100).toFixed(0)}%, stop $${stopPrice}`);
+    const _instrDesc = p.instrument === 'option' ? ` as ${p.optionType.toUpperCase()}` : '';
+    console.log(`[bot] BET ${p.direction.toUpperCase()}${_instrDesc} ${p.ticker} $${notional.toFixed(0)} (${(frac * 100).toFixed(0)}% of book${p.leverage > 1 ? `, ${p.leverage}x → $${dollars.toFixed(0)} exposure` : ''}) — conf ${(p.confidence * 100).toFixed(0)}%, vol ${(p._vol * 100).toFixed(0)}%, stop $${stopPrice}`);
   }
 
   bot.lastRunDate = today;
@@ -36868,30 +38230,178 @@ function shortDividendCarry(ticker, dollars, days) {
 }
 
 // Honest scoring: uses ONLY the current price vs the frozen entry. No rewriting.
+// ----- Bot live-quote layer -----
+// The bot's mark-to-market used the GitHub-committed price, which can be HOURS
+// stale for international markets (e.g. SK Hynix 000660.KS: the Korean session
+// moved after the nightly pipeline ran, so a +6% position showed +0.4%). This
+// fetches a FRESHER quote browser-side and converts to USD, falling back to the
+// GitHub price if no live source responds. It is best-effort and HONEST about
+// freshness — Stooq's intraday coverage of some Asian/illiquid names is delayed
+// or absent, so this is "fresher when available," not guaranteed real-time. A
+// Finnhub key (Data Sources) gives the most reliable live quotes.
+//
+// Map a Yahoo-suffix ticker (000660.KS, 7203.T, 0700.HK, BMW.DE) to a Stooq
+// symbol. Stooq uses lowercase + its own suffixes; US names get ".us".
+const _YAHOO_TO_STOOQ_SUFFIX = {
+  KS: 'kr', KQ: 'kr', T: 'jp', HK: 'hk', SS: 'cn', SZ: 'cn', TW: 'tw',
+  L: 'uk', PA: 'fr', DE: 'de', MI: 'it', MC: 'es', AS: 'nl', BR: 'be',
+  ST: 'se', CO: 'dk', OL: 'no', TO: 'ca', V: 'ca', AX: 'au', NS: 'in',
+  BO: 'in', SI: 'sg', HE: 'fi', VI: 'at',
+};
+function _yahooToStooqSymbol(ticker) {
+  const t = String(ticker || '').toUpperCase();
+  const m = t.match(/^(.+)\.([A-Z]{1,3})$/);
+  if (!m) {
+    // No suffix → US equity. Stooq wants lowercase + .us (BRK.B → brk-b.us).
+    return t.toLowerCase().replace(/\./g, '-') + '.us';
+  }
+  const body = m[1].toLowerCase(), suf = m[2];
+  // Single-letter suffixes that aren't exchange codes are US share classes
+  // (BRK.B, BF.B) — treat the whole thing as a US symbol with a dash.
+  if (!_YAHOO_TO_STOOQ_SUFFIX[suf] && (suf === 'A' || suf === 'B' || suf === 'C')) {
+    return t.toLowerCase().replace(/\./g, '-') + '.us';
+  }
+  const stooqSuf = _YAHOO_TO_STOOQ_SUFFIX[suf];
+  if (!stooqSuf) return null;   // exchange Stooq doesn't cover
+  return `${body}.${stooqSuf}`;
+}
+
+const _botQuoteCache = {};  // ticker → { price, at } (cached briefly within a MTM pass)
+async function botLiveQuote(ticker, githubRow) {
+  const t = String(ticker || '').toUpperCase();
+  // Short in-pass cache so one MTM run doesn't refetch the same name.
+  const cached = _botQuoteCache[t];
+  if (cached && (Date.now() - cached.at) < 60000) return cached;
+
+  let rawLocal = null, source = null;
+  // 1) Finnhub (most reliable live quote) if a key is set — US-centric but exact.
+  try {
+    const fhKey = (typeof getFinnhubKey === 'function') ? getFinnhubKey() : '';
+    if (fhKey && !/\.[A-Z]{1,3}$/.test(t)) {  // Finnhub free tier = US symbols
+      const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(t)}&token=${fhKey}`);
+      if (r.ok) {
+        const j = await r.json();
+        if (j && isFinite(j.c) && j.c > 0) { rawLocal = j.c; source = 'finnhub'; }
+      }
+    }
+  } catch {}
+  // 2) Stooq (CORS-ok, free, covers many intl exchanges) — fresher than nightly.
+  if (rawLocal == null) {
+    try {
+      const sym = _yahooToStooqSymbol(t);
+      if (sym) {
+        const r = await fetch(`https://stooq.com/q/l/?s=${encodeURIComponent(sym)}&f=sd2t2ohlcv&h&e=csv`);
+        if (r.ok) {
+          const text = await r.text();
+          const lines = text.trim().split('\n');
+          if (lines.length >= 2) {
+            const cols = lines[1].split(',');
+            const close = parseFloat(cols[6]);
+            if (cols[3] !== 'N/D' && isFinite(close) && close > 0) { rawLocal = close; source = 'stooq'; }
+          }
+        }
+      }
+    } catch {}
+  }
+  // 3) Fall back to the GitHub-committed price (already in the row).
+  if (rawLocal == null) {
+    const ghPx = githubRow?.price;
+    const out = { price: (ghPx != null && isFinite(ghPx)) ? ghPx : null, source: 'github', live: false, at: Date.now() };
+    _botQuoteCache[t] = out;
+    return out;
+  }
+
+  // Convert the LOCAL live price to USD using the same FX path as the row.
+  // (Stooq/Finnhub return the price in the listing's local currency; the bot's
+  // entry price and exposure are in USD, so we must convert consistently.)
+  let usd = rawLocal;
+  try {
+    let currency = (githubRow?.currency && githubRow.currency !== 'USD') ? githubRow.currency : _tickerLocalCurrency(t);
+    let penceFactor = 1;
+    if (currency === 'GBX' || currency === 'GBp') { currency = 'GBP'; penceFactor = 0.01; }
+    if (currency && currency !== 'USD') {
+      const rate = (typeof _fxRateToUSD === 'function') ? _fxRateToUSD(currency) : null;
+      if (rate != null && isFinite(rate)) usd = rawLocal * penceFactor * rate;
+      else usd = null;  // can't convert reliably → don't fabricate; fall back below
+    }
+  } catch { usd = null; }
+
+  if (usd == null || !isFinite(usd)) {
+    // Conversion failed — use GitHub USD price rather than an unconverted local one.
+    const ghPx = githubRow?.price;
+    const out = { price: (ghPx != null && isFinite(ghPx)) ? ghPx : null, source: 'github (fx-fallback)', live: false, at: Date.now() };
+    _botQuoteCache[t] = out;
+    return out;
+  }
+  const out = { price: +usd.toFixed(4), source, live: true, at: Date.now(), rawLocal };
+  _botQuoteCache[t] = out;
+  return out;
+}
+if (typeof window !== 'undefined') window.botLiveQuote = botLiveQuote;
+
 function botMarkToMarket() {
   const bot = loadBotState();
   const today = new Date().toISOString().slice(0, 10);
   let changed = false;
   for (const bet of bot.bets) {
-    const row = (typeof getStockbookRow === 'function') ? getStockbookRow(bet.ticker) : null;
-    const px = row?.price;
+    // Mark using whatever the bet actually holds: a leveraged-ETF bet marks the
+    // ETF's own price (markTicker), everything else marks the underlying.
+    const markTic = bet.markTicker || bet.ticker;
+    const row = (typeof getStockbookRow === 'function') ? getStockbookRow(markTic) : null;
+    let px = null, pxSource = 'github';
+    const lq = _botQuoteCache[markTic];
+    if (lq && lq.live && isFinite(lq.price)) { px = lq.price; pxSource = lq.source; }
+    else if (row?.price != null && isFinite(row.price)) { px = row.price; pxSource = 'github'; }
     if (px == null || !isFinite(px)) continue;
     bet.lastPrice = px;
+    bet.lastPriceSource = pxSource;
     // Raw % move of the underlying since entry
     const rawPct = bet.entryPrice > 0 ? (px - bet.entryPrice) / bet.entryPrice : 0;
     // Directional return (short profits when price falls), times leverage
-    const dirPct = (bet.direction === 'long' ? rawPct : -rawPct) * (bet.leverage || 1);
+    // For a leveraged ETF, we HOLD THE ETF LONG regardless of view — a bear ETF
+    // (e.g. TSLQ) is bought to express a short, and its price already rises when
+    // the underlying falls. So its P&L is just the ETF's own raw move; direction
+    // and leverage are already baked into which ETF we hold and its price.
+    const dirPct = (bet.instrument === 'leveraged_etf')
+      ? rawPct
+      : (bet.direction === 'long' ? rawPct : -rawPct) * (bet.leverage || 1);
     // Exposure base: prefer the explicit `dollars` (post-leverage). Fall back to
     // notional×leverage, then shares×entryPrice, so a bet missing one field never
     // produces NaN P&L (which would silently corrupt the compounding bankroll).
     let exposure = bet.dollars;
     if (!isFinite(exposure)) exposure = (bet.notional || 0) * (bet.leverage || 1);
     if (!isFinite(exposure) || exposure === 0) exposure = (bet.shares || 0) * (bet.entryPrice || 0) * (bet.leverage || 1);
-    let pnl = exposure * dirPct;
+    let pnl;
+    if (bet.instrument === 'option' && bet.optionPremium > 0 && bet.optionStrike != null) {
+      // OPTION P&L — non-linear, with loss CAPPED at premium paid. We model the
+      // option's current value with a simple intrinsic + decaying-time-value
+      // approximation, then P&L = (currentValue − premium) × 100 × contracts.
+      // For a call: intrinsic = max(0, px − strike); put: max(0, strike − px).
+      const isCall = bet.optionType !== 'put';
+      const intrinsic = isCall ? Math.max(0, px - bet.optionStrike) : Math.max(0, bet.optionStrike - px);
+      // Remaining time value decays linearly to zero at expiry.
+      const totalDays = Math.max(1, Math.round((new Date(bet.optionExpiry) - new Date(bet.entryDate)) / 86400000));
+      const daysLeft = Math.max(0, Math.round((new Date(bet.optionExpiry) - new Date(today)) / 86400000));
+      const timeFrac = totalDays > 0 ? daysLeft / totalDays : 0;
+      // Original time value = premium − original intrinsic (ATM entry ⇒ ≈ premium).
+      const origIntrinsic = isCall ? Math.max(0, bet.entryPrice - bet.optionStrike) : Math.max(0, bet.optionStrike - bet.entryPrice);
+      const origTimeValue = Math.max(0, bet.optionPremium - origIntrinsic);
+      const currentValue = intrinsic + origTimeValue * timeFrac;
+      const contracts = bet.optionContracts || 1;
+      pnl = (currentValue - bet.optionPremium) * 100 * contracts;
+      // Hard floor: can never lose more than the premium paid (defined risk).
+      const maxLoss = bet.maxLoss != null ? bet.maxLoss : bet.optionPremium * 100 * contracts;
+      if (pnl < -maxLoss) pnl = -maxLoss;
+      bet.optionValue = +currentValue.toFixed(2);
+      bet.returnPct = bet.optionPremium > 0 ? +(((currentValue - bet.optionPremium) / bet.optionPremium) * 100).toFixed(2) : 0;
+    } else {
+      pnl = exposure * dirPct;
+      bet.returnPct = +(dirPct * 100).toFixed(2);
+    }
     if (!isFinite(pnl)) pnl = 0;
     // SHORT negative carry: deduct the owed dividend, prorated by days held.
-    // This is a genuine cost that makes shorts on high-yielders expensive to hold.
-    if (bet.direction === 'short') {
+    // (Options don't owe dividend carry — only a short STOCK position does.)
+    if (bet.direction === 'short' && bet.instrument !== 'option') {
       const heldDays = Math.max(0, Math.round((new Date(today) - new Date(bet.entryDate)) / 86400000));
       const carry = (typeof shortDividendCarry === 'function')
         ? shortDividendCarry(bet.ticker, exposure, heldDays) : 0;
@@ -36900,7 +38410,6 @@ function botMarkToMarket() {
         bet.dividendCarry = +carry.toFixed(2);   // surfaced in the ledger
       }
     }
-    bet.returnPct = +(dirPct * 100).toFixed(2);
     bet.pnl = +pnl.toFixed(2);
     // ===== EXIT LOGIC — close when the trade thesis resolves =====
     // Three triggers, whichever comes first: stop-loss hit (thesis wrong),
@@ -36911,14 +38420,21 @@ function botMarkToMarket() {
       const ageDays = Math.round((new Date(today) - new Date(bet.entryDate)) / 86400000);
       let exitReason = null;
       if (bet.stopPrice != null) {
-        const stopped = bet.direction === 'short' ? (px >= bet.stopPrice) : (px <= bet.stopPrice);
+        // Leveraged ETFs are held long (direction baked into the ETF choice).
+        const heldLong = bet.instrument === 'leveraged_etf' ? true : (bet.direction !== 'short');
+        const stopped = heldLong ? (px <= bet.stopPrice) : (px >= bet.stopPrice);
         if (stopped) exitReason = 'stop-loss';
       }
       if (!exitReason && bet.targetPrice != null) {
-        const hit = bet.direction === 'short' ? (px <= bet.targetPrice) : (px >= bet.targetPrice);
+        const heldLong = bet.instrument === 'leveraged_etf' ? true : (bet.direction !== 'short');
+        const hit = heldLong ? (px >= bet.targetPrice) : (px <= bet.targetPrice);
         if (hit) exitReason = 'target';
       }
       if (!exitReason && ageDays >= bet.horizonDays) exitReason = 'horizon';
+      // Options also expire — close at/after expiry regardless of horizon.
+      if (!exitReason && bet.instrument === 'option' && bet.optionExpiry && today >= bet.optionExpiry) {
+        exitReason = 'option-expiry';
+      }
       if (exitReason) {
         bet.status = 'closed';
         bet.exitDate = today;
@@ -36936,10 +38452,29 @@ function botMarkToMarket() {
     // Bets just settled → fold their outcomes into the learned signal weights.
     try { if (typeof botRetrain === 'function') botRetrain(); } catch {}
   }
+  // ---- Daily equity-curve snapshot ----
+  // Record today's mark-to-market book value (bankroll + unrealized P&L) once per
+  // day so we can draw the bot's equity curve and compute windowed (W/M/Y/all)
+  // returns — exactly like a portfolio chart. Always measured in dollars; the
+  // performance % is derived against the FIXED $100k basis, never a moving one.
+  try {
+    const openPnlNow = bot.bets.filter(b => b.status === 'open').reduce((s, b) => s + (b.pnl || 0), 0);
+    const realizedNow = bot.bets.filter(b => b.status === 'closed').reduce((s, b) => s + (b.pnl || 0), 0);
+    const bookValue = +(BOT_STARTING_BANKROLL + realizedNow + openPnlNow).toFixed(2);
+    if (!Array.isArray(bot.equityCurve)) bot.equityCurve = [];
+    const last = bot.equityCurve[bot.equityCurve.length - 1];
+    if (last && last.date === today) {
+      // Update today's point in place (price moved during the day).
+      if (last.value !== bookValue) { last.value = bookValue; saveBotState(bot); }
+    } else {
+      bot.equityCurve.push({ date: today, value: bookValue });
+      // Cap the stored curve at ~3 years of daily points to bound storage.
+      if (bot.equityCurve.length > 1100) bot.equityCurve = bot.equityCurve.slice(-1100);
+      saveBotState(bot);
+    }
+  } catch {}
   return bot;
 }
-
-// ---- Position total / book value (open exposure + cash) ----
 function botBookValue() {
   const bot = botMarkToMarket();
   const open = bot.bets.filter(b => b.status === 'open');
@@ -36956,10 +38491,48 @@ function botBookValue() {
     openExposure: +openExposure.toFixed(2),     // post-leverage market exposure
     openPnl: +openPnl.toFixed(2),               // unrealized
     totalValue: +(bot.bankroll + openPnl).toFixed(2),  // mark-to-market book value
+    // Open-position return %: unrealized P&L as a % of the capital committed to
+    // open positions (your "$35k up 6.84%" read). This is the CURRENT TRADES'
+    // performance — it naturally "resets" as positions close and new ones open,
+    // separate from the fixed-$100k all-time number.
+    openReturnPct: openNotional > 0 ? +((openPnl / openNotional) * 100).toFixed(2) : null,
     grossLeverage: bot.bankroll > 0 ? +(openExposure / bot.bankroll).toFixed(2) : 0,
   };
 }
 if (typeof window !== 'undefined') window.botBookValue = botBookValue;
+
+// Prime fresh live quotes for all OPEN bot positions, then re-render the bets
+// tab. Runs browser-side (Stooq/Finnhub), USD-converts, and populates the cache
+// botMarkToMarket reads. Best-effort and bounded — failures fall back to the
+// GitHub price. Call this when the bets tab opens and via a manual "refresh
+// prices" button.
+let _botLiveQuotesInflight = false;
+async function botRefreshLiveQuotes() {
+  if (_botLiveQuotesInflight) return;
+  _botLiveQuotesInflight = true;
+  try {
+    const bot = loadBotState();
+    const open = bot.bets.filter(b => b.status === 'open');
+    if (!open.length) return;
+    // Dedupe tickers; fetch with limited concurrency so we don't hammer Stooq.
+    const tickers = [...new Set(open.map(b => b.ticker))];
+    const CONC = 5;
+    for (let i = 0; i < tickers.length; i += CONC) {
+      const slice = tickers.slice(i, i + CONC);
+      await Promise.all(slice.map(async (tk) => {
+        const row = (typeof getStockbookRow === 'function') ? getStockbookRow(tk) : null;
+        try { await botLiveQuote(tk, row); } catch {}
+      }));
+    }
+    // Re-render with the fresh marks.
+    if (typeof renderBetsTab === 'function') renderBetsTab();
+    const n = tickers.filter(t => _botQuoteCache[t]?.live).length;
+    if (typeof flashStatus === 'function') flashStatus(`Refreshed ${n}/${tickers.length} live prices`, n ? 'success' : 'info');
+  } finally {
+    _botLiveQuotesInflight = false;
+  }
+}
+if (typeof window !== 'undefined') window.botRefreshLiveQuotes = botRefreshLiveQuotes;
 
 // ---- Aggregate performance (optionally filtered to one ticker) ----
 function botPerformance(filterTicker = null) {
@@ -37001,12 +38574,76 @@ function botPerformance(filterTicker = null) {
   };
 }
 
+// ---- Windowed performance from the equity curve ----
+// Returns the bot's book-value and return over a time window. The ALL-TIME and
+// every windowed % is computed against the FIXED $100k basis for the headline,
+// but each window ALSO reports its period return (start-of-window value → now)
+// so you can see "up X% this month" the way a portfolio chart does. The basis
+// for the period return resets at the window start (and, per the request, the
+// "current trades" basis effectively resets when positions close and book value
+// is realized) — while all-time always anchors to $100k.
+function botWindowedPerformance() {
+  const bot = botMarkToMarket();
+  const curve = Array.isArray(bot.equityCurve) ? bot.equityCurve.slice() : [];
+  const now = curve.length ? curve[curve.length - 1].value : BOT_STARTING_BANKROLL;
+  const today = new Date();
+  const windows = {
+    week:  7,
+    month: 30,
+    year:  365,
+    all:   null,
+  };
+  const valueAtOrBefore = (cutoffMs) => {
+    // The curve point on/just before the cutoff is the window's starting value.
+    let start = null;
+    for (const p of curve) {
+      const t = new Date(p.date + 'T00:00:00Z').getTime();
+      if (t <= cutoffMs) start = p; else break;
+    }
+    return start ? start.value : null;
+  };
+  const out = {};
+  for (const [name, days] of Object.entries(windows)) {
+    if (name === 'all') {
+      // All-time: anchored to the fixed $100k basis (never moves).
+      out.all = {
+        startValue: BOT_STARTING_BANKROLL,
+        endValue: now,
+        returnPct: +(((now - BOT_STARTING_BANKROLL) / BOT_STARTING_BANKROLL) * 100).toFixed(2),
+        dollars: +(now - BOT_STARTING_BANKROLL).toFixed(2),
+      };
+      continue;
+    }
+    const cutoff = today.getTime() - days * 86400000;
+    const startVal = valueAtOrBefore(cutoff);
+    if (startVal == null || startVal === 0) {
+      out[name] = { startValue: null, endValue: now, returnPct: null, dollars: null };
+    } else {
+      out[name] = {
+        startValue: startVal,
+        endValue: now,
+        returnPct: +(((now - startVal) / startVal) * 100).toFixed(2),
+        dollars: +(now - startVal).toFixed(2),
+      };
+    }
+  }
+  return { curve, now, windows: out };
+}
+if (typeof window !== 'undefined') window.botWindowedPerformance = botWindowedPerformance;
+
 // ============================================================
 //   BETS TAB RENDERER + TODAY'S-BETS TOP BANNER
 // ============================================================
 function renderBetsTab() {
   const body = document.getElementById('bets-body');
   if (!body) return;
+  // On first render of a session, kick off a live-quote refresh in the
+  // background so open positions show fresh marks rather than stale nightly
+  // prices. Guarded so it fires once, not on every re-render.
+  if (!_betsLiveQuotesPrimed && typeof botRefreshLiveQuotes === 'function') {
+    _betsLiveQuotesPrimed = true;
+    setTimeout(() => botRefreshLiveQuotes().catch(() => {}), 150);
+  }
   const filter = (document.getElementById('bets-filter')?.value || '').trim().toUpperCase() || null;
   const perf = botPerformance(filter);
   const today = new Date().toISOString().slice(0, 10);
@@ -37030,8 +38667,8 @@ function renderBetsTab() {
         <div style="font-family:var(--mono);font-size:9px;color:${pnlColor(perf.totalPnl)};margin-top:2px">${perf.totalReturnPct >= 0 ? '+' : ''}${perf.totalReturnPct}% from $100,000</div>
       </div>
       ${book ? `<div class="company-card" style="margin:0;border-left:3px solid var(--amber)">
-        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Position Total</div>
-        <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:var(--ink);margin-top:4px">$${book.openNotional.toLocaleString(undefined,{maximumFractionDigits:0})}</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Open Positions</div>
+        <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:var(--ink);margin-top:4px">$${book.openNotional.toLocaleString(undefined,{maximumFractionDigits:0})}${book.openReturnPct != null ? ` <span style="font-size:13px;color:${pnlColor(book.openPnl)}">${book.openReturnPct >= 0 ? '+' : ''}${book.openReturnPct}%</span>` : ''}</div>
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">${book.openPositions} open · $${book.openExposure.toLocaleString(undefined,{maximumFractionDigits:0})} exposure (${book.grossLeverage}× gross)</div>
       </div>
       <div class="company-card" style="margin:0">
@@ -37056,8 +38693,73 @@ function renderBetsTab() {
       </div>
     </div>`;
 
-  // ---- Today's bets highlight ----
-  const todayBets = perf.bets.filter(b => b.entryDate === today);
+  // ---- Equity curve chart + time-window performance ----
+  const wp = (typeof botWindowedPerformance === 'function') ? botWindowedPerformance() : null;
+  const activeWin = BETS_STATE.perfWindow || 'all';
+  let chartHtml = '';
+  if (wp && wp.curve.length >= 2) {
+    // Slice the curve to the active window.
+    const winDays = { week: 7, month: 30, year: 365, all: null }[activeWin];
+    let pts = wp.curve;
+    if (winDays != null) {
+      const cutoff = Date.now() - winDays * 86400000;
+      pts = wp.curve.filter(p => new Date(p.date + 'T00:00:00Z').getTime() >= cutoff);
+      if (pts.length < 2) pts = wp.curve.slice(-2);  // always show something
+    }
+    const vals = pts.map(p => p.value);
+    const minV = Math.min(...vals), maxV = Math.max(...vals);
+    const pad = (maxV - minV) * 0.08 || 1000;
+    const lo = minV - pad, hi = maxV + pad;
+    const W = 600, H = 160;
+    const x = (i) => pts.length > 1 ? (i / (pts.length - 1)) * W : 0;
+    const y = (v) => H - ((v - lo) / (hi - lo)) * H;
+    const linePath = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(p.value).toFixed(1)}`).join(' ');
+    const basisY = y(BOT_STARTING_BANKROLL);   // the $100k reference line
+    const showBasis = BOT_STARTING_BANKROLL >= lo && BOT_STARTING_BANKROLL <= hi;
+    const first = pts[0].value, lastV = pts[pts.length - 1].value;
+    const up = lastV >= first;
+    const lineColor = up ? 'var(--pos)' : 'var(--neg)';
+    const areaPath = linePath + ` L${W},${H} L0,${H} Z`;
+    const winData = wp.windows[activeWin];
+    const winPct = winData?.returnPct;
+    const winColor = winPct == null ? 'var(--ink-dim)' : winPct >= 0 ? 'var(--pos)' : 'var(--neg)';
+    chartHtml = `
+    <div class="company-card" style="margin:0 0 18px">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px">
+        <div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Equity Curve</div>
+          <div style="font-family:var(--mono);font-size:11px;color:var(--ink-dim);margin-top:2px">
+            ${activeWin === 'all' ? 'All-time vs $100,000 basis' : activeWin + ' window'} ·
+            <span style="color:${winColor};font-weight:700">${winPct == null ? '—' : (winPct >= 0 ? '+' : '') + winPct + '%'}</span>
+            ${winData?.dollars != null ? `<span style="color:${winColor}"> (${winData.dollars >= 0 ? '+' : ''}$${Math.abs(winData.dollars).toLocaleString(undefined,{maximumFractionDigits:0})})</span>` : ''}
+          </div>
+        </div>
+        <div class="seg-control" style="font-size:10px">
+          ${['week','month','year','all'].map(w => `<button class="seg-btn ${activeWin===w?'active':''}" data-perfwin="${w}" style="font-size:10px;text-transform:capitalize">${w==='all'?'All':w==='week'?'1W':w==='month'?'1M':'1Y'}</button>`).join('')}
+        </div>
+      </div>
+      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:160px;display:block">
+        <defs>
+          <linearGradient id="botEqGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="${up ? 'rgba(61,220,132,0.28)' : 'rgba(255,92,92,0.28)'}"/>
+            <stop offset="100%" stop-color="${up ? 'rgba(61,220,132,0)' : 'rgba(255,92,92,0)'}"/>
+          </linearGradient>
+        </defs>
+        ${showBasis ? `<line x1="0" y1="${basisY.toFixed(1)}" x2="${W}" y2="${basisY.toFixed(1)}" stroke="var(--ink-faint)" stroke-width="1" stroke-dasharray="4,4" opacity="0.5"/>
+        <text x="4" y="${(basisY - 4).toFixed(1)}" font-family="monospace" font-size="9" fill="var(--ink-faint)" opacity="0.7">$100k basis</text>` : ''}
+        <path d="${areaPath}" fill="url(#botEqGrad)"/>
+        <path d="${linePath}" fill="none" stroke="${lineColor}" stroke-width="2" stroke-linejoin="round"/>
+        <circle cx="${x(pts.length-1).toFixed(1)}" cy="${y(lastV).toFixed(1)}" r="3.5" fill="${lineColor}"/>
+      </svg>
+      <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:4px">
+        <span>${pts[0].date}</span>
+        <span>$${lastV.toLocaleString(undefined,{maximumFractionDigits:0})}</span>
+        <span>${pts[pts.length-1].date}</span>
+      </div>
+    </div>`;
+  } else {
+    chartHtml = `<div class="company-card" style="margin:0 0 18px"><div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);padding:8px 0">Equity curve builds as the bot runs daily — one point per day. Run the scan over multiple days to see the chart and weekly/monthly/yearly performance.</div></div>`;
+  }
   const todayHtml = todayBets.length ? `
     <div class="company-card" style="border-left:3px solid var(--amber)">
       <h4>Today's Bets · ${today}</h4>
@@ -37065,8 +38767,8 @@ function renderBetsTab() {
         ${todayBets.map(b => `
           <div style="padding:10px 12px;background:var(--bg-elev);border:1px solid var(--rule);border-radius:3px">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
-              <strong style="color:var(--amber);font-family:var(--mono)">${b.ticker}</strong>
-              <span style="font-family:var(--mono);font-size:10px">${dirBadge(b.direction)}${b.leverage > 1 ? ` <span style="color:#e0b04c">${b.leverage}x</span>` : ''}${b.hedge ? ' 🛡' : ''}</span>
+              <strong class="bot-ticker-link" data-ticker="${b.ticker}" style="color:var(--amber);font-family:var(--mono);cursor:pointer;text-decoration:underline;text-decoration-style:dotted" title="Open ${b.ticker} in Valuation">${b.ticker}</strong>
+              <span style="font-family:var(--mono);font-size:10px">${dirBadge(b.direction)}${b.instrument === 'option' ? ` <span style="color:#c08ae0;font-weight:700">${(b.optionType||'').toUpperCase()}</span>` : b.instrument === 'leveraged_etf' ? ` <span style="color:#4ec9a8;font-weight:700" title="${b.leveragedEtfMultiplier}x leveraged ETF on ${b.ticker}">${b.leveragedEtf}</span>` : (b.leverage > 1 ? ` <span style="color:#e0b04c">${b.leverage}x</span>` : '')}${b.hedge ? ' 🛡' : ''}</span>
             </div>
             <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim)">$${b.dollars.toFixed(0)} · conf ${(b.confidence * 100).toFixed(0)}% · entry $${b.entryPrice.toFixed(2)}</div>
             <div style="font-size:10px;color:var(--ink-faint);margin-top:6px;line-height:1.4">${(b.rationale || []).slice(0, 2).map(escapeHtml).join(' · ')}</div>
@@ -37085,8 +38787,8 @@ function renderBetsTab() {
   const ledgerRows = perf.bets.slice().reverse().map(b => `
     <tr>
       <td style="font-family:var(--mono);font-size:11px">${b.entryDate}</td>
-      <td style="font-family:var(--mono);font-weight:700">${b.ticker}</td>
-      <td style="font-family:var(--mono);font-size:11px">${dirBadge(b.direction)}${b.leverage > 1 ? ` ${b.leverage}x` : ''}${b.hedge ? ' 🛡' : ''}</td>
+      <td style="font-family:var(--mono);font-weight:700"><span class="bot-ticker-link" data-ticker="${b.ticker}" style="cursor:pointer;color:var(--amber);text-decoration:underline;text-decoration-style:dotted" title="Open ${b.ticker} in Valuation">${b.ticker}</span></td>
+      <td style="font-family:var(--mono);font-size:11px">${dirBadge(b.direction)}${b.instrument === 'option' ? ` <span style="color:#c08ae0;font-weight:700">${(b.optionType||'').toUpperCase()}</span>` : b.instrument === 'leveraged_etf' ? ` <span style="color:#4ec9a8;font-weight:700">${b.leveragedEtf}</span>` : (b.leverage > 1 ? ` ${b.leverage}x` : '')}${b.hedge ? ' 🛡' : ''}</td>
       <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">$${b.dollars.toFixed(0)}</td>
       <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">$${b.entryPrice.toFixed(2)}</td>
       <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${b.lastPrice != null ? '$' + b.lastPrice.toFixed(2) : '—'}</td>
@@ -37115,7 +38817,28 @@ function renderBetsTab() {
       </div>
     </div>`;
 
-  body.innerHTML = summary + todayHtml + ledger + note;
+  body.innerHTML = summary + chartHtml + todayHtml + ledger + note;
+  // Wire the equity-curve window selector.
+  body.querySelectorAll('[data-perfwin]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      BETS_STATE.perfWindow = btn.dataset.perfwin;
+      renderBetsTab();
+    });
+  });
+  // Click a bot ticker → open it in the Valuation tab (the connection requested).
+  body.querySelectorAll('.bot-ticker-link').forEach(el => {
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const tk = el.dataset.ticker;
+      if (tk && typeof executeCommand === 'function') executeCommand(tk);
+      else if (tk) {
+        const inp = document.getElementById('ticker');
+        if (inp) inp.value = tk;
+        if (typeof switchTab === 'function') switchTab('valuation');
+        setTimeout(() => document.getElementById('fetch-btn')?.click(), 100);
+      }
+    });
+  });
 }
 
 // Top-of-page banner showing today's bets (rendered on the Valuation/Home view).
@@ -37133,7 +38856,7 @@ function renderTodaysBetsBanner() {
       ${todayBets.map(b => `
         <span style="font-family:var(--mono);font-size:11px;cursor:pointer" onclick="switchTab('bets')" title="${escapeHtml((b.rationale||[]).slice(0,2).join(' · '))}">
           <strong style="color:var(--ink)">${b.ticker}</strong>
-          <span style="color:${b.direction === 'long' ? 'var(--pos)' : 'var(--neg)'}">${b.direction === 'long' ? '▲' : '▼'}</span>${b.leverage > 1 ? `<span style="color:#e0b04c">${b.leverage}x</span>` : ''}
+          <span style="color:${b.direction === 'long' ? 'var(--pos)' : 'var(--neg)'}">${b.direction === 'long' ? '▲' : '▼'}</span>${b.instrument === 'option' ? `<span style="color:#c08ae0;font-weight:700"> ${(b.optionType||'').toUpperCase()}</span>` : b.instrument === 'leveraged_etf' ? `<span style="color:#4ec9a8;font-weight:700"> ${b.leveragedEtf}</span>` : ''}${b.leverage > 1 && b.instrument !== 'option' && b.instrument !== 'leveraged_etf' ? `<span style="color:#e0b04c">${b.leverage}x</span>` : ''}
         </span>
       `).join('<span style="color:var(--ink-faint)">·</span>')}
       <span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-left:auto;cursor:pointer" onclick="switchTab('bets')">view all →</span>
