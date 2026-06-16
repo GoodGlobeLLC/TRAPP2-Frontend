@@ -3237,6 +3237,11 @@ document.addEventListener('DOMContentLoaded', () => {
     if (btn) { btn.textContent = '⤒ Import Repo'; btn.disabled = false; }
     if (typeof renderBetsTab === 'function') renderBetsTab();
   });
+  document.getElementById('bets-rebalance-btn')?.addEventListener('click', () => {
+    if (typeof botRebalanceToPositiveCash === 'function') botRebalanceToPositiveCash(0.10);
+    if (typeof renderBetsTab === 'function') renderBetsTab();
+    if (typeof renderTodaysBetsBanner === 'function') renderTodaysBetsBanner();
+  });
   let _betsFilterTimer = null;
   document.getElementById('bets-filter')?.addEventListener('input', () => {
     clearTimeout(_betsFilterTimer);
@@ -37264,6 +37269,13 @@ function buildBotTrainingData() {
       optionType: b.optionType || null,
       leveragedEtf: b.leveragedEtf || null,
       style: _classifyTradeStyle(b),
+      horizonType: b.horizonType || null,
+      horizonDays: b.horizonDays || null,
+      dalioEnv: b.dalioEnv || null,
+      longTermTrend: b.longTermTrend || null,
+      taxTreatment: b.taxTreatment || null,
+      taxOwed: b.taxOwed != null ? b.taxOwed : null,
+      afterTaxPnl: b.afterTaxPnl != null ? b.afterTaxPnl : null,
       entryDate: b.entryDate,
       exitDate: b.exitDate,
       entryPrice: b.entryPrice,
@@ -37508,9 +37520,57 @@ function renderBotTrainingInsights() {
 }
 if (typeof window !== 'undefined') window.renderBotTrainingInsights = renderBotTrainingInsights;
 
+// Render the Dalio all-weather balance: how the open book's risk is spread
+// across the four economic environments, plus an after-tax P&L summary.
+function renderBotEnvironmentBalance() {
+  const bot = loadBotState();
+  const open = bot.bets.filter(b => b.status === 'open');
+  if (!open.length) return '';
+  const exp = botEnvironmentExposure(open);
+  if (!exp.total) return '';
+  const labels = { 'growth-up': 'Growth ↑', 'growth-down': 'Growth ↓', 'inflation-up': 'Inflation ↑', 'inflation-down': 'Inflation ↓' };
+  const colors = { 'growth-up': 'var(--pos)', 'growth-down': '#7faaca', 'inflation-up': 'var(--data-amber)', 'inflation-down': '#c08ae0' };
+  const bars = Object.entries(exp.env).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]).map(([k, v]) => {
+    const pct = Math.round((v / exp.total) * 100);
+    return `<div style="margin-bottom:5px">
+      <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px;color:var(--ink-dim)"><span>${labels[k] || k}</span><span>${pct}%</span></div>
+      <div style="height:5px;background:var(--bg-elev);border-radius:3px;overflow:hidden"><div style="height:100%;width:${pct}%;background:${colors[k] || 'var(--ink-dim)'}"></div></div>
+    </div>`;
+  }).join('');
+  const concWarn = exp.concentration > 0.6
+    ? `<div style="font-family:var(--mono);font-size:9px;color:var(--data-amber);margin-top:8px;line-height:1.5">⚠ ${Math.round(exp.concentration * 100)}% of risk is in ${labels[exp.dominant] || exp.dominant}. Dalio: a book that's concentrated in one environment is fragile to a regime shift — the bot is now sizing new picks away from this.</div>`
+    : `<div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:8px">Risk spread across environments — reasonably all-weather.</div>`;
+
+  // After-tax summary of settled trades.
+  const closed = bot.bets.filter(b => b.status === 'closed' && b.afterTaxPnl != null);
+  let taxHtml = '';
+  if (closed.length) {
+    const gross = closed.reduce((s, b) => s + (b.pnl || 0), 0);
+    const net = closed.reduce((s, b) => s + (b.afterTaxPnl || 0), 0);
+    const tax = closed.reduce((s, b) => s + (b.taxOwed || 0), 0);
+    const lt = closed.filter(b => b.taxTreatment === 'long-term').length;
+    taxHtml = `<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--rule)">
+      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">After-tax (Ohio) · realized</div>
+      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-dim);line-height:1.6">
+        Gross ${gross >= 0 ? '+' : ''}$${gross.toFixed(0)} · tax −$${tax.toFixed(0)} · <strong style="color:${net >= 0 ? 'var(--pos)' : 'var(--neg)'}">net ${net >= 0 ? '+' : ''}$${net.toFixed(0)}</strong><br>
+        <span style="font-size:9px;color:var(--ink-faint)">${lt}/${closed.length} held long-term (>1yr, lower rate) · short-term taxed as income</span>
+      </div>
+    </div>`;
+  }
+
+  return `<div class="company-card" style="margin:0 0 18px">
+    <h4 style="margin-bottom:8px">All-Weather Balance <span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);font-weight:400">· Dalio risk-by-environment</span></h4>
+    ${bars}
+    ${concWarn}
+    ${taxHtml}
+  </div>`;
+}
+if (typeof window !== 'undefined') window.renderBotEnvironmentBalance = renderBotEnvironmentBalance;
+
 const BOT_STARTING_BANKROLL = 100000;
 const BETS_STATE = { perfWindow: 'all' };   // equity-curve window: week|month|year|all
 let _betsLiveQuotesPrimed = false;          // fires a one-time live-quote refresh on bets tab open
+let _betsRepoSynced = false;                // fires a one-time TRAPP2-BOT repo import on bets tab open
 const BOT_MAX_BETS_PER_DAY = 6;
 const BOT_MIN_BETS_PER_DAY = 0;   // can sit out entirely
 const BOT_CONVICTION_THRESHOLD = 0.30;  // below this absolute conviction → no bet
@@ -37768,6 +37828,55 @@ function computePeerGrade(ticker) {
 
 // Regime grade: is the current market regime a tailwind or headwind for this
 // stock's sector? Uses the bot's regime assessment + SECTOR_ETFS quad-favoring.
+// ============================================================
+//   RAY DALIO ALL-WEATHER LAYER — Dalio's core insight is that every asset does
+//   well in some economic environment and badly in others, so a robust book
+//   spreads risk ACROSS environments rather than betting everything on one. We
+//   classify each position by the environment it implicitly bets on, then nudge
+//   the bot away from piling all its risk into a single environment (a hidden
+//   concentration that looks diversified by ticker but isn't by RISK).
+//
+//   Four Dalio quadrants (growth × inflation):
+//     • growth-up   : cyclicals, tech, small caps, industrials, materials
+//     • growth-down : defensives, staples, utilities, healthcare, long bonds
+//     • inflation-up: energy, materials, commodities, TIPS, real assets
+//     • inflation-down: long-duration growth, bonds, rate-sensitive
+// ============================================================
+function dalioEnvironmentOf(ticker, sector, direction) {
+  const s = (sector || '').toLowerCase();
+  let env;
+  if (/energy|material|metal|mining|oil/.test(s)) env = 'inflation-up';
+  else if (/utilit|staple|consumer defensive|health/.test(s)) env = 'growth-down';
+  else if (/tech|communication|consumer cyclical|discretionary|industrial|financ/.test(s)) env = 'growth-up';
+  else env = 'growth-up';   // default risk-on bucket
+  // A SHORT inverts the environment exposure (shorting cyclicals = betting on
+  // growth-down, etc.).
+  if (direction === 'short') {
+    const flip = { 'growth-up': 'growth-down', 'growth-down': 'growth-up', 'inflation-up': 'inflation-down', 'inflation-down': 'inflation-up' };
+    env = flip[env] || env;
+  }
+  return env;
+}
+
+// Look at the bot's OPEN book and report how concentrated its risk is by Dalio
+// environment. Returns a per-environment dollar-risk map + the dominant env and
+// a concentration ratio (0 = perfectly spread, 1 = all in one environment).
+function botEnvironmentExposure(openBets) {
+  const env = { 'growth-up': 0, 'growth-down': 0, 'inflation-up': 0, 'inflation-down': 0 };
+  let total = 0;
+  for (const b of (openBets || [])) {
+    const e = dalioEnvironmentOf(b.ticker, b.sector, b.direction);
+    const risk = (b.dollars || b.notional || 0);
+    env[e] = (env[e] || 0) + risk;
+    total += risk;
+  }
+  if (total <= 0) return { env, total: 0, dominant: null, concentration: 0 };
+  let dominant = null, max = 0;
+  for (const [k, v] of Object.entries(env)) { if (v > max) { max = v; dominant = k; } }
+  return { env, total, dominant, concentration: +(max / total).toFixed(2) };
+}
+if (typeof window !== 'undefined') { window.dalioEnvironmentOf = dalioEnvironmentOf; window.botEnvironmentExposure = botEnvironmentExposure; }
+
 function computeRegimeGrade(ticker) {
   const t = String(ticker || '').toUpperCase();
   const row = (typeof getStockbookRow === 'function') ? getStockbookRow(t) : null;
@@ -38323,6 +38432,17 @@ async function botDailyRun(force = false) {
   }
 }
 async function _botDailyRunInner(bot, today, rows, force = false) {
+  // SAFETY FIRST: if a prior over-commit left cash negative (positions exceed
+  // bankroll), trim back to positive cash BEFORE considering any new entries.
+  // This unwinds the -$6,426 situation and keeps the book solvent every run.
+  try {
+    const _open = bot.bets.filter(b => b.status === 'open');
+    const _committed = _open.reduce((s, b) => s + (b.notional || 0), 0);
+    if (bot.bankroll - _committed < 0) {
+      botRebalanceToPositiveCash(0.10);
+      bot = loadBotState();   // reload trimmed state
+    }
+  } catch (e) { console.warn('[bot] pre-run rebalance failed:', e.message); }
 
   // ============================================================
   //   FULL-UNIVERSE BACKGROUND SCAN — no cap, no timeout, resumable
@@ -38420,10 +38540,25 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
     if (typeof flashStatus === 'function') flashStatus(`Bot scanned ${candidates.length} tickers — none cleared the ${(effThreshold * 100).toFixed(0)}% conviction bar today`, 'success');
   }
 
-  // Rank by confidence (absolute conviction), take top N
+  // Rank by confidence (absolute conviction), take top N — but make sure the bot
+  // takes BOTH SIDES when bearish candidates exist. Filling all slots with longs
+  // (because longs happened to edge out on confidence) means the bot never shorts
+  // and never learns the short side. So if there are qualifying shorts, reserve
+  // up to ~40% of the slots for the best shorts, then fill the rest by confidence.
   scored.sort((a, b) => b.confidence - a.confidence);
   const slotsLeft = BOT_MAX_BETS_PER_DAY - bot.bets.filter(b => b.entryDate === today).length;
-  const picks = scored.slice(0, Math.max(0, slotsLeft));
+  let picks;
+  {
+    const shorts = scored.filter(s => s.direction === 'short');
+    const longs = scored.filter(s => s.direction !== 'short');
+    const shortSlots = Math.min(shorts.length, Math.max(1, Math.floor(slotsLeft * 0.4)));
+    const chosenShorts = shorts.slice(0, shortSlots);
+    const chosenLongs = longs.slice(0, Math.max(0, slotsLeft - chosenShorts.length));
+    picks = [...chosenShorts, ...chosenLongs]
+      .sort((a, b) => b.confidence - a.confidence)
+      .slice(0, Math.max(0, slotsLeft));
+    if (chosenShorts.length) console.log(`[bot] reserved ${chosenShorts.length} slot(s) for shorts (best bearish candidates) so the bot trades both sides`);
+  }
 
   if (!bot.startedAt && picks.length) {
     bot.startedAt = today;
@@ -38432,7 +38567,7 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
     bot.benchmarkStart = spy?.price || null;
   }
 
-  // ===== POSITION SIZING — risk-based, correlation-aware =====
+  // ===== POSITION SIZING — risk-based, correlation-aware, CASH-CONSTRAINED =====
   // Philosophy (mirrors the Risk Calculator's thinking):
   //  • Size by RISK, not just conviction. A volatile name gets fewer dollars
   //    for the same conviction so each position risks a similar amount.
@@ -38440,12 +38575,36 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
   //    conviction is exceptional (then concentration is allowed, as requested).
   //  • Prefer uncorrelated bets when diversifying: if two picks are in the same
   //    sector/asset class, the second is sized down (its risk overlaps the first).
-  //  • Deploy more capital when conviction is high across the slate; sit on cash
-  //    when it's thin.
-  const equity = bot.bankroll;                      // current capital
-  const MAX_SINGLE = 0.35;                           // ≤35% in one position normally
+  //  • NEVER EXCEED AVAILABLE CASH. Prior open positions already consumed cash;
+  //    a new run can only deploy what's actually left, MINUS a sidelines reserve
+  //    and MINUS a reserve to cover open shorts if they move against us. This is
+  //    the fix for cash going to -$6,426: sizing now bases on free cash, not the
+  //    full $100k book, and total committed can never push cash negative.
+  const bankroll = bot.bankroll;
+  // Capital already tied up in open positions (pre-leverage notional).
+  const openBets = bot.bets.filter(b => b.status === 'open');
+  const committedCash = openBets.reduce((s, b) => s + (b.notional || 0), 0);
+  // Reserve to cover open SHORTS if they run against us (shorts can lose more
+  // than the notional, so we hold back margin = a fraction of short exposure).
+  const shortExposure = openBets.filter(b => b.direction === 'short')
+    .reduce((s, b) => s + (b.dollars || b.notional || 0), 0);
+  const shortCoverReserve = shortExposure * 0.5;   // hold 50% of short exposure as cover
+  // Sidelines buffer — always keep some dry powder (strategic cash on the side).
+  const SIDELINES_FRACTION = 0.10;                 // keep ≥10% of bankroll uncommitted
+  const sidelinesReserve = bankroll * SIDELINES_FRACTION;
+  // What's actually free to deploy on THIS run.
+  const freeCash = bankroll - committedCash;
+  const deployableCash = Math.max(0, freeCash - sidelinesReserve - shortCoverReserve);
+  // If there's effectively no cash to deploy, skip new entries this run (the bot
+  // sits out rather than over-committing — it can still close/trim existing ones).
+  if (deployableCash < bankroll * 0.02) {
+    console.log(`[bot] sizing: only $${deployableCash.toFixed(0)} deployable (cash $${freeCash.toFixed(0)} − $${sidelinesReserve.toFixed(0)} sidelines − $${shortCoverReserve.toFixed(0)} short-cover). Sitting out new entries; existing positions still managed.`);
+    picks.length = 0;   // no new bets this run
+  }
+  const equity = deployableCash;                    // size against FREE cash, not full book
+  const MAX_SINGLE = 0.35;                           // ≤35% of deployable in one position normally
   const MAX_SINGLE_HIGH_CONV = 0.60;                 // up to 60% if conviction ≥ 0.75
-  const MAX_GROSS = 0.90;                             // deploy ≤90% gross, keep some cash
+  const MAX_GROSS = 0.95;                             // deploy ≤95% of DEPLOYABLE cash (sidelines already held back)
 
   // Per-pick RISK weight: conviction ÷ volatility (vol from history if available,
   // else a regime-based default). Higher conviction + lower vol → bigger weight.
@@ -38469,6 +38628,15 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
 
   // Correlation penalty: discount a pick's weight by how much it overlaps names
   // already sized (same sector or asset class = correlated risk).
+  // DALIO RISK-PARITY NUDGE: also discount a pick if the book is already heavily
+  // concentrated in that pick's economic environment (growth-up/down,
+  // inflation-up/down). Ticker-diversification can hide environment-concentration
+  // — owning 6 tech names "feels" diversified but is one big growth-up bet. So
+  // picks that pile onto an already-dominant environment get sized down.
+  const _openForEnv = bot.bets.filter(b => b.status === 'open');
+  const _envExp = (typeof botEnvironmentExposure === 'function') ? botEnvironmentExposure(_openForEnv) : { env: {}, total: 0 };
+  const _envRunning = { ...(_envExp.env || {}) };
+  let _envRunningTotal = _envExp.total || 0;
   const usedGroups = {};
   picks.sort((a, b) => b.confidence - a.confidence);  // size highest-conviction first
   const rawWeights = picks.map(p => {
@@ -38478,14 +38646,44 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
     const overlap = usedGroups[group] || 0;
     if (overlap > 0) w *= Math.pow(0.55, overlap);     // each correlated peer halves the next
     usedGroups[group] = overlap + 1;
+    // Environment concentration: if this pick's Dalio environment already holds
+    // >40% of the book's risk, damp it (the more concentrated, the harder).
+    const env = (typeof dalioEnvironmentOf === 'function') ? dalioEnvironmentOf(p.ticker, p.sector, p.direction) : null;
+    if (env && _envRunningTotal > 0) {
+      const share = (_envRunning[env] || 0) / _envRunningTotal;
+      if (share > 0.4) w *= Math.max(0.45, 1 - (share - 0.4) * 1.5);   // up to ~55% haircut
+      p._dalioEnv = env;
+    } else if (env) { p._dalioEnv = env; }
     p._vol = vol; p._group = group;
+    // Sync long-term trend read (no CPI) for the dynamic-horizon decision: is
+    // this name in a multi-year up/down trend? A strong long-term uptrend earns
+    // a longer hold (Dalio: ride the durable machine).
+    try {
+      const h = (typeof getHistoryForTicker === 'function') ? getHistoryForTicker(p.ticker) : null;
+      if (h && h.length >= 200) {
+        const px = h.map(x => Array.isArray(x) ? x[1] : (x.close ?? x.price)).filter(v => v > 0);
+        if (px.length >= 200) {
+          const ret = (px[px.length - 1] - px[0]) / px[0];
+          const yrs = px.length / 252;
+          const cagr = Math.pow(px[px.length - 1] / px[0], 1 / Math.max(0.5, yrs)) - 1;
+          p._longTermTrend = {
+            classification: cagr > 0.15 ? 'strong-up' : cagr > 0.03 ? 'up' : cagr < -0.15 ? 'strong-down' : cagr < -0.03 ? 'down' : 'flat',
+            cagr: +cagr.toFixed(3),
+          };
+        }
+      }
+    } catch {}
     return Math.max(0, w);
   });
   const wSum = rawWeights.reduce((a, b) => a + b, 0) || 1;
 
   // Gross deployment scales with average conviction: thin slate → less capital.
   const avgConf = picks.reduce((s, p) => s + p.confidence, 0) / (picks.length || 1);
-  const grossTarget = Math.min(MAX_GROSS, 0.45 + avgConf);  // 0.45..0.90
+  const grossTarget = Math.min(MAX_GROSS, 0.45 + avgConf);  // 0.45..0.95
+
+  // Running tally of cash committed THIS run — a hard backstop so the cumulative
+  // notional across all of today's picks can never exceed what's deployable.
+  let cashRemaining = deployableCash;
 
   for (let i = 0; i < picks.length; i++) {
     const p = picks[i];
@@ -38493,7 +38691,18 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
     // Per-position cap (relaxed when conviction is exceptional).
     const cap = p.confidence >= 0.75 ? MAX_SINGLE_HIGH_CONV : MAX_SINGLE;
     frac = Math.min(frac, cap);
-    const notional = equity * frac;                   // capital allocated
+    let notional = equity * frac;                     // capital allocated (of deployable)
+    // HARD CLAMP: never commit more than the cash still remaining this run. A
+    // leveraged position only consumes its NOTIONAL in cash (the leverage is
+    // synthetic exposure), so we clamp on notional. If almost no cash remains,
+    // skip the rest of the slate rather than overcommit.
+    if (notional > cashRemaining) notional = cashRemaining;
+    if (notional < equity * 0.01 || notional < 50) {
+      console.log(`[bot] sizing: out of deployable cash at pick ${i + 1}/${picks.length} (${p.ticker}) — stopping new entries to stay within cash.`);
+      picks.length = i;   // drop the rest; we're out of cash
+      break;
+    }
+    cashRemaining -= notional;
     const dollars = notional * p.leverage;            // exposure (leverage applied)
     // Risk-calculator-style stop: 2× the position's volatility below entry (long)
     // / above (short), so the stop distance reflects the name's own noise.
@@ -38577,11 +38786,23 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
       components: p.components,
       decisionPath: p.decisionPath || null,
       regimeAtEntry: (typeof _botRegime !== 'undefined' && _botRegime) ? _botRegime.mode : (typeof botAssessRegime === 'function' ? botAssessRegime().mode : null),
-      horizonDays: confidenceHorizonDays(p.confidence),
+      tradeStyle: _classifyTradeStyle({ ...p, components: p.components }),
+      dalioEnv: p._dalioEnv || null,
+      longTermTrend: p._longTermTrend?.classification || null,
+      horizonDays: confidenceHorizonDays(p.confidence, {
+        style: _classifyTradeStyle({ ...p, components: p.components }),
+        regimeMode: (typeof _botRegime !== 'undefined' && _botRegime) ? _botRegime.mode : null,
+        longTermTrend: p._longTermTrend || null,
+      }),
+      // Horizon character for the ledger + tax logic: a hold intended to run past
+      // a year aims for the lower long-term capital-gains rate.
+      horizonType: null,   // set just below from the computed horizon
       status: 'open',
       exitDate: null,
       exitPrice: null,
     });
+    // Label the horizon character now that horizonDays is set.
+    { const _b = bot.bets[bot.bets.length - 1]; _b.horizonType = _b.horizonDays >= 90 ? 'long-term' : _b.horizonDays >= 21 ? 'swing' : 'short-term'; }
     const _instrDesc = p.instrument === 'option' ? ` as ${p.optionType.toUpperCase()}` : '';
     console.log(`[bot] BET ${p.direction.toUpperCase()}${_instrDesc} ${p.ticker} $${notional.toFixed(0)} (${(frac * 100).toFixed(0)}% of book${p.leverage > 1 ? `, ${p.leverage}x → $${dollars.toFixed(0)} exposure` : ''}) — conf ${(p.confidence * 100).toFixed(0)}%, vol ${(p._vol * 100).toFixed(0)}%, stop $${stopPrice}`);
   }
@@ -38594,8 +38815,80 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
 // ---- Mark-to-market + close bets that hit their horizon ----
 // Expected hold length for a bet, derived from conviction strength — used both
 // for sizing the dividend-carry penalty and for setting a bet's horizon.
-function confidenceHorizonDays(confidence) {
-  return confidence >= 0.8 ? 20 : 10;
+// ============================================================
+//   CAPITAL-GAINS TAX MODEL (Ohio) — the bot's realized gains aren't free; it
+//   should think in AFTER-TAX terms and prefer holding a winner past the 1-year
+//   line when it's close, to drop from short-term (ordinary income) to long-term
+//   (lower federal) rates. This is a simplified model for a paper account.
+//
+//   Federal:  short-term (held ≤ 1 yr)  → ordinary income (assume a mid bracket)
+//             long-term  (held > 1 yr)   → 15% (the common LTCG bracket)
+//   Ohio:     flat state income tax applies to BOTH (Ohio doesn't give LTCG a
+//             break) — Ohio's rate has been falling toward a flat ~3.5%.
+//   These are assumptions, not tax advice — a paper-trading approximation.
+// ============================================================
+const BOT_TAX = {
+  fedShortRate: 0.24,   // assumed ordinary-income bracket for short-term gains
+  fedLongRate: 0.15,    // long-term capital-gains rate
+  ohioRate: 0.035,      // Ohio flat income-tax assumption (applies to all gains)
+  longTermDays: 365,    // > 1 year qualifies for long-term treatment
+};
+// After-tax value of a realized gain given the holding period. Losses aren't
+// taxed (and could offset gains, but we keep it simple: tax only positive gains).
+function botAfterTaxGain(gain, holdDays) {
+  if (!(gain > 0)) return gain;   // losses pass through untaxed in this model
+  const isLong = holdDays != null && holdDays > BOT_TAX.longTermDays;
+  const fed = isLong ? BOT_TAX.fedLongRate : BOT_TAX.fedShortRate;
+  const rate = fed + BOT_TAX.ohioRate;
+  return +(gain * (1 - rate)).toFixed(2);
+}
+// The tax owed on a realized gain (for display/ledger).
+function botTaxOwed(gain, holdDays) {
+  if (!(gain > 0)) return 0;
+  return +(gain - botAfterTaxGain(gain, holdDays)).toFixed(2);
+}
+// Is this position close enough to the 1-year line that holding for the lower
+// long-term rate is worth waiting for? Used to AVOID a premature exit on a
+// winner that's, say, 11 months in — selling now incurs the higher short-term
+// rate. Returns true if within `windowDays` of qualifying AND in profit.
+function botNearLongTerm(bet, today, windowDays = 45) {
+  if (!bet.entryDate || !(bet.pnl > 0)) return false;
+  const held = Math.round((new Date(today) - new Date(bet.entryDate)) / 86400000);
+  const toQualify = BOT_TAX.longTermDays - held;
+  return toQualify > 0 && toQualify <= windowDays;
+}
+if (typeof window !== 'undefined') { window.botAfterTaxGain = botAfterTaxGain; window.BOT_TAX = BOT_TAX; }
+
+
+// the trade was taken and the market regime, not just a flat number. Some trades
+// are long-term theses (months), others are short-term tactical (days). Inputs:
+//   • tradeStyle: momentum/mean-reversion = short; value/fundamental/rotation =
+//     longer; a strong multi-year uptrend (Dalio "trend is your friend") extends it.
+//   • regime: trending risk-on lets winners run; choppy/risk-off shortens leashes.
+//   • conviction: higher conviction → willing to hold longer through noise.
+// Returns days. Used for the exit "horizon" and for tax-aware hold decisions.
+function confidenceHorizonDays(confidence, opts = {}) {
+  const { style = null, regimeMode = null, longTermTrend = null } = opts;
+  // Base horizon by conviction.
+  let days = confidence >= 0.85 ? 45 : confidence >= 0.7 ? 25 : confidence >= 0.5 ? 14 : 8;
+  // Style adjusts the character of the hold.
+  if (style) {
+    if (/mean-reversion/.test(style)) days = Math.round(days * 0.5);        // snap-back, exit fast
+    else if (/momentum/.test(style)) days = Math.round(days * 0.8);          // ride the move, but momentum fades
+    else if (/value|fundamental/.test(style)) days = Math.round(days * 2.2); // thesis needs time to play out
+    else if (/rotation|macro/.test(style)) days = Math.round(days * 1.6);    // regime trades persist
+    else if (/leveraged-etf/.test(style)) days = Math.round(days * 0.6);     // decay risk — don't hold long
+    else if (/option/.test(style)) days = Math.round(days * 0.7);            // theta works against you
+  }
+  // Regime stretches or compresses the leash.
+  if (regimeMode === 'risk-on') days = Math.round(days * 1.3);   // let winners run in a trending tape
+  else if (regimeMode === 'risk-off') days = Math.round(days * 0.7);
+  else if (regimeMode === 'choppy') days = Math.round(days * 0.8);
+  // A strong multi-year uptrend earns a longer hold (Dalio: don't fight the
+  // long-term machine). longTermTrend.classification from analyzeLongTermTrend.
+  if (longTermTrend?.classification === 'strong-up') days = Math.round(days * 1.5);
+  else if (longTermTrend?.classification === 'strong-down') days = Math.round(days * 0.7);
+  return Math.max(3, Math.min(400, days));   // 3 days .. ~13 months
 }
 
 // Negative carry on a SHORT: when you short a dividend-paying stock you OWE the
@@ -38721,6 +39014,71 @@ async function botLiveQuote(ticker, githubRow) {
 }
 if (typeof window !== 'undefined') window.botLiveQuote = botLiveQuote;
 
+// Partially sell a fraction (0..1) of an open position — realizes that share of
+// the P&L into the bankroll and shrinks the position's notional/shares/exposure.
+// This lets the bot scale OUT without going all-or-nothing (per the request).
+function botPartialSell(bet, fraction, today, reason) {
+  fraction = Math.max(0, Math.min(1, fraction));
+  if (fraction <= 0 || bet.status !== 'open') return 0;
+  const realized = +((bet.pnl || 0) * fraction).toFixed(2);
+  // Shrink the position proportionally.
+  const keep = 1 - fraction;
+  bet.notional = +((bet.notional || 0) * keep).toFixed(2);
+  bet.dollars = +((bet.dollars || 0) * keep).toFixed(2);
+  bet.shares = +((bet.shares || 0) * keep).toFixed(4);
+  bet.pnl = +((bet.pnl || 0) * keep).toFixed(2);
+  bet.allocationPct = +((bet.allocationPct || 0) * keep).toFixed(2);
+  bet.partialSells = bet.partialSells || [];
+  bet.partialSells.push({ date: today, fraction: +fraction.toFixed(3), realized, reason: reason || 'trim' });
+  if (keep <= 0.001) { bet.status = 'closed'; bet.exitDate = today; bet.exitReason = reason || 'trimmed-out'; }
+  return realized;
+}
+
+// Rebalance the book back to POSITIVE cash by trimming open positions. The bot
+// went over-committed (cash negative) before sizing was cash-aware; this brings
+// it back onside by proportionally trimming the largest/leveraged positions
+// until cash ≥ the target reserve. Realized P&L flows to the bankroll.
+function botRebalanceToPositiveCash(targetCashFraction = 0.10) {
+  const bot = loadBotState();
+  const open = bot.bets.filter(b => b.status === 'open');
+  if (!open.length) return bot;
+  const committed = open.reduce((s, b) => s + (b.notional || 0), 0);
+  let cash = bot.bankroll - committed;
+  const targetCash = bot.bankroll * targetCashFraction;
+  if (cash >= targetCash) return bot;   // already onside
+
+  // Need to free up (targetCash − cash) of notional. Trim from the biggest
+  // positions first (and leveraged ones, which carry more risk per dollar).
+  let need = targetCash - cash;
+  const ranked = open.slice().sort((a, b) => {
+    const ax = (b.notional || 0) * (b.leverage || 1);
+    const bx = (a.notional || 0) * (a.leverage || 1);
+    return ax - bx;
+  });
+  let totalRealized = 0;
+  for (const bet of ranked) {
+    if (need <= 0) break;
+    const n = bet.notional || 0;
+    if (n <= 0) continue;
+    // Trim just enough of THIS position to cover the remaining need, capped at
+    // selling the whole thing. Leave a little so we don't churn entirely out
+    // unless necessary.
+    let frac = Math.min(1, need / n);
+    const realized = botPartialSell(bet, frac, new Date().toISOString().slice(0, 10), 'rebalance-cash');
+    bot.bankroll = +(bot.bankroll + realized).toFixed(2);
+    totalRealized += realized;
+    need -= n * frac;
+  }
+  saveBotState(bot);
+  console.log(`[bot] rebalanced to cash target — trimmed positions, realized ${totalRealized >= 0 ? '+' : ''}$${totalRealized.toFixed(0)}, bankroll now $${bot.bankroll.toFixed(0)}`);
+  if (typeof flashStatus === 'function') flashStatus(`Rebalanced to positive cash (trimmed, realized ${totalRealized >= 0 ? '+' : ''}$${totalRealized.toFixed(0)})`, 'success');
+  return bot;
+}
+if (typeof window !== 'undefined') {
+  window.botPartialSell = botPartialSell;
+  window.botRebalanceToPositiveCash = botRebalanceToPositiveCash;
+}
+
 function botMarkToMarket() {
   const bot = loadBotState();
   const today = new Date().toISOString().slice(0, 10);
@@ -38812,7 +39170,19 @@ function botMarkToMarket() {
         const hit = heldLong ? (px >= bet.targetPrice) : (px <= bet.targetPrice);
         if (hit) exitReason = 'target';
       }
-      if (!exitReason && ageDays >= bet.horizonDays) exitReason = 'horizon';
+      if (!exitReason && ageDays >= bet.horizonDays) {
+        // TAX-AWARE HOLD: if this is a WINNER sitting just short of the 1-year
+        // long-term line, don't let a horizon exit trigger the higher short-term
+        // tax. Extend the hold to capture the lower long-term rate (Dalio-style
+        // patience + after-tax thinking). Options/leveraged ETFs are excluded
+        // (decay/expiry makes waiting unwise).
+        const taxSensitive = bet.instrument === 'shares' && bet.direction === 'long';
+        if (taxSensitive && botNearLongTerm(bet, today, 45)) {
+          bet._heldForLongTermTax = true;   // flag for the ledger; skip the exit
+        } else {
+          exitReason = 'horizon';
+        }
+      }
       // Options also expire — close at/after expiry regardless of horizon.
       if (!exitReason && bet.instrument === 'option' && bet.optionExpiry && today >= bet.optionExpiry) {
         exitReason = 'option-expiry';
@@ -38822,10 +39192,17 @@ function botMarkToMarket() {
         bet.exitDate = today;
         bet.exitPrice = px;
         bet.exitReason = exitReason;
-        // Realize P&L into the bankroll so the $100k compounds (or draws down).
-        bot.bankroll = +(bot.bankroll + (bet.pnl || 0)).toFixed(2);
+        // Tax accounting: record the holding period, tax owed, and after-tax P&L.
+        const holdDays = Math.round((new Date(today) - new Date(bet.entryDate)) / 86400000);
+        bet.holdDays = holdDays;
+        bet.taxTreatment = holdDays > BOT_TAX.longTermDays ? 'long-term' : 'short-term';
+        bet.taxOwed = botTaxOwed(bet.pnl || 0, holdDays);
+        bet.afterTaxPnl = botAfterTaxGain(bet.pnl || 0, holdDays);
+        // Realize P&L into the bankroll. We compound the AFTER-TAX gain so the
+        // account reflects what the bot actually keeps (taxes are a real drag).
+        bot.bankroll = +(bot.bankroll + (bet.afterTaxPnl != null ? bet.afterTaxPnl : (bet.pnl || 0))).toFixed(2);
         changed = true;
-        console.log(`[bot] CLOSE ${bet.direction.toUpperCase()} ${bet.ticker} @ $${px} — ${exitReason}, P&L ${bet.pnl >= 0 ? '+' : ''}$${(bet.pnl || 0).toFixed(0)} → bankroll $${bot.bankroll.toFixed(0)}`);
+        console.log(`[bot] CLOSE ${bet.direction.toUpperCase()} ${bet.ticker} @ $${px} — ${exitReason}, ${bet.taxTreatment} P&L ${bet.pnl >= 0 ? '+' : ''}$${(bet.pnl || 0).toFixed(0)} (after-tax ${bet.afterTaxPnl >= 0 ? '+' : ''}$${(bet.afterTaxPnl || 0).toFixed(0)}, tax $${bet.taxOwed.toFixed(0)}) → bankroll $${bot.bankroll.toFixed(0)}`);
       }
     }
   }
@@ -39025,6 +39402,16 @@ function renderBetsTab() {
   if (!_betsLiveQuotesPrimed && typeof botRefreshLiveQuotes === 'function') {
     _betsLiveQuotesPrimed = true;
     setTimeout(() => botRefreshLiveQuotes().catch(() => {}), 150);
+    // Also sync from the TRAPP2-BOT repo once per session — pulls any trades /
+    // learned weights committed from another device. The import MERGES (adds
+    // missing closed trades, keeps local open positions), so it's safe to run
+    // automatically; an empty/seed repo file adds nothing.
+    if (!_betsRepoSynced && typeof importBotTrainingData === 'function') {
+      _betsRepoSynced = true;
+      setTimeout(() => importBotTrainingData().then(() => {
+        if (typeof renderBetsTab === 'function') renderBetsTab();
+      }).catch(() => {}), 400);
+    }
   }
   const filter = (document.getElementById('bets-filter')?.value || '').trim().toUpperCase() || null;
   const perf = botPerformance(filter);
@@ -39145,6 +39532,10 @@ function renderBetsTab() {
   // Training insights panel — what the bot has learned (for the bot-data repo view).
   let insightsHtml = '';
   try { insightsHtml = renderBotTrainingInsights(); } catch {}
+  // Dalio all-weather balance panel — how the open book's RISK is spread across
+  // economic environments (not just tickers).
+  let balanceHtml = '';
+  try { balanceHtml = renderBotEnvironmentBalance(); } catch {}
   // Today's bets for the highlight card. (This was referenced below but never
   // defined in this function's scope — that ReferenceError was throwing BEFORE
   // body.innerHTML got set, so the whole Bets tab rendered blank even though the
@@ -39161,6 +39552,7 @@ function renderBetsTab() {
               <span style="font-family:var(--mono);font-size:10px">${dirBadge(b.direction)}${b.instrument === 'option' ? ` <span style="color:#c08ae0;font-weight:700">${(b.optionType||'').toUpperCase()}</span>` : b.instrument === 'leveraged_etf' ? ` <span style="color:#4ec9a8;font-weight:700" title="${b.leveragedEtfMultiplier}x leveraged ETF on ${b.ticker}">${b.leveragedEtf}</span>` : (b.leverage > 1 ? ` <span style="color:#e0b04c">${b.leverage}x</span>` : '')}${b.hedge ? ' 🛡' : ''}</span>
             </div>
             <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim)">$${b.dollars.toFixed(0)} · conf ${(b.confidence * 100).toFixed(0)}% · entry $${b.entryPrice.toFixed(2)}</div>
+            <div style="font-family:var(--mono);font-size:8px;color:var(--ink-faint);margin-top:2px">${b.horizonType ? b.horizonType + ' (' + b.horizonDays + 'd)' : ''}${b.tradeStyle ? ' · ' + b.tradeStyle : ''}${b.dalioEnv ? ' · ' + b.dalioEnv : ''}</div>
             <div style="font-size:10px;color:var(--ink-faint);margin-top:6px;line-height:1.4">${(b.rationale || []).slice(0, 2).map(escapeHtml).join(' · ')}</div>
           </div>
         `).join('')}
@@ -39207,7 +39599,7 @@ function renderBetsTab() {
       </div>
     </div>`;
 
-  body.innerHTML = summary + chartHtml + insightsHtml + todayHtml + ledger + note;
+  body.innerHTML = summary + chartHtml + balanceHtml + insightsHtml + todayHtml + ledger + note;
   // Wire the equity-curve window selector.
   body.querySelectorAll('[data-perfwin]').forEach(btn => {
     btn.addEventListener('click', () => {
