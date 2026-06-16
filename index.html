@@ -6856,7 +6856,7 @@
     <span class="tab-label">News</span>
   </button>
   <button class="tab-btn" data-tab="bets" title="Bot trading signals · paper portfolio · backtested performance vs you + SPY">
-    <span class="tab-num">🤖</span>
+    <span class="tab-num">↗</span>
     <span class="tab-label">Bets</span>
   </button>
   <button class="tab-btn" data-tab="research" title="Cross-stockbook statistical ranking · screen by any metric · letter grades · rank in every category">
@@ -7920,7 +7920,7 @@
 <div class="tab-panel" data-panel="bets">
   <div class="news-header">
     <div>
-      <h1 style="font-family:var(--serif);font-size:34px;margin:0">Bot Bets 🤖</h1>
+      <h1 style="font-family:var(--serif);font-size:34px;margin:0">Bot Bets ↗</h1>
       <div style="color:var(--ink-dim);font-family:var(--mono);font-size:11px;letter-spacing:0.05em;margin-top:4px">
         $1,000 paper portfolio · conviction-sized signals · 6-month challenge vs you
       </div>
@@ -7930,6 +7930,8 @@
       <button class="btn btn-ghost" id="bets-refresh-btn" title="Fetch fresh live prices for open positions (Stooq/Finnhub), USD-converted">Refresh Prices</button>
       <button class="btn btn-ghost" id="bets-run-btn" title="Run today's signal scan now">Run Scan</button>
       <button class="btn btn-ghost" id="bets-retrain-btn" title="Retrain signal weights from settled bets — learns from wins and losses">Retrain</button>
+      <button class="btn btn-ghost" id="bets-export-btn" title="Export full training journal as JSON to commit to the bot-data repo">⤓ Export Training</button>
+      <button class="btn btn-ghost" id="bets-import-btn" title="Import the bot's history from the bot-data repo (restores full journal on a fresh device)">⤒ Import Repo</button>
     </div>
   </div>
   <div id="bets-body" style="padding:0 32px 60px;overflow-x:auto"></div>
@@ -8661,6 +8663,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260614w"></script>
+<script src="app.js?v=20260614y"></script>
 </body>
 </html>

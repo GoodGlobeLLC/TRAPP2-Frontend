@@ -3226,6 +3226,17 @@ document.addEventListener('DOMContentLoaded', () => {
     } catch {}
     if (typeof renderBetsTab === 'function') renderBetsTab();
   });
+  document.getElementById('bets-export-btn')?.addEventListener('click', () => {
+    if (typeof exportBotTrainingData === 'function') exportBotTrainingData();
+  });
+  document.getElementById('bets-import-btn')?.addEventListener('click', async () => {
+    const btn = document.getElementById('bets-import-btn');
+    if (btn) { btn.textContent = 'Importing…'; btn.disabled = true; }
+    try { if (typeof importBotTrainingData === 'function') await importBotTrainingData(); }
+    catch (e) { console.warn('import failed', e); }
+    if (btn) { btn.textContent = '⤒ Import Repo'; btn.disabled = false; }
+    if (typeof renderBetsTab === 'function') renderBetsTab();
+  });
   let _betsFilterTimer = null;
   document.getElementById('bets-filter')?.addEventListener('input', () => {
     clearTimeout(_betsFilterTimer);
@@ -35628,7 +35639,7 @@ function renderResearchGrades(data) {
 
   return `
     ${_researchSparseDataDetected ? `<div style="background:rgba(224,176,76,0.15);border:1px solid var(--amber);border-radius:6px;padding:10px 12px;margin-bottom:12px;font-family:var(--mono);font-size:11px;color:var(--amber);line-height:1.5">
-      ⚠ <strong>Stale data detected.</strong> Your stockbook rows are missing financial fields (revenue, margins, debt…), so grades and coverage are unreliable. The committed data HAS these fields — your browser is serving a cached copy. Fix: <strong>Stock Book → Refresh All</strong>, or hard-refresh the page (Ctrl/Cmd-Shift-R). Grades will be accurate once fresh data loads.
+      <strong>Stale data detected.</strong> Your stockbook rows are missing financial fields (revenue, margins, debt…), so grades and coverage are unreliable. The committed data HAS these fields — your browser is serving a cached copy. Fix: <strong>Stock Book → Refresh All</strong>, or hard-refresh the page (Ctrl/Cmd-Shift-R). Grades will be accurate once fresh data loads.
     </div>` : ''}
     <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);margin-bottom:12px;line-height:1.6">
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
@@ -35864,7 +35875,7 @@ function renderResearchDetail(data, ticker) {
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
         <div>
           <h3 style="font-family:var(--serif);font-size:24px;margin:0">${escapeHtml(t.ticker)} <span style="font-size:13px;color:var(--ink-dim);font-weight:400">${escapeHtml(t.name)}</span></h3>
-          <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-top:4px">${escapeHtml(t.sector || '')} · graded on ${t.coverage} of ${t.coverageTotal} metrics${t.coverage < t.coverageTotal/2 ? ' · ⚠ sparse data, grade less reliable' : ''}</div>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-top:4px">${escapeHtml(t.sector || '')} · graded on ${t.coverage} of ${t.coverageTotal} metrics${t.coverage < t.coverageTotal/2 ? ' · sparse data, grade less reliable' : ''}</div>
         </div>
         <div style="text-align:center">
           <div style="font-family:var(--mono);font-size:48px;font-weight:700;line-height:1;color:${researchGradeColor(t.grade)}">${t.grade}</div>
@@ -37144,6 +37155,12 @@ async function fetchXtrappData() {
 // ============================================================
 
 const BOT_KEY = 'valuatio.bot.v1';
+// The bot-data repo: durable, cross-device source of truth for the bot's full
+// training journal (all trades, learnings, styles, signal attribution). The app
+// can't write to GitHub from the browser, so the flow is EXPORT here → manually
+// commit bot_training_data.json to this repo (same pattern as XTRAPP). On load /
+// on demand the app can IMPORT it back to restore history on a fresh device.
+const BOT_DATA_REPO_URL = 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-BOT/main/data/bot_training_data.json';
 // ---- Learnable signal weights ----
 // Per-signal multipliers (key = the component name botScoreTicker uses, e.g.
 // 'trend', 'health', 'fundamental'). 1.0 = neutral. botRetrain() nudges them
@@ -37189,6 +37206,308 @@ function botRetrain() {
 }
 if (typeof window !== 'undefined') { window.botRetrain = botRetrain; window.loadBotWeights = loadBotWeights; }
 
+// ============================================================
+//   BOT TRAINING-DATA EXPORT — the durable journal for the bot-data repo.
+//
+//   localStorage was overflowing (the bot's "permanent, never pruned" bet log
+//   grew past the ~5MB quota, so saves silently failed and the bot looked
+//   broken + lost data). The fix is to host the bot's full history in a
+//   dedicated GitHub repo. The browser has no write token, so the pattern mirrors
+//   XTRAPP: EXPORT here → manually commit to the repo. The repo is the source of
+//   truth; localStorage is just a fast cache (now self-trimming so it can't
+//   break again).
+//
+//   This export is written to be READ BY THE BOT (and a human) as a training
+//   corpus. For every settled trade it records what was done, why, the style,
+//   what worked, what didn't, and a "what could have worked" counterfactual.
+//   It also rolls those up into aggregate learnings + per-signal attribution so
+//   the next session can attack better.
+// ============================================================
+function buildBotTrainingData() {
+  const bot = loadBotState();
+  const weights = (typeof loadBotWeights === 'function') ? loadBotWeights() : {};
+  const bets = bot.bets || [];
+  const closed = bets.filter(b => b.status === 'closed');
+  const open = bets.filter(b => b.status === 'open');
+
+  // ---- Per-trade training records (the "what happened & why" corpus) ----
+  const trades = closed.map(b => {
+    const won = (b.pnl || 0) > 0;
+    const ret = b.returnPct != null ? b.returnPct : null;
+    // The dominant signals behind this trade (largest |contribution|).
+    const comps = b.components || {};
+    const ranked = Object.entries(comps)
+      .filter(([, v]) => isFinite(v) && v !== 0)
+      .sort((a, b2) => Math.abs(b2[1]) - Math.abs(a[1]));
+    const topDrivers = ranked.slice(0, 4).map(([k, v]) => ({ signal: k, lean: +v.toFixed(2) }));
+    // Which signals AGREED vs FOUGHT the realized outcome.
+    const dirSign = b.direction === 'short' ? -1 : 1;
+    const helped = [], hurt = [];
+    for (const [k, v] of ranked) {
+      const agreedWithDirection = Math.sign(v) === dirSign;
+      // A signal "helped" if it agreed with direction and we won, or disagreed and we lost.
+      if (agreedWithDirection === won) helped.push(k); else hurt.push(k);
+    }
+    // Counterfactual: what could have worked. Simple, honest heuristics.
+    let couldHaveWorked = null;
+    if (!won) {
+      if (b.exitReason === 'stop-loss') couldHaveWorked = 'Stop was hit — either the entry was early or the stop too tight for this name\'s volatility. A wider stop or waiting for confirmation might have survived the shakeout.';
+      else if (b.exitReason === 'horizon' || b.exitReason === 'option-expiry') couldHaveWorked = 'Thesis didn\'t play out in the allotted time. A longer horizon, or not forcing the trade in a choppy regime, may have helped.';
+      else couldHaveWorked = 'Outcome went against the dominant signals — the signal mix may be miscalibrated for this setup.';
+    }
+    return {
+      ticker: b.ticker,
+      name: b.name || b.ticker,
+      sector: b.sector || null,
+      direction: b.direction,
+      instrument: b.instrument || 'shares',
+      optionType: b.optionType || null,
+      leveragedEtf: b.leveragedEtf || null,
+      style: _classifyTradeStyle(b),
+      entryDate: b.entryDate,
+      exitDate: b.exitDate,
+      entryPrice: b.entryPrice,
+      exitPrice: b.exitPrice,
+      holdDays: (b.entryDate && b.exitDate) ? Math.round((new Date(b.exitDate) - new Date(b.entryDate)) / 86400000) : null,
+      pnl: b.pnl,
+      returnPct: ret,
+      won,
+      exitReason: b.exitReason || null,
+      conviction: b.conviction,
+      confidence: b.confidence,
+      regimeAtEntry: b.regimeAtEntry || null,
+      // WHY the bot took it:
+      topDrivers,
+      rationale: b.rationale || [],
+      // WHAT WORKED / DIDN'T (signal attribution vs the realized result):
+      signalsThatHelped: helped,
+      signalsThatHurt: hurt,
+      // WHERE TO GET BETTER:
+      couldHaveWorked,
+    };
+  });
+
+  // ---- Aggregate learnings (the "how do we attack next time" rollup) ----
+  const wins = closed.filter(b => (b.pnl || 0) > 0);
+  const losses = closed.filter(b => (b.pnl || 0) <= 0);
+  const winRate = closed.length ? +(wins.length / closed.length).toFixed(3) : null;
+  const totalPnl = +closed.reduce((s, b) => s + (b.pnl || 0), 0).toFixed(2);
+  const avgWin = wins.length ? +(wins.reduce((s, b) => s + b.pnl, 0) / wins.length).toFixed(2) : null;
+  const avgLoss = losses.length ? +(losses.reduce((s, b) => s + b.pnl, 0) / losses.length).toFixed(2) : null;
+  const profitFactor = (avgLoss && avgLoss !== 0 && wins.length && losses.length)
+    ? +Math.abs((avgWin * wins.length) / (avgLoss * losses.length)).toFixed(2) : null;
+
+  // Per-signal performance: across all settled trades, when a signal leaned a
+  // direction, did the trade tend to win? This tells the bot which signals to
+  // trust — the data-driven version of what botRetrain nudges.
+  const signalPerf = {};
+  for (const b of closed) {
+    const won = (b.pnl || 0) > 0;
+    const dirSign = b.direction === 'short' ? -1 : 1;
+    for (const [k, v] of Object.entries(b.components || {})) {
+      if (!isFinite(v) || v === 0) continue;
+      const agreed = Math.sign(v) === dirSign;
+      const s = signalPerf[k] || { trades: 0, wins: 0, agreedAndWon: 0, agreedTrades: 0 };
+      s.trades++; if (won) s.wins++;
+      if (agreed) { s.agreedTrades++; if (won) s.agreedAndWon++; }
+      signalPerf[k] = s;
+    }
+  }
+  const signalScores = Object.entries(signalPerf).map(([k, s]) => ({
+    signal: k,
+    trades: s.trades,
+    winRateWhenLeaning: s.agreedTrades ? +(s.agreedAndWon / s.agreedTrades).toFixed(3) : null,
+    currentWeight: +(weights[k] ?? 1).toFixed(2),
+  })).sort((a, b) => (b.winRateWhenLeaning ?? 0) - (a.winRateWhenLeaning ?? 0));
+
+  // Style performance (which trade styles worked).
+  const stylePerf = {};
+  for (const b of closed) {
+    const st = _classifyTradeStyle(b);
+    const s = stylePerf[st] || { trades: 0, wins: 0, pnl: 0 };
+    s.trades++; if ((b.pnl || 0) > 0) s.wins++; s.pnl += (b.pnl || 0);
+    stylePerf[st] = s;
+  }
+  const styleScores = Object.entries(stylePerf).map(([style, s]) => ({
+    style, trades: s.trades, winRate: +(s.wins / s.trades).toFixed(3), totalPnl: +s.pnl.toFixed(2),
+  })).sort((a, b) => b.totalPnl - a.totalPnl);
+
+  // Human/bot-readable takeaways.
+  const takeaways = [];
+  if (winRate != null) takeaways.push(`Win rate ${(winRate * 100).toFixed(0)}% over ${closed.length} settled trades; net P&L ${totalPnl >= 0 ? '+' : ''}$${totalPnl}.`);
+  if (profitFactor != null) takeaways.push(`Profit factor ${profitFactor} (avg win $${avgWin} vs avg loss $${avgLoss}).`);
+  const bestSig = signalScores.filter(s => s.trades >= 3 && s.winRateWhenLeaning != null)[0];
+  const worstSig = [...signalScores].filter(s => s.trades >= 3 && s.winRateWhenLeaning != null).pop();
+  if (bestSig) takeaways.push(`Most reliable signal: ${bestSig.signal} (${(bestSig.winRateWhenLeaning * 100).toFixed(0)}% win when it leans, ${bestSig.trades} trades) — trust it more.`);
+  if (worstSig && worstSig !== bestSig) takeaways.push(`Least reliable signal: ${worstSig.signal} (${(worstSig.winRateWhenLeaning * 100).toFixed(0)}% win when it leans) — consider down-weighting.`);
+  if (styleScores[0]) takeaways.push(`Best-performing style: ${styleScores[0].style} (${styleScores[0].totalPnl >= 0 ? '+' : ''}$${styleScores[0].totalPnl} over ${styleScores[0].trades} trades).`);
+  const stopOuts = closed.filter(b => b.exitReason === 'stop-loss').length;
+  if (stopOuts / Math.max(1, closed.length) > 0.4) takeaways.push(`${Math.round(stopOuts / closed.length * 100)}% of trades stopped out — stops may be too tight or entries too early.`);
+
+  return {
+    schema: 'valuatio-bot-training/v1',
+    generatedAt: new Date().toISOString(),
+    bankroll: bot.bankroll,
+    startingBankroll: BOT_STARTING_BANKROLL,
+    allTimeReturnPct: +(((bot.bankroll - BOT_STARTING_BANKROLL) / BOT_STARTING_BANKROLL) * 100).toFixed(2),
+    counts: { total: bets.length, open: open.length, closed: closed.length, wins: wins.length, losses: losses.length },
+    performance: { winRate, totalPnl, avgWin, avgLoss, profitFactor },
+    learnedWeights: weights,
+    signalScores,      // which signals actually predict wins
+    styleScores,       // which styles actually make money
+    takeaways,         // plain-language lessons
+    trades,            // full per-trade training corpus
+    openPositions: open.map(b => ({ ticker: b.ticker, direction: b.direction, instrument: b.instrument, entryDate: b.entryDate, entryPrice: b.entryPrice, conviction: b.conviction })),
+    equityCurve: Array.isArray(bot.equityCurve) ? bot.equityCurve : [],
+  };
+}
+
+// Classify a trade's STYLE from its drivers (for the "what style was used" ask).
+function _classifyTradeStyle(b) {
+  if (b.instrument === 'option') return b.optionType === 'put' ? 'protective/bearish-option' : 'bullish-option';
+  if (b.instrument === 'leveraged_etf') return 'leveraged-etf';
+  if (b.direction === 'short') return 'short';
+  if (b.leverage > 1) return 'leveraged-long';
+  const c = b.components || {};
+  // Largest driver names the style.
+  const top = Object.entries(c).filter(([, v]) => isFinite(v)).sort((a, b2) => Math.abs(b2[1]) - Math.abs(a[1]))[0];
+  if (!top) return 'long';
+  const k = top[0];
+  if (k === 'momentum' || k === 'trend' || k === 'momentumGrade') return 'momentum-long';
+  if (k === 'meanReversion') return 'mean-reversion';
+  if (k === 'fundamentals' || k === 'research') return 'value/fundamental';
+  if (k === 'peerGrade' || k === 'regimeGrade') return 'rotation/macro';
+  return 'long';
+}
+
+// Export the training data as a downloadable JSON file for the bot-data repo.
+function exportBotTrainingData() {
+  const data = buildBotTrainingData();
+  const json = JSON.stringify(data, null, 2);
+  try {
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `bot_training_data.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    if (typeof flashStatus === 'function') flashStatus(`Exported ${data.counts.closed} settled trades for the bot-data repo`, 'success');
+  } catch (e) {
+    console.error('[bot] export failed', e);
+  }
+  return data;
+}
+
+// Import bot history from the bot-data repo (the durable source of truth). Merges
+// repo trades into local state so a fresh device / cleared cache restores the
+// full journal. Repo wins for closed trades; local open positions are kept.
+async function importBotTrainingData(repoUrl) {
+  const url = repoUrl || (typeof BOT_DATA_REPO_URL !== 'undefined' ? BOT_DATA_REPO_URL : null);
+  if (!url) { console.warn('[bot] no bot-data repo URL configured'); return null; }
+  try {
+    const r = await fetch(url);
+    if (!r.ok) { console.warn('[bot] bot-data repo fetch failed:', r.status); return null; }
+    const data = await r.json();
+    if (!data || data.schema?.indexOf('valuatio-bot-training') !== 0) {
+      console.warn('[bot] bot-data repo file has unexpected schema'); return null;
+    }
+    const bot = loadBotState();
+    // Reconstruct closed bets from the repo's trade corpus, keyed by ticker+entryDate.
+    const localByKey = new Map((bot.bets || []).map(b => [`${b.ticker}|${b.entryDate}`, b]));
+    let added = 0;
+    for (const t of (data.trades || [])) {
+      const key = `${t.ticker}|${t.entryDate}`;
+      if (!localByKey.has(key)) {
+        bot.bets.push({
+          ticker: t.ticker, name: t.name, sector: t.sector, direction: t.direction,
+          instrument: t.instrument, optionType: t.optionType, leveragedEtf: t.leveragedEtf,
+          entryDate: t.entryDate, exitDate: t.exitDate, entryPrice: t.entryPrice, exitPrice: t.exitPrice,
+          pnl: t.pnl, returnPct: t.returnPct, status: 'closed', exitReason: t.exitReason,
+          conviction: t.conviction, confidence: t.confidence, rationale: t.rationale,
+          components: (t.topDrivers || []).reduce((o, d) => { o[d.signal] = d.lean; return o; }, {}),
+          _trained: true,   // repo trades already shaped the weights they shipped with
+          _fromRepo: true,
+        });
+        added++;
+      }
+    }
+    // Adopt the repo's learned weights if present (they encode prior training).
+    if (data.learnedWeights && typeof saveBotWeights === 'function') saveBotWeights(data.learnedWeights);
+    if (typeof data.bankroll === 'number') bot.bankroll = data.bankroll;
+    saveBotState(bot);
+    console.log(`[bot] imported ${added} trades from bot-data repo (now ${bot.bets.length} total)`);
+    if (typeof flashStatus === 'function') flashStatus(`Imported ${added} trades from bot-data repo`, 'success');
+    return data;
+  } catch (e) {
+    console.warn('[bot] bot-data import failed:', e.message);
+    return null;
+  }
+}
+
+if (typeof window !== 'undefined') {
+  window.buildBotTrainingData = buildBotTrainingData;
+  window.exportBotTrainingData = exportBotTrainingData;
+  window.importBotTrainingData = importBotTrainingData;
+}
+
+// Render the bot's learnings as a readable panel (the human/bot view of the
+// training corpus). Shows takeaways, which signals predict wins, and which
+// styles make money — the actionable distillation of the bot-data repo.
+function renderBotTrainingInsights() {
+  const d = buildBotTrainingData();
+  if (!d.counts.closed) {
+    return `<div class="company-card" style="margin:0 0 18px">
+      <h4 style="margin-bottom:6px">Bot Training Insights</h4>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);line-height:1.5">No settled trades yet — insights appear once positions close. Each closed trade teaches the bot once (Retrain), and ⤓ Export Training writes the full journal for the bot-data repo.</div>
+    </div>`;
+  }
+  const takeawayList = d.takeaways.map(t => `<li style="margin-bottom:4px">${escapeHtml(t)}</li>`).join('');
+  const sigRows = d.signalScores.filter(s => s.trades >= 2).slice(0, 8).map(s => {
+    const wr = s.winRateWhenLeaning;
+    const c = wr == null ? 'var(--ink-faint)' : wr >= 0.55 ? 'var(--pos)' : wr <= 0.45 ? 'var(--neg)' : 'var(--ink)';
+    return `<tr>
+      <td style="font-family:var(--mono);font-size:10px">${escapeHtml(s.signal)}</td>
+      <td style="font-family:var(--mono);font-size:10px;text-align:right;color:${c}">${wr == null ? '—' : Math.round(wr * 100) + '%'}</td>
+      <td style="font-family:var(--mono);font-size:10px;text-align:right;color:var(--ink-dim)">${s.trades}</td>
+      <td style="font-family:var(--mono);font-size:10px;text-align:right;color:var(--ink-dim)">×${s.currentWeight}</td>
+    </tr>`;
+  }).join('');
+  const styleRows = d.styleScores.slice(0, 6).map(s => {
+    const c = s.totalPnl >= 0 ? 'var(--pos)' : 'var(--neg)';
+    return `<tr>
+      <td style="font-family:var(--mono);font-size:10px">${escapeHtml(s.style)}</td>
+      <td style="font-family:var(--mono);font-size:10px;text-align:right">${Math.round(s.winRate * 100)}%</td>
+      <td style="font-family:var(--mono);font-size:10px;text-align:right;color:var(--ink-dim)">${s.trades}</td>
+      <td style="font-family:var(--mono);font-size:10px;text-align:right;color:${c}">${s.totalPnl >= 0 ? '+' : ''}$${Math.abs(s.totalPnl).toLocaleString(undefined, { maximumFractionDigits: 0 })}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="company-card" style="margin:0 0 18px">
+    <h4 style="margin-bottom:8px">Bot Training Insights <span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);font-weight:400">· ${d.counts.closed} settled · ${d.performance.winRate != null ? Math.round(d.performance.winRate * 100) + '% win' : ''} · PF ${d.performance.profitFactor ?? '—'}</span></h4>
+    ${takeawayList ? `<ul style="margin:0 0 14px;padding-left:18px;color:var(--ink-dim);font-size:11px;line-height:1.5">${takeawayList}</ul>` : ''}
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px">
+      <div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">Signal reliability (win% when it leans)</div>
+        <table style="width:100%;border-collapse:collapse">
+          <thead><tr><th style="text-align:left;font-family:var(--mono);font-size:8px;color:var(--ink-faint)">SIGNAL</th><th style="text-align:right;font-family:var(--mono);font-size:8px;color:var(--ink-faint)">WIN%</th><th style="text-align:right;font-family:var(--mono);font-size:8px;color:var(--ink-faint)">N</th><th style="text-align:right;font-family:var(--mono);font-size:8px;color:var(--ink-faint)">WEIGHT</th></tr></thead>
+          <tbody>${sigRows || '<tr><td colspan="4" style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">Need ≥2 trades per signal</td></tr>'}</tbody>
+        </table>
+      </div>
+      <div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">Style performance</div>
+        <table style="width:100%;border-collapse:collapse">
+          <thead><tr><th style="text-align:left;font-family:var(--mono);font-size:8px;color:var(--ink-faint)">STYLE</th><th style="text-align:right;font-family:var(--mono);font-size:8px;color:var(--ink-faint)">WIN%</th><th style="text-align:right;font-family:var(--mono);font-size:8px;color:var(--ink-faint)">N</th><th style="text-align:right;font-family:var(--mono);font-size:8px;color:var(--ink-faint)">P&L</th></tr></thead>
+          <tbody>${styleRows}</tbody>
+        </table>
+      </div>
+    </div>
+    <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:12px;line-height:1.5">⤓ Export Training writes this full journal (every trade + why + what worked) to <strong>bot_training_data.json</strong> for the bot-data repo. ⤒ Import Repo restores it on a fresh device.</div>
+  </div>`;
+}
+if (typeof window !== 'undefined') window.renderBotTrainingInsights = renderBotTrainingInsights;
+
 const BOT_STARTING_BANKROLL = 100000;
 const BETS_STATE = { perfWindow: 'all' };   // equity-curve window: week|month|year|all
 let _betsLiveQuotesPrimed = false;          // fires a one-time live-quote refresh on bets tab open
@@ -37204,7 +37523,26 @@ const BOT_CONVICTION_THRESHOLD = 0.30;  // below this absolute conviction → no
 function loadBotState() {
   try {
     const raw = localStorage.getItem(BOT_KEY);
-    if (raw) return JSON.parse(raw);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      // Sanity-check the shape. A truncated/corrupted write (e.g. from a prior
+      // quota-exceeded setItem) can leave invalid JSON that throws above, OR a
+      // partial object. If bets isn't an array, treat it as corrupt and try the
+      // backup rather than silently returning fresh state (which looked like the
+      // bot "lost all data").
+      if (parsed && Array.isArray(parsed.bets)) return parsed;
+      console.warn('[bot] stored state malformed — trying backup');
+    }
+  } catch (e) {
+    console.warn('[bot] state parse failed — trying backup:', e.message);
+  }
+  // Backup slot (last known-good full state).
+  try {
+    const bak = localStorage.getItem(BOT_KEY + '.bak');
+    if (bak) {
+      const p = JSON.parse(bak);
+      if (p && Array.isArray(p.bets)) { console.log('[bot] recovered from backup'); return p; }
+    }
   } catch {}
   return {
     bankroll: BOT_STARTING_BANKROLL,
@@ -37215,9 +37553,52 @@ function loadBotState() {
   };
 }
 
+// Trim a bet down to what MUST persist locally. The heavy fields (full
+// decisionPath, rationale, components) are valuable for TRAINING but don't need
+// to live in localStorage forever — they go to the bot-data repo via export.
+// Keeping them all locally is what overflowed the ~5MB quota and broke saves.
+function _slimBetForLocal(b) {
+  const slim = { ...b };
+  // Closed bets keep only a compact training summary locally; the full detail is
+  // preserved in the exported journal (repo). Open bets keep everything (small N).
+  if (b.status === 'closed') {
+    delete slim.decisionPath;
+    // Keep components (small, useful for retrain) but drop the verbose rationale.
+    if (Array.isArray(slim.rationale) && slim.rationale.length > 2) slim.rationale = slim.rationale.slice(0, 2);
+  }
+  return slim;
+}
+
 function saveBotState(b) {
-  try { localStorage.setItem(BOT_KEY, JSON.stringify(b)); }
-  catch (e) { console.warn('[bot] save failed:', e.message); }
+  // Primary save. If it fails (quota), progressively slim and retry so the bot
+  // NEVER silently loses its state again.
+  const attempt = (obj) => { localStorage.setItem(BOT_KEY, JSON.stringify(obj)); };
+  try {
+    attempt(b);
+    // Write a backup copy too (best-effort) so a future corrupt write is recoverable.
+    try { localStorage.setItem(BOT_KEY + '.bak', JSON.stringify(b)); } catch {}
+    return true;
+  } catch (e1) {
+    console.warn('[bot] save failed (quota?) — slimming closed-bet detail and retrying:', e1.message);
+    try {
+      const slim = { ...b, bets: (b.bets || []).map(_slimBetForLocal) };
+      attempt(slim);
+      return true;
+    } catch (e2) {
+      console.warn('[bot] still too big — keeping only open + last 200 closed bets locally:', e2.message);
+      try {
+        const open = (b.bets || []).filter(x => x.status === 'open');
+        const closed = (b.bets || []).filter(x => x.status === 'closed').slice(-200).map(_slimBetForLocal);
+        const trimmed = { ...b, bets: [...closed, ...open], _localTrimmed: true };
+        attempt(trimmed);
+        console.warn('[bot] ⚠ Local storage trimmed to last 200 closed bets. EXPORT to the bot-data repo to preserve full history.');
+        return true;
+      } catch (e3) {
+        console.error('[bot] save impossible even trimmed:', e3.message);
+        return false;
+      }
+    }
+  }
 }
 
 // ---- Conviction scoring: fuse every signal source for one ticker ----
@@ -38195,6 +38576,7 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
       rationale: p.rationale,
       components: p.components,
       decisionPath: p.decisionPath || null,
+      regimeAtEntry: (typeof _botRegime !== 'undefined' && _botRegime) ? _botRegime.mode : (typeof botAssessRegime === 'function' ? botAssessRegime().mode : null),
       horizonDays: confidenceHorizonDays(p.confidence),
       status: 'open',
       exitDate: null,
@@ -38350,8 +38732,8 @@ function botMarkToMarket() {
     const row = (typeof getStockbookRow === 'function') ? getStockbookRow(markTic) : null;
     let px = null, pxSource = 'github';
     const lq = _botQuoteCache[markTic];
-    if (lq && lq.live && isFinite(lq.price)) { px = lq.price; pxSource = lq.source; }
-    else if (row?.price != null && isFinite(row.price)) { px = row.price; pxSource = 'github'; }
+    if (lq && lq.live && isFinite(lq.price)) { px = Number(lq.price); pxSource = lq.source; }
+    else if (row?.price != null && isFinite(row.price)) { px = Number(row.price); pxSource = 'github'; }
     if (px == null || !isFinite(px)) continue;
     bet.lastPrice = px;
     bet.lastPriceSource = pxSource;
@@ -38760,6 +39142,14 @@ function renderBetsTab() {
   } else {
     chartHtml = `<div class="company-card" style="margin:0 0 18px"><div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);padding:8px 0">Equity curve builds as the bot runs daily — one point per day. Run the scan over multiple days to see the chart and weekly/monthly/yearly performance.</div></div>`;
   }
+  // Training insights panel — what the bot has learned (for the bot-data repo view).
+  let insightsHtml = '';
+  try { insightsHtml = renderBotTrainingInsights(); } catch {}
+  // Today's bets for the highlight card. (This was referenced below but never
+  // defined in this function's scope — that ReferenceError was throwing BEFORE
+  // body.innerHTML got set, so the whole Bets tab rendered blank even though the
+  // bets existed and the separate banner showed them.)
+  const todayBets = (perf.bets || []).filter(b => b.entryDate === today);
   const todayHtml = todayBets.length ? `
     <div class="company-card" style="border-left:3px solid var(--amber)">
       <h4>Today's Bets · ${today}</h4>
@@ -38791,7 +39181,7 @@ function renderBetsTab() {
       <td style="font-family:var(--mono);font-size:11px">${dirBadge(b.direction)}${b.instrument === 'option' ? ` <span style="color:#c08ae0;font-weight:700">${(b.optionType||'').toUpperCase()}</span>` : b.instrument === 'leveraged_etf' ? ` <span style="color:#4ec9a8;font-weight:700">${b.leveragedEtf}</span>` : (b.leverage > 1 ? ` ${b.leverage}x` : '')}${b.hedge ? ' 🛡' : ''}</td>
       <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">$${b.dollars.toFixed(0)}</td>
       <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">$${b.entryPrice.toFixed(2)}</td>
-      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${b.lastPrice != null ? '$' + b.lastPrice.toFixed(2) : '—'}</td>
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${(b.lastPrice != null && isFinite(b.lastPrice)) ? '$' + Number(b.lastPrice).toFixed(2) : '—'}</td>
       <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${pnlColor(b.returnPct)}">${b.returnPct != null ? (b.returnPct >= 0 ? '+' : '') + b.returnPct + '%' : '—'}</td>
       <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${pnlColor(b.pnl)}">${fmtPnl(b.pnl)}</td>
       <td style="font-family:var(--mono);font-size:10px;color:${b.status === 'open' ? 'var(--amber)' : 'var(--ink-faint)'}">${b.status.toUpperCase()}</td>
@@ -38817,7 +39207,7 @@ function renderBetsTab() {
       </div>
     </div>`;
 
-  body.innerHTML = summary + chartHtml + todayHtml + ledger + note;
+  body.innerHTML = summary + chartHtml + insightsHtml + todayHtml + ledger + note;
   // Wire the equity-curve window selector.
   body.querySelectorAll('[data-perfwin]').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -38852,7 +39242,7 @@ function renderTodaysBetsBanner() {
   host.style.display = '';
   host.innerHTML = `
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 14px;background:var(--bg-elev);border:1px solid var(--amber);border-radius:4px">
-      <span style="font-family:var(--mono);font-size:10px;color:var(--amber);font-weight:700;letter-spacing:0.1em">🤖 TODAY'S BOT BETS</span>
+      <span style="font-family:var(--mono);font-size:10px;color:var(--amber);font-weight:700;letter-spacing:0.1em">↗ TODAY'S BOT BETS</span>
       ${todayBets.map(b => `
         <span style="font-family:var(--mono);font-size:11px;cursor:pointer" onclick="switchTab('bets')" title="${escapeHtml((b.rationale||[]).slice(0,2).join(' · '))}">
           <strong style="color:var(--ink)">${b.ticker}</strong>
