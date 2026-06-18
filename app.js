@@ -4211,15 +4211,46 @@ async function getPriceHistory(ticker, opts = {}) {
   //    Cached GitHub history (fresh) short-circuits without a refetch.
   const _cacheEarly = loadPriceHistCache();
   if (_cacheEarly[TIC] && (Date.now() - _cacheEarly[TIC].t) < PRICE_HIST_TTL_MS
-      && Array.isArray(_cacheEarly[TIC].data) && _cacheEarly[TIC].data.length >= 250) {
-    return _cacheEarly[TIC].data;   // already have a deep cached series
+      && Array.isArray(_cacheEarly[TIC].data) && _cacheEarly[TIC].data.length >= 1200) {
+    return _cacheEarly[TIC].data;   // already have a DEEP cached series (~5y+) — keep it
   }
+  // NOTE: the threshold above is intentionally high (~1200 bars ≈ 5y). A thin
+  // ~250-bar (1-year) cache must NOT short-circuit here, or the chart would stay
+  // capped at a year even though the 20-year GitHub file exists — that was the
+  // BAC-shows-1-year bug. A thin cache falls through to the GitHub fetch below
+  // and only gets used as a last resort (step 3).
   const _hasGitHubHistory = !!(state._historyManifest?.baseUrl) ||
     (typeof getGitHubDataBase === 'function' && getGitHubDataBase());
   if (_hasGitHubHistory) {
     const ghDeep = await fetchGitHubHistory(TIC).catch(() => null);
     if (ghDeep && ghDeep.length >= 2) return persist(ghDeep);
   }
+
+  // 1b. FALLBACK DISCOVERY: even if no manifest was registered, the user may
+  //     have a TRAPP2-style data source configured (raw.githubusercontent.com/
+  //     <user>/<repo>/<branch>/data/...). Derive the per-ticker history URL
+  //     (.../data/history/<TICKER>.json) straight from those URLs and try it.
+  //     This is what makes BAC's full 20-year series load without the user
+  //     having to add the history_manifest.json line by hand.
+  try {
+    const srcUrls = (typeof getSheetUrls === 'function') ? getSheetUrls() : [];
+    const bases = new Set();
+    for (const u of srcUrls) {
+      // match up to and including the '/data/' segment
+      const m = u.match(/^(https?:\/\/raw\.githubusercontent\.com\/[^\/]+\/[^\/]+\/[^\/]+\/(?:.*?\/)?data)\//i);
+      if (m) bases.add(m[1]);
+    }
+    for (const b of bases) {
+      const histBase = b.replace(/\/+$/, '') + '/history/';
+      const deep = await fetchPerTickerHistory(histBase, TIC).catch(() => null);
+      if (deep && deep.length >= 2) {
+        // Register this base so subsequent tickers + the manifest path reuse it.
+        state._historyManifest = state._historyManifest || {};
+        if (!state._historyManifest.baseUrl) state._historyManifest.baseUrl = histBase;
+        return persist(deep);
+      }
+    }
+  } catch {}
 
   // 2. Sheet (master.csv) — short trailing window, used when no GitHub history.
   if (!opts.skipSheet) {
@@ -11511,6 +11542,9 @@ function getRangedHistory() {
   } else if (range === '1w') {
     cutoff = new Date(lastDate);
     cutoff.setDate(cutoff.getDate() - 7);
+  } else if (range === '5y' || range === '20y') {
+    cutoff = new Date(lastDate);
+    cutoff.setFullYear(cutoff.getFullYear() - (range === '5y' ? 5 : 20));
   } else {
     const months = { '1m': 1, '3m': 3, '6m': 6, '1y': 12 };
     const m = months[range] || 0;
@@ -25724,7 +25758,7 @@ async function taRender() {
   taRenderStats();
   await taRenderFundamentals();
 
-  taShowStatus(`${primary} · ${state.ta.range} · ${state.ta.displayMode === 'pct' ? '% change' : state.ta.displayMode === 'real' ? 'inflation-adjusted' : 'nominal price'}`);
+  taShowStatus(`${primary} · ${state.ta.range} · ${state.ta.displayMode === 'pct' ? '% change' : state.ta.displayMode === 'real' ? 'inflation-adjusted (I/A · today\'s $)' : state.ta.displayMode === 'log' ? 'log scale' : 'nominal price'}`);
 }
 
 function taShowStatus(msg) {
@@ -25735,17 +25769,35 @@ function taShowStatus(msg) {
 // ---- history loader ----
 async function taEnsureHistory(ticker) {
   if (state.ta.histCache[ticker]) return state.ta.histCache[ticker];
-  let h = getHistoryForTicker(ticker);
-  if (!h && typeof fetchGitHubHistory === 'function') {
-    try { await fetchGitHubHistory(ticker); h = getHistoryForTicker(ticker); } catch {}
+
+  // Start with whatever the SYNC sources have (sheet + in-memory cache). This is
+  // often a THIN ~1-year window from master.csv — useful as a fallback but NOT
+  // what we want to show when a deep 20-year file exists.
+  let h = getHistoryForTicker(ticker) || [];
+
+  // ALWAYS try the deep loader (getPriceHistory), which prefers the GitHub
+  // 20-year per-ticker file (data/history/<T>.json) and auto-discovers the base
+  // URL from configured data sources. The OLD code only did this when the sync
+  // result was empty — so a thin 1-year sheet series satisfied it and the chart
+  // capped at a year even though 20y existed. We now fetch the deep series and
+  // KEEP WHICHEVER IS DEEPER, so the TA chart always shows the fullest history.
+  try {
+    if (typeof getPriceHistory === 'function') {
+      const deep = await getPriceHistory(ticker);
+      if (deep && deep.length > h.length) h = deep;   // deeper wins
+    }
+  } catch {}
+
+  // Last resort: if BOTH came up short, try a direct GitHub history fetch by
+  // ticker (covers the case where getPriceHistory's sheet step returned the thin
+  // series and short-circuited before the GitHub step for some edge reason).
+  if (h.length < 300 && typeof fetchGitHubHistory === 'function') {
+    try {
+      const gh = await fetchGitHubHistory(ticker);
+      if (gh && gh.length > h.length) h = gh;
+    } catch {}
   }
-  // If the sync sources (sheet + cache + GitHub) still came up empty, fall back
-  // to the SAME rich loader the Overview chart uses (getPriceHistory: Twelve
-  // Data / FMP / etc.). This is what closes the "shows in Overview but not TA"
-  // gap — both tabs now reach every source, not a subset.
-  if ((!h || h.length < 2) && typeof getPriceHistory === 'function') {
-    try { h = await getPriceHistory(ticker); } catch {}
-  }
+
   // Canonical shape (both .date/.close/.price/.volume) so the TA range filter,
   // RSI, volume, and MA readouts all work regardless of the upstream source.
   state.ta.histCache[ticker] = (typeof normalizeHistorySeries === 'function') ? normalizeHistorySeries(h || []) : (h || []);
@@ -25922,6 +25974,18 @@ async function taLoadCpi() {
   state.ta.cpiSeries = series;
   saveCpiCache(series, 'Embedded fallback (BLS monthly, 2000-2026)');
   return series;
+}
+
+// Inflation-adjust a single nominal price at `date` into TODAY'S dollars, using
+// the loaded CPI series. Returns null if CPI isn't available. This is the
+// per-point version of the 'real' display mode — used by the hover I/A readout.
+function taRealValueAt(date, nominalPrice) {
+  const cpi = state.ta && state.ta.cpiSeries;
+  if (!cpi || !cpi.length || nominalPrice == null) return null;
+  const latest = cpi[cpi.length - 1].value;
+  const at = taCpiAt(date, cpi);
+  if (!at || !latest) return null;
+  return nominalPrice * (latest / at);
 }
 
 function taCpiAt(date, cpiSeries) {
@@ -26321,10 +26385,10 @@ function taRenderChart() {
       <line id="ta-hover-hline" class="ta-crosshair" x1="${margin.left}" y1="0" x2="${W - margin.right}" y2="0"/>
       <circle id="ta-hover-dot" r="4" fill="var(--amber)" stroke="var(--bg)" stroke-width="2"/>
       <g id="ta-hover-tooltip">
-        <rect id="ta-hover-bg" x="0" y="0" width="160" height="56" rx="3" fill="var(--bg-card)" stroke="var(--amber)" stroke-width="1" opacity="0.97"/>
-        <text id="ta-hover-date" x="8" y="18" fill="var(--ink-dim)" font-family="var(--mono)" font-size="10"></text>
-        <text id="ta-hover-price" x="8" y="34" fill="var(--ink)" font-family="var(--mono)" font-size="13" font-weight="700"></text>
-        <text id="ta-hover-extra" x="8" y="50" fill="var(--ink-faint)" font-family="var(--mono)" font-size="9"></text>
+        <rect id="ta-hover-bg" x="0" y="0" width="172" height="56" rx="4" fill="var(--bg-card)" stroke="var(--amber)" stroke-width="1" opacity="0.98"/>
+        <text id="ta-hover-date" x="10" y="17" fill="var(--ink-dim)" font-family="var(--mono)" font-size="10"></text>
+        <text id="ta-hover-price" x="10" y="34" fill="var(--ink)" font-family="var(--mono)" font-size="13" font-weight="700"></text>
+        <g id="ta-hover-rows"></g>
       </g>
     </g>
     <rect id="ta-click-target" x="${margin.left}" y="${margin.top}" width="${plotW}" height="${plotH}" fill="transparent" style="cursor:${state.ta.activeTools.has('fib') || state.ta.activeTools.has('trendline') ? 'crosshair' : 'crosshair'}"/>
@@ -26452,7 +26516,7 @@ function taWireHover(svg, primarySeries, compareSeries, xScale, yScale, margin, 
   const tooltip = document.getElementById('ta-hover-tooltip');
   const dateEl = document.getElementById('ta-hover-date');
   const priceEl = document.getElementById('ta-hover-price');
-  const extraEl = document.getElementById('ta-hover-extra');
+  const rowsEl = document.getElementById('ta-hover-rows');
   const bgEl = document.getElementById('ta-hover-bg');
   const H = svg.viewBox.baseVal.height;
   const vbW = svg.viewBox.baseVal.width;
@@ -26466,7 +26530,6 @@ function taWireHover(svg, primarySeries, compareSeries, xScale, yScale, margin, 
       group.style.display = 'none';
       return;
     }
-    // Find nearest data point by x-coord (binary search would be faster but linear is fine for our range)
     let nearestIdx = 0, nearestDist = Infinity;
     for (let i = 0; i < xAt.length; i++) {
       const d = Math.abs(xAt[i] - px);
@@ -26483,7 +26546,7 @@ function taWireHover(svg, primarySeries, compareSeries, xScale, yScale, margin, 
     dot.setAttribute('cx', x);
     dot.setAttribute('cy', y);
 
-    // Format readouts based on effective display mode
+    // Headline price for the hovered date, formatted per display mode.
     let priceText;
     if (effectiveMode === 'pct') {
       priceText = (p._v >= 0 ? '+' : '') + p._v.toFixed(2) + '%';
@@ -26491,72 +26554,122 @@ function taWireHover(svg, primarySeries, compareSeries, xScale, yScale, margin, 
       const raw = Math.pow(10, p._v);
       priceText = fmt$(raw, raw >= 100 ? 2 : 4);
     } else if (effectiveMode === 'real') {
-      // Real $ shows the inflation-adjusted value, with raw value as secondary
-      priceText = fmt$(p._v) + (p._raw && Math.abs(p._raw - p._v) > 0.01 ? ` (nom ${fmt$(p._raw)})` : '');
+      priceText = fmt$(p._v) + (p._raw && Math.abs(p._raw - p._v) > 0.01 ? `  nom ${fmt$(p._raw)}` : '');
     } else {
       priceText = fmt$(p._raw || p._v);
     }
     dateEl.textContent = p.date;
     priceEl.textContent = priceText;
 
-    // Show compare-asset values on the same date — using the SAME unit as primary.
-    // In % mode we show %, in log we show $ (decoded), in price/real we show $.
-    let extraParts = [];
+    // ---- Build a list of {label, value, color} rows for EVERY active overlay,
+    // so the hover reveals each selected indicator's number on that date. Each
+    // gets its own line (no more cramming + truncation), and the box auto-sizes.
+    const rows = [];
+    // % since start (always useful context)
+    const firstRaw = primarySeries[0]._raw ?? primarySeries[0]._v ?? primarySeries[0].price;
+    const curRaw = p._raw ?? p._v ?? p.price;
+    if (effectiveMode !== 'pct' && firstRaw > 0) {
+      const chg = ((curRaw - firstRaw) / firstRaw) * 100;
+      rows.push({ label: 'Δ since start', value: (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%', color: chg >= 0 ? 'var(--pos)' : 'var(--neg)' });
+    }
+    // Compare assets
     compareSeries.forEach(c => {
       const cp = c.series.find(s => s.date === p.date);
       if (!cp) return;
       let val;
-      if (effectiveMode === 'pct') {
-        val = (cp._v >= 0 ? '+' : '') + cp._v.toFixed(2) + '%';
-      } else if (effectiveMode === 'log') {
-        const raw = Math.pow(10, cp._v);
-        val = fmt$(raw, raw >= 100 ? 2 : 4);
-      } else if (effectiveMode === 'real') {
-        val = fmt$(cp._v);
-      } else {
-        val = fmt$(cp._raw || cp._v);
-      }
-      extraParts.push(`${c.ticker}: ${val}`);
+      if (effectiveMode === 'pct') val = (cp._v >= 0 ? '+' : '') + cp._v.toFixed(2) + '%';
+      else if (effectiveMode === 'log') { const raw = Math.pow(10, cp._v); val = fmt$(raw, raw >= 100 ? 2 : 4); }
+      else if (effectiveMode === 'real') val = fmt$(cp._v);
+      else val = fmt$(cp._raw || cp._v);
+      rows.push({ label: c.ticker, value: val, color: 'var(--ink-dim)' });
     });
 
-    // Show the value of any ACTIVE indicator at the hovered date — so when RSI,
-    // volume, VWAP, or a moving average is selected, hovering reveals its number,
-    // not just the price. This is what makes the hover "show all selected data".
     try {
-      const at = state.ta.activeTools;
-      // RSI value at this point (primarySeries carries .price via spread)
-      if (at && at.has('rsi') && typeof taComputeRSI === 'function') {
-        const rsiSeries = taComputeRSI(primarySeries, 14);
-        const r = rsiSeries.find(s => s.date === p.date);
-        if (r && r.rsi != null) extraParts.push(`RSI ${r.rsi.toFixed(0)}`);
-      }
-      // Volume at this point
-      if (at && at.has('volume') && p.volume) {
-        const v = p.volume;
-        const vStr = v >= 1e9 ? (v / 1e9).toFixed(1) + 'B' : v >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : v >= 1e3 ? (v / 1e3).toFixed(0) + 'K' : String(v);
-        extraParts.push(`Vol ${vStr}`);
-      }
-      // Moving-average values at this point
+      const at = state.ta.activeTools || new Set();
+      // Moving averages
       const maWins = [];
-      if (at && at.has('ma50')) maWins.push(50);
-      if (at && at.has('ma100')) maWins.push(100);
-      if (at && at.has('ma200')) maWins.push(200);
+      if (at.has('ma50')) maWins.push(50);
+      if (at.has('ma100')) maWins.push(100);
+      if (at.has('ma200')) maWins.push(200);
       for (const w of maWins) {
         if (nearestIdx >= w - 1) {
           let sum = 0; for (let k = nearestIdx - w + 1; k <= nearestIdx; k++) sum += (primarySeries[k]?.price ?? 0);
           const ma = sum / w;
-          if (isFinite(ma) && ma > 0) extraParts.push(`MA${w} ${fmt$(ma)}`);
+          if (isFinite(ma) && ma > 0) {
+            const above = (p._raw ?? p.price) >= ma;
+            rows.push({ label: `MA${w}`, value: fmt$(ma), color: above ? 'var(--pos)' : 'var(--neg)' });
+          }
         }
       }
+      // Bollinger Bands (upper / mid / lower) + %B position
+      if (at.has('bb') && typeof taComputeBollinger === 'function') {
+        const bb = taComputeBollinger(primarySeries, 20, 2);
+        const u = bb.upper.find(s => s.date === p.date);
+        const m = bb.middle.find(s => s.date === p.date);
+        const l = bb.lower.find(s => s.date === p.date);
+        if (u && m && l) {
+          rows.push({ label: 'BB upper', value: fmt$(u.price), color: '#7faaca' });
+          rows.push({ label: 'BB mid', value: fmt$(m.price), color: 'var(--ink-dim)' });
+          rows.push({ label: 'BB lower', value: fmt$(l.price), color: '#7faaca' });
+          const span = u.price - l.price;
+          if (span > 0) {
+            const pctB = ((p._raw ?? p.price) - l.price) / span * 100;
+            rows.push({ label: '%B', value: pctB.toFixed(0) + '%', color: pctB > 100 ? 'var(--neg)' : pctB < 0 ? 'var(--pos)' : 'var(--ink-dim)' });
+          }
+        }
+      }
+      // RSI
+      if (at.has('rsi') && typeof taComputeRSI === 'function') {
+        const rsiSeries = taComputeRSI(primarySeries, 14);
+        const r = rsiSeries.find(s => s.date === p.date);
+        if (r && r.rsi != null) {
+          const col = r.rsi >= 70 ? 'var(--neg)' : r.rsi <= 30 ? 'var(--pos)' : 'var(--ink-dim)';
+          rows.push({ label: 'RSI(14)', value: r.rsi.toFixed(0) + (r.rsi >= 70 ? ' OB' : r.rsi <= 30 ? ' OS' : ''), color: col });
+        }
+      }
+      // P/E at this date (price ÷ trailing EPS) when the P/E overlay is on
+      if (at.has('pe') && effectiveMode === 'price') {
+        const row = (typeof getStockbookRow === 'function') ? getStockbookRow(primary) : null;
+        const eps = row?.eps;
+        if (eps != null && isFinite(eps) && eps !== 0) {
+          const peAt = (p._raw ?? p.price) / eps;
+          if (isFinite(peAt) && peAt > 0) rows.push({ label: 'P/E', value: peAt.toFixed(1) + '×', color: 'var(--data-amber)' });
+        }
+      }
+      // Volume
+      if (at.has('volume') && p.volume) {
+        const v = p.volume;
+        const vStr = v >= 1e9 ? (v / 1e9).toFixed(1) + 'B' : v >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : v >= 1e3 ? (v / 1e3).toFixed(0) + 'K' : String(v);
+        rows.push({ label: 'Vol', value: vStr, color: 'var(--ink-dim)' });
+      }
+      // Inflation-adjusted (I/A) value when NOT already in real mode, so the
+      // hover always reveals today's-dollars value alongside the nominal one.
+      if (at.has('infl') && effectiveMode !== 'real' && state.ta.cpiSeries && state.ta.cpiSeries.length) {
+        const ia = taRealValueAt(p.date, p._raw ?? p.price);
+        if (ia != null && isFinite(ia)) rows.push({ label: 'I/A (today $)', value: fmt$(ia), color: '#9a7aa0' });
+      }
     } catch {}
-    extraEl.textContent = extraParts.join(' · ').slice(0, 90);
 
-    // Position tooltip — try right of cursor, flip to left if too close to edge
-    const tooltipW = 160;
-    const tooltipH = extraParts.length > 0 ? 56 : 42;
-    bgEl.setAttribute('height', tooltipH);
-    const tx = x + 12 + tooltipW < vbW - margin.right ? x + 12 : x - tooltipW - 12;
-    const ty = Math.max(margin.top + 4, Math.min(y - tooltipH / 2, H - margin.bottom - tooltipH));
+    // Render rows as stacked <text> lines; size the bg to fit.
+    const lineH = 14;
+    const headerH = 40;            // date + price block
+    const padB = 8;
+    const labelX = 10, valueX = 162;
+    let ry = headerH + 11;
+    let inner = '';
+    for (const r of rows) {
+      inner += `<text x="${labelX}" y="${ry}" fill="var(--ink-faint)" font-family="var(--mono)" font-size="9.5">${r.label}</text>`;
+      inner += `<text x="${valueX}" y="${ry}" fill="${r.color}" font-family="var(--mono)" font-size="9.5" font-weight="700" text-anchor="end">${r.value}</text>`;
+      ry += lineH;
+    }
+    rowsEl.innerHTML = inner;
+    const boxH = rows.length ? (headerH + rows.length * lineH + padB) : headerH + 4;
+    const boxW = 172;
+    bgEl.setAttribute('height', boxH);
+    bgEl.setAttribute('width', boxW);
+
+    const tx = x + 14 + boxW < vbW - margin.right ? x + 14 : x - boxW - 14;
+    const ty = Math.max(margin.top + 4, Math.min(y - boxH / 2, H - margin.bottom - boxH));
     tooltip.setAttribute('transform', `translate(${tx}, ${ty})`);
     group.style.display = '';
   };
@@ -26962,6 +27075,10 @@ function taWireInputs() {
       } else {
         state.ta.activeTools.add(tool);
         btn.classList.add('active');
+        // The I/A overlay needs CPI — load it if we don't have it yet, then redraw.
+        if (tool === 'infl' && (!state.ta.cpiSeries || !state.ta.cpiSeries.length) && typeof taLoadCpi === 'function') {
+          taLoadCpi().then(() => taRender()).catch(() => {});
+        }
       }
     }
     taRender();
@@ -30541,12 +30658,28 @@ function openArticleEditor(key) {
       impact: chosenImp,
     });
     applyArticleFix(article);
-    // Remove from review queue if it was queued.
-    try { saveReviewQueue(loadReviewQueue().filter(x => x.articleKey !== articleKey(article))); } catch {}
+    // Log this fix into the Review hub for APPROVAL rather than silently clearing
+    // it. The fix applies immediately (stats update live), but it now shows up in
+    // Review as a pending human-applied change the user can confirm or revert —
+    // which is also what feeds the learnable layer (XTRAPP).
+    try {
+      if (typeof flagForReview === 'function') {
+        flagForReview('newsFix', {
+          key: articleKey(article),
+          label: `News ticker fix: ${tickers.join(', ')}`,
+          detail: `"${(headline || article.headline || '').slice(0, 80)}" → ${tickers.join(', ')}`,
+          ticker: mainT,
+          options: [
+            { label: 'Approve fix', action: 'approveNewsFix' },
+            { label: 'Revert', action: 'revertNewsFix' },
+          ],
+        });
+      }
+    } catch {}
     close();
     if (typeof renderNewsFeed === 'function') { try { renderNewsFeed(); } catch {} }
     if (typeof renderReviewHub === 'function') { try { renderReviewHub(); } catch {} }
-    if (typeof flashStatus === 'function') flashStatus(`Fixed: ${tickers.join(', ')} — durable + XTRAPP-ready`, 'success');
+    if (typeof flashStatus === 'function') flashStatus(`Fixed: ${tickers.join(', ')} — applied + sent to Review for approval`, 'success');
   });
 }
 if (typeof window !== 'undefined') window.openArticleEditor = openArticleEditor;
@@ -31949,28 +32082,50 @@ function updateNewsStatus(text) {
 // Used to compute "% change since article published". Returns the closest
 // date on or before the target (so weekends/holidays roll back to the prior
 // trading day).
+// Resolve a ticker's price history from ANY cache we have, normalized to an
+// ascending [{date,price}] array. Checks: sheet cache → priceHist cache (which
+// holds the deep GitHub 20y series) → the TA module's in-memory cache. This is
+// the single source the news returns use, so "Today" and "since written" stop
+// coming up blank just because the series lives in a different cache than the
+// one a given helper happened to check.
+function _newsHistoryFor(ticker) {
+  const norm = (h) => {
+    if (!Array.isArray(h) || !h.length) return null;
+    const out = h.map(p => ({ date: p.date || p.d, price: (p.price ?? p.close ?? p.c) }))
+      .filter(p => p.date && isFinite(p.price) && p.price > 0);
+    if (out.length < 1) return null;
+    out.sort((a, b) => a.date.localeCompare(b.date));
+    return out;
+  };
+  let h = null;
+  try { const c = getSheetCacheObj(); h = norm(c?.data?.priceHistory?.[ticker]); } catch {}
+  if (!h) { try { const ext = loadPriceHistCache(); h = norm(ext[ticker]?.data); } catch {} }
+  if (!h) { try { h = norm(state.ta?.histCache?.[ticker]); } catch {} }
+  if (!h) { try { h = norm(getHistoryForTicker(ticker)); } catch {} }
+  return h;
+}
+
 function _getPriceOnDate(ticker, targetDateMs) {
-  // Try sheet history first
-  let history = null;
-  try {
-    const cached = getSheetCacheObj();
-    history = cached?.data?.priceHistory?.[ticker];
-  } catch {}
-  if (!history?.length) {
-    try {
-      const ext = loadPriceHistCache();
-      history = ext[ticker]?.data;
-    } catch {}
-  }
-  if (!history?.length) return null;
-  // history is array of { date: 'YYYY-MM-DD', price: number }
+  const history = _newsHistoryFor(ticker);
+  if (!history) return null;
   const targetISO = new Date(targetDateMs).toISOString().slice(0, 10);
-  // Find the latest history entry on or before targetISO
+  // Latest entry on or before the target date.
   let best = null;
   for (const entry of history) {
-    if (entry.date <= targetISO) {
-      if (!best || entry.date > best.date) best = entry;
-    }
+    if (entry.date <= targetISO) { if (!best || entry.date > best.date) best = entry; }
+  }
+  return best?.price ?? null;
+}
+
+// Price on the last trading day STRICTLY BEFORE a date — the "prior close". Used
+// as the reference for a fresh article's return (the news broke after that close).
+function _getPriorCloseBefore(ticker, targetDateMs) {
+  const history = _newsHistoryFor(ticker);
+  if (!history) return null;
+  const targetISO = new Date(targetDateMs).toISOString().slice(0, 10);
+  let best = null;
+  for (const entry of history) {
+    if (entry.date < targetISO) { if (!best || entry.date > best.date) best = entry; }
   }
   return best?.price ?? null;
 }
@@ -31978,20 +32133,8 @@ function _getPriceOnDate(ticker, targetDateMs) {
 // Returns today's % change vs prior trading day's close. Uses cached history
 // since stockbook's `changesPercentage` field is often missing for non-equities.
 function _getTodayPctChange(ticker) {
-  let history = null;
-  try {
-    const cached = getSheetCacheObj();
-    history = cached?.data?.priceHistory?.[ticker];
-  } catch {}
-  if (!history?.length) {
-    try {
-      const ext = loadPriceHistCache();
-      history = ext[ticker]?.data;
-    } catch {}
-  }
-  if (!history?.length || history.length < 2) return null;
-  // Most-recent two entries
-  const sorted = [...history].sort((a, b) => a.date.localeCompare(b.date));
+  const sorted = _newsHistoryFor(ticker);
+  if (!sorted || sorted.length < 2) return null;
   const last = sorted[sorted.length - 1];
   const prev = sorted[sorted.length - 2];
   if (!last?.price || !prev?.price) return null;
@@ -32113,21 +32256,36 @@ function renderNewsFeed() {
     const dayChangeClass = dayChange == null ? '' : dayChange > 0 ? 'news-item-sentiment-positive' : dayChange < 0 ? 'news-item-sentiment-negative' : '';
     const dayChangeStr = dayChange != null ? (dayChange >= 0 ? '+' : '') + (dayChange * 100).toFixed(2) + '%' : '—';
 
-    // Price change since article published. Daily history can't capture
-    // intraday moves, so for very fresh articles (<1 trading day) we compare
-    // current price to the close on/before the publish date — it shows the
-    // move since the last close before the news, which is still informative.
+    // Price change SINCE THE ARTICLE WAS WRITTEN.
+    //   • For fresh articles (< 24h, or same-day), daily bars can't capture the
+    //     intraday move, so we measure from the PRIOR trading close — the last
+    //     settled price BEFORE the news broke — up to the latest price. For a
+    //     same-day article this equals "Today", which is why a <24h article
+    //     shows matching Today and Since-written numbers (as expected).
+    //   • For older articles, we measure from the close on/around the publish
+    //     date to now — the true "what has it returned since this was written".
     let sincePublishedStr = null;
     let sincePublishedClass = '';
-    let sincePublishedLabel = 'since published';
+    let sincePublishedLabel = 'since written';
     if (currentPrice != null) {
-      const priceAtPub = _getPriceOnDate(article.ticker, article.datetime);
-      if (priceAtPub != null && priceAtPub > 0 && Math.abs(priceAtPub - currentPrice) > 1e-9) {
-        const change = (currentPrice - priceAtPub) / priceAtPub;
+      let refPrice;
+      if (hoursAgo < 24) {
+        // fresh: from the prior close (before the news), so it reflects the move
+        // that has happened since the article hit.
+        refPrice = _getPriorCloseBefore(article.ticker, article.datetime);
+        sincePublishedLabel = 'since written';
+      } else {
+        refPrice = _getPriceOnDate(article.ticker, article.datetime);
+        sincePublishedLabel = 'since written';
+      }
+      if (refPrice != null && refPrice > 0 && Math.abs(refPrice - currentPrice) > 1e-9) {
+        const change = (currentPrice - refPrice) / refPrice;
         sincePublishedStr = (change >= 0 ? '+' : '') + (change * 100).toFixed(2) + '%';
         sincePublishedClass = change > 0 ? 'news-item-sentiment-positive' : change < 0 ? 'news-item-sentiment-negative' : '';
-        // For sub-24h articles, clarify this is from the prior close
-        if (hoursAgo < 24) sincePublishedLabel = 'since prior close';
+      } else if (refPrice != null && refPrice > 0) {
+        // Price unchanged from reference (or only the same single bar exists).
+        sincePublishedStr = '0.00%';
+        sincePublishedClass = '';
       }
     }
 
@@ -32244,7 +32402,7 @@ function renderNewsFeed() {
           </div>
           ${sincePublishedStr ? `
           <div class="news-item-stat">
-            <span class="news-item-stat-label">Since ${pubDateLabel}</span>
+            <span class="news-item-stat-label" title="Return from when the article was written (${pubDateLabel}) to the latest price. For articles under 24h old this is measured from the prior close, so it lines up with Today.">Since written (${pubDateLabel})</span>
             <span class="news-item-stat-value ${sincePublishedClass}">${sincePublishedStr}</span>
           </div>
           ` : ''}
@@ -32274,7 +32432,6 @@ function renderNewsFeed() {
               return `<button class="news-item-cta" onclick="markArticleStateAndRender('${articleId}', 'dismissed')" style="background:transparent;cursor:pointer" title="Hide from feed">✕ Hide</button>`;
             })()}
             <button class="news-item-cta" onclick="reportAndRetryArticle('${articleId}')" style="background:transparent;cursor:pointer;color:var(--neg)" title="Report as wrong / irrelevant and try fetching this article from another source">⚠ Report &amp; Retry</button>
-            <button class="news-item-cta" onclick="sendArticleToReview('${articleId}')" style="background:transparent;cursor:pointer;color:#7faaca" title="Wrong ticker? Send to Review to confirm, fix, or delete the ticker — the fix survives news refreshes">🧠 Fix ticker</button>
           </div>
         </div>
       </article>
@@ -35505,35 +35662,39 @@ const ANALYTICS_BASE = 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-AN
 let _backendResearch = null;          // { generatedAt, byTicker, ... } | null
 let _backendResearchFetched = false;
 
-// Overlay backend grades onto the local research data, with the BACKEND WINNING.
-// The backend (analytics repo) grades nightly from the full clean dataset, so it
-// is the authoritative source; the local computation is only a fallback for
-// tickers the backend hasn't covered or when the backend file is missing/stale.
-// Mutates data.byTicker in place. Each row gets _gradeSource = 'backend'|'local'.
+// Attach the backend grade to each row as a SEPARATE field, WITHOUT overwriting
+// the local (frontend) grade. The frontend grade is what the user sees in the
+// "Grade" column — it's computed live from the metrics this browser has, and it
+// can legitimately differ from the backend (different data freshness, different
+// coverage). The backend grade is kept as `backendGrade`/`backendScore` purely
+// so the table can SORT by it (the backend is the stable nightly reference).
+// Mutates data.byTicker in place. Each row gets _gradeSource for provenance.
 function mergeBackendGradesOverLocal(data) {
   if (!data || !data.byTicker) return data;
   const be = _backendResearch;
-  // Only trust a backend that exists and isn't badly stale.
   const beOk = be && be.byTicker && be._fresh !== false;
   for (const tk of Object.keys(data.byTicker)) {
     const local = data.byTicker[tk];
     const beRow = beOk ? be.byTicker[tk] : null;
     if (beRow && (beRow.grade != null || beRow.gradeScore != null)) {
-      // Backend wins for the headline grade + score. Keep the local per-metric
-      // ranks/categoryScores for the breakdown UI (backend may not ship those),
-      // but the GRADE the user sees is the backend's.
-      local._localGrade = local.grade;          // preserve for the divergence note
-      local._localGradeScore = local.gradeScore;
-      if (beRow.gradeScore != null) local.gradeScore = beRow.gradeScore;
-      if (beRow.grade != null) local.grade = beRow.grade;
-      else if (beRow.gradeScore != null) local.grade = researchGradeLetter(beRow.gradeScore);
-      // Surface backend coverage if it provides it (more authoritative count).
+      // Keep the FRONTEND grade as the displayed grade (do NOT overwrite it).
+      // Record the backend grade/score separately, used as the sort key + shown
+      // in the dedicated "Backend" column with a Δ flag when they disagree.
+      local.backendGrade = beRow.grade != null ? beRow.grade : (beRow.gradeScore != null ? researchGradeLetter(beRow.gradeScore) : null);
+      local.backendScore = beRow.gradeScore != null ? beRow.gradeScore : null;
+      // Backend may ship richer coverage/category data — adopt those for the
+      // breakdown UI, but NOT the headline grade.
       if (beRow.coverage != null) local.coverage = beRow.coverage;
       if (beRow.coverageTotal != null) local.coverageTotal = beRow.coverageTotal;
-      if (beRow.categoryScores) local.categoryScores = beRow.categoryScores;
-      local._gradeSource = 'backend';
-      local._gradeDiverged = (local._localGrade != null && local._localGrade !== local.grade);
+      // Divergence: do the frontend and backend disagree on the letter grade?
+      local._gradeDiverged = (local.grade != null && local.backendGrade != null && local.grade !== local.backendGrade);
+      if (local._gradeDiverged && local.gradeScore != null && local.backendScore != null) {
+        local.divergence = Math.abs(local.gradeScore - local.backendScore);
+      }
+      local._gradeSource = 'local-shown-backend-sorted';
     } else {
+      local.backendGrade = null;
+      local.backendScore = null;
       local._gradeSource = 'local';
     }
   }
@@ -35851,7 +36012,7 @@ function researchGradeColor(grade) {
 // ============================================================
 //   RESEARCH TAB RENDERER
 // ============================================================
-const RESEARCH_STATE = { view: 'grade', metric: 'roe', side: 'top', gradeSort: 'grade', detailTicker: null, minCoverage: 0, filters: [] };
+const RESEARCH_STATE = { view: 'grade', metric: 'roe', side: 'top', gradeSort: 'grade', detailTicker: null, minCoverage: 0, filters: [], screenCats: [] };
 
 function renderResearchTab() {
   const body = document.getElementById('research-body');
@@ -35900,13 +36061,102 @@ function renderResearchTab() {
 }
 
 function renderResearchScreener(data) {
-  // ===== Multi-metric screener =====
-  // Build a set of filter rows (metric + operator + threshold). A company must
-  // pass ALL active filters. Every metric we compute is screenable, and the
-  // result rows are clickable → jump straight to valuing that ticker.
+  // ===== CATEGORY SCREENER + multi-metric filter =====
+  // PRIMARY MODE — Category screen: pick one or more grade categories
+  // (Profitability, Growth, Valuation, Balance Sheet, Income). Each ticker is
+  // ranked by the WEIGHTED AVERAGE of its scores in the selected categories
+  // (using the same category weights the overall grade uses, re-normalized over
+  // just the picked categories). The result shows that blended category score
+  // AND a letter grade derived from it — so values and grade always match and
+  // are pulled strictly from the chosen categories.
   const allRows = Object.values(data.byTicker);
+  const GRADED_CATS = [...RESEARCH_GRADED_CATEGORIES];   // Profitability, Growth, Valuation, Balance Sheet, Income
 
-  // Metric options grouped by category, reused by every filter row.
+  if (!Array.isArray(RESEARCH_STATE.screenCats)) RESEARCH_STATE.screenCats = [];
+  const picked = RESEARCH_STATE.screenCats.filter(c => RESEARCH_GRADED_CATEGORIES.has(c));
+
+  // Blended score for a ticker across the picked categories (weighted, re-
+  // normalized over the categories the ticker actually has data for).
+  const blendedCatScore = (t) => {
+    const cs = t.categoryScores || {};
+    let sum = 0, wsum = 0, used = 0;
+    for (const c of picked) {
+      if (cs[c] != null && isFinite(cs[c])) {
+        const w = RESEARCH_CATEGORY_WEIGHTS[c] || 0;
+        sum += cs[c] * w; wsum += w; used++;
+      }
+    }
+    if (used === 0 || wsum === 0) return null;
+    return sum / wsum;
+  };
+
+  // Category chips (multi-select).
+  const catChips = GRADED_CATS.map(c => {
+    const on = picked.includes(c);
+    const w = ((RESEARCH_CATEGORY_WEIGHTS[c] || 0) * 100).toFixed(0);
+    return `<button class="rf-cat-chip" data-cat="${escapeHtml(c)}" style="
+      font-family:var(--mono);font-size:10px;padding:6px 11px;border-radius:14px;cursor:pointer;
+      border:1px solid ${on ? 'var(--amber)' : 'var(--rule)'};
+      background:${on ? 'var(--amber)' : 'transparent'};
+      color:${on ? '#1a1a1a' : 'var(--ink-dim)'};font-weight:${on ? '700' : '400'}">
+      ${on ? '✓ ' : ''}${escapeHtml(c)} <span style="opacity:0.7">${w}%</span></button>`;
+  }).join(' ');
+
+  // Build the category-ranked result set when ≥1 category is picked.
+  let catTableHtml = '';
+  if (picked.length > 0) {
+    const minCov = RESEARCH_STATE.minCoverage || 0;
+    const ranked = allRows
+      .map(t => ({ t, score: blendedCatScore(t) }))
+      .filter(x => x.score != null && (x.t.coverage || 0) >= minCov)
+      .sort((a, b) => b.score - a.score);
+
+    const catCols = picked.map(c => `<th style="text-align:right" title="${escapeHtml(c)} percentile (0-100)">${escapeHtml(c)}</th>`).join('');
+    const catRows = ranked.map((x, i) => {
+      const t = x.t;
+      const blendGrade = researchGradeLetter(x.score);
+      const perCatCells = picked.map(c => {
+        const v = (t.categoryScores || {})[c];
+        return `<td style="text-align:right;font-family:var(--mono);font-size:11px;color:${v != null ? researchGradeColor(researchGradeLetter(v)) : 'var(--ink-faint)'}">${v != null ? v.toFixed(0) : '—'}</td>`;
+      }).join('');
+      return `<tr class="research-screen-row" data-ticker="${escapeHtml(t.ticker)}" style="cursor:pointer">
+        <td style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);text-align:right">${i + 1}</td>
+        <td style="font-family:var(--mono);font-weight:700">${escapeHtml(t.ticker)}</td>
+        <td style="font-size:11px;color:var(--ink-dim);max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(t.name)}</td>
+        <td style="text-align:center"><span style="font-family:var(--mono);font-size:14px;font-weight:700;color:${researchGradeColor(blendGrade)}" title="Grade from the blended score of the selected categories">${blendGrade}</span></td>
+        <td style="text-align:right;font-family:var(--mono);font-size:12px;font-weight:700">${x.score.toFixed(0)}<span style="color:var(--ink-faint);font-size:9px">/100</span></td>
+        ${perCatCells}
+        <td style="text-align:center;font-family:var(--mono);font-size:9px;color:var(--amber)">value →</td>
+      </tr>`;
+    }).join('');
+
+    catTableHtml = `
+      <div class="company-card" style="margin:0 0 14px">
+        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%">
+        <table class="sb-table" style="width:100%;min-width:0">
+          <thead><tr>
+            <th style="text-align:right">#</th><th>Ticker</th><th>Company</th>
+            <th style="text-align:center" title="Letter grade from the blended category score">Grade</th>
+            <th style="text-align:right" title="Weighted average of the selected categories' percentile scores">Blended</th>
+            ${catCols}
+            <th></th>
+          </tr></thead>
+          <tbody>${catRows || `<tr><td colspan="${6 + picked.length}" style="padding:20px;text-align:center;color:var(--ink-faint)">No tickers have data in the selected categor${picked.length > 1 ? 'ies' : 'y'}.</td></tr>`}</tbody>
+        </table>
+        </div>
+      </div>`;
+  }
+
+  const catScreenerHtml = `
+    <div class="company-card" style="margin:0 0 14px">
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:4px">Category screen</div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);margin-bottom:10px;line-height:1.5">Pick one or more categories. Tickers are ranked by the weighted average of their scores in those categories, with a grade to match. ${picked.length ? `<span style="color:var(--amber)">Showing ${picked.length} categor${picked.length > 1 ? 'ies' : 'y'}.</span>` : 'Pick a category to begin.'}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:7px">${catChips}</div>
+      ${picked.length > 1 ? `<div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:8px">Blended weights re-normalized over your picks: ${picked.map(c => `${c} ${((RESEARCH_CATEGORY_WEIGHTS[c] / picked.reduce((s, x) => s + RESEARCH_CATEGORY_WEIGHTS[x], 0)) * 100).toFixed(0)}%`).join(' · ')}</div>` : ''}
+    </div>
+    ${catTableHtml}`;
+
+  // ===== SECONDARY: metric-threshold filter (unchanged) =====
   const cats = [...new Set(RESEARCH_METRICS.map(x => x.cat))];
   const metricOptionsFor = (sel) => cats.map(cat =>
     `<optgroup label="${cat}">` +
@@ -35915,7 +36165,6 @@ function renderResearchScreener(data) {
     `</optgroup>`
   ).join('');
 
-  // Ensure at least one filter row exists.
   if (!RESEARCH_STATE.filters || !RESEARCH_STATE.filters.length) {
     RESEARCH_STATE.filters = [{ metric: 'roe', op: 'gte', val: '' }];
   }
@@ -36006,8 +36255,9 @@ function renderResearchScreener(data) {
   }).join('');
 
   return `
+    ${catScreenerHtml}
     <div class="company-card" style="margin:0 0 14px">
-      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:10px">Screen — companies must pass ALL filters</div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:10px">Metric filter — companies must pass ALL filters</div>
       ${filterRowsHtml}
       <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
         <button class="btn btn-ghost" id="rf-add" style="font-size:10px">+ Add filter</button>
@@ -36032,6 +36282,15 @@ function renderResearchScreener(data) {
 }
 
 function wireResearchScreener() {
+  // Category chips: toggle membership in RESEARCH_STATE.screenCats, then re-render.
+  document.querySelectorAll('.rf-cat-chip').forEach(chip => chip.addEventListener('click', () => {
+    const c = chip.dataset.cat;
+    if (!Array.isArray(RESEARCH_STATE.screenCats)) RESEARCH_STATE.screenCats = [];
+    const i = RESEARCH_STATE.screenCats.indexOf(c);
+    if (i >= 0) RESEARCH_STATE.screenCats.splice(i, 1);
+    else RESEARCH_STATE.screenCats.push(c);
+    renderResearchTab();
+  }));
   const syncFromInputs = () => {
     document.querySelectorAll('.rf-metric').forEach(el => { const i = +el.dataset.i; if (RESEARCH_STATE.filters[i]) RESEARCH_STATE.filters[i].metric = el.value; });
     document.querySelectorAll('.rf-op').forEach(el => { const i = +el.dataset.i; if (RESEARCH_STATE.filters[i]) RESEARCH_STATE.filters[i].op = el.value; });
@@ -36055,13 +36314,17 @@ function wireResearchScreener() {
 }
 
 function renderResearchGrades(data) {
-  // All companies sorted by grade score (desc). Show grade + coverage + top categories.
+  // The "Grade" column shows the FRONTEND grade (live, this-browser compute).
+  // The "Backend" column shows the backend's nightly grade. They can differ —
+  // that's expected and surfaced with a Δ flag. We SORT by the BACKEND score
+  // (the stable nightly reference), falling back to the frontend score for any
+  // ticker the backend hasn't graded yet, so the ordering is anchored to the
+  // authoritative source while each row still displays its own live grade.
   const minCov = RESEARCH_STATE.minCoverage || 0;
   const allUnfiltered = Object.values(data.byTicker).filter(t => t.gradeScore != null);
-  // Coverage filter: hide grades built on too few metrics (likely unreliable),
-  // so you can focus on names with strong data coverage.
   const all = allUnfiltered.filter(t => (t.coverage || 0) >= minCov);
-  all.sort((a, b) => b.gradeScore - a.gradeScore);
+  const sortScore = (t) => (t.backendScore != null ? t.backendScore : t.gradeScore);
+  all.sort((a, b) => sortScore(b) - sortScore(a));
   const hiddenCount = allUnfiltered.length - all.length;
 
   const rowsHtml = all.map((t, i) => `
@@ -36136,7 +36399,7 @@ function renderResearchGrades(data) {
         <thead><tr>
           <th style="text-align:center;width:28px"><input type="checkbox" id="research-select-all" title="Select all shown" style="cursor:pointer"></th>
           <th style="text-align:right">#</th><th>Ticker</th><th>Company</th>
-          <th style="text-align:center">Grade</th><th style="text-align:center" title="Computed nightly by the analytics backend across all three books">Backend</th><th style="text-align:right">Score</th><th style="text-align:right">Coverage</th>
+          <th style="text-align:center" title="Frontend grade — computed live in this browser from the metrics it currently has. Can differ from the backend (different data freshness/coverage).">Grade</th><th style="text-align:center" title="Backend grade — computed nightly by the analytics backend across all three books. The table is sorted by this score.">Backend ↓</th><th style="text-align:right">Score</th><th style="text-align:right">Coverage</th>
         </tr></thead>
         <tbody>${rowsHtml}</tbody>
       </table>
@@ -37775,44 +38038,55 @@ function buildBotTrainingData() {
       couldHaveWorked = `Won, but sold while momentum was still strong (exit momentum ${b.exitMomentum}). If the capital didn't go into something clearly better, this likely left gains on the table — let runners run longer next time.`;
     }
     return {
-      id: b.id || null,
+      id: b.id || `${b.ticker}-${b.entryDate}-${Math.random().toString(36).slice(2, 10)}`,
       ticker: b.ticker,
       name: b.name || b.ticker,
-      sector: b.sector || null,
+      sector: b.sector || 'Unknown',
       direction: b.direction,
       instrument: b.instrument || 'shares',
-      optionType: b.optionType || null,
-      leveragedEtf: b.leveragedEtf || null,
-      style: _classifyTradeStyle(b),
-      horizonType: b.horizonType || null,
-      horizonDays: b.horizonDays || null,
-      dalioEnv: b.dalioEnv || null,
-      longTermTrend: b.longTermTrend || null,
+      optionType: b.optionType || null,        // null only meaningful: non-options have no type
+      leveragedEtf: b.leveragedEtf || null,     // null only meaningful: most trades aren't leveraged ETFs
+      style: _classifyTradeStyle(b) || 'long',
+      horizonType: b.horizonType || 'swing',
+      horizonDays: b.horizonDays || 21,
+      dalioEnv: b.dalioEnv || 'unclassified',
+      longTermTrend: b.longTermTrend || 'unknown',
       soldStillStrong: b.soldStillStrong || false,
-      exitMomentum: b.exitMomentum != null ? b.exitMomentum : null,
+      exitMomentum: b.exitMomentum != null ? b.exitMomentum : 0,
       rolledForMomentum: b.rolledForMomentum || 0,
       entryDate: b.entryDate,
-      exitDate: b.exitDate,
+      exitDate: b.exitDate || null,             // null only meaningful: position still OPEN
       entryPrice: b.entryPrice,
-      exitPrice: b.exitPrice,
-      holdDays: (b.entryDate && b.exitDate) ? Math.round((new Date(b.exitDate) - new Date(b.entryDate)) / 86400000) : null,
-      pnl: b.pnl,
-      returnPct: ret,
+      exitPrice: b.exitPrice != null ? b.exitPrice : null,   // null only meaningful: still open
+      // ---- POSITION SIZE (was missing — the reason imports showed no size /
+      // no cash-after). These reconstruct the order size on re-import. ----
+      shares: b.shares != null ? b.shares : (b.entryPrice > 0 && b.notional ? +(b.notional / b.entryPrice).toFixed(4) : 0),
+      notional: b.notional != null ? b.notional : 0,          // capital committed (pre-leverage)
+      dollars: b.dollars != null ? b.dollars : (b.notional || 0),  // exposure (post-leverage)
+      allocationPct: b.allocationPct != null ? b.allocationPct : 0,
+      leverage: b.leverage != null ? b.leverage : 1,
+      hedge: b.hedge || false,
+      stopPrice: b.stopPrice != null ? b.stopPrice : null,
+      targetPrice: b.targetPrice != null ? b.targetPrice : null,
+      holdDays: (b.entryDate && b.exitDate) ? Math.round((new Date(b.exitDate) - new Date(b.entryDate)) / 86400000) : (b.holdDays != null ? b.holdDays : 0),
+      pnl: b.pnl != null ? b.pnl : 0,
+      returnPct: ret != null ? ret : 0,
       won,
-      exitReason: b.exitReason || null,
-      conviction: b.conviction,
-      confidence: b.confidence,
-      regimeAtEntry: b.regimeAtEntry || null,
+      exitReason: b.exitReason || (b.status === 'open' ? 'open' : 'unknown'),
+      conviction: b.conviction != null ? b.conviction : 0,
+      confidence: b.confidence != null ? b.confidence : (b.conviction != null ? b.conviction : 0),
+      regimeAtEntry: b.regimeAtEntry || 'unclassified',
+      status: b.status || (b.exitDate ? 'closed' : 'open'),
       // WHY the bot took it:
-      topDrivers,
+      topDrivers: topDrivers.length ? topDrivers : [],
       rationale: b.rationale || [],
-      cashAfter: b.cashAfter != null ? b.cashAfter : null,
-      decisionReceipt: b.decisionReceipt || null,
+      cashAfter: b.cashAfter != null ? b.cashAfter : null,   // null only meaningful: not recorded at entry
+      decisionReceipt: b.decisionReceipt || null,            // null only meaningful: pre-receipt trade
       // WHAT WORKED / DIDN'T (signal attribution vs the realized result):
       signalsThatHelped: helped,
       signalsThatHurt: hurt,
       // WHERE TO GET BETTER:
-      couldHaveWorked,
+      couldHaveWorked: couldHaveWorked || (b.status === 'open' ? 'Position still open — outcome pending.' : ''),
     };
   });
 
@@ -37951,15 +38225,42 @@ function _mergeBotTrainingData(data, sourceLabel) {
   for (const t of (data.trades || [])) {
     const key = idOf(t);
     if (!localById.has(key)) {
+      // Reconstruct position size. Prefer the exported size; if an older file
+      // lacks it, derive shares from notional/entryPrice (and notional from
+      // dollars or vice-versa) so size + cash-after can still display.
+      const entryPx = t.entryPrice;
+      let notional = t.notional != null ? t.notional : (t.dollars != null ? t.dollars : null);
+      let dollars = t.dollars != null ? t.dollars : (notional != null ? notional : null);
+      let shares = t.shares != null ? t.shares
+                 : (entryPx > 0 && notional != null ? +(notional / entryPx).toFixed(4) : null);
+      // If we have shares + price but no notional, back into notional.
+      if (notional == null && shares != null && entryPx > 0) notional = +(shares * entryPx).toFixed(2);
+      if (dollars == null && notional != null) dollars = notional;
       bot.bets.push({
         id: t.id || `imported-${key}`,
         ticker: t.ticker, name: t.name, sector: t.sector, direction: t.direction,
-        instrument: t.instrument, optionType: t.optionType, leveragedEtf: t.leveragedEtf,
-        entryDate: t.entryDate, exitDate: t.exitDate, entryPrice: t.entryPrice, exitPrice: t.exitPrice,
-        pnl: t.pnl, returnPct: t.returnPct, status: t.exitDate ? 'closed' : 'open', exitReason: t.exitReason,
-        conviction: t.conviction, confidence: t.confidence, rationale: t.rationale,
+        instrument: t.instrument || 'shares', optionType: t.optionType, leveragedEtf: t.leveragedEtf,
+        leveragedEtfMultiplier: t.leveragedEtfMultiplier || null,
+        markTicker: t.markTicker || t.ticker,
+        entryDate: t.entryDate, exitDate: t.exitDate || null, entryPrice: entryPx, exitPrice: t.exitPrice,
+        // ---- restored size (was dropped on import → no size, no cash-after) ----
+        shares: shares != null ? shares : 0,
+        notional: notional != null ? notional : 0,
+        dollars: dollars != null ? dollars : (notional != null ? notional : 0),
+        allocationPct: t.allocationPct != null ? t.allocationPct : 0,
+        leverage: t.leverage != null ? t.leverage : 1,
+        hedge: t.hedge || false,
+        stopPrice: t.stopPrice != null ? t.stopPrice : null,
+        targetPrice: t.targetPrice != null ? t.targetPrice : null,
+        cashAfter: t.cashAfter != null ? t.cashAfter : null,
+        pnl: t.pnl != null ? t.pnl : 0, returnPct: t.returnPct != null ? t.returnPct : 0,
+        status: t.status || (t.exitDate ? 'closed' : 'open'), exitReason: t.exitReason,
+        conviction: t.conviction, confidence: t.confidence != null ? t.confidence : t.conviction,
+        rationale: t.rationale || [],
         tradeStyle: t.style || t.tradeStyle, horizonType: t.horizonType, horizonDays: t.horizonDays,
-        dalioEnv: t.dalioEnv, holdDays: t.holdDays,
+        dalioEnv: t.dalioEnv, longTermTrend: t.longTermTrend, holdDays: t.holdDays,
+        soldStillStrong: t.soldStillStrong || false, exitMomentum: t.exitMomentum,
+        rolledForMomentum: t.rolledForMomentum || 0,
         decisionReceipt: t.decisionReceipt || null,
         signalsThatHelped: t.signalsThatHelped, signalsThatHurt: t.signalsThatHurt,
         couldHaveWorked: t.couldHaveWorked,
@@ -37975,6 +38276,14 @@ function _mergeBotTrainingData(data, sourceLabel) {
   saveBotState(bot);
   console.log(`[bot] imported ${added} new trades from ${sourceLabel || 'source'} (now ${bot.bets.length} total)`);
   if (typeof flashStatus === 'function') flashStatus(`Imported ${added} new trade${added !== 1 ? 's' : ''} from ${sourceLabel || 'file'} (appended — ${bot.bets.length} total)`, 'success');
+  // If Supabase is configured, push the newly-imported trades up too — the sync
+  // already dedups against what's in the DB, so this only inserts trades that
+  // aren't there yet (and re-upserts open positions). Best-effort; never blocks.
+  if (added > 0 && typeof supabaseConfigured === 'function' && supabaseConfigured() && typeof supabaseSyncAllTrades === 'function') {
+    supabaseSyncAllTrades().then(n => {
+      if (n > 0 && typeof flashStatus === 'function') flashStatus(`Imported ${added} trade${added !== 1 ? 's' : ''} · pushed ${n} new to Supabase`, 'success');
+    }).catch(() => {});
+  }
   return data;
 }
 
@@ -38054,16 +38363,67 @@ function _supabaseHeaders(extra) {
   }, extra || {});
 }
 
-// Upsert ONE trade to Supabase the moment it's placed or closed. Fire-and-forget
-// (never blocks the UI); failures are logged but don't interrupt trading.
+// Guarantee a trade has a STABLE unique id. Supabase's primary key is `id`; rows
+// with a null/blank id all collide on the PK, so an upsert collapses them into
+// ONE row — that was the "only 1 trade synced" bug. Every trade must have an id.
+function _ensureTradeId(b) {
+  if (b && b.id) return b.id;
+  const id = `${b.ticker || 'UNK'}-${b.entryDate || 'nodate'}-${(b.entryPrice ?? 0)}-${Math.random().toString(36).slice(2, 9)}`;
+  if (b) b.id = id;
+  return id;
+}
+
+// Strip nulls/undefined from the trade object we store. Keep a small allow-list
+// where null is genuinely meaningful (open position, no exit yet). Everything
+// else gets sensible defaults so the DB doesn't fill with nulls.
+function _cleanTradeForStore(b) {
+  // null is allowed ONLY for these (it carries real meaning):
+  const NULL_OK = new Set(['exitDate', 'exitPrice', 'optionType', 'leveragedEtf',
+    'leveragedEtfMultiplier', 'decisionReceipt', 'stopPrice', 'targetPrice', 'cashAfter']);
+  const DEFAULTS = {
+    sector: 'Unknown', instrument: 'shares', direction: 'long', style: 'long',
+    horizonType: 'swing', horizonDays: 21, dalioEnv: 'unclassified',
+    longTermTrend: 'unknown', regimeAtEntry: 'unclassified', exitReason: 'open',
+    shares: 0, notional: 0, dollars: 0, allocationPct: 0, leverage: 1,
+    pnl: 0, returnPct: 0, conviction: 0, confidence: 0, exitMomentum: 0,
+    rolledForMomentum: 0, holdDays: 0, hedge: false, soldStillStrong: false,
+    won: false, rationale: [], topDrivers: [], signalsThatHelped: [], signalsThatHurt: [],
+    name: '', couldHaveWorked: '',
+  };
+  const out = {};
+  for (const [k, v] of Object.entries(b || {})) {
+    if (k.startsWith('_')) continue;               // drop internal flags
+    if (v === null || v === undefined) {
+      if (NULL_OK.has(k)) out[k] = null;            // keep meaningful nulls
+      else if (k in DEFAULTS) out[k] = DEFAULTS[k]; // else default
+      // otherwise omit entirely
+    } else {
+      out[k] = v;
+    }
+  }
+  // Backfill any missing defaulted keys (so the shape is consistent).
+  for (const [k, d] of Object.entries(DEFAULTS)) if (!(k in out)) out[k] = d;
+  // Ensure the verbatim/core columns always exist.
+  _ensureTradeId(out);
+  out.status = out.status || (out.exitDate ? 'closed' : 'open');
+  return out;
+}
+
+// Build the {id, trade, updated_at} row exactly as the Supabase table expects.
+function _supabaseRow(b) {
+  const clean = _cleanTradeForStore(b);
+  return { id: clean.id, trade: clean, updated_at: new Date().toISOString() };
+}
+
+// Upsert ONE trade the moment it's placed or closed. Fire-and-forget.
 async function supabaseUpsertTrade(bet) {
   if (!supabaseConfigured() || !bet) return false;
   try {
-    const row = { id: bet.id, trade: bet, updated_at: new Date().toISOString() };
+    _ensureTradeId(bet);
     const r = await fetch(`${getSupabaseUrl()}/rest/v1/${SUPABASE_TABLE}`, {
       method: 'POST',
       headers: _supabaseHeaders({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
-      body: JSON.stringify(row),
+      body: JSON.stringify(_supabaseRow(bet)),
     });
     if (!r.ok && r.status !== 409) {
       console.warn('[supabase] upsert failed', r.status, await r.text().catch(() => ''));
@@ -38076,29 +38436,73 @@ async function supabaseUpsertTrade(bet) {
   }
 }
 
-// Push EVERY local trade to Supabase (bulk sync — e.g. first-time backfill or a
-// manual "sync now"). Upserts so re-running is safe.
+// Fetch the set of trade ids already in Supabase (for dedup-before-insert).
+async function _supabaseExistingIds() {
+  const ids = new Set();
+  try {
+    const r = await fetch(`${getSupabaseUrl()}/rest/v1/${SUPABASE_TABLE}?select=id`, {
+      headers: _supabaseHeaders(),
+    });
+    if (r.ok) {
+      const rows = await r.json();
+      if (Array.isArray(rows)) for (const row of rows) if (row.id) ids.add(row.id);
+    }
+  } catch (e) { console.warn('[supabase] existing-id fetch failed', e.message); }
+  return ids;
+}
+
+// Push EVERY local trade to Supabase. FIX for "only 1 trade synced": every trade
+// gets a stable unique id first (null ids collided on the PK). DEDUP: we read the
+// ids already in the DB and only upload trades that are NEW (or whose payload
+// changed), so we don't re-write identical rows. Chunked to avoid huge requests.
 async function supabaseSyncAllTrades() {
   if (!supabaseConfigured()) { if (typeof flashStatus === 'function') flashStatus('Supabase not configured — add URL + anon key in Data Sources', 'error'); return 0; }
   const bot = loadBotState();
   const bets = bot.bets || [];
-  if (!bets.length) return 0;
+  if (!bets.length) { if (typeof flashStatus === 'function') flashStatus('No trades to sync', ''); return 0; }
   try {
-    const rows = bets.map(b => ({ id: b.id, trade: b, updated_at: new Date().toISOString() }));
-    const r = await fetch(`${getSupabaseUrl()}/rest/v1/${SUPABASE_TABLE}`, {
-      method: 'POST',
-      headers: _supabaseHeaders({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
-      body: JSON.stringify(rows),
-    });
-    if (!r.ok && r.status !== 409) {
-      console.warn('[supabase] bulk sync failed', r.status);
-      if (typeof flashStatus === 'function') flashStatus(`Supabase sync failed (HTTP ${r.status})`, 'error');
+    // 1. ensure ids (and persist them back so local + DB agree).
+    let mutated = false;
+    for (const b of bets) { const had = b.id; _ensureTradeId(b); if (b.id !== had) mutated = true; }
+    if (mutated) saveBotState(bot);
+
+    // 2. dedup — pull existing ids + their current payload hash, skip unchanged.
+    const existing = await _supabaseExistingIds();
+
+    // 3. build rows; only those NOT already in the DB (new) or always re-upsert
+    //    open positions (their P&L/cash moves). Closed+already-present = skip.
+    const rows = [];
+    for (const b of bets) {
+      const row = _supabaseRow(b);
+      const isOpen = (b.status || (b.exitDate ? 'closed' : 'open')) === 'open';
+      if (!existing.has(row.id) || isOpen) rows.push(row);   // new, or open (mutable)
+    }
+    if (!rows.length) {
+      if (typeof flashStatus === 'function') flashStatus(`Supabase already up to date (${bets.length} trades, nothing new)`, 'success');
       return 0;
     }
-    if (typeof flashStatus === 'function') flashStatus(`Synced ${rows.length} trades to Supabase`, 'success');
-    return rows.length;
+
+    // 4. upsert in chunks of 100.
+    let sent = 0;
+    for (let i = 0; i < rows.length; i += 100) {
+      const chunk = rows.slice(i, i + 100);
+      const r = await fetch(`${getSupabaseUrl()}/rest/v1/${SUPABASE_TABLE}`, {
+        method: 'POST',
+        headers: _supabaseHeaders({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+        body: JSON.stringify(chunk),
+      });
+      if (!r.ok && r.status !== 409) {
+        console.warn('[supabase] bulk sync chunk failed', r.status, await r.text().catch(() => ''));
+        if (typeof flashStatus === 'function') flashStatus(`Supabase sync failed at row ${i} (HTTP ${r.status})`, 'error');
+        break;
+      }
+      sent += chunk.length;
+    }
+    if (typeof flashStatus === 'function') flashStatus(`Synced ${sent} trade${sent !== 1 ? 's' : ''} to Supabase (${bets.length - sent} already current)`, 'success');
+    return sent;
   } catch (e) {
     console.warn('[supabase] bulk sync error', e.message);
+    if (typeof flashStatus === 'function') flashStatus('Supabase sync error — see console', 'error');
     return 0;
   }
 }

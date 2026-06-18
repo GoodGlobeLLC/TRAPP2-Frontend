@@ -7349,6 +7349,8 @@
           <button data-range="6m" class="seg-btn">6M</button>
           <button data-range="ytd" class="seg-btn">YTD</button>
           <button data-range="1y" class="seg-btn">1Y</button>
+          <button data-range="5y" class="seg-btn">5Y</button>
+          <button data-range="20y" class="seg-btn">20Y</button>
           <button data-range="all" class="seg-btn active">ALL</button>
         </span>
         <button id="fx-invert-toggle" class="seg-btn" style="display:none;margin-left:8px" title="Toggle between USD/foreign (rate) and foreign/USD (decimal value vs the dollar)">↔ Invert</button>
@@ -7492,7 +7494,7 @@
           <button type="button" data-val="price" class="seg-btn active">$ Price</button>
           <button type="button" data-val="log"   class="seg-btn" title="Log10 scale — TradingView-style logarithmic Y axis">Log10</button>
           <button type="button" data-val="pct"   class="seg-btn">% Change</button>
-          <button type="button" data-val="real"  class="seg-btn" title="Inflation-adjusted (CPI)">Real $</button>
+          <button type="button" data-val="real"  class="seg-btn" title="Inflation-adjusted: every historical price converted to today's purchasing power using CPI. $200 in 2005 buys what ~$320 buys today — this shows the REAL value of a blue chip over the years.">I/A</button>
         </div>
       </div>
     </div>
@@ -7532,6 +7534,9 @@
         </button>
         <button class="ta-tool" data-tool="pe" title="Live Price/Earnings — shows current P/E and marks the EPS-implied price band on the chart">
           <span class="ta-tool-icon">⊙</span><span class="ta-tool-name">P/E</span>
+        </button>
+        <button class="ta-tool" data-tool="infl" title="I/A — Inflation-Adjusted. Adds the today's-dollars value to the hover readout, so you see purchasing power alongside the nominal price without switching the whole chart. (Use the I/A display button to redraw the whole line in real dollars.)">
+          <span class="ta-tool-icon">≈</span><span class="ta-tool-name">I/A</span>
         </button>
         <div style="margin-left:auto;display:flex;gap:6px">
           <button class="ta-tool ta-tool-secondary" id="ta-clear-drawings" title="Clear all drawings">
@@ -8834,6 +8839,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260615k"></script>
+<script src="app.js?v=20260615p"></script>
 </body>
 </html>
