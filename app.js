@@ -146,6 +146,9 @@ const FMP_KEY_STORAGE = 'valuatio.fmp.key';
 const TWELVE_KEY_STORAGE = 'valuatio.twelvedata.key';
 const POLYGON_KEY_STORAGE = 'valuatio.polygon.key';
 const FCS_KEY_STORAGE = 'valuatio.fcs.key';
+// Supabase optional auto-backend (browser writes + reads with a public anon key)
+const SUPABASE_URL_STORAGE = 'valuatio.supabase.url';
+const SUPABASE_ANON_STORAGE = 'valuatio.supabase.anon';
 const FRED_KEY_STORAGE = 'valuatio.fred.key';
 const SHEET_URL_STORAGE = 'valuatio.sheet.url';
 const SOURCE_PREF_STORAGE = 'valuatio.source.preference';
@@ -3213,15 +3216,26 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   document.getElementById('bets-retrain-btn')?.addEventListener('click', () => {
     if (typeof botRetrain !== 'function') return;
+    // Tell the user how many settled trades exist — retrain only learns from
+    // CLOSED trades, so if the bot has only opened/added positions so far there's
+    // nothing to learn yet (and that's fine).
+    const bot = (typeof loadBotState === 'function') ? loadBotState() : { bets: [] };
+    const settledCount = (bot.bets || []).filter(b => b.status === 'closed' && b.components && isFinite(b.pnl)).length;
+    const untrainedCount = (bot.bets || []).filter(b => b.status === 'closed' && b.components && isFinite(b.pnl) && !b._trained).length;
+    if (settledCount === 0) {
+      if (typeof flashStatus === 'function') flashStatus('Nothing to retrain yet — the bot learns from CLOSED trades, and none have closed so far. Open positions don\'t teach until they settle.', '');
+      return;
+    }
     const w = botRetrain();
-    // Show what was learned: the top up/down-weighted signals.
     try {
       const entries = Object.entries(w || {}).filter(([,v]) => isFinite(v));
       entries.sort((a, b) => b[1] - a[1]);
       const top = entries.slice(0, 3).map(([k,v]) => `${k} ×${v.toFixed(2)}`).join(', ');
-      const bot = entries.slice(-3).map(([k,v]) => `${k} ×${v.toFixed(2)}`).join(', ');
+      const bottom = entries.slice(-3).map(([k,v]) => `${k} ×${v.toFixed(2)}`).join(', ');
       if (typeof flashStatus === 'function' && entries.length) {
-        flashStatus(`Retrained. Most trusted: ${top}. Least: ${bot}`, 'success');
+        flashStatus(untrainedCount > 0
+          ? `Retrained on ${untrainedCount} newly-settled trade${untrainedCount !== 1 ? 's' : ''} (${settledCount} total). Most trusted: ${top}. Least: ${bottom}`
+          : `No new settled trades since last retrain (${settledCount} total already learned). Most trusted: ${top}.`, 'success');
       }
     } catch {}
     if (typeof renderBetsTab === 'function') renderBetsTab();
@@ -3237,10 +3251,44 @@ document.addEventListener('DOMContentLoaded', () => {
     if (btn) { btn.textContent = '⤒ Import Repo'; btn.disabled = false; }
     if (typeof renderBetsTab === 'function') renderBetsTab();
   });
+  // Import-from-file: opens a picker; also accepts drag-and-drop onto the button.
+  document.getElementById('bets-import-file-btn')?.addEventListener('click', () => {
+    document.getElementById('bets-import-file-input')?.click();
+  });
+  document.getElementById('bets-import-file-input')?.addEventListener('change', async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (file && typeof importBotTrainingFromFile === 'function') {
+      await importBotTrainingFromFile(file);
+      if (typeof renderBetsTab === 'function') renderBetsTab();
+      if (typeof renderTodaysBetsBanner === 'function') renderTodaysBetsBanner();
+    }
+    e.target.value = '';  // allow re-importing the same filename
+  });
+  // Drag-and-drop a JSON file straight onto the Import File button.
+  const _impFileBtn = document.getElementById('bets-import-file-btn');
+  if (_impFileBtn) {
+    ['dragover', 'dragenter'].forEach(ev => _impFileBtn.addEventListener(ev, (e) => { e.preventDefault(); _impFileBtn.style.outline = '2px solid var(--amber)'; }));
+    ['dragleave', 'drop'].forEach(ev => _impFileBtn.addEventListener(ev, () => { _impFileBtn.style.outline = ''; }));
+    _impFileBtn.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      const file = e.dataTransfer?.files && e.dataTransfer.files[0];
+      if (file && typeof importBotTrainingFromFile === 'function') {
+        await importBotTrainingFromFile(file);
+        if (typeof renderBetsTab === 'function') renderBetsTab();
+        if (typeof renderTodaysBetsBanner === 'function') renderTodaysBetsBanner();
+      }
+    });
+  }
   document.getElementById('bets-rebalance-btn')?.addEventListener('click', () => {
     if (typeof botRebalanceToPositiveCash === 'function') botRebalanceToPositiveCash(0.10);
     if (typeof renderBetsTab === 'function') renderBetsTab();
     if (typeof renderTodaysBetsBanner === 'function') renderTodaysBetsBanner();
+  });
+  document.getElementById('bets-commit-btn')?.addEventListener('click', () => {
+    window.open(BOT_DATA_REPO_EDIT, '_blank', 'noopener');
+  });
+  document.getElementById('bets-repo-btn')?.addEventListener('click', () => {
+    window.open(BOT_DATA_REPO, '_blank', 'noopener');
   });
   let _betsFilterTimer = null;
   document.getElementById('bets-filter')?.addEventListener('input', () => {
@@ -4154,7 +4202,26 @@ async function getPriceHistory(ticker, opts = {}) {
     return norm;
   };
 
-  // 1. Try sheet first
+  // 1. PREFER the user's own GitHub 20-year history file when available — it's
+  //    the deepest series (data/history/<TICKER>.json, up to 20y). The master
+  //    sheet only carries a short trailing window (~1y), so if we returned the
+  //    sheet first the chart would be capped at ~1 year even though 20y exists
+  //    in the backend (the BAC-only-shows-1-year bug). We still fall back to the
+  //    sheet/APIs if the GitHub file is missing or thin.
+  //    Cached GitHub history (fresh) short-circuits without a refetch.
+  const _cacheEarly = loadPriceHistCache();
+  if (_cacheEarly[TIC] && (Date.now() - _cacheEarly[TIC].t) < PRICE_HIST_TTL_MS
+      && Array.isArray(_cacheEarly[TIC].data) && _cacheEarly[TIC].data.length >= 250) {
+    return _cacheEarly[TIC].data;   // already have a deep cached series
+  }
+  const _hasGitHubHistory = !!(state._historyManifest?.baseUrl) ||
+    (typeof getGitHubDataBase === 'function' && getGitHubDataBase());
+  if (_hasGitHubHistory) {
+    const ghDeep = await fetchGitHubHistory(TIC).catch(() => null);
+    if (ghDeep && ghDeep.length >= 2) return persist(ghDeep);
+  }
+
+  // 2. Sheet (master.csv) — short trailing window, used when no GitHub history.
   if (!opts.skipSheet) {
     const sheet = await getSheetData(false).catch(() => null);
     if (sheet?.priceHistory?.[TIC]) {
@@ -4163,16 +4230,10 @@ async function getPriceHistory(ticker, opts = {}) {
     }
   }
 
-  // 2. Check ticker-specific cache
+  // 3. Check ticker-specific cache (any depth)
   const cache = loadPriceHistCache();
   if (cache[TIC] && (Date.now() - cache[TIC].t) < PRICE_HIST_TTL_MS) {
     return cache[TIC].data;
-  }
-
-  // 3. GitHub Actions pipeline (user's own data — preferred over third-party APIs)
-  if (getGitHubDataBase()) {
-    const gh = await fetchGitHubHistory(TIC).catch(() => null);
-    if (gh && gh.length >= 2) return persist(gh);
   }
 
   // 4. Twelve Data
@@ -6696,7 +6757,26 @@ function openSourcesModal() {
   const fcsEl = document.getElementById('fcs-key-input');
   if (fcsEl) fcsEl.value = getFcsKey();
   const fredEl = document.getElementById('fred-key-input');
-  if (fredEl) fredEl.value = getFredKey();
+  if (fredEl) {
+    fredEl.value = getFredKey();
+    // Auto-save the FRED key the moment you click away — so it persists even if
+    // you don't hit the main Save button. (Belt-and-suspenders against the key
+    // "disappearing" on refresh.)
+    if (!fredEl._autosaveBound) {
+      fredEl._autosaveBound = true;
+      fredEl.addEventListener('blur', () => {
+        const v = fredEl.value.trim();
+        setFredKey(v);
+        if (v) flashStatus('FRED key saved', 'success');
+      });
+    }
+  }
+  const sbUrlEl = document.getElementById('supabase-url-input');
+  if (sbUrlEl) sbUrlEl.value = getSupabaseUrl();
+  const sbAnonEl = document.getElementById('supabase-anon-input');
+  if (sbAnonEl) sbAnonEl.value = getSupabaseAnon();
+  const sbStatus = document.getElementById('supabase-status');
+  if (sbStatus) sbStatus.textContent = supabaseConfigured() ? '● connected' : '';
   document.getElementById('sheet-url-input').value = getSheetUrls().join('\n');
   const pref = getSourcePref();
   document.querySelectorAll('#source-pref-control .seg-btn').forEach(b => {
@@ -6727,6 +6807,23 @@ document.querySelectorAll('#source-pref-control .seg-btn').forEach(btn => {
 });
 
 // Quick-add GitHub URLs: type user + repo, click, both URLs append to textarea
+document.getElementById('supabase-save-btn')?.addEventListener('click', () => {
+  const url = document.getElementById('supabase-url-input')?.value.trim() || '';
+  const anon = document.getElementById('supabase-anon-input')?.value.trim() || '';
+  setSupabaseConfig(url, anon);
+  const st = document.getElementById('supabase-status');
+  if (st) st.textContent = supabaseConfigured() ? '● connected' : '';
+  flashStatus(supabaseConfigured() ? 'Supabase connected — trades will auto-save' : 'Supabase config cleared', 'success');
+});
+document.getElementById('supabase-sync-btn')?.addEventListener('click', async () => {
+  const btn = document.getElementById('supabase-sync-btn');
+  if (btn) { btn.textContent = 'Syncing…'; btn.disabled = true; }
+  if (typeof supabaseSyncAllTrades === 'function') await supabaseSyncAllTrades();
+  if (typeof supabaseLoadTrades === 'function') await supabaseLoadTrades();
+  if (btn) { btn.textContent = 'Sync All Trades Now ↗'; btn.disabled = false; }
+  if (typeof renderBetsTab === 'function') renderBetsTab();
+});
+
 document.getElementById('github-quick-add-btn')?.addEventListener('click', () => {
   const user = document.getElementById('github-quick-user').value.trim();
   const repo = document.getElementById('github-quick-repo').value.trim() || 'trapp';
@@ -6947,9 +7044,9 @@ renderSaved();
 
 // ============================================================
 //   MACRO QUAD MODEL
-//   Hedgeye-style GIP regime classifier built from public data.
+//   GIP (Growth/Inflation/Policy) regime classifier built from public data.
 //   This is an APPROXIMATION using GDP YoY rate-of-change and
-//   CPI YoY rate-of-change. Not the proprietary Hedgeye nowcast.
+//   CPI YoY rate-of-change.
 // ============================================================
 
 const MACRO_CACHE_KEY = 'valuatio.macroData.v1';
@@ -7970,6 +8067,17 @@ const FRED_SERIES = {
   cpi: 'CPIAUCSL',
   tsy10: 'DGS10',
   fedFunds: 'DFF',
+  // Supplementary regime indicators (leading/confirming the growth-inflation read):
+  tsy2: 'DGS2',            // 2Y Treasury — short end; 10y-2y is the recession-signal curve
+  unrate: 'UNRATE',        // Unemployment rate — labor slack (growth)
+  payems: 'PAYEMS',        // Nonfarm payrolls — jobs momentum (growth)
+  claims: 'ICSA',          // Initial jobless claims — weekly, leading labor indicator
+  coreCpi: 'CPILFESL',     // Core CPI (ex food & energy) — the Fed's inflation focus
+  pce: 'PCEPILFE',         // Core PCE — the Fed's preferred inflation gauge
+  indpro: 'INDPRO',        // Industrial production — real-economy output (growth)
+  umcsent: 'UMCSENT',      // U. Michigan consumer sentiment — demand leading indicator
+  retail: 'RSAFS',         // Retail sales — consumer spending (growth)
+  hyoas: 'BAMLH0A0HYM2',   // High-yield credit spread — risk appetite / financial stress
 };
 
 // ============================================================
@@ -8940,6 +9048,7 @@ async function loadMacroTab(forceRefresh = false) {
     renderQuadGrid();
     renderQuadHistory();
     attachQuadChartHover();
+    renderMacroIndicators();
     renderSectorStocks();
     renderTieIn();
 
@@ -9118,15 +9227,27 @@ function renderQuadHistory() {
   // Cache geometry for the hover handler
   state.macroChartGeom = { padL, padT, padR, padB, plotW, plotH, W, H, data, x, y };
 
-  // STRONGER quad backgrounds — alpha bumped from 22 to 40 (25%) for visibility on black
-  // Also draw a subtle border between quad regions
+  // Quad background bands — colored by which quad we were in at each point, so
+  // the chart's backdrop tells the regime story at a glance.
+  // IMPORTANT: QUADS[].color is a CSS variable string like 'var(--pos)', which
+  // the canvas CANNOT parse — assigning it (or it + '40') silently fails, which
+  // is why the colored bands had vanished. Resolve to a real hex first, then add
+  // an alpha suffix.
+  const quadHex = (quad) => {
+    const raw = QUADS[quad]?.color || '#888';
+    if (raw.startsWith('var(')) {
+      const name = raw.slice(4, -1).trim();   // 'var(--pos)' -> '--pos'
+      return cssVar(name, quad === 1 ? '#5a9e6f' : quad === 2 ? '#d4a24c' : quad === 3 ? '#c08a4a' : '#a5645a');
+    }
+    return raw;
+  };
   let prevQuad = null;
   let regionStart = 0;
   data.forEach((d, i) => {
     const xc = x(i);
     const xn = i < data.length - 1 ? x(i + 1) : xc + (plotW / data.length);
     const w = xn - xc;
-    ctx.fillStyle = QUADS[d.quad].color + '40'; // ~25% alpha — much more visible
+    ctx.fillStyle = quadHex(d.quad) + '4d'; // ~30% alpha hex — visible on black
     ctx.fillRect(xc, padT, w + 1, plotH);
 
     // When the quad changes, label the previous region at top
@@ -9143,6 +9264,19 @@ function renderQuadHistory() {
     const cx = (x(regionStart) + x(data.length - 1)) / 2;
     labelQuadRegion(ctx, cx, padT, prevQuad);
   }
+  // Thin separators where the quad changes, so band boundaries read clearly.
+  ctx.save();
+  ctx.strokeStyle = 'rgba(232,223,201,0.25)';
+  ctx.lineWidth = 1;
+  let pq = null;
+  data.forEach((d, i) => {
+    if (pq !== null && d.quad !== pq) {
+      const px = x(i);
+      ctx.beginPath(); ctx.moveTo(px, padT); ctx.lineTo(px, padT + plotH); ctx.stroke();
+    }
+    pq = d.quad;
+  });
+  ctx.restore();
 
   // Zero line
   ctx.strokeStyle = '#5a564e';
@@ -9206,11 +9340,135 @@ function renderQuadHistory() {
 
 // Draw a "Q1", "Q2" etc. label for a quad-shaded region
 function labelQuadRegion(ctx, cx, top, quad) {
-  ctx.fillStyle = QUADS[quad].color;
-  ctx.font = 'bold 10px JetBrains Mono';
+  const raw = QUADS[quad]?.color || '#888';
+  let col = raw;
+  if (raw.startsWith('var(')) {
+    const name = raw.slice(4, -1).trim();
+    col = cssVar(name, quad === 1 ? '#5a9e6f' : quad === 2 ? '#d4a24c' : quad === 3 ? '#c08a4a' : '#a5645a');
+  }
+  ctx.fillStyle = col;
+  ctx.font = 'bold 11px JetBrains Mono';
   ctx.textAlign = 'center';
-  ctx.fillText('Q' + quad, cx, top - 8);
+  ctx.fillText('Q' + quad + ' ' + (QUADS[quad]?.name || ''), cx, top - 8);
 }
+
+// ============================================================
+//   SUPPLEMENTARY MACRO INDICATORS
+//   A compact dashboard of leading/confirming series for the growth-inflation
+//   regime, fetched live from FRED (proxied). Each tile shows the latest value,
+//   the recent direction, and what it signals. Best-effort — tiles that fail to
+//   fetch are simply skipped so the panel always renders what it has.
+// ============================================================
+let _macroIndicatorsLoaded = false;
+async function renderMacroIndicators(force = false) {
+  const host = document.getElementById('macro-indicators');
+  if (!host) return;
+  if (_macroIndicatorsLoaded && !force) return;
+  _macroIndicatorsLoaded = true;
+
+  // Each indicator: which FRED series, how to read it, and the regime axis.
+  const defs = [
+    { id: 'DGS10', id2: 'DGS2', label: '10Y–2Y Curve', kind: 'spread', unit: 'pp', axis: 'Recession signal', good: 'up',
+      note: 'Yield-curve slope. Negative (inverted) has preceded most recessions; steepening off a trough often marks early-cycle.' },
+    { id: 'PCEPILFE', label: 'Core PCE', kind: 'yoy', unit: '%', axis: 'Inflation', good: 'down',
+      note: "The Fed's preferred inflation gauge (ex food & energy). Falling = disinflation, supportive of cuts." },
+    { id: 'UNRATE', label: 'Unemployment', kind: 'level', unit: '%', axis: 'Growth / Labor', good: 'down',
+      note: 'Labor-market slack. Rising unemployment signals slowing growth (Quad 3/4 risk).' },
+    { id: 'ICSA', label: 'Jobless Claims', kind: 'level', unit: 'k', axis: 'Growth (leading)', good: 'down', scale: 0.001,
+      note: 'Weekly initial claims — a fast, leading read on the labor market. Rising trend warns of softening.' },
+    { id: 'INDPRO', label: 'Industrial Prod.', kind: 'yoy', unit: '%', axis: 'Growth', good: 'up',
+      note: 'Real output of factories, mines, utilities. Positive YoY = real-economy expansion.' },
+    { id: 'BAMLH0A0HYM2', label: 'HY Credit Spread', kind: 'level', unit: 'pp', axis: 'Risk appetite', good: 'down',
+      note: 'High-yield spread over Treasuries. Widening = financial stress / risk-off; tight = risk-on.' },
+    { id: 'UMCSENT', label: 'Consumer Sent.', kind: 'level', unit: '', axis: 'Demand (leading)', good: 'up',
+      note: 'U. Michigan sentiment. Leading indicator of consumer spending; higher is pro-growth.' },
+    { id: 'RSAFS', label: 'Retail Sales', kind: 'yoy', unit: '%', axis: 'Growth', good: 'up',
+      note: 'Consumer spending YoY — the demand engine of the economy.' },
+  ];
+
+  const fetchSeries = async (sid) => {
+    if (typeof fetchFredSeries === 'function') {
+      try { const r = await fetchFredSeries(sid); if (Array.isArray(r) && r.length) return r; } catch {}
+    }
+    return null;
+  };
+
+  // YoY % change from a {date,value} monthly series.
+  const yoy = (rows) => {
+    if (!rows || rows.length < 13) return null;
+    const last = rows[rows.length - 1];
+    // Find the value ~12 months before the last date.
+    const target = new Date(last.date); target.setFullYear(target.getFullYear() - 1);
+    let prior = rows[0];
+    for (const r of rows) { if (new Date(r.date) <= target) prior = r; else break; }
+    if (!prior.value) return null;
+    return { value: (last.value / prior.value - 1) * 100, last, rows };
+  };
+
+  const tiles = await Promise.all(defs.map(async (d) => {
+    try {
+      if (d.kind === 'spread') {
+        const [a, b] = await Promise.all([fetchSeries(d.id), fetchSeries(d.id2)]);
+        if (!a || !b) return null;
+        const la = a[a.length - 1], lb = b[b.length - 1];
+        const val = la.value - lb.value;
+        // Trend: compare to ~3 months ago.
+        const a3 = a[Math.max(0, a.length - 64)], b3 = b[Math.max(0, b.length - 64)];
+        const prev = (a3.value - b3.value);
+        return { d, val, prev, asOf: la.date };
+      }
+      const rows = await fetchSeries(d.id);
+      if (!rows || !rows.length) return null;
+      if (d.kind === 'yoy') {
+        const y = yoy(rows);
+        if (!y) return null;
+        const yPrev = yoy(rows.slice(0, -3));
+        return { d, val: y.value, prev: yPrev ? yPrev.value : null, asOf: y.last.date };
+      }
+      // level
+      const last = rows[rows.length - 1];
+      const prevRow = rows[Math.max(0, rows.length - (d.id === 'ICSA' ? 13 : 4))];
+      const scale = d.scale || 1;
+      return { d, val: last.value * scale, prev: prevRow.value * scale, asOf: last.date };
+    } catch { return null; }
+  }));
+
+  const valid = tiles.filter(Boolean);
+  if (!valid.length) {
+    host.innerHTML = '<div style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);padding:8px;grid-column:1/-1">Macro indicators unavailable right now (FRED proxy busy). They\'ll load on the next refresh.</div>';
+    _macroIndicatorsLoaded = false;  // allow a retry
+    return;
+  }
+
+  host.innerHTML = valid.map(({ d, val, prev, asOf }) => {
+    const delta = (prev != null && isFinite(prev)) ? val - prev : null;
+    // "Good direction" coloring: green when moving the regime-favorable way.
+    let dirCol = 'var(--ink-dim)', arrow = '→';
+    if (delta != null && Math.abs(delta) > 1e-6) {
+      const rising = delta > 0;
+      arrow = rising ? '▲' : '▼';
+      const favorable = (d.good === 'up' && rising) || (d.good === 'down' && !rising);
+      dirCol = favorable ? 'var(--pos)' : 'var(--neg)';
+    }
+    const fmtVal = (v) => {
+      if (d.unit === '%' || d.unit === 'pp') return (v >= 0 ? '+' : '') + v.toFixed(2) + d.unit;
+      if (d.unit === 'k') return v.toFixed(0) + 'k';
+      return v.toFixed(1);
+    };
+    return `
+      <div class="company-card" style="margin:0;padding:11px 12px;cursor:help" title="${escapeHtml(d.note)} (as of ${asOf})">
+        <div style="font-family:var(--mono);font-size:8px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.06em">${d.axis}</div>
+        <div style="font-family:var(--mono);font-size:11px;color:var(--ink-dim);margin:2px 0 4px">${d.label}</div>
+        <div style="display:flex;align-items:baseline;gap:8px">
+          <span style="font-family:var(--serif);font-size:20px;color:var(--ink)">${fmtVal(val)}</span>
+          ${delta != null ? `<span style="font-family:var(--mono);font-size:10px;color:${dirCol}">${arrow} ${(delta >= 0 ? '+' : '') + delta.toFixed(2)}</span>` : ''}
+        </div>
+      </div>`;
+  }).join('');
+}
+if (typeof window !== 'undefined') window.renderMacroIndicators = renderMacroIndicators;
+
+
 
 // Hover handler for the quad history chart
 function attachQuadChartHover() {
@@ -9247,21 +9505,29 @@ function attachQuadChartHover() {
     ctx.lineTo(px, geom.padT + geom.plotH);
     ctx.stroke();
     ctx.setLineDash([]);
-    // Dots
-    ctx.fillStyle = '#d4a24c';
+    // Dots — colored by sign (green up / red down) to match the tooltip.
+    const dotCol = (v) => v > 0 ? cssVar('--pos', '#5a9e6f') : v < 0 ? cssVar('--neg', '#a5645a') : cssVar('--ink-dim', '#8a8275');
+    ctx.fillStyle = dotCol(d.growthRoC);
     ctx.beginPath(); ctx.arc(px, geom.y(d.growthRoC), 4, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = cssVar('--neg', '#a5645a');
+    ctx.fillStyle = dotCol(d.inflationRoC);
     ctx.beginPath(); ctx.arc(px, geom.y(d.inflationRoC), 4, 0, Math.PI * 2); ctx.fill();
 
     // Position tooltip
     const q = QUADS[d.quad];
+    // Sign-based coloring: positive = green, negative = red, for BOTH growth and
+    // inflation deltas (consistent, readable — no more one-orange-one-red).
+    const signCol = (v) => v > 0 ? cssVar('--pos', '#5a9e6f') : v < 0 ? cssVar('--neg', '#a5645a') : cssVar('--ink-dim', '#8a8275');
+    const gYoYCol = signCol(d.growthYoY);
+    const cYoYCol = signCol(d.inflationYoY);
+    const gRoCCol = signCol(d.growthRoC);
+    const cRoCCol = signCol(d.inflationRoC);
     tip.innerHTML = `
       <div class="qct-date">${d.date}</div>
       <div class="qct-quad" style="color:${q.color}">Q${d.quad} · ${q.name}</div>
-      <div class="qct-row"><span>GDP YoY</span><span>${(d.growthYoY * 100).toFixed(2)}%</span></div>
-      <div class="qct-row"><span>CPI YoY</span><span>${(d.inflationYoY * 100).toFixed(2)}%</span></div>
-      <div class="qct-row"><span>Growth Δ</span><span style="color:#d4a24c">${(d.growthRoC * 100 >= 0 ? '+' : '') + (d.growthRoC * 100).toFixed(2)}pp</span></div>
-      <div class="qct-row"><span>Inflation Δ</span><span style="color:var(--neg)">${(d.inflationRoC * 100 >= 0 ? '+' : '') + (d.inflationRoC * 100).toFixed(2)}pp</span></div>
+      <div class="qct-row"><span>GDP YoY</span><span style="color:${gYoYCol}">${(d.growthYoY * 100 >= 0 ? '+' : '') + (d.growthYoY * 100).toFixed(2)}%</span></div>
+      <div class="qct-row"><span>CPI YoY</span><span style="color:${cYoYCol}">${(d.inflationYoY * 100 >= 0 ? '+' : '') + (d.inflationYoY * 100).toFixed(2)}%</span></div>
+      <div class="qct-row"><span>Growth Δ</span><span style="color:${gRoCCol}">${(d.growthRoC * 100 >= 0 ? '+' : '') + (d.growthRoC * 100).toFixed(2)}pp</span></div>
+      <div class="qct-row"><span>Inflation Δ</span><span style="color:${cRoCCol}">${(d.inflationRoC * 100 >= 0 ? '+' : '') + (d.inflationRoC * 100).toFixed(2)}pp</span></div>
     `;
     tip.style.display = 'block';
     const tipW = 200;
@@ -9414,22 +9680,51 @@ function renderSectorTable() {
 }
 
 // Populate the stocks list for an expanded sector ETF row.
-// Uses SECTOR_HOLDINGS (curated top holdings) — clicking a ticker runs valuation.
+// Pulls the constituents LIVE from your own Stock Book by matching each holding's
+// sector to this ETF (so it reflects your actual universe and never goes stale),
+// then falls back to a curated top-holdings list if the stockbook has nothing
+// for that sector. Clicking a ticker runs valuation.
 function populateSectorStocksList(etfTicker) {
   const container = document.getElementById(`sector-stocks-list-${etfTicker}`);
   if (!container) return;
-  const holdings = SECTOR_HOLDINGS[etfTicker] || [];
-  if (holdings.length === 0) {
-    container.innerHTML = '<span style="color:var(--ink-faint);font-style:italic">No holdings data available for this ETF</span>';
+
+  const sbRows = state.stockbook?.rows || [];
+  // 1. LIVE: every stockbook ticker whose sector maps to this ETF.
+  let tickers = [];
+  try {
+    tickers = sbRows
+      .filter(r => {
+        const sec = r.sector || r.rawRow?.sector || r.rawRow?.Sector;
+        if (!sec) return false;
+        const mappedEtf = (typeof sectorNameToETF === 'function') ? sectorNameToETF(sec) : null;
+        return mappedEtf === etfTicker;
+      })
+      .map(r => r.ticker)
+      .filter(Boolean);
+  } catch {}
+
+  // 2. FALLBACK: curated top holdings if the stockbook had none for this sector.
+  if (tickers.length === 0) {
+    tickers = (SECTOR_HOLDINGS[etfTicker] || []).slice();
+  }
+
+  if (tickers.length === 0) {
+    container.innerHTML = '<span style="color:var(--ink-faint);font-style:italic">No constituent stocks for this ETF in your Stock Book. Add tickers in this sector, or refresh the Stock Book.</span>';
     return;
   }
-  // Render as clickable pills — clicking runs valuation immediately
-  const sbRows = state.stockbook?.rows || [];
-  container.innerHTML = holdings.map(tic => {
+
+  // Sort by today's move (biggest gainers first) when we have it.
+  const chgOf = (tic) => {
+    const sb = sbRows.find(r => r.ticker === tic);
+    return sb?.rawRow ? parsePct(sb.rawRow['changepct']) : null;
+  };
+  tickers.sort((a, b) => (chgOf(b) ?? -Infinity) - (chgOf(a) ?? -Infinity));
+
+  container.innerHTML = tickers.map(tic => {
     const sb = sbRows.find(r => r.ticker === tic);
     const name = sb?.name || tic;
     const price = sb?.price;
-    const chg = sb?.rawRow ? parsePct(sb.rawRow['changepct']) : null;
+    const chg = chgOf(tic);
     const chgColor = chg == null ? 'var(--ink-faint)' : chg > 0 ? 'var(--pos)' : 'var(--neg)';
     const chgText = chg == null ? '' : (chg >= 0 ? '+' : '') + (chg * 100).toFixed(2) + '%';
     return `
@@ -9443,19 +9738,15 @@ function populateSectorStocksList(etfTicker) {
       </button>
     `;
   }).join('');
-  // Wire clicks → switch to valuation tab + auto-run valuation
+
+  // Wire clicks → switch to valuation tab + auto-run valuation.
   container.querySelectorAll('.sector-stock-pill').forEach(btn => {
     btn.addEventListener('click', () => {
       const tic = btn.dataset.sectorStock;
-      // Switch to valuation tab
       switchTab('valuation');
-      // Populate ticker field
       const input = document.getElementById('ticker');
       if (input) input.value = tic;
-      // Auto-run valuation
-      if (typeof loadValuation === 'function') {
-        loadValuation();
-      }
+      if (typeof loadValuation === 'function') loadValuation();
     });
   });
 }
@@ -9603,7 +9894,7 @@ function switchTab(tabName) {
   if (sub) {
     sub.textContent =
       tabName === 'regime' ? 'Regime · unified signal engine · Markov transition forecasts' :
-      tabName === 'macro' ? 'Macro Quad · GIP regime detection · Hedgeye-style framework' :
+      tabName === 'macro' ? 'Macro Quad · GIP regime detection · growth/inflation framework' :
       tabName === 'stockbook' ? 'Stock Book · universe of tickers + saved valuations' :
       tabName === 'probability' ? 'Probability · binary thesis odds blended from priors' :
       tabName === 'risk' ? 'Risk Calculator · Ray Dalio Holy Grail · diversification math' :
@@ -22438,6 +22729,150 @@ function loadPortfolio() {
 function savePortfolio(arr) {
   try { localStorage.setItem(PORTFOLIO_STORAGE, JSON.stringify(arr)); } catch {}
 }
+
+// ============================================================
+//   TRAPP2-PORT — portfolio backend repo (export / import).
+//
+//   Durable, cross-device store for everything portfolio-related: holdings,
+//   watching/tracking/avoid lists, the full transaction ledger, cash position,
+//   and the GoodGlobe Index (members + curve). Same proven pattern as the bot
+//   (TRAPP2-BOT) and XTRAPP: the browser has no GitHub write token, so the flow
+//   is EXPORT here → commit the JSON to the repo → IMPORT on any device to
+//   restore. The repo is the source of truth; localStorage is the local cache.
+// ============================================================
+const PORT_DATA_REPO = 'https://github.com/GoodGlobeLLC/TRAPP2-PORT';
+const PORT_DATA_REPO_RAW = 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-PORT/main/data/portfolio_data.json';
+const PORT_DATA_REPO_EDIT = 'https://github.com/GoodGlobeLLC/TRAPP2-PORT/edit/main/data/portfolio_data.json';
+
+// Build the full portfolio snapshot for the repo.
+function buildPortfolioData() {
+  let portfolio = [], transactions = [], cash = 0, ggIndex = null, ggCurve = null;
+  try { portfolio = loadPortfolio(); } catch {}
+  try { transactions = loadTransactions(); } catch {}
+  try { cash = (typeof getCashPosition === 'function') ? getCashPosition() : 0; } catch {}
+  try { ggIndex = (typeof loadGoodGlobeIndex === 'function') ? loadGoodGlobeIndex() : null; } catch {}
+  try {
+    const raw = localStorage.getItem(GOODGLOBE_INDEX_CURVE_KEY);
+    ggCurve = raw ? JSON.parse(raw) : null;
+  } catch {}
+
+  // Split the portfolio array by role for a readable export (it's all one list
+  // internally, keyed by `position`).
+  const byRole = { holdings: [], watching: [], tracking: [], avoid: [], other: [] };
+  for (const e of portfolio) {
+    const pos = (e.position || '').toLowerCase();
+    if (pos === 'watching') byRole.watching.push(e);
+    else if (pos === 'tracking') byRole.tracking.push(e);
+    else if (pos === 'avoid') byRole.avoid.push(e);
+    else if (pos === 'holding' || pos === 'active' || e.shares > 0) byRole.holdings.push(e);
+    else byRole.other.push(e);
+  }
+
+  return {
+    schema: 'valuatio-portfolio/v1',
+    generatedAt: new Date().toISOString(),
+    counts: {
+      portfolio: portfolio.length,
+      holdings: byRole.holdings.length,
+      watching: byRole.watching.length,
+      tracking: byRole.tracking.length,
+      avoid: byRole.avoid.length,
+      transactions: transactions.length,
+    },
+    cashPosition: cash,
+    portfolio,                 // the full raw list (authoritative for re-import)
+    byRole,                    // same data split by role, for human readability
+    transactions,              // immutable trade ledger
+    goodGlobeIndex: ggIndex,   // index members + levels
+    goodGlobeCurve: ggCurve,   // index value curve
+  };
+}
+
+// Export the portfolio snapshot as a downloadable JSON for the TRAPP2-PORT repo.
+function exportPortfolioData() {
+  const data = buildPortfolioData();
+  const json = JSON.stringify(data, null, 2);
+  try {
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'portfolio_data.json';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    if (typeof flashStatus === 'function') {
+      flashStatus(`Exported ${data.counts.portfolio} positions + ${data.counts.transactions} transactions for TRAPP2-PORT`, 'success');
+    }
+  } catch (e) {
+    console.error('[portfolio] export failed', e);
+  }
+  return data;
+}
+
+// Import the portfolio snapshot from the TRAPP2-PORT repo (the durable source of
+// truth). Restores holdings, watchlists, transactions, cash, and the GoodGlobe
+// Index. The repo snapshot REPLACES local portfolio state (it's a full snapshot,
+// not a partial merge) — transactions are unioned by id so none are lost.
+async function importPortfolioData(repoUrl) {
+  const url = repoUrl || PORT_DATA_REPO_RAW;
+  try {
+    const r = await fetch(url, { cache: 'no-store' });
+    if (!r.ok) {
+      console.warn('[portfolio] repo fetch failed:', r.status);
+      if (typeof flashStatus === 'function') flashStatus(`Import failed (HTTP ${r.status}) — is the repo file committed?`, 'error');
+      return null;
+    }
+    const data = await r.json();
+    if (!data || (data.schema || '').indexOf('valuatio-portfolio') !== 0) {
+      console.warn('[portfolio] unexpected schema');
+      if (typeof flashStatus === 'function') flashStatus('Import failed — unexpected file schema', 'error');
+      return null;
+    }
+    // Restore portfolio list (authoritative full snapshot).
+    if (Array.isArray(data.portfolio)) {
+      savePortfolio(data.portfolio);
+    }
+    // Union transactions by id so we never drop a locally-recorded trade that
+    // isn't yet in the repo snapshot.
+    if (Array.isArray(data.transactions)) {
+      const local = (typeof loadTransactions === 'function') ? loadTransactions() : [];
+      const seen = new Set(local.map(t => t.id));
+      const merged = local.slice();
+      for (const t of data.transactions) { if (t && !seen.has(t.id)) { merged.push(t); seen.add(t.id); } }
+      // Keep chronological order.
+      merged.sort((a, b) => String(a.ts || '').localeCompare(String(b.ts || '')));
+      if (typeof saveTransactions === 'function') saveTransactions(merged);
+    }
+    // Cash position.
+    if (typeof data.cashPosition === 'number' && typeof setCashPosition === 'function') {
+      setCashPosition(data.cashPosition);
+    }
+    // GoodGlobe Index + curve.
+    if (data.goodGlobeIndex && typeof saveGoodGlobeIndex === 'function') {
+      saveGoodGlobeIndex(data.goodGlobeIndex);
+    }
+    if (data.goodGlobeCurve) {
+      try { localStorage.setItem(GOODGLOBE_INDEX_CURVE_KEY, JSON.stringify(data.goodGlobeCurve)); } catch {}
+    }
+    if (typeof flashStatus === 'function') {
+      flashStatus(`Imported ${data.counts?.portfolio ?? '?'} positions + ${data.counts?.transactions ?? '?'} transactions from TRAPP2-PORT`, 'success');
+    }
+    return data;
+  } catch (e) {
+    console.warn('[portfolio] import failed:', e.message);
+    if (typeof flashStatus === 'function') flashStatus('Import failed — see console', 'error');
+    return null;
+  }
+}
+
+if (typeof window !== 'undefined') {
+  window.buildPortfolioData = buildPortfolioData;
+  window.exportPortfolioData = exportPortfolioData;
+  window.importPortfolioData = importPortfolioData;
+}
+
 // ============================================================
 //   TRANSACTIONS & CASH POSITION
 //
@@ -30654,42 +31089,59 @@ function saveNewsCache(items) {
 async function fetchStockTwits(ticker) {
   const t = String(ticker || '').toUpperCase().replace(/\..*$/, '');  // ST uses bare US symbols
   if (!t) return null;
-  const url = `https://api.stocktwits.com/api/2/streams/symbol/${encodeURIComponent(t)}.json`;
-  try {
-    const r = await fetch(url);
-    if (!r.ok) {
-      // 404 = no symbol stream; 429 = rate-limited. Either way, soft-fail.
-      return { platform: 'stocktwits', available: r.status !== 404, items: [], error: `HTTP ${r.status}` };
-    }
-    const j = await r.json();
-    const msgs = Array.isArray(j?.messages) ? j.messages : [];
-    const items = msgs.map(m => {
-      // StockTwits author sentiment: m.entities.sentiment.basic = "Bullish"|"Bearish"|null
-      const stSent = m?.entities?.sentiment?.basic;
-      let sentiment, sentimentSource;
-      if (stSent === 'Bullish') { sentiment = 'bullish'; sentimentSource = 'author'; }
-      else if (stSent === 'Bearish') { sentiment = 'bearish'; sentimentSource = 'author'; }
-      else {
-        // Untagged → score with our learnable lexicon.
-        const s = (typeof extractSentiment === 'function') ? extractSentiment(m.body || '') : { label: 'neutral' };
-        sentiment = s.label; sentimentSource = 'lexicon';
+  const target = `https://api.stocktwits.com/api/2/streams/symbol/${encodeURIComponent(t)}.json`;
+  // StockTwits' API does NOT send browser-friendly CORS headers, so a direct
+  // fetch from the page is blocked (this is why the Activity tab showed nothing
+  // while news — which already proxies — worked). Try direct first in case it
+  // ever works, then fall through the same CORS-proxy chain the rest of the app
+  // uses. allorigins/raw is most reliable for this JSON endpoint.
+  const attempts = [
+    target,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`,
+    `https://corsproxy.io/?url=${encodeURIComponent(target)}`,
+    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(target)}`,
+  ];
+  let lastStatus = null;
+  for (let i = 0; i < attempts.length; i++) {
+    try {
+      const r = await fetch(attempts[i], { headers: { 'Accept': 'application/json' } });
+      lastStatus = r.status;
+      if (!r.ok) {
+        // 404 = no such symbol stream (don't keep proxying); else try next proxy.
+        if (r.status === 404) return { platform: 'stocktwits', available: false, items: [], error: 'HTTP 404' };
+        continue;
       }
-      return {
-        platform: 'stocktwits',
-        author: m?.user?.username || 'anon',
-        authorFollowers: m?.user?.followers ?? null,
-        text: m?.body || '',
-        url: m?.id ? `https://stocktwits.com/message/${m.id}` : (m?.user?.username ? `https://stocktwits.com/${m.user.username}` : '#'),
-        datetime: m?.created_at ? new Date(m.created_at).getTime() : Date.now(),
-        sentiment,
-        sentimentSource,
-        likes: m?.likes?.total ?? 0,
-      };
-    });
-    return { platform: 'stocktwits', available: true, items, symbol: t };
-  } catch (e) {
-    return { platform: 'stocktwits', available: false, items: [], error: e.message };
+      const text = await r.text();
+      if (!text || text[0] !== '{') continue;  // proxy error page, not JSON
+      const j = JSON.parse(text);
+      const msgs = Array.isArray(j?.messages) ? j.messages : [];
+      const items = msgs.map(m => {
+        const stSent = m?.entities?.sentiment?.basic;
+        let sentiment, sentimentSource;
+        if (stSent === 'Bullish') { sentiment = 'bullish'; sentimentSource = 'author'; }
+        else if (stSent === 'Bearish') { sentiment = 'bearish'; sentimentSource = 'author'; }
+        else {
+          const s = (typeof extractSentiment === 'function') ? extractSentiment(m.body || '') : { label: 'neutral' };
+          sentiment = s.label; sentimentSource = 'lexicon';
+        }
+        return {
+          platform: 'stocktwits',
+          author: m?.user?.username || 'anon',
+          authorFollowers: m?.user?.followers ?? null,
+          text: m?.body || '',
+          url: m?.id ? `https://stocktwits.com/message/${m.id}` : (m?.user?.username ? `https://stocktwits.com/${m.user.username}` : '#'),
+          datetime: m?.created_at ? new Date(m.created_at).getTime() : Date.now(),
+          sentiment,
+          sentimentSource,
+          likes: m?.likes?.total ?? 0,
+        };
+      });
+      return { platform: 'stocktwits', available: true, items, symbol: t };
+    } catch (e) {
+      lastStatus = lastStatus || e.message;
+    }
   }
+  return { platform: 'stocktwits', available: false, items: [], error: `unreachable (${lastStatus})` };
 }
 
 // Reddit: search recent posts mentioning the ticker across investing subs.
@@ -31734,6 +32186,27 @@ function renderNewsFeed() {
       ? `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:8px 0;border-top:1px dashed var(--rule);margin-top:8px">${entityChips.join('')}</div>`
       : '';
 
+    // Sentiment badge — the article's bull/bear lean as a signed score next to
+    // the headline. Uses the human-corrected sentiment if one exists; otherwise
+    // scores the headline + summary with the learnable lexicon. Shown on a
+    // −100…+100 scale (green bullish / red bearish / muted neutral).
+    let sentimentBadge = '';
+    {
+      const fix = (typeof getArticleFix === 'function') ? getArticleFix(article) : null;
+      const sent = (typeof extractSentiment === 'function')
+        ? extractSentiment((article.headline || '') + ' ' + (article.summary || article.expandedSummary || ''))
+        : { label: 'neutral', score: 0, confidence: 0 };
+      // A human-set label overrides the computed label (keeps the score as the
+      // strength indicator).
+      const label = (fix && fix.sentiment) || article.sentiment || sent.label;
+      const score100 = Math.round((sent.score || 0) * 100);
+      const col = label === 'bullish' ? 'var(--pos)' : label === 'bearish' ? 'var(--neg)' : 'var(--ink-faint)';
+      const arrow = label === 'bullish' ? '▲' : label === 'bearish' ? '▼' : '·';
+      const conf = sent.confidence != null ? ` · conf ${(sent.confidence * 100).toFixed(0)}%` : '';
+      const srcNote = (fix && fix.sentiment) ? ' (human-set)' : ' (lexicon-scored from headline + summary)';
+      sentimentBadge = `<span class="news-item-mcap" style="color:${col};border-color:${col};font-weight:700" title="Article sentiment${srcNote}: ${label}, score ${score100 >= 0 ? '+' : ''}${score100}/100${conf}. This is the news tone — separate from the company-health badge.">${arrow} ${label.toUpperCase()} ${score100 >= 0 ? '+' : ''}${score100}</span>`;
+    }
+
     const articleId = escapeHtml(articleKey(article));
     const isMyNews = myNewsTickerSet.has(article.ticker);
 
@@ -31748,6 +32221,7 @@ function renderNewsFeed() {
           <span class="news-item-mcap" title="Market cap: ${fmt$(article.marketCap)}">${article.priorityLabel} · ${fmt$H(article.marketCap)}</span>
           ${reassignBadge}
           ${breakingBadge}
+          ${sentimentBadge}
           ${healthBadge}
           <span class="news-item-source">${escapeHtml(article.source)}</span>
           <span class="news-item-time">${timeLabel} · ${ts.toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' })}</span>
@@ -35937,6 +36411,39 @@ function renderResearchDetail(data, ticker) {
             ${card('Regime Grade', rg, 'tailwind/headwind in the current regime')}
             ${card('Momentum Grade', mg, momSub)}
           </div>
+          ${(() => {
+            // DEEP TREND ANALYSIS — the statistical read (σ-momentum, trend
+            // quality, health-vs-toppy classification, peer-relative, real drift).
+            let tr = null;
+            try { tr = (typeof analyzePriceTrend === 'function') ? analyzePriceTrend(t.ticker) : null; } catch {}
+            if (!tr) return '';
+            const classColors = {
+              'healthy-uptrend': 'var(--pos)', 'persistent-downtrend': 'var(--neg)',
+              'late-stage-extended': 'var(--amber)', 'rolling-over': 'var(--amber)',
+              'breaking-down': 'var(--neg)', 'choppy-rangebound': 'var(--ink-dim)', 'neutral': 'var(--ink-dim)',
+            };
+            const cc = classColors[tr.classification] || 'var(--ink-dim)';
+            const su = (k) => tr.momentumByHorizon[k] ? `${tr.momentumByHorizon[k].sigmaUnits >= 0 ? '+' : ''}${tr.momentumByHorizon[k].sigmaUnits}σ` : '—';
+            const pct = (v) => v == null ? '—' : `${v >= 0 ? '+' : ''}${(v * 100).toFixed(1)}%`;
+            const stat = (label, val, tip) => `<div title="${tip || ''}"><span style="color:var(--ink-faint)">${label}</span> <span style="color:var(--ink)">${val}</span></div>`;
+            return `<div style="margin-top:10px;background:var(--bg-card);border:1px solid var(--rule);border-left:3px solid ${cc};border-radius:6px;padding:11px">
+              <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px;margin-bottom:8px">
+                <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.05em">Trend Analysis <span style="opacity:0.6">· statistical price-behavior read</span></div>
+                <div style="font-family:var(--mono);font-size:11px;font-weight:700;color:${cc}">${tr.classification.replace(/-/g, ' ')}</div>
+              </div>
+              <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);margin-bottom:8px;line-height:1.4">${escapeHtml(tr.healthNote)}</div>
+              <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:6px 14px;font-family:var(--mono);font-size:10px;line-height:1.5">
+                ${stat('Momentum', tr.momentumScore + '/100', 'Blended σ-unit momentum across horizons')}
+                ${stat('Trend quality', tr.trendQuality + '/100 ' + tr.trendDir, 'R² of the log-price fit — how clean the trend is')}
+                ${stat('Ann. vol', (tr.stats.annualizedVol * 100).toFixed(0) + '%', 'Annualized volatility of daily returns')}
+                ${stat('1mo / 3mo', su('d20') + ' / ' + su('d63'), 'Momentum in standard-deviation units — judged against this stock own volatility, not a flat percent')}
+                ${stat('Vol regime', tr.stats.volRegime != null ? tr.stats.volRegime + '×' : '—', 'Recent vol ÷ long-run vol. >1.3 = expanding (risk rising)')}
+                ${stat('From high', pct(tr.stats.fromHigh), 'Distance below the running peak')}
+                ${tr.real ? stat('Real drift', pct(tr.real.realDriftAnn) + '/yr', 'Inflation-adjusted annualized trend (CPI-deflated)') : ''}
+                ${tr.peerRelative != null ? stat('Vs peers', pct(tr.peerRelative), tr.peerNote || 'vs sector peers, 3-month') : ''}
+              </div>
+            </div>`;
+          })()}
         </div>`;
       })()}
     </div>
@@ -37166,6 +37673,8 @@ const BOT_KEY = 'valuatio.bot.v1';
 // commit bot_training_data.json to this repo (same pattern as XTRAPP). On load /
 // on demand the app can IMPORT it back to restore history on a fresh device.
 const BOT_DATA_REPO_URL = 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-BOT/main/data/bot_training_data.json';
+const BOT_DATA_REPO = 'https://github.com/GoodGlobeLLC/TRAPP2-BOT';
+const BOT_DATA_REPO_EDIT = 'https://github.com/GoodGlobeLLC/TRAPP2-BOT/edit/main/data/bot_training_data.json';
 // ---- Learnable signal weights ----
 // Per-signal multipliers (key = the component name botScoreTicker uses, e.g.
 // 'trend', 'health', 'fundamental'). 1.0 = neutral. botRetrain() nudges them
@@ -37235,8 +37744,11 @@ function buildBotTrainingData() {
   const closed = bets.filter(b => b.status === 'closed');
   const open = bets.filter(b => b.status === 'open');
 
-  // ---- Per-trade training records (the "what happened & why" corpus) ----
-  const trades = closed.map(b => {
+  // ---- Per-trade records. EXPORT EVERY TRANSACTION (open AND closed) so a
+  // re-import reconstructs the complete history — no transaction can be lost.
+  // Closed trades carry full outcome/learning fields; open trades carry the
+  // entry-side fields and are restored as still-open. ----
+  const trades = bets.map(b => {
     const won = (b.pnl || 0) > 0;
     const ret = b.returnPct != null ? b.returnPct : null;
     // The dominant signals behind this trade (largest |contribution|).
@@ -37259,8 +37771,11 @@ function buildBotTrainingData() {
       if (b.exitReason === 'stop-loss') couldHaveWorked = 'Stop was hit — either the entry was early or the stop too tight for this name\'s volatility. A wider stop or waiting for confirmation might have survived the shakeout.';
       else if (b.exitReason === 'horizon' || b.exitReason === 'option-expiry') couldHaveWorked = 'Thesis didn\'t play out in the allotted time. A longer horizon, or not forcing the trade in a choppy regime, may have helped.';
       else couldHaveWorked = 'Outcome went against the dominant signals — the signal mix may be miscalibrated for this setup.';
+    } else if (b.soldStillStrong) {
+      couldHaveWorked = `Won, but sold while momentum was still strong (exit momentum ${b.exitMomentum}). If the capital didn't go into something clearly better, this likely left gains on the table — let runners run longer next time.`;
     }
     return {
+      id: b.id || null,
       ticker: b.ticker,
       name: b.name || b.ticker,
       sector: b.sector || null,
@@ -37273,9 +37788,9 @@ function buildBotTrainingData() {
       horizonDays: b.horizonDays || null,
       dalioEnv: b.dalioEnv || null,
       longTermTrend: b.longTermTrend || null,
-      taxTreatment: b.taxTreatment || null,
-      taxOwed: b.taxOwed != null ? b.taxOwed : null,
-      afterTaxPnl: b.afterTaxPnl != null ? b.afterTaxPnl : null,
+      soldStillStrong: b.soldStillStrong || false,
+      exitMomentum: b.exitMomentum != null ? b.exitMomentum : null,
+      rolledForMomentum: b.rolledForMomentum || 0,
       entryDate: b.entryDate,
       exitDate: b.exitDate,
       entryPrice: b.entryPrice,
@@ -37291,6 +37806,8 @@ function buildBotTrainingData() {
       // WHY the bot took it:
       topDrivers,
       rationale: b.rationale || [],
+      cashAfter: b.cashAfter != null ? b.cashAfter : null,
+      decisionReceipt: b.decisionReceipt || null,
       // WHAT WORKED / DIDN'T (signal attribution vs the realized result):
       signalsThatHelped: helped,
       signalsThatHurt: hurt,
@@ -37355,6 +37872,8 @@ function buildBotTrainingData() {
   if (styleScores[0]) takeaways.push(`Best-performing style: ${styleScores[0].style} (${styleScores[0].totalPnl >= 0 ? '+' : ''}$${styleScores[0].totalPnl} over ${styleScores[0].trades} trades).`);
   const stopOuts = closed.filter(b => b.exitReason === 'stop-loss').length;
   if (stopOuts / Math.max(1, closed.length) > 0.4) takeaways.push(`${Math.round(stopOuts / closed.length * 100)}% of trades stopped out — stops may be too tight or entries too early.`);
+  const soldEarly = closed.filter(b => b.soldStillStrong).length;
+  if (soldEarly >= 2) takeaways.push(`${soldEarly} winners were sold while still trending up (opportunity cost) — let runners run longer unless a clearly better trade is waiting.`);
 
   return {
     schema: 'valuatio-bot-training/v1',
@@ -37416,45 +37935,78 @@ function exportBotTrainingData() {
 // Import bot history from the bot-data repo (the durable source of truth). Merges
 // repo trades into local state so a fresh device / cleared cache restores the
 // full journal. Repo wins for closed trades; local open positions are kept.
+// Merge a parsed bot-training payload into local state. Shared by the repo-URL
+// import and the drop-a-JSON-file import. APPENDS new trades by stable id; never
+// overwrites or drops an existing trade.
+function _mergeBotTrainingData(data, sourceLabel) {
+  if (!data || (data.schema || '').indexOf('valuatio-bot-training') !== 0) {
+    console.warn('[bot] import: unexpected schema');
+    if (typeof flashStatus === 'function') flashStatus('Import failed — that file isn\'t a valuatio bot-training export', 'error');
+    return null;
+  }
+  const bot = loadBotState();
+  const idOf = (t) => t.id || `${t.ticker}|${t.entryDate}|${t.exitDate || 'open'}|${t.entryPrice ?? ''}|${t.pnl ?? ''}`;
+  const localById = new Map((bot.bets || []).map(b => [idOf(b), b]));
+  let added = 0;
+  for (const t of (data.trades || [])) {
+    const key = idOf(t);
+    if (!localById.has(key)) {
+      bot.bets.push({
+        id: t.id || `imported-${key}`,
+        ticker: t.ticker, name: t.name, sector: t.sector, direction: t.direction,
+        instrument: t.instrument, optionType: t.optionType, leveragedEtf: t.leveragedEtf,
+        entryDate: t.entryDate, exitDate: t.exitDate, entryPrice: t.entryPrice, exitPrice: t.exitPrice,
+        pnl: t.pnl, returnPct: t.returnPct, status: t.exitDate ? 'closed' : 'open', exitReason: t.exitReason,
+        conviction: t.conviction, confidence: t.confidence, rationale: t.rationale,
+        tradeStyle: t.style || t.tradeStyle, horizonType: t.horizonType, horizonDays: t.horizonDays,
+        dalioEnv: t.dalioEnv, holdDays: t.holdDays,
+        decisionReceipt: t.decisionReceipt || null,
+        signalsThatHelped: t.signalsThatHelped, signalsThatHurt: t.signalsThatHurt,
+        couldHaveWorked: t.couldHaveWorked,
+        components: t.components || (t.topDrivers || []).reduce((o, d) => { o[d.signal] = d.lean; return o; }, {}),
+        _trained: true, _fromRepo: true,
+      });
+      localById.set(key, true);
+      added++;
+    }
+  }
+  if (data.learnedWeights && typeof saveBotWeights === 'function') saveBotWeights(data.learnedWeights);
+  if (typeof data.bankroll === 'number') bot.bankroll = data.bankroll;
+  saveBotState(bot);
+  console.log(`[bot] imported ${added} new trades from ${sourceLabel || 'source'} (now ${bot.bets.length} total)`);
+  if (typeof flashStatus === 'function') flashStatus(`Imported ${added} new trade${added !== 1 ? 's' : ''} from ${sourceLabel || 'file'} (appended — ${bot.bets.length} total)`, 'success');
+  return data;
+}
+
 async function importBotTrainingData(repoUrl) {
   const url = repoUrl || (typeof BOT_DATA_REPO_URL !== 'undefined' ? BOT_DATA_REPO_URL : null);
   if (!url) { console.warn('[bot] no bot-data repo URL configured'); return null; }
   try {
-    const r = await fetch(url);
-    if (!r.ok) { console.warn('[bot] bot-data repo fetch failed:', r.status); return null; }
+    const r = await fetch(url, { cache: 'no-store' });
+    if (!r.ok) {
+      console.warn('[bot] bot-data repo fetch failed:', r.status);
+      if (typeof flashStatus === 'function') flashStatus(`Repo import failed (HTTP ${r.status}) — is the file committed at TRAPP2-BOT?`, 'error');
+      return null;
+    }
     const data = await r.json();
-    if (!data || data.schema?.indexOf('valuatio-bot-training') !== 0) {
-      console.warn('[bot] bot-data repo file has unexpected schema'); return null;
-    }
-    const bot = loadBotState();
-    // Reconstruct closed bets from the repo's trade corpus, keyed by ticker+entryDate.
-    const localByKey = new Map((bot.bets || []).map(b => [`${b.ticker}|${b.entryDate}`, b]));
-    let added = 0;
-    for (const t of (data.trades || [])) {
-      const key = `${t.ticker}|${t.entryDate}`;
-      if (!localByKey.has(key)) {
-        bot.bets.push({
-          ticker: t.ticker, name: t.name, sector: t.sector, direction: t.direction,
-          instrument: t.instrument, optionType: t.optionType, leveragedEtf: t.leveragedEtf,
-          entryDate: t.entryDate, exitDate: t.exitDate, entryPrice: t.entryPrice, exitPrice: t.exitPrice,
-          pnl: t.pnl, returnPct: t.returnPct, status: 'closed', exitReason: t.exitReason,
-          conviction: t.conviction, confidence: t.confidence, rationale: t.rationale,
-          components: (t.topDrivers || []).reduce((o, d) => { o[d.signal] = d.lean; return o; }, {}),
-          _trained: true,   // repo trades already shaped the weights they shipped with
-          _fromRepo: true,
-        });
-        added++;
-      }
-    }
-    // Adopt the repo's learned weights if present (they encode prior training).
-    if (data.learnedWeights && typeof saveBotWeights === 'function') saveBotWeights(data.learnedWeights);
-    if (typeof data.bankroll === 'number') bot.bankroll = data.bankroll;
-    saveBotState(bot);
-    console.log(`[bot] imported ${added} trades from bot-data repo (now ${bot.bets.length} total)`);
-    if (typeof flashStatus === 'function') flashStatus(`Imported ${added} trades from bot-data repo`, 'success');
-    return data;
+    return _mergeBotTrainingData(data, 'TRAPP2-BOT repo');
   } catch (e) {
     console.warn('[bot] bot-data import failed:', e.message);
+    if (typeof flashStatus === 'function') flashStatus('Repo import failed — see console', 'error');
+    return null;
+  }
+}
+
+// Import from a dropped/selected JSON file (no GitHub needed).
+async function importBotTrainingFromFile(file) {
+  if (!file) return null;
+  try {
+    const text = await file.text();
+    const data = JSON.parse(text);
+    return _mergeBotTrainingData(data, file.name || 'file');
+  } catch (e) {
+    console.warn('[bot] file import failed:', e.message);
+    if (typeof flashStatus === 'function') flashStatus('Couldn\'t read that file — is it a valid JSON export?', 'error');
     return null;
   }
 }
@@ -37463,7 +38015,136 @@ if (typeof window !== 'undefined') {
   window.buildBotTrainingData = buildBotTrainingData;
   window.exportBotTrainingData = exportBotTrainingData;
   window.importBotTrainingData = importBotTrainingData;
+  window.importBotTrainingFromFile = importBotTrainingFromFile;
 }
+
+
+// ============================================================
+//   SUPABASE AUTO-BACKEND (optional) — the "no manual entry" layer.
+//
+//   GitHub can't be written from the browser (no token), so it requires the
+//   manual export→commit step. Supabase IS built for browser writes: with a
+//   public "anon" key (safe to ship in client code; row-level security guards
+//   the table) the app writes each trade the instant it happens and reads them
+//   all on load. Zero manual steps, no human-error window. GitHub stays as the
+//   backup/export path.
+//
+//   Setup (one time): create a Supabase project, make a table `bot_trades`
+//   (columns: id text primary key, trade jsonb, updated_at timestamptz default
+//   now()), enable an insert/update/select policy for the anon role, then paste
+//   the project URL + anon key into Data Sources. See the SUPABASE-SETUP notes.
+// ============================================================
+function getSupabaseUrl() { return (localStorage.getItem(SUPABASE_URL_STORAGE) || '').replace(/\/+$/, ''); }
+function getSupabaseAnon() { return localStorage.getItem(SUPABASE_ANON_STORAGE) || ''; }
+function setSupabaseConfig(url, anon) {
+  if (url) localStorage.setItem(SUPABASE_URL_STORAGE, url.trim().replace(/\/+$/, '')); else localStorage.removeItem(SUPABASE_URL_STORAGE);
+  if (anon) localStorage.setItem(SUPABASE_ANON_STORAGE, anon.trim()); else localStorage.removeItem(SUPABASE_ANON_STORAGE);
+}
+function supabaseConfigured() { return !!(getSupabaseUrl() && getSupabaseAnon()); }
+
+const SUPABASE_TABLE = 'bot_trades';
+
+// Shared headers for Supabase REST (PostgREST).
+function _supabaseHeaders(extra) {
+  const anon = getSupabaseAnon();
+  return Object.assign({
+    'apikey': anon,
+    'Authorization': `Bearer ${anon}`,
+    'Content-Type': 'application/json',
+  }, extra || {});
+}
+
+// Upsert ONE trade to Supabase the moment it's placed or closed. Fire-and-forget
+// (never blocks the UI); failures are logged but don't interrupt trading.
+async function supabaseUpsertTrade(bet) {
+  if (!supabaseConfigured() || !bet) return false;
+  try {
+    const row = { id: bet.id, trade: bet, updated_at: new Date().toISOString() };
+    const r = await fetch(`${getSupabaseUrl()}/rest/v1/${SUPABASE_TABLE}`, {
+      method: 'POST',
+      headers: _supabaseHeaders({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+      body: JSON.stringify(row),
+    });
+    if (!r.ok && r.status !== 409) {
+      console.warn('[supabase] upsert failed', r.status, await r.text().catch(() => ''));
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.warn('[supabase] upsert error', e.message);
+    return false;
+  }
+}
+
+// Push EVERY local trade to Supabase (bulk sync — e.g. first-time backfill or a
+// manual "sync now"). Upserts so re-running is safe.
+async function supabaseSyncAllTrades() {
+  if (!supabaseConfigured()) { if (typeof flashStatus === 'function') flashStatus('Supabase not configured — add URL + anon key in Data Sources', 'error'); return 0; }
+  const bot = loadBotState();
+  const bets = bot.bets || [];
+  if (!bets.length) return 0;
+  try {
+    const rows = bets.map(b => ({ id: b.id, trade: b, updated_at: new Date().toISOString() }));
+    const r = await fetch(`${getSupabaseUrl()}/rest/v1/${SUPABASE_TABLE}`, {
+      method: 'POST',
+      headers: _supabaseHeaders({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+      body: JSON.stringify(rows),
+    });
+    if (!r.ok && r.status !== 409) {
+      console.warn('[supabase] bulk sync failed', r.status);
+      if (typeof flashStatus === 'function') flashStatus(`Supabase sync failed (HTTP ${r.status})`, 'error');
+      return 0;
+    }
+    if (typeof flashStatus === 'function') flashStatus(`Synced ${rows.length} trades to Supabase`, 'success');
+    return rows.length;
+  } catch (e) {
+    console.warn('[supabase] bulk sync error', e.message);
+    return 0;
+  }
+}
+
+// Read ALL trades from Supabase and merge into local state (append by id, never
+// drop). This is the auto-load on a fresh device — pulls the full history with
+// no manual import.
+async function supabaseLoadTrades() {
+  if (!supabaseConfigured()) return null;
+  try {
+    const r = await fetch(`${getSupabaseUrl()}/rest/v1/${SUPABASE_TABLE}?select=id,trade&order=updated_at.asc`, {
+      headers: _supabaseHeaders(),
+    });
+    if (!r.ok) { console.warn('[supabase] load failed', r.status); return null; }
+    const rows = await r.json();
+    if (!Array.isArray(rows)) return null;
+    const bot = loadBotState();
+    const localIds = new Set((bot.bets || []).map(b => b.id));
+    let added = 0;
+    for (const row of rows) {
+      const t = row.trade;
+      if (t && t.id && !localIds.has(t.id)) {
+        bot.bets.push(t);
+        localIds.add(t.id);
+        added++;
+      }
+    }
+    if (added) saveBotState(bot);
+    console.log(`[supabase] loaded ${rows.length} trades, ${added} new appended`);
+    if (typeof flashStatus === 'function' && added) flashStatus(`Loaded ${added} trades from Supabase`, 'success');
+    return { total: rows.length, added };
+  } catch (e) {
+    console.warn('[supabase] load error', e.message);
+    return null;
+  }
+}
+
+if (typeof window !== 'undefined') {
+  window.getSupabaseUrl = getSupabaseUrl;
+  window.supabaseConfigured = supabaseConfigured;
+  window.supabaseUpsertTrade = supabaseUpsertTrade;
+  window.supabaseSyncAllTrades = supabaseSyncAllTrades;
+  window.supabaseLoadTrades = supabaseLoadTrades;
+  window.setSupabaseConfig = setSupabaseConfig;
+}
+
 
 // Render the bot's learnings as a readable panel (the human/bot view of the
 // training corpus). Shows takeaways, which signals predict wins, and which
@@ -37521,7 +38202,8 @@ function renderBotTrainingInsights() {
 if (typeof window !== 'undefined') window.renderBotTrainingInsights = renderBotTrainingInsights;
 
 // Render the Dalio all-weather balance: how the open book's risk is spread
-// across the four economic environments, plus an after-tax P&L summary.
+// across the four economic environments. (Tax influences hold decisions but is
+// not displayed anywhere.)
 function renderBotEnvironmentBalance() {
   const bot = loadBotState();
   const open = bot.bets.filter(b => b.status === 'open');
@@ -37541,22 +38223,9 @@ function renderBotEnvironmentBalance() {
     ? `<div style="font-family:var(--mono);font-size:9px;color:var(--data-amber);margin-top:8px;line-height:1.5">⚠ ${Math.round(exp.concentration * 100)}% of risk is in ${labels[exp.dominant] || exp.dominant}. Dalio: a book that's concentrated in one environment is fragile to a regime shift — the bot is now sizing new picks away from this.</div>`
     : `<div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:8px">Risk spread across environments — reasonably all-weather.</div>`;
 
-  // After-tax summary of settled trades.
-  const closed = bot.bets.filter(b => b.status === 'closed' && b.afterTaxPnl != null);
-  let taxHtml = '';
-  if (closed.length) {
-    const gross = closed.reduce((s, b) => s + (b.pnl || 0), 0);
-    const net = closed.reduce((s, b) => s + (b.afterTaxPnl || 0), 0);
-    const tax = closed.reduce((s, b) => s + (b.taxOwed || 0), 0);
-    const lt = closed.filter(b => b.taxTreatment === 'long-term').length;
-    taxHtml = `<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--rule)">
-      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">After-tax (Ohio) · realized</div>
-      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-dim);line-height:1.6">
-        Gross ${gross >= 0 ? '+' : ''}$${gross.toFixed(0)} · tax −$${tax.toFixed(0)} · <strong style="color:${net >= 0 ? 'var(--pos)' : 'var(--neg)'}">net ${net >= 0 ? '+' : ''}$${net.toFixed(0)}</strong><br>
-        <span style="font-size:9px;color:var(--ink-faint)">${lt}/${closed.length} held long-term (>1yr, lower rate) · short-term taxed as income</span>
-      </div>
-    </div>`;
-  }
+  // (Tax is considered in the bot's hold/exit decisions but intentionally not
+  // displayed — it works silently in the background.)
+  const taxHtml = '';
 
   return `<div class="company-card" style="margin:0 0 18px">
     <h4 style="margin-bottom:8px">All-Weather Balance <span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);font-weight:400">· Dalio risk-by-environment</span></h4>
@@ -37567,18 +38236,91 @@ function renderBotEnvironmentBalance() {
 }
 if (typeof window !== 'undefined') window.renderBotEnvironmentBalance = renderBotEnvironmentBalance;
 
+// ============================================================
+//   TRADE RECEIPT POPUP — the bot's full reasoning for one transaction, shown
+//   when the user taps a ledger row. Like a receipt: what it did, what it saw,
+//   why, what it learned, and what it could have done better (for the retrain).
+// ============================================================
+function showBotReceipt(betId) {
+  const bot = loadBotState();
+  const bet = (bot.bets || []).find(b => b.id === betId);
+  if (!bet) return;
+  const r = bet.decisionReceipt || {};
+  const won = (bet.pnl || 0) > 0;
+  const c = (label, body) => body ? `<div style="margin-bottom:14px"><div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:5px">${label}</div>${body}</div>` : '';
+  const pill = (txt, col) => `<span style="display:inline-block;font-family:var(--mono);font-size:10px;padding:2px 8px;border-radius:10px;background:${col};color:#000;font-weight:700;margin:2px 4px 2px 0">${txt}</span>`;
+
+  // WHAT IT SAW — top drivers as colored pills.
+  const drivers = (r.topDrivers || []).map(d =>
+    pill(`${d.signal} ${d.lean > 0 ? '+' : ''}${d.lean}`, d.lean > 0 ? 'var(--pos)' : 'var(--neg)')
+  ).join('') || '<span style="color:var(--ink-faint);font-family:var(--mono);font-size:10px">—</span>';
+
+  const rationale = (r.rationale || []).length
+    ? `<ul style="margin:0;padding-left:16px;color:var(--ink-dim);font-size:11px;line-height:1.6">${r.rationale.map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul>`
+    : '';
+
+  // WHAT IT LEARNED.
+  const learned = r.learned ? `
+    <div style="font-size:11px;color:var(--ink-dim);line-height:1.6">
+      ${escapeHtml(r.learned.note || '')}
+      ${(r.learned.signalsValidated || []).length ? `<div style="margin-top:6px">Validated: ${r.learned.signalsValidated.map(s => pill(s, 'var(--pos)')).join('')}</div>` : ''}
+      ${(r.learned.signalsMisled || []).length ? `<div style="margin-top:4px">Misled by: ${r.learned.signalsMisled.map(s => pill(s, 'var(--neg)')).join('')}</div>` : ''}
+    </div>` : '<div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">Still open — lessons recorded when it closes.</div>';
+
+  // OUTCOME line.
+  const outcome = r.outcome ? `
+    <div style="display:flex;gap:14px;flex-wrap:wrap;font-family:var(--mono);font-size:12px">
+      <span style="color:${won ? 'var(--pos)' : 'var(--neg)'};font-weight:800">${r.outcome.result} ${fmtPnl(r.outcome.pnl)}</span>
+      <span style="color:var(--ink-dim)">${r.outcome.returnPct != null ? (r.outcome.returnPct >= 0 ? '+' : '') + r.outcome.returnPct + '%' : ''}</span>
+      <span style="color:var(--ink-faint)">${r.outcome.exitReason || ''}${r.outcome.holdDays != null ? ' · held ' + r.outcome.holdDays + 'd' : ''}</span>
+    </div>` : `<div style="font-family:var(--mono);font-size:12px;color:var(--amber);font-weight:700">OPEN · unrealized ${fmtPnl(bet.pnl)}</div>`;
+
+  const host = document.createElement('div');
+  host.id = 'bot-receipt-modal';
+  host.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.78);z-index:400;display:flex;align-items:center;justify-content:center;padding:16px';
+  host.innerHTML = `
+    <div style="background:var(--bg-card);border:1px solid var(--amber);border-radius:10px;max-width:560px;width:100%;max-height:88vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,0.5)">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid var(--rule);position:sticky;top:0;background:var(--bg-card)">
+        <div>
+          <div style="font-family:var(--serif);font-size:20px;font-style:italic;color:var(--ink)">${bet.ticker} <span style="font-size:12px;color:var(--ink-faint)">· ${bet.entryDate}</span></div>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-top:2px">Bot decision receipt</div>
+        </div>
+        <button id="bot-receipt-close" style="background:none;border:1px solid var(--rule);color:var(--ink-dim);width:30px;height:30px;font-size:18px;cursor:pointer;border-radius:4px;line-height:1">×</button>
+      </div>
+      <div style="padding:20px">
+        ${c('Outcome', outcome)}
+        ${c('Action', `<div style="font-family:var(--mono);font-size:12px;color:var(--ink)">${escapeHtml(r.action || (bet.direction + ' ' + (bet.instrument || 'shares')))}</div>`)}
+        ${c('Sizing & cash', `<div style="font-family:var(--mono);font-size:11px;color:var(--ink-dim);line-height:1.6">${escapeHtml(r.sizing || ('$' + (bet.dollars||0).toFixed(0)))}<br>Cash after this trade: <strong style="color:var(--ink)">$${(r.cashAfter ?? bet.cashAfter ?? 0).toLocaleString(undefined, {maximumFractionDigits: 0})}</strong></div>`)}
+        ${c('Conviction', `${pill((r.confidence ?? Math.round((bet.confidence||0)*100)) + '% confidence', 'var(--amber)')}${r.style ? pill(r.style, '#7faaca') : ''}${r.horizon ? pill(r.horizon, '#9c7aaf') : ''}${r.dalioEnv ? pill(r.dalioEnv, '#4ec9a8') : ''}`)}
+        ${c('Market regime', r.regime ? `<div style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${escapeHtml(r.regime)}</div>` : '')}
+        ${c('What it saw (top signals)', `<div>${drivers}</div>`)}
+        ${c('Why it acted', rationale)}
+        ${c('What it learned', learned)}
+        ${c('What it could have done better', r.couldHaveDoneBetter ? `<div style="font-size:11px;color:var(--ink-dim);line-height:1.6;font-style:italic">${escapeHtml(r.couldHaveDoneBetter)}</div>` : '<div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">Recorded at close.</div>')}
+        ${(r.decisionPath || []).length ? `<details style="margin-top:8px"><summary style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);cursor:pointer">Full decision path (${r.decisionPath.length} steps)</summary><div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);line-height:1.7;margin-top:6px;max-height:200px;overflow-y:auto">${r.decisionPath.map(s => escapeHtml(s)).join('<br>')}</div></details>` : ''}
+      </div>
+    </div>`;
+  document.body.appendChild(host);
+  const close = () => host.remove();
+  host.addEventListener('click', (e) => { if (e.target === host) close(); });
+  document.getElementById('bot-receipt-close')?.addEventListener('click', close);
+}
+if (typeof window !== 'undefined') window.showBotReceipt = showBotReceipt;
+
 const BOT_STARTING_BANKROLL = 100000;
 const BETS_STATE = { perfWindow: 'all' };   // equity-curve window: week|month|year|all
 let _betsLiveQuotesPrimed = false;          // fires a one-time live-quote refresh on bets tab open
 let _betsRepoSynced = false;                // fires a one-time TRAPP2-BOT repo import on bets tab open
+let _betsView = 'portfolio';                // 'portfolio' | 'ledger' — the bets-tab sub-view toggle
 const BOT_MAX_BETS_PER_DAY = 6;
-const BOT_MIN_BETS_PER_DAY = 0;   // can sit out entirely
-const BOT_CONVICTION_THRESHOLD = 0.30;  // below this absolute conviction → no bet
-// Lowered 0.45 → 0.30 to get the bot REPS. The point of the paper account right
-// now is to accumulate trades to retrain on (wins AND losses), not to be right.
-// A lower bar = more, riskier trades = more training signal. We expect drawdowns
-// — that's the cost of learning. Raise it back once botRetrain() has enough
-// settled bets to sharpen the signal weights.
+const BOT_MIN_BETS_PER_DAY = 0;   // can sit out entirely — no daily quota
+const BOT_CONVICTION_THRESHOLD = 0.42;  // below this absolute conviction → no bet
+// Set to 0.42 for QUALITY over quantity. The bot is NOT required to trade daily,
+// hit a trade count, or show a trading pattern — sitting out when nothing clears
+// the bar is a valid, encouraged outcome. It will still go long OR short (shorts
+// are first-class here), add to existing positions gradually, or do nothing at
+// all on a given day. A higher bar = fewer, higher-conviction trades. (This was
+// briefly 0.30 to farm training reps; raised back now that the journal exists.)
 
 function loadBotState() {
   try {
@@ -37685,6 +38427,7 @@ function saveBotState(b) {
 //   benchmark history (SPY, fallback QQQ): 20d-vs-60d trend + realized vol.
 // ============================================================
 let _botRegime = null;
+let _botBestAvailableConfidence = null;   // best conviction seen in the latest scan (for opportunity-cost exits)
 function botAssessRegime() {
   // 1) The nightly pipeline's regime_current.json (loaded into state.marketRegime
   //    by loadRegimeSnapshot) — it sees macro/liquidity/breadth data the browser
@@ -37944,6 +38687,285 @@ function computeRegimeGrade(ticker) {
 //   the price+volume momentum alone — still a valid, universe-wide metric so it
 //   adds to EVERY ticker's coverage.
 // ============================================================
+// ============================================================
+//   TREND & MOMENTUM ANALYSIS ENGINE
+//
+//   A single, synchronous, statistically-grounded read of a ticker's price
+//   behavior. Built to be a shared TOOL for the trading bot, the research
+//   grade, and the composite score — not primarily a display (though a compact
+//   summary can be shown in the valuation panel).
+//
+//   What it computes, all from price history (+ CPI when cached):
+//     • Multi-horizon momentum (returns measured in STANDARD-DEVIATION units, so
+//       a move is judged against the stock's own volatility, not a flat %).
+//     • Trend quality via R² of a linear/log fit — distinguishes a clean trend
+//       from a noisy drift.
+//     • Distribution stats: mean/σ of daily log returns, skew, and how unusual
+//       the latest move is (z-score) — the basis for "is this normal or a shock."
+//     • Volatility regime (recent σ vs long σ) — expanding vol = risk rising.
+//     • Drawdown + distance-from-high — durability and exhaustion.
+//     • Inflation-adjusted (REAL) drift when CPI is available, so secular trend
+//       is judged in purchasing-power terms, not nominal.
+//     • Peer-relative strength vs same-sector names (out/under-performance).
+//     • A synthesized read: momentumScore (0-100), trendQuality, and a
+//       "healthVsToppy" classification that separates HEALTHY momentum from a
+//       BAD/late/distribution trend (the core ask).
+//
+//   Returns null only when there's too little history. Everything is wrapped so
+//   a partial dataset still yields a partial-but-useful result.
+// ============================================================
+const _trendCache = new Map();   // ticker -> { t, result } short TTL cache
+const _TREND_TTL_MS = 5 * 60 * 1000;
+
+function analyzePriceTrend(ticker, opts = {}) {
+  const t = String(ticker || '').toUpperCase();
+  if (!t) return null;
+  // Cache (the bot calls this across many tickers; recompute is cheap but this
+  // avoids redoing it several times in one scan).
+  const cached = _trendCache.get(t);
+  if (cached && !opts.force && (Date.now() - cached.t) < _TREND_TTL_MS) return cached.result;
+
+  const hist = (typeof getHistoryForTicker === 'function') ? getHistoryForTicker(t) : null;
+  if (!hist || hist.length < 20) return null;
+  const px = hist.map(p => ({ date: p.date, v: (p.close ?? p.price) }))
+    .filter(p => isFinite(p.v) && p.v > 0);
+  if (px.length < 20) return null;
+  px.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+  const prices = px.map(p => p.v);
+  const n = prices.length;
+  const last = prices[n - 1];
+
+  // ---- Daily LOG returns (the statistical backbone). ----
+  const rets = [];
+  for (let i = 1; i < n; i++) rets.push(Math.log(prices[i] / prices[i - 1]));
+  const mean = rets.reduce((s, x) => s + x, 0) / rets.length;
+  const variance = rets.reduce((s, x) => s + (x - mean) ** 2, 0) / Math.max(1, rets.length - 1);
+  let sigma = Math.sqrt(variance);                 // daily volatility
+  // Floor sigma to a tiny positive value so a near-flat series can't blow up the
+  // σ-unit math (division by ~0 → absurd numbers). 0.0001 = 0.01%/day floor.
+  if (!(sigma > 0.0001)) sigma = 0.0001;
+  const annSigma = sigma * Math.sqrt(252);           // annualized
+  // Skew of daily returns (negative = crash-prone left tail).
+  let skew = 0;
+  if (sigma > 0) {
+    skew = rets.reduce((s, x) => s + ((x - mean) / sigma) ** 3, 0) / rets.length;
+  }
+
+  // ---- Multi-horizon momentum, measured in σ units (return / expected σ over
+  //      that horizon). A "+2σ" 1-month move means a genuinely strong push for
+  //      THIS stock; "+0.3σ" is noise even if the % looks large. ----
+  const horizons = { d5: 5, d20: 20, d63: 63, d126: 126, d252: 252 };
+  const momByH = {};
+  for (const [k, h] of Object.entries(horizons)) {
+    if (n > h) {
+      const ago = prices[n - 1 - h];
+      const ret = ago > 0 ? Math.log(last / ago) : 0;
+      const expSigma = sigma * Math.sqrt(h);          // expected move scale over h days
+      const su = expSigma > 0 ? ret / expSigma : 0;
+      momByH[k] = {
+        retPct: +(Math.exp(ret) - 1).toFixed(4),
+        sigmaUnits: +Math.max(-15, Math.min(15, su)).toFixed(2),   // clamp to ±15σ
+      };
+    }
+  }
+
+  // ---- Trend quality: R² of a linear fit on LOG price over ~63 days. High R²
+  //      = a clean, persistent trend; low R² = chop. Slope sign = direction. ----
+  const fitWin = Math.min(63, n);
+  const seg = prices.slice(-fitWin).map(v => Math.log(v));
+  let slope = 0, r2 = 0;
+  {
+    const m = seg.length;
+    let sx = 0, sy = 0, sxy = 0, sx2 = 0, sy2 = 0;
+    seg.forEach((y, i) => { sx += i; sy += y; sxy += i * y; sx2 += i * i; sy2 += y * y; });
+    const mx = sx / m, my = sy / m;
+    const denom = (sx2 - m * mx * mx);
+    slope = denom !== 0 ? (sxy - m * mx * my) / denom : 0;   // log-price slope per day
+    const r2den = denom * (sy2 - m * my * my);
+    r2 = r2den !== 0 ? ((sxy - m * mx * my) ** 2) / r2den : 0;
+  }
+  const slopeAnnPct = Math.exp(slope * 252) - 1;     // annualized trend drift
+
+  // ---- How UNUSUAL is the latest move? z-score of today's return vs the
+  //      distribution. |z|>2.5 = a statistically notable shock. ----
+  const lastRet = rets[rets.length - 1];
+  const lastZ = sigma > 0 ? (lastRet - mean) / sigma : 0;
+
+  // ---- Volatility regime: recent (20d) σ vs longer (100d) σ. >1.3 = vol
+  //      expanding (risk rising, often around tops/breaks). ----
+  let volRegime = null;
+  if (rets.length >= 100) {
+    const r20 = rets.slice(-20), r100 = rets.slice(-100);
+    const s20 = Math.sqrt(r20.reduce((s, x) => s + x * x, 0) / r20.length);
+    const s100 = Math.sqrt(r100.reduce((s, x) => s + x * x, 0) / r100.length);
+    volRegime = s100 > 0 ? +(s20 / s100).toFixed(2) : null;
+  }
+
+  // ---- Drawdown + distance from running peak (exhaustion / durability). ----
+  let peak = prices[0], maxDD = 0;
+  for (const v of prices) { if (v > peak) peak = v; const dd = (peak - v) / peak; if (dd > maxDD) maxDD = dd; }
+  const fromHigh = peak > 0 ? (last - peak) / peak : 0;    // 0 = at high, negative = below
+
+  // ---- Inflation-adjusted (REAL) drift, when CPI is cached. Compares nominal
+  //      annualized drift to CPI inflation over the same window. ----
+  let realDriftAnn = null, inflationAnn = null;
+  try {
+    const cpi = (typeof _cpiIndexCache !== 'undefined' && _cpiIndexCache) ? _cpiIndexCache : null;
+    if (cpi && cpi.map && px.length > 252) {
+      const firstDate = px[0].date, lastDate = px[n - 1].date;
+      const yrs = (new Date(lastDate) - new Date(firstDate)) / (365.25 * 86400000);
+      const cpiAt = (d) => {
+        // nearest CPI month at-or-before date
+        const key = String(d).slice(0, 7);
+        if (cpi.map[key] != null) return cpi.map[key];
+        // walk back through sorted months
+        let best = null;
+        for (const m of cpi.sorted) { if (m.date.slice(0, 7) <= key) best = m.value; else break; }
+        return best;
+      };
+      const c0 = cpiAt(firstDate), c1 = cpiAt(lastDate);
+      if (c0 && c1 && yrs > 0.5) {
+        const nominalAnn = Math.pow(last / prices[0], 1 / yrs) - 1;
+        inflationAnn = Math.pow(c1 / c0, 1 / yrs) - 1;
+        realDriftAnn = (1 + nominalAnn) / (1 + inflationAnn) - 1;
+      }
+    }
+  } catch {}
+
+  // ---- Peer-relative strength: this stock's 3-month return minus the median
+  //      3-month return of same-sector peers. Positive = outperforming peers. ----
+  let peerRelative = null, peerNote = null;
+  try {
+    const row = (typeof getStockbookRow === 'function') ? getStockbookRow(t) : null;
+    const sector = row?.sector;
+    if (sector && typeof getStockbookRows === 'function') {
+      const my3 = momByH.d63 ? momByH.d63.retPct : null;
+      if (my3 != null) {
+        const peerRets = [];
+        for (const r of getStockbookRows()) {
+          if (r.ticker === t) continue;
+          if ((r.sector || '') !== sector) continue;
+          const ph = (typeof getHistoryForTicker === 'function') ? getHistoryForTicker(r.ticker) : null;
+          if (ph && ph.length > 63) {
+            const pp = ph.map(x => x.close ?? x.price).filter(v => isFinite(v) && v > 0);
+            if (pp.length > 63) {
+              const pl = pp[pp.length - 1], pa = pp[pp.length - 1 - 63];
+              if (pa > 0) peerRets.push((pl - pa) / pa);
+            }
+          }
+          if (peerRets.length >= 12) break;   // enough for a stable median; cap work
+        }
+        if (peerRets.length >= 3) {
+          peerRets.sort((a, b) => a - b);
+          const med = peerRets[Math.floor(peerRets.length / 2)];
+          peerRelative = +(my3 - med).toFixed(4);
+          peerNote = `${peerRelative >= 0 ? '+' : ''}${(peerRelative * 100).toFixed(1)}pp vs ${sector} peers (n=${peerRets.length})`;
+        }
+      }
+    }
+  } catch {}
+
+  // ============================================================
+  //   SYNTHESIS — turn the stats into a momentum score + a health read.
+  // ============================================================
+  // momentumScore (0-100): blend of σ-unit momentum across horizons, weighted
+  // toward the medium horizons (1-3 months) that drive swing decisions.
+  const mw = { d5: 0.10, d20: 0.30, d63: 0.30, d126: 0.20, d252: 0.10 };
+  let mNum = 0, mDen = 0;
+  for (const k of Object.keys(mw)) {
+    if (momByH[k]) { mNum += Math.tanh(momByH[k].sigmaUnits / 2) * mw[k]; mDen += mw[k]; }
+  }
+  const momBlend = mDen > 0 ? mNum / mDen : 0;            // -1..+1
+  let momentumScore = Math.round(50 + momBlend * 50);     // 0..100
+  momentumScore = Math.max(0, Math.min(100, momentumScore));
+
+  // trendQuality (0-100): R² scaled, but only "counts" in the slope's direction.
+  const trendQuality = Math.round(r2 * 100);
+  const trendDir = slope > 0 ? 'up' : slope < 0 ? 'down' : 'flat';
+
+  // ---- HEALTHY momentum vs BAD/TOPPY trend — the core classification. ----
+  // Healthy up: positive medium-horizon σ-momentum, decent R², not stretched far
+  //   above trend on exploding vol, left-tail not screaming.
+  // Toppy/late: strong recent move BUT vol expanding hard + price stretched +
+  //   negative skew (distribution) — momentum that's likely exhausting.
+  // Deteriorating: was up, now rolling over (short-horizon σ-momentum negative
+  //   while longer-horizon still positive) — early bad-trend warning.
+  const shortMom = momByH.d20 ? momByH.d20.sigmaUnits : 0;
+  const longMom = momByH.d126 ? momByH.d126.sigmaUnits : (momByH.d63 ? momByH.d63.sigmaUnits : 0);
+  // "Stretched" = vol expanding AND a notable recent shock, OR an extreme
+  // short-horizon push (parabolic). Negative skew adds distribution risk.
+  const volExpanding = (volRegime != null && volRegime > 1.3);
+  const parabolic = shortMom > 3.5;                         // >3.5σ in a month = vertical
+  const stretched = (volExpanding && Math.abs(lastZ) > 1.3) || parabolic;
+  let classification, healthNote;
+  if (momentumScore >= 60 && trendQuality >= 35 && !(stretched || skew < -0.5)) {
+    classification = 'healthy-uptrend';
+    healthNote = 'Clean, well-supported up-momentum';
+  } else if (momentumScore >= 58 && (stretched || skew < -0.6)) {
+    classification = 'late-stage-extended';
+    healthNote = parabolic
+      ? 'Parabolic — vertical short-term move; high reversal/chase risk'
+      : 'Strong but stretched — vol expanding / negative skew suggests late-stage; chase risk';
+  } else if (longMom > 0.3 && shortMom < -0.3) {
+    classification = 'rolling-over';
+    healthNote = 'Up longer-term but rolling over short-term — early deterioration';
+  } else if (momentumScore <= 40 && trendDir === 'down' && trendQuality >= 35) {
+    classification = 'persistent-downtrend';
+    healthNote = 'Clean downtrend — momentum and trend both negative';
+  } else if (momentumScore <= 40 && (volRegime != null && volRegime > 1.3)) {
+    classification = 'breaking-down';
+    healthNote = 'Weak and vol expanding — active breakdown / distribution';
+  } else if (momentumScore > 45 && momentumScore < 60 && trendQuality < 30) {
+    classification = 'choppy-rangebound';
+    healthNote = 'No clean trend — choppy / rangebound';
+  } else {
+    classification = 'neutral';
+    healthNote = 'Mixed / no decisive trend';
+  }
+
+  // A signed directional read for the bot (-1..+1): combines momentum and the
+  // health flavor (penalize toppy/breaking even if raw momentum is high/low).
+  let signed = momBlend;
+  if (classification === 'late-stage-extended') signed *= 0.5;       // discount chase
+  if (classification === 'rolling-over') signed = Math.min(signed, -0.1);
+  if (classification === 'breaking-down') signed = Math.min(signed, -0.4);
+  signed = Math.max(-1, Math.min(1, +signed.toFixed(3)));
+
+  const result = {
+    ticker: t,
+    bars: n,
+    momentumScore,
+    signed,
+    trendQuality,
+    trendDir,
+    classification,
+    healthNote,
+    // raw stats (for the bot / grading / display)
+    stats: {
+      dailySigma: +sigma.toFixed(4),
+      annualizedVol: +annSigma.toFixed(3),
+      skew: +skew.toFixed(2),
+      lastMoveZ: +lastZ.toFixed(2),
+      volRegime,
+      maxDrawdown: +maxDD.toFixed(3),
+      fromHigh: +fromHigh.toFixed(3),
+      slopeAnnPct: +slopeAnnPct.toFixed(3),
+      r2: +r2.toFixed(2),
+    },
+    momentumByHorizon: momByH,
+    real: (realDriftAnn != null) ? {
+      realDriftAnn: +realDriftAnn.toFixed(4),
+      inflationAnn: inflationAnn != null ? +inflationAnn.toFixed(4) : null,
+      beatsInflation: realDriftAnn > 0,
+    } : null,
+    peerRelative,
+    peerNote,
+  };
+  _trendCache.set(t, { t: Date.now(), result });
+  return result;
+}
+if (typeof window !== 'undefined') window.analyzePriceTrend = analyzePriceTrend;
+
 function computeMomentumGrade(ticker) {
   const t = String(ticker || '').toUpperCase();
   const row = (typeof getStockbookRow === 'function') ? getStockbookRow(t) : null;
@@ -38031,6 +39053,25 @@ function computeMomentumGrade(ticker) {
   score = Math.max(0, Math.min(100, Math.round(score)));   // floored at 0, capped at 100
 
   const noteBits = [priceNote, volNote, socialNote].filter(Boolean);
+  // ---- ENRICH with the deeper trend engine: nudge the score by trend health
+  //      and surface the classification + key stats. A "late-stage-extended" or
+  //      "rolling-over" read pulls a high momentum score DOWN (chasing risk);
+  //      a "healthy-uptrend" with strong σ-momentum nudges it up. ----
+  let trendRead = null;
+  try {
+    trendRead = (typeof analyzePriceTrend === 'function') ? analyzePriceTrend(t) : null;
+    if (trendRead) {
+      const c = trendRead.classification;
+      if (c === 'late-stage-extended') score = Math.round(score * 0.85);
+      else if (c === 'rolling-over') score = Math.round(score * 0.75);
+      else if (c === 'breaking-down') score = Math.round(score * 0.6);
+      else if (c === 'healthy-uptrend' && trendRead.momentumScore >= 65) score = Math.min(100, Math.round(score * 1.05 + 2));
+      else if (c === 'persistent-downtrend') score = Math.round(score * 0.7);
+      score = Math.max(0, Math.min(100, score));
+      if (trendRead.healthNote) noteBits.push(trendRead.healthNote);
+    }
+  } catch {}
+
   return {
     score,
     label: _gradeLetterFromScore(score),
@@ -38043,6 +39084,7 @@ function computeMomentumGrade(ticker) {
     },
     socialPresence,
     hasSocial: socialScore != null,
+    trend: trendRead,   // full deep-analysis object attached for consumers
   };
 }
 if (typeof window !== 'undefined') window.computeMomentumGrade = computeMomentumGrade;
@@ -38225,6 +39267,32 @@ async function botScoreTicker(ticker) {
       if (mg && isFinite(mg.signed) && mg.label !== 'N/A') {
         // A touch more weight when the social component is present (more signal).
         add('momentumGrade', mg.signed, mg.hasSocial ? 0.13 : 0.10, `Momentum ${mg.label} (${mg.note})`);
+      }
+    }
+  } catch {}
+
+  // 6e. TREND ENGINE — the deep statistical read (σ-unit momentum, trend
+  // quality via R², health-vs-toppy classification, peer-relative strength,
+  // inflation-adjusted drift). This is the bot's "understand the trend" signal:
+  // it rewards HEALTHY momentum and actively penalizes late-stage/breaking-down
+  // trends (so the bot doesn't chase blow-off tops or buy into distribution),
+  // and it boosts a name outperforming its sector peers.
+  try {
+    if (typeof analyzePriceTrend === 'function') {
+      const tr = analyzePriceTrend(t);
+      if (tr && isFinite(tr.signed)) {
+        // The engine's `signed` already folds in the health classification.
+        add('trendEngine', tr.signed, 0.14, `Trend ${tr.classification} (q${tr.trendQuality}, mom ${tr.momentumScore})`);
+        // Peer-relative strength as a smaller, separate nudge.
+        if (tr.peerRelative != null) {
+          const rel = Math.max(-1, Math.min(1, tr.peerRelative / 0.15));   // ±15pp → full
+          add('peerRelativeStrength', rel, 0.06, tr.peerNote || 'peer-relative');
+        }
+        // Real (inflation-adjusted) secular drift: a long-term tailwind/headwind.
+        if (tr.real && tr.real.realDriftAnn != null) {
+          const realSig = Math.max(-1, Math.min(1, tr.real.realDriftAnn / 0.15));  // ±15%/yr real → full
+          add('realTrend', realSig, 0.05, `Real drift ${(tr.real.realDriftAnn * 100).toFixed(1)}%/yr (inflation-adj)`);
+        }
       }
     }
   } catch {}
@@ -38540,24 +39608,75 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
     if (typeof flashStatus === 'function') flashStatus(`Bot scanned ${candidates.length} tickers — none cleared the ${(effThreshold * 100).toFixed(0)}% conviction bar today`, 'success');
   }
 
-  // Rank by confidence (absolute conviction), take top N — but make sure the bot
-  // takes BOTH SIDES when bearish candidates exist. Filling all slots with longs
-  // (because longs happened to edge out on confidence) means the bot never shorts
-  // and never learns the short side. So if there are qualifying shorts, reserve
-  // up to ~40% of the slots for the best shorts, then fill the rest by confidence.
+  // Pick which candidates to bet on — NOT a rigid "one of each style." Instead,
+  // bias toward whatever has been WORKING (by style + direction, from settled
+  // history) while keeping randomness so the bot keeps exploring both sides and
+  // all horizons. This is exploration-vs-exploitation: exploit what's profitable,
+  // but explore enough to discover regime changes and avoid overfitting to a
+  // streak. The mix is different every run — never a fixed quota.
   scored.sort((a, b) => b.confidence - a.confidence);
+  // Record the best available conviction this scan saw (among names NOT already
+  // held), so the mark-to-market exit logic can judge opportunity cost: a held
+  // winner is only worth rotating out of if something clearly better is waiting.
+  try {
+    const heldTickers = new Set(bot.bets.filter(b => b.status === 'open').map(b => b.ticker));
+    const bestNew = scored.find(s => !heldTickers.has(s.ticker));
+    _botBestAvailableConfidence = bestNew ? bestNew.confidence : (scored[0]?.confidence ?? null);
+  } catch { _botBestAvailableConfidence = scored[0]?.confidence ?? null; }
   const slotsLeft = BOT_MAX_BETS_PER_DAY - bot.bets.filter(b => b.entryDate === today).length;
   let picks;
   {
-    const shorts = scored.filter(s => s.direction === 'short');
-    const longs = scored.filter(s => s.direction !== 'short');
-    const shortSlots = Math.min(shorts.length, Math.max(1, Math.floor(slotsLeft * 0.4)));
-    const chosenShorts = shorts.slice(0, shortSlots);
-    const chosenLongs = longs.slice(0, Math.max(0, slotsLeft - chosenShorts.length));
-    picks = [...chosenShorts, ...chosenLongs]
-      .sort((a, b) => b.confidence - a.confidence)
-      .slice(0, Math.max(0, slotsLeft));
-    if (chosenShorts.length) console.log(`[bot] reserved ${chosenShorts.length} slot(s) for shorts (best bearish candidates) so the bot trades both sides`);
+    // Performance priors: how has each style/direction done? (net P&L per style,
+    // win rate per direction). Falls back to neutral when there's little history.
+    const settled = bot.bets.filter(b => b.status === 'closed' && isFinite(b.pnl));
+    const stylePnl = {}, dirStats = { long: { n: 0, w: 0 }, short: { n: 0, w: 0 } };
+    for (const b of settled) {
+      const st = (typeof _classifyTradeStyle === 'function') ? _classifyTradeStyle(b) : 'long';
+      stylePnl[st] = (stylePnl[st] || 0) + (b.pnl || 0);
+      const d = b.direction === 'short' ? 'short' : 'long';
+      dirStats[d].n++; if ((b.pnl || 0) > 0) dirStats[d].w++;
+    }
+    // A multiplier per candidate: blends conviction with how well its style and
+    // direction have performed, then adds randomness (exploration noise).
+    const styleMult = (st) => {
+      const p = stylePnl[st];
+      if (p == null || settled.length < 5) return 1;        // not enough data → neutral
+      // Map net P&L to ~0.6..1.6 (winners favored, losers de-emphasized, never 0).
+      return Math.max(0.6, Math.min(1.6, 1 + Math.tanh(p / 2000) * 0.6));
+    };
+    const dirMult = (d) => {
+      const s = dirStats[d === 'short' ? 'short' : 'long'];
+      if (s.n < 4) return 1;                                 // too few → neutral (still explore)
+      const wr = s.w / s.n;
+      return Math.max(0.7, Math.min(1.4, 0.7 + wr * 0.9));   // higher win rate → favored
+    };
+    // Exploration noise: a random factor so the slate varies every run and the
+    // bot keeps trying both sides / all horizons even when one is hot. ±35%.
+    const explore = () => 0.65 + Math.random() * 0.70;
+
+    const ranked = scored.map(s => {
+      const st = (typeof _classifyTradeStyle === 'function') ? _classifyTradeStyle(s) : 'long';
+      const score = s.confidence * styleMult(st) * dirMult(s.direction) * explore();
+      return { s, score };
+    }).sort((a, b) => b.score - a.score);
+
+    picks = ranked.slice(0, Math.max(0, slotsLeft)).map(r => r.s);
+
+    // Light guarantee of two-sidedness: IF qualifying shorts exist and the slate
+    // came out all-long (or vice-versa), swap the weakest pick for the best
+    // opposite-side candidate ~60% of the time — so the bot usually (not always)
+    // carries both sides, but it's not a rigid quota.
+    const hasShort = picks.some(p => p.direction === 'short');
+    const hasLong = picks.some(p => p.direction !== 'short');
+    const bestShort = scored.find(s => s.direction === 'short');
+    const bestLong = scored.find(s => s.direction !== 'short');
+    if (picks.length >= 2 && Math.random() < 0.6) {
+      if (!hasShort && bestShort) { picks[picks.length - 1] = bestShort; }
+      else if (!hasLong && bestLong) { picks[picks.length - 1] = bestLong; }
+    }
+    picks.sort((a, b) => b.confidence - a.confidence);
+    const nShort = picks.filter(p => p.direction === 'short').length;
+    console.log(`[bot] slate: ${picks.length} picks (${nShort} short, ${picks.length - nShort} long) — performance-weighted + randomized, not a fixed quota`);
   }
 
   if (!bot.startedAt && picks.length) {
@@ -38802,7 +39921,44 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
       exitPrice: null,
     });
     // Label the horizon character now that horizonDays is set.
-    { const _b = bot.bets[bot.bets.length - 1]; _b.horizonType = _b.horizonDays >= 90 ? 'long-term' : _b.horizonDays >= 21 ? 'swing' : 'short-term'; }
+    { const _b = bot.bets[bot.bets.length - 1];
+      _b.horizonType = _b.horizonDays >= 90 ? 'long-term' : _b.horizonDays >= 21 ? 'swing' : 'short-term';
+      // ---- DECISION RECEIPT: the full "why" captured at trade time, shown in a
+      // popup when the user taps a trade. This is the bot's reasoning made
+      // legible: what it saw, why it acted, and (filled in at close) what it
+      // learned / could have done better. ----
+      const comps = p.components || {};
+      const drivers = Object.entries(comps)
+        .filter(([, v]) => isFinite(v) && v !== 0)
+        .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
+        .map(([k, v]) => ({ signal: k, lean: +v.toFixed(2), favors: (v > 0 ? 'long' : 'short') }));
+      // Cash balance AFTER this buy (committed cash subtracted).
+      const _committedNow = bot.bets.filter(b => b.status === 'open').reduce((s, b) => s + (b.notional || 0), 0);
+      _b.cashAfter = +(bot.bankroll - _committedNow).toFixed(2);
+      _b.decisionReceipt = {
+        placedAt: new Date().toISOString(),
+        action: `${p.direction.toUpperCase()} ${p.instrument === 'option' ? p.optionType?.toUpperCase() + ' option' : p.instrument === 'leveraged_etf' ? (p.leveragedEtf?.etf + ' (leveraged ETF)') : 'shares'}`,
+        regime: (typeof _botRegime !== 'undefined' && _botRegime) ? `${_botRegime.mode} — ${_botRegime.evidence}` : null,
+        conviction: +p.conviction.toFixed(2),
+        confidence: +(p.confidence * 100).toFixed(0),
+        sizing: `$${notional.toFixed(0)} (${(frac * 100).toFixed(1)}% of deployable)${p.leverage > 1 ? `, ${p.leverage}× → $${dollars.toFixed(0)} exposure` : ''}`,
+        cashAfter: _b.cashAfter,
+        style: _b.tradeStyle,
+        horizon: `${_b.horizonType} (~${_b.horizonDays} trading days)`,
+        dalioEnv: _b.dalioEnv,
+        // WHAT IT SAW — the signals that drove the call.
+        topDrivers: drivers.slice(0, 6),
+        // WHY — the human-readable rationale lines.
+        rationale: Array.isArray(p.rationale) ? p.rationale.slice(0, 8) : [],
+        // The full decision path (every gate it passed through).
+        decisionPath: Array.isArray(p.decisionPath) ? p.decisionPath : [],
+        // Filled in at close:
+        outcome: null, learned: null, couldHaveDoneBetter: null,
+      };
+      // AUTO-PERSIST to Supabase the instant the trade is placed (if configured).
+      // Fire-and-forget so it never blocks; GitHub export remains the backup.
+      if (typeof supabaseUpsertTrade === 'function') { try { supabaseUpsertTrade(_b); } catch {} }
+    }
     const _instrDesc = p.instrument === 'option' ? ` as ${p.optionType.toUpperCase()}` : '';
     console.log(`[bot] BET ${p.direction.toUpperCase()}${_instrDesc} ${p.ticker} $${notional.toFixed(0)} (${(frac * 100).toFixed(0)}% of book${p.leverage > 1 ? `, ${p.leverage}x → $${dollars.toFixed(0)} exposure` : ''}) — conf ${(p.confidence * 100).toFixed(0)}%, vol ${(p._vol * 100).toFixed(0)}%, stop $${stopPrice}`);
   }
@@ -39171,16 +40327,45 @@ function botMarkToMarket() {
         if (hit) exitReason = 'target';
       }
       if (!exitReason && ageDays >= bet.horizonDays) {
-        // TAX-AWARE HOLD: if this is a WINNER sitting just short of the 1-year
-        // long-term line, don't let a horizon exit trigger the higher short-term
-        // tax. Extend the hold to capture the lower long-term rate (Dalio-style
-        // patience + after-tax thinking). Options/leveraged ETFs are excluded
-        // (decay/expiry makes waiting unwise).
+        // LET WINNERS RUN (opportunity cost): a winner that's STILL trending up
+        // shouldn't be auto-sold just because the clock hit — selling a stock
+        // that keeps rising isn't a win, it's leaving money on the table UNLESS
+        // the capital goes somewhere equal-or-better. So at the horizon:
+        //   • If the position is a WINNER and still has positive momentum, extend
+        //     the hold (roll the horizon forward) rather than sell — UNLESS the
+        //     bot currently sees a clearly better opportunity for that capital.
+        //   • If momentum has rolled over, or a better trade is waiting, exit and
+        //     free the capital.
+        let stillStrong = false;
+        try {
+          if (bet.direction === 'long' && (bet.pnl || 0) > 0 && typeof computeMomentumGrade === 'function') {
+            const mg = computeMomentumGrade(bet.ticker);
+            // Still strong if momentum grade is healthy (>55) — the up-move persists.
+            stillStrong = mg && mg.score != null && mg.score > 55;
+          }
+        } catch {}
+        // Is there a clearly better place for this capital right now? Compare the
+        // best available candidate's confidence to this position's original
+        // confidence. "Better" = meaningfully higher conviction (>1.15x) — only
+        // then is rotating worth the tax + spread cost of selling a runner.
+        let betterOpportunity = false;
+        try {
+          const bestAvail = (typeof _botBestAvailableConfidence === 'number') ? _botBestAvailableConfidence : null;
+          if (bestAvail != null && bet.confidence != null) {
+            betterOpportunity = bestAvail > bet.confidence * 1.15;
+          }
+        } catch {}
         const taxSensitive = bet.instrument === 'shares' && bet.direction === 'long';
-        if (taxSensitive && botNearLongTerm(bet, today, 45)) {
-          bet._heldForLongTermTax = true;   // flag for the ledger; skip the exit
+        if (stillStrong && !betterOpportunity) {
+          // Roll the horizon forward — keep riding the winner. (No sale.)
+          bet.horizonDays = ageDays + Math.max(7, Math.round(bet.horizonDays * 0.4));
+          bet._rolledForMomentum = (bet._rolledForMomentum || 0) + 1;
+          bet._lastRollDate = today;
+        } else if (taxSensitive && botNearLongTerm(bet, today, 45) && (bet.pnl || 0) > 0) {
+          // Near the 1-year line on a winner → hold for the lower long-term rate.
+          bet._heldForLongTermTax = true;
         } else {
-          exitReason = 'horizon';
+          exitReason = betterOpportunity ? 'rotate-better-opportunity' : 'horizon';
         }
       }
       // Options also expire — close at/after expiry regardless of horizon.
@@ -39192,17 +40377,81 @@ function botMarkToMarket() {
         bet.exitDate = today;
         bet.exitPrice = px;
         bet.exitReason = exitReason;
-        // Tax accounting: record the holding period, tax owed, and after-tax P&L.
+        // Holding period drives the bot's tax-aware HOLD decisions (above), but
+        // tax is intentionally not surfaced — store the treatment internally only.
         const holdDays = Math.round((new Date(today) - new Date(bet.entryDate)) / 86400000);
         bet.holdDays = holdDays;
-        bet.taxTreatment = holdDays > BOT_TAX.longTermDays ? 'long-term' : 'short-term';
-        bet.taxOwed = botTaxOwed(bet.pnl || 0, holdDays);
-        bet.afterTaxPnl = botAfterTaxGain(bet.pnl || 0, holdDays);
-        // Realize P&L into the bankroll. We compound the AFTER-TAX gain so the
-        // account reflects what the bot actually keeps (taxes are a real drag).
-        bot.bankroll = +(bot.bankroll + (bet.afterTaxPnl != null ? bet.afterTaxPnl : (bet.pnl || 0))).toFixed(2);
+        bet._taxTreatment = holdDays > BOT_TAX.longTermDays ? 'long-term' : 'short-term';   // internal
+        // Opportunity-cost breadcrumb: capture how strong the name still looked at
+        // exit. If we sold a still-strong winner (high momentum) and it wasn't a
+        // rotation into something better, that's a flag the bot can learn from
+        // ("sold a runner too early"). The training export turns this into a
+        // counterfactual lesson.
+        try {
+          if (typeof computeMomentumGrade === 'function') {
+            const mg = computeMomentumGrade(bet.ticker);
+            bet.exitMomentum = mg && mg.score != null ? mg.score : null;
+            bet.soldStillStrong = (bet.direction === 'long' && (bet.pnl || 0) > 0 && bet.exitMomentum != null && bet.exitMomentum > 60 && exitReason === 'horizon');
+          }
+        } catch {}
+        if (bet._rolledForMomentum) bet.rolledForMomentum = bet._rolledForMomentum;
+        // Realize the GROSS P&L into the bankroll (the displayed account matches
+        // gross P&L — no surprise tax drag shown). Tax only influences WHICH
+        // trades the bot makes / how long it holds, not the reported balance.
+        bot.bankroll = +(bot.bankroll + (bet.pnl || 0)).toFixed(2);
+        // Cash balance AFTER this sell: freed notional returns to cash, P&L
+        // realized into the bankroll. Recompute against remaining open positions.
+        {
+          const _committedAfter = bot.bets.filter(b => b.status === 'open' && b.id !== bet.id).reduce((s, b) => s + (b.notional || 0), 0);
+          bet.cashAfter = +(bot.bankroll - _committedAfter).toFixed(2);
+        }
+        // COMPLETE THE RECEIPT — what happened, what it learned, what it could
+        // have done better. This is the close-side of the trade's story, used in
+        // the popup and fed into the retrain.
+        if (bet.decisionReceipt) {
+          const won = (bet.pnl || 0) > 0;
+          bet.decisionReceipt.outcome = {
+            result: won ? 'WIN' : 'LOSS',
+            pnl: +(bet.pnl || 0).toFixed(2),
+            returnPct: bet.returnPct != null ? +bet.returnPct.toFixed(2) : null,
+            exitReason,
+            holdDays: bet.holdDays,
+            cashAfter: bet.cashAfter,
+          };
+          // What it LEARNED: which signals were validated/invalidated by the result.
+          const dirSign = bet.direction === 'short' ? -1 : 1;
+          const comps = bet.components || {};
+          const helped = [], hurt = [];
+          for (const [k, v] of Object.entries(comps)) {
+            if (!isFinite(v) || v === 0) continue;
+            const agreed = Math.sign(v) === dirSign;
+            if (agreed === won) helped.push(k); else hurt.push(k);
+          }
+          bet.decisionReceipt.learned = {
+            signalsValidated: helped,     // these leaned the right way → trust more
+            signalsMisled: hurt,          // these leaned wrong → down-weight
+            note: won
+              ? `The winning drivers (${helped.slice(0, 3).join(', ') || 'n/a'}) were validated — the retrain nudges their weight up.`
+              : `Drivers ${hurt.slice(0, 3).join(', ') || 'n/a'} pointed the wrong way — the retrain nudges them down.`,
+          };
+          // What it COULD HAVE DONE BETTER.
+          let better = null;
+          if (!won) {
+            if (exitReason === 'stop-loss') better = 'Stopped out — entry may have been early or the stop too tight for this name\u2019s volatility. Waiting for confirmation or a wider stop might have survived the shakeout.';
+            else if (exitReason === 'horizon' || exitReason === 'option-expiry') better = 'Thesis didn\u2019t play out in time. A longer horizon, or sitting out in this regime, may have helped.';
+            else better = 'Outcome fought the dominant signals — the signal mix looks miscalibrated for this setup.';
+          } else if (bet.soldStillStrong) {
+            better = `Won, but sold while momentum was still strong (exit momentum ${bet.exitMomentum}). If the capital didn\u2019t move into something clearly better, this left gains on the table — let runners run longer.`;
+          } else {
+            better = 'Clean win — sizing, timing, and exit aligned with the signals.';
+          }
+          bet.decisionReceipt.couldHaveDoneBetter = better;
+        }
         changed = true;
-        console.log(`[bot] CLOSE ${bet.direction.toUpperCase()} ${bet.ticker} @ $${px} — ${exitReason}, ${bet.taxTreatment} P&L ${bet.pnl >= 0 ? '+' : ''}$${(bet.pnl || 0).toFixed(0)} (after-tax ${bet.afterTaxPnl >= 0 ? '+' : ''}$${(bet.afterTaxPnl || 0).toFixed(0)}, tax $${bet.taxOwed.toFixed(0)}) → bankroll $${bot.bankroll.toFixed(0)}`);
+        // AUTO-PERSIST the closed trade (with its full outcome/receipt) to
+        // Supabase so the settled result is captured with no manual step.
+        if (typeof supabaseUpsertTrade === 'function') { try { supabaseUpsertTrade(bet); } catch {} }
+        console.log(`[bot] CLOSE ${bet.direction.toUpperCase()} ${bet.ticker} @ $${px} — ${exitReason}, P&L ${bet.pnl >= 0 ? '+' : ''}$${(bet.pnl || 0).toFixed(0)} → bankroll $${bot.bankroll.toFixed(0)}`);
       }
     }
   }
@@ -39411,6 +40660,14 @@ function renderBetsTab() {
       setTimeout(() => importBotTrainingData().then(() => {
         if (typeof renderBetsTab === 'function') renderBetsTab();
       }).catch(() => {}), 400);
+      // If Supabase is configured, ALSO pull the full trade history from it (the
+      // auto-backend). Appends by id, so it composes with the repo import — and
+      // means a fresh device restores everything with zero manual steps.
+      if (typeof supabaseLoadTrades === 'function' && typeof supabaseConfigured === 'function' && supabaseConfigured()) {
+        setTimeout(() => supabaseLoadTrades().then((res) => {
+          if (res && res.added && typeof renderBetsTab === 'function') renderBetsTab();
+        }).catch(() => {}), 600);
+      }
     }
   }
   const filter = (document.getElementById('bets-filter')?.value || '').trim().toUpperCase() || null;
@@ -39536,6 +40793,92 @@ function renderBetsTab() {
   // economic environments (not just tickers).
   let balanceHtml = '';
   try { balanceHtml = renderBotEnvironmentBalance(); } catch {}
+
+  // ---- OPEN POSITIONS table: total shares held per ticker + current value. ----
+  const openBets = (perf.bets || []).filter(b => b.status === 'open');
+  // Aggregate by ticker+direction so multiple adds to the same name roll up into
+  // one line showing TOTAL shares (the gradual-accumulation view).
+  const posMap = new Map();
+  for (const b of openBets) {
+    const key = `${b.ticker}|${b.direction}|${b.instrument || 'shares'}`;
+    const cur = posMap.get(key) || { ticker: b.ticker, direction: b.direction, instrument: b.instrument || 'shares', leveragedEtf: b.leveragedEtf, shares: 0, notional: 0, dollars: 0, pnl: 0, lots: 0, lastPrice: null, entryCost: 0 };
+    cur.shares += (b.shares || 0);
+    cur.notional += (b.notional || 0);
+    cur.dollars += (b.dollars || 0);
+    cur.pnl += (b.pnl || 0);
+    cur.entryCost += (b.entryPrice || 0) * (b.shares || 0);
+    cur.lots += 1;
+    if (b.lastPrice != null && isFinite(b.lastPrice)) cur.lastPrice = Number(b.lastPrice);
+    posMap.set(key, cur);
+  }
+  const positions = Array.from(posMap.values()).sort((a, b) => b.notional - a.notional);
+  const totalSharesAll = positions.reduce((s, p) => s + p.shares, 0);
+  const positionsHtml = positions.length ? `
+    <div class="company-card">
+      <h4>Open Positions <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· ${positions.length} ${positions.length === 1 ? 'name' : 'names'} · total ${totalSharesAll.toLocaleString(undefined,{maximumFractionDigits:2})} shares · gradual adds roll up here</span></h4>
+      <div style="overflow-x:auto">
+        <table class="sb-table" style="width:100%;min-width:640px">
+          <thead><tr><th>Ticker</th><th>Direction</th><th>Total Shares</th><th>Avg Entry</th><th>Last</th><th>Cost Basis</th><th>Unrealized</th><th>Lots</th></tr></thead>
+          <tbody>${positions.map(p => {
+            const avgEntry = p.shares > 0 ? p.entryCost / p.shares : 0;
+            return `
+            <tr>
+              <td style="font-family:var(--mono);font-weight:700"><span class="bot-ticker-link" data-ticker="${p.ticker}" style="cursor:pointer;color:var(--amber);text-decoration:underline;text-decoration-style:dotted" title="Open ${p.ticker} in Valuation">${p.ticker}</span></td>
+              <td style="font-family:var(--mono);font-size:11px">${dirBadge(p.direction)}${p.instrument === 'leveraged_etf' && p.leveragedEtf ? ` <span style="color:#4ec9a8;font-weight:700">${p.leveragedEtf}</span>` : ''}</td>
+              <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--ink)">${p.shares.toLocaleString(undefined,{maximumFractionDigits:2})}</td>
+              <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">$${avgEntry.toFixed(2)}</td>
+              <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${p.lastPrice != null ? '$' + p.lastPrice.toFixed(2) : '—'}</td>
+              <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">$${p.notional.toLocaleString(undefined,{maximumFractionDigits:0})}</td>
+              <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${pnlColor(p.pnl)}">${fmtPnl(p.pnl)}</td>
+              <td style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)" title="${p.lots} separate entries rolled into this position">${p.lots}${p.lots > 1 ? ' adds' : ''}</td>
+            </tr>`;
+          }).join('')}</tbody>
+        </table>
+      </div>
+    </div>` : `<div class="company-card"><div style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);padding:10px 0">No open positions. The bot is flat — it only holds when something clears its conviction bar (long or short), and sitting in cash is a valid stance.</div></div>`;
+
+  // ---- DAILY ACTIVITY: trades grouped by day (opens, adds, closes). Shows the
+  // bot's actual cadence — including days it did nothing. ----
+  const byDay = new Map();
+  for (const b of (perf.bets || [])) {
+    if (b.entryDate) {
+      const e = byDay.get(b.entryDate) || { opens: [], closes: [] };
+      e.opens.push(b); byDay.set(b.entryDate, e);
+    }
+    if (b.exitDate) {
+      const e = byDay.get(b.exitDate) || { opens: [], closes: [] };
+      e.closes.push(b); byDay.set(b.exitDate, e);
+    }
+  }
+  const days = Array.from(byDay.keys()).sort().reverse().slice(0, 14);  // last 14 active days
+  // Detect adds: an open on a ticker we already held an open lot of on an earlier date.
+  const heldBefore = (ticker, dir, beforeDate) => (perf.bets || []).some(b =>
+    b.ticker === ticker && b.direction === dir && b.entryDate < beforeDate &&
+    (!b.exitDate || b.exitDate >= beforeDate));
+  const activityHtml = days.length ? `
+    <div class="company-card">
+      <h4>Daily Activity <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· last ${days.length} active day${days.length !== 1 ? 's' : ''} · opens, adds &amp; closes</span></h4>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        ${days.map(day => {
+          const e = byDay.get(day);
+          const items = [];
+          for (const b of e.opens) {
+            const isAdd = heldBefore(b.ticker, b.direction, day);
+            items.push(`<span style="font-family:var(--mono);font-size:10px;color:${b.direction === 'short' ? 'var(--neg)' : 'var(--pos)'}">${isAdd ? '➕ ADD' : (b.direction === 'short' ? '▼ SHORT' : '▲ LONG')} ${b.ticker} $${(b.notional||0).toFixed(0)}</span>`);
+          }
+          for (const b of e.closes) {
+            items.push(`<span style="font-family:var(--mono);font-size:10px;color:var(--ink-dim)">✕ CLOSE ${b.ticker} ${fmtPnl(b.pnl)}</span>`);
+          }
+          return `
+            <div style="display:flex;gap:12px;align-items:flex-start;padding:6px 0;border-bottom:1px solid var(--rule)">
+              <span style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);min-width:78px">${day}</span>
+              <div style="display:flex;flex-wrap:wrap;gap:8px;flex:1">${items.join('') || '<span style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">— no activity —</span>'}</div>
+            </div>`;
+        }).join('')}
+      </div>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:8px;line-height:1.6">The bot has no daily quota — days with no activity are normal and expected. It trades (long or short), adds to a position, or sits out based purely on conviction.</div>
+    </div>` : '';
+
   // Today's bets for the highlight card. (This was referenced below but never
   // defined in this function's scope — that ReferenceError was throwing BEFORE
   // body.innerHTML got set, so the whole Bets tab rendered blank even though the
@@ -39546,14 +40889,15 @@ function renderBetsTab() {
       <h4>Today's Bets · ${today}</h4>
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px">
         ${todayBets.map(b => `
-          <div style="padding:10px 12px;background:var(--bg-elev);border:1px solid var(--rule);border-radius:3px">
+          <div class="bot-receipt-row" data-bet-id="${b.id || ''}" style="padding:10px 12px;background:var(--bg-elev);border:1px solid var(--rule);border-radius:3px;cursor:pointer" title="Tap for the bot's full decision receipt">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
               <strong class="bot-ticker-link" data-ticker="${b.ticker}" style="color:var(--amber);font-family:var(--mono);cursor:pointer;text-decoration:underline;text-decoration-style:dotted" title="Open ${b.ticker} in Valuation">${b.ticker}</strong>
               <span style="font-family:var(--mono);font-size:10px">${dirBadge(b.direction)}${b.instrument === 'option' ? ` <span style="color:#c08ae0;font-weight:700">${(b.optionType||'').toUpperCase()}</span>` : b.instrument === 'leveraged_etf' ? ` <span style="color:#4ec9a8;font-weight:700" title="${b.leveragedEtfMultiplier}x leveraged ETF on ${b.ticker}">${b.leveragedEtf}</span>` : (b.leverage > 1 ? ` <span style="color:#e0b04c">${b.leverage}x</span>` : '')}${b.hedge ? ' 🛡' : ''}</span>
             </div>
-            <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim)">$${b.dollars.toFixed(0)} · conf ${(b.confidence * 100).toFixed(0)}% · entry $${b.entryPrice.toFixed(2)}</div>
+            <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim)">$${(b.dollars ?? b.notional ?? 0).toFixed(0)} · conf ${((b.confidence||0) * 100).toFixed(0)}% · entry ${b.entryPrice != null ? '$' + Number(b.entryPrice).toFixed(2) : '—'}</div>
+            <div style="font-family:var(--mono);font-size:9px;color:var(--pos);margin-top:3px">cash after: $${b.cashAfter != null ? Number(b.cashAfter).toLocaleString(undefined, {maximumFractionDigits: 0}) : '—'}</div>
             <div style="font-family:var(--mono);font-size:8px;color:var(--ink-faint);margin-top:2px">${b.horizonType ? b.horizonType + ' (' + b.horizonDays + 'd)' : ''}${b.tradeStyle ? ' · ' + b.tradeStyle : ''}${b.dalioEnv ? ' · ' + b.dalioEnv : ''}</div>
-            <div style="font-size:10px;color:var(--ink-faint);margin-top:6px;line-height:1.4">${(b.rationale || []).slice(0, 2).map(escapeHtml).join(' · ')}</div>
+            <div style="font-size:10px;color:var(--ink-faint);margin-top:6px;line-height:1.4">${(b.rationale || []).slice(0, 2).map(escapeHtml).join(' · ')} <span style="color:var(--amber)">· tap for receipt ›</span></div>
           </div>
         `).join('')}
       </div>
@@ -39565,41 +40909,68 @@ function renderBetsTab() {
       </div>
     </div>`;
 
-  // ---- Full bet ledger ----
+  // ---- Full bet ledger — every transaction, click a row for the receipt ----
   const ledgerRows = perf.bets.slice().reverse().map(b => `
-    <tr>
+    <tr class="bot-receipt-row" data-bet-id="${b.id || ''}" style="cursor:pointer" title="Tap for the bot's full decision receipt">
       <td style="font-family:var(--mono);font-size:11px">${b.entryDate}</td>
       <td style="font-family:var(--mono);font-weight:700"><span class="bot-ticker-link" data-ticker="${b.ticker}" style="cursor:pointer;color:var(--amber);text-decoration:underline;text-decoration-style:dotted" title="Open ${b.ticker} in Valuation">${b.ticker}</span></td>
       <td style="font-family:var(--mono);font-size:11px">${dirBadge(b.direction)}${b.instrument === 'option' ? ` <span style="color:#c08ae0;font-weight:700">${(b.optionType||'').toUpperCase()}</span>` : b.instrument === 'leveraged_etf' ? ` <span style="color:#4ec9a8;font-weight:700">${b.leveragedEtf}</span>` : (b.leverage > 1 ? ` ${b.leverage}x` : '')}${b.hedge ? ' 🛡' : ''}</td>
-      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">$${b.dollars.toFixed(0)}</td>
-      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">$${b.entryPrice.toFixed(2)}</td>
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">$${(b.dollars ?? b.notional ?? 0).toFixed(0)}</td>
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${b.entryPrice != null ? '$' + Number(b.entryPrice).toFixed(2) : '—'}</td>
       <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${(b.lastPrice != null && isFinite(b.lastPrice)) ? '$' + Number(b.lastPrice).toFixed(2) : '—'}</td>
       <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${pnlColor(b.returnPct)}">${b.returnPct != null ? (b.returnPct >= 0 ? '+' : '') + b.returnPct + '%' : '—'}</td>
       <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${pnlColor(b.pnl)}">${fmtPnl(b.pnl)}</td>
-      <td style="font-family:var(--mono);font-size:10px;color:${b.status === 'open' ? 'var(--amber)' : 'var(--ink-faint)'}">${b.status.toUpperCase()}</td>
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${b.cashAfter != null ? '$' + Number(b.cashAfter).toLocaleString(undefined, {maximumFractionDigits: 0}) : '—'}</td>
+      <td style="font-family:var(--mono);font-size:10px;color:${b.status === 'open' ? 'var(--amber)' : 'var(--ink-faint)'}">${b.status.toUpperCase()} ›</td>
     </tr>
   `).join('');
 
   const ledger = perf.bets.length ? `
     <div class="company-card">
-      <h4>${filter ? filter + ' — ' : ''}Bet Ledger <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· every bet permanent · ${perf.bets.length} total</span></h4>
+      <h4>${filter ? filter + ' — ' : ''}Transaction Ledger <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· every transaction permanent · ${perf.bets.length} total · tap any row for the receipt</span></h4>
       <div style="overflow-x:auto">
-        <table class="sb-table" style="width:100%;min-width:680px">
-          <thead><tr><th>Entry Date</th><th>Ticker</th><th>Direction</th><th>Size</th><th>Entry</th><th>Last</th><th>Return</th><th>P/L</th><th>Status</th></tr></thead>
+        <table class="sb-table" style="width:100%;min-width:720px">
+          <thead><tr><th>Date</th><th>Ticker</th><th>Direction</th><th>Size</th><th>Entry</th><th>Last</th><th>Return</th><th>P/L</th><th>Cash After</th><th>Status</th></tr></thead>
           <tbody>${ledgerRows}</tbody>
         </table>
       </div>
-    </div>` : '';
+    </div>` : `<div class="company-card"><div style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);padding:12px 0">No transactions yet. Run the scan to place the bot's first trades.</div></div>`;
 
   // ---- Honesty note ----
   const note = `
     <div class="company-card" style="border-left:3px solid var(--ink-faint)">
       <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);line-height:1.7">
-        <strong style="color:var(--ink)">How this stays honest:</strong> every bet is frozen at its entry price/date the moment it's placed and is <strong>never removed</strong> — wins and losses both count. The track record only accumulates <strong>forward</strong> from the day the bot started (${perf.startedAt || 'not yet started'}); it does not reconstruct hypothetical past trades. Returns are measured purely from the underlying's move since entry (shorts profit when price falls; leverage multiplies both ways). This is a paper portfolio.
+        <strong style="color:var(--ink)">How this stays honest:</strong> every transaction is frozen at its entry price/date the moment it's placed and is <strong>never removed</strong> — wins and losses both count. The track record only accumulates <strong>forward</strong> from the day the bot started (${perf.startedAt || 'not yet started'}). This is a paper portfolio.
       </div>
     </div>`;
 
-  body.innerHTML = summary + chartHtml + balanceHtml + insightsHtml + todayHtml + ledger + note;
+  // ---- Portfolio ⇄ Ledger toggle. Portfolio = the flashy live dashboard;
+  // Ledger = the full transaction history with tap-for-receipt rows. ----
+  const view = _betsView === 'ledger' ? 'ledger' : 'portfolio';
+  const toggle = `
+    <div style="display:flex;gap:0;margin:0 0 18px;border:1px solid var(--rule);border-radius:8px;overflow:hidden;width:fit-content">
+      <button class="bets-view-btn" data-view="portfolio" style="font-family:var(--mono);font-size:11px;padding:8px 18px;border:none;cursor:pointer;background:${view==='portfolio'?'var(--amber)':'transparent'};color:${view==='portfolio'?'#000':'var(--ink-dim)'};font-weight:${view==='portfolio'?'700':'400'}">◆ Portfolio</button>
+      <button class="bets-view-btn" data-view="ledger" style="font-family:var(--mono);font-size:11px;padding:8px 18px;border:none;cursor:pointer;background:${view==='ledger'?'var(--amber)':'transparent'};color:${view==='ledger'?'#000':'var(--ink-dim)'};font-weight:${view==='ledger'?'700':'400'}">▤ Ledger (${perf.bets.length})</button>
+    </div>`;
+
+  if (view === 'ledger') {
+    body.innerHTML = toggle + ledger + note;
+  } else {
+    body.innerHTML = toggle + summary + chartHtml + balanceHtml + positionsHtml + activityHtml + insightsHtml + todayHtml + note;
+  }
+  // Wire the view toggle.
+  body.querySelectorAll('.bets-view-btn').forEach(btn => {
+    btn.addEventListener('click', () => { _betsView = btn.dataset.view; renderBetsTab(); });
+  });
+  // Wire receipt-row taps (ledger view).
+  body.querySelectorAll('.bot-receipt-row').forEach(row => {
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('.bot-ticker-link')) return;  // ticker link handled separately
+      const id = row.dataset.betId;
+      if (id && typeof showBotReceipt === 'function') showBotReceipt(id);
+    });
+  });
+
   // Wire the equity-curve window selector.
   body.querySelectorAll('[data-perfwin]').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -42977,6 +44348,27 @@ document.addEventListener('DOMContentLoaded', () => {
         source: 'system',
       });
     }
+  });
+
+  // ---- Home → TRAPP2-PORT portfolio backend repo ----
+  document.getElementById('home-port-export-btn')?.addEventListener('click', () => {
+    if (typeof exportPortfolioData === 'function') exportPortfolioData();
+  });
+  document.getElementById('home-port-import-btn')?.addEventListener('click', async () => {
+    const btn = document.getElementById('home-port-import-btn');
+    if (btn) { btn.textContent = 'Importing…'; btn.disabled = true; }
+    try { if (typeof importPortfolioData === 'function') await importPortfolioData(); }
+    catch (e) { console.warn('[portfolio] import failed', e); }
+    if (btn) { btn.textContent = '⤒ Import from Repo'; btn.disabled = false; }
+    // Refresh portfolio-dependent views if open.
+    try { if (typeof renderStockBook === 'function') renderStockBook(); } catch {}
+    try { if (typeof renderGoodGlobeIndex === 'function') renderGoodGlobeIndex(); } catch {}
+  });
+  document.getElementById('home-port-commit-btn')?.addEventListener('click', () => {
+    window.open(PORT_DATA_REPO_EDIT, '_blank', 'noopener');
+  });
+  document.getElementById('home-port-open-btn')?.addEventListener('click', () => {
+    window.open(PORT_DATA_REPO, '_blank', 'noopener');
   });
 
   // ---- Home → Cache clearing ----

@@ -6742,6 +6742,140 @@
     .control-bar > input, #ticker { min-width: 0; flex: 1 1 200px; }
     /* Generic: long mono strings (rationales, tags) wrap rather than push width. */
     .company-tag { white-space: normal; word-break: break-word; }
+
+    /* ============================================================
+       COMPREHENSIVE MOBILE LAYOUT (≤ 640px) — phones & narrow windows.
+       Covers every tab: reduces oversized paddings, collapses multi-column
+       card grids to single column, fixes the function overlays (supply-chain
+       WEB graph), and keeps tables/controls inside the viewport.
+       ============================================================ */
+
+    /* 1. Tab body containers: the hardcoded 32px side padding eats ~64px on a
+       390px screen. Cut it right down so content uses the full width. */
+    .tab-body-pad { padding-left: 12px !important; padding-right: 12px !important; padding-bottom: 48px !important; }
+
+    /* 2. The workspace (valuation/company/etc.) — tighten side padding. */
+    .workspace { padding: 12px !important; }
+
+    /* 3. Card grids → collapse on phones. Large content cards (minmax ≥180px)
+       go to a SINGLE column (they cramp otherwise). Small stat cards
+       (minmax 120–160px) stay TWO-up — compact metrics like Portfolio Value /
+       Cash / P&L read fine side-by-side and waste less vertical space.
+       Default: any auto-fit/auto-fill grid → 2 columns; the larger-minmax ones
+       below override to 1. */
+    [style*="grid-template-columns:repeat(auto-fit"],
+    [style*="grid-template-columns: repeat(auto-fit"],
+    [style*="grid-template-columns:repeat(auto-fill"],
+    [style*="grid-template-columns: repeat(auto-fill"] {
+      grid-template-columns: repeat(2, 1fr) !important;
+    }
+    /* Larger content-card grids → single column (these are the ones that cramp). */
+    [style*="minmax(180px"], [style*="minmax(200px"], [style*="minmax(220px"],
+    [style*="minmax(240px"], [style*="minmax(260px"], [style*="minmax(280px"],
+    [style*="minmax(300px"], [style*="minmax(320px"], [style*="minmax(340px"],
+    [style*="minmax(360px"] {
+      grid-template-columns: 1fr !important;
+    }
+    /* Fixed 2-/3-column grids also collapse to single column. */
+    [style*="grid-template-columns:1fr 1fr"],
+    [style*="grid-template-columns: 1fr 1fr"],
+    [style*="grid-template-columns:repeat(3"],
+    [style*="grid-template-columns: repeat(3"] {
+      grid-template-columns: 1fr !important;
+    }
+
+    /* 4. Bot Bets tab: the big serif header + the control buttons. Shrink the
+       header, stack it above the controls, and let the filter/buttons wrap to
+       full-width rows of comfortable tap targets. */
+    .bets-title { font-size: 22px !important; }
+    .news-header { flex-direction: column !important; align-items: stretch !important; gap: 10px !important; }
+    .bets-controls { flex-wrap: wrap !important; width: 100%; }
+    #bets-filter { width: 100% !important; flex: 1 1 100% !important; margin-bottom: 4px; box-sizing: border-box; }
+    /* The control buttons (Refresh/Run/Retrain/Export/Import/Rebalance) wrap into
+       a tidy grid of tap targets instead of overflowing off-screen. */
+    .bets-controls button, [id^="bets-"][id$="-btn"] {
+      flex: 1 1 40%; min-height: 40px; white-space: nowrap; font-size: 11px;
+    }
+
+    /* 5. Generic card/company-card padding trim so cards aren't mostly padding. */
+    .company-card { padding: 12px !important; }
+
+    /* 6. FUNCTION OVERLAYS (supply-chain WEB graph, and all fn-overlays):
+       drop the 40px frame to ~6px so the graph gets the whole screen, and let
+       the control bar wrap. The canvas is width:100% so it follows. */
+    .fn-overlay { padding: 6px !important; }
+    .fn-overlay-head { padding: 10px 12px !important; flex-wrap: wrap; row-gap: 6px; }
+    .fn-overlay-title { font-size: 17px !important; }
+    .fn-overlay-meta { font-size: 10px !important; gap: 8px !important; }
+    .fn-overlay-body { padding: 12px !important; }
+    /* WEB graph control row: selects/inputs go full-width and stack. */
+    #web-lens, #web-kw { width: 100% !important; min-width: 0 !important; flex: 1 1 100%; }
+    #web-stats { margin-left: 0 !important; }
+    /* The graph needs real height on a phone. The overlay body is a flex column;
+       give the canvas a solid floor and let its wrapper fill remaining space. */
+    #web-canvas { min-height: 55vh; height: 55vh; }
+
+    /* 7. Tables: never force page width; scroll inside their own container. */
+    table { max-width: 100%; }
+    .sb-table, .proj-table, .financials-table, .corr-matrix-table,
+    .research-table, .ledger-table {
+      display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; white-space: nowrap;
+    }
+
+    /* 8. Masthead/title shrink so the header doesn't dominate a small screen. */
+    .masthead-title { font-size: 20px !important; }
+    .masthead-sub { font-size: 9px !important; }
+    .masthead { padding: 8px 12px !important; }
+
+    /* 9. Sub-tab strips (valuation/company) scroll horizontally rather than wrap
+       into a tall stack — keeps them to one swipeable row. */
+    .val-subtabs, .company-tabs { overflow-x: auto; -webkit-overflow-scrolling: touch; flex-wrap: nowrap; }
+    .val-subtabs::-webkit-scrollbar, .company-tabs::-webkit-scrollbar { height: 0; }
+
+    /* 10. The main tab nav: horizontal scroll, no wrap, comfortable tap size. */
+    .tabs, .tab-nav { overflow-x: auto; -webkit-overflow-scrolling: touch; flex-wrap: nowrap; }
+    .tab-btn { flex: 0 0 auto; }
+
+    /* 11. Segmented controls (News/Social toggle, Overview/etc.) wrap cleanly. */
+    .seg-control { flex-wrap: wrap; }
+
+    /* 12. Charts/SVGs never overflow horizontally. */
+    svg, canvas { max-width: 100%; }
+
+    /* 13. Wide min-widths force horizontal scroll on phones — neutralize the
+       common ones so content reflows to the viewport. (These are mostly chart
+       wrappers and tables that read fine narrower or can scroll internally.) */
+    [style*="min-width:560px"], [style*="min-width: 560px"],
+    [style*="min-width:520px"], [style*="min-width: 520px"],
+    [style*="min-width:600px"], [style*="min-width: 600px"],
+    [style*="min-width:620px"], [style*="min-width: 620px"],
+    [style*="min-width:680px"], [style*="min-width: 680px"] {
+      min-width: 0 !important;
+    }
+  }
+
+  /* ============================================================
+     VERY SMALL PHONES (≤ 400px) — iPhone mini / SE and similar. Even compact
+     2-up stat cards get tight here, so go fully single-column and trim further.
+     ============================================================ */
+  @media (max-width: 400px) {
+    .tab-body-pad { padding-left: 8px !important; padding-right: 8px !important; }
+    .workspace { padding: 8px !important; }
+    /* Everything single-column at this width — including the small stat cards. */
+    [style*="grid-template-columns:repeat(auto-fit"],
+    [style*="grid-template-columns: repeat(auto-fit"],
+    [style*="grid-template-columns:repeat(auto-fill"],
+    [style*="grid-template-columns: repeat(auto-fill"],
+    [style*="grid-template-columns:repeat(2"],
+    [style*="grid-template-columns: repeat(2"] {
+      grid-template-columns: 1fr !important;
+    }
+    .masthead-title { font-size: 18px !important; }
+    .company-card { padding: 10px !important; }
+    #web-canvas { min-height: 300px; }
+    /* The WEB graph's corner hint text is noise on a tiny screen — hide it. */
+    .fn-overlay-body [style*="position:absolute;bottom:8px;left:8px"] { display: none !important; }
+
 </style>
 </head>
 <body>
@@ -7562,7 +7696,7 @@
     <h2>Growth & Inflation Regime Detection</h2>
     <p class="macro-intro-sub">A four-quadrant macro framework based on the <em>rate of change</em> of growth and inflation. Each regime has historically favored different sectors, asset classes, and investment styles.</p>
     <p class="macro-intro-disclaimer">
-      <strong>This is a transparent, public-data approximation</strong> using FRED's official Real GDP (GDPC1) and CPI (CPIAUCSL) series — not Hedgeye's proprietary GIP nowcast. No API key needed for macro data. Use this as an educational reference; their daily Quad call is a paid service with proprietary inputs.
+      <strong>This is a transparent, public-data approximation</strong> using FRED's official Real GDP (GDPC1) and CPI (CPIAUCSL) series. No API key needed for macro data. Use this as an educational reference for the growth/inflation regime.
     </p>
   </div>
 
@@ -7599,6 +7733,14 @@
           <span><span class="dot" style="background:var(--neg)"></span>Quad 3</span>
           <span><span class="dot" style="background:#6b7a8f"></span>Quad 4</span>
         </div>
+      </div>
+    </div>
+
+    <!-- SUPPLEMENTARY MACRO INDICATORS -->
+    <div class="section">
+      <div class="section-title">Macro Indicators <small>leading &amp; confirming signals for the growth / inflation regime · FRED</small></div>
+      <div id="macro-indicators" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px">
+        <div style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);padding:8px">Loading indicators…</div>
       </div>
     </div>
 
@@ -7909,7 +8051,7 @@
       <button class="btn btn-ghost" id="fed-refresh-btn" title="Re-read seeded data">Reset to Public Data</button>
     </div>
   </div>
-  <div id="fed-body" style="padding:0 32px 60px;overflow-x:auto"></div>
+  <div id="fed-body" class="tab-body-pad" style="padding:0 32px 60px;overflow-x:auto"></div>
 </div><!-- /fed panel -->
 
 <!-- ===== BETS PANEL =====
@@ -7920,22 +8062,26 @@
 <div class="tab-panel" data-panel="bets">
   <div class="news-header">
     <div>
-      <h1 style="font-family:var(--serif);font-size:34px;margin:0">Bot Bets ↗</h1>
+      <h1 class="bets-title" style="font-family:var(--serif);font-size:34px;margin:0">Bot Bets ↗</h1>
       <div style="color:var(--ink-dim);font-family:var(--mono);font-size:11px;letter-spacing:0.05em;margin-top:4px">
         $1,000 paper portfolio · conviction-sized signals · 6-month challenge vs you
       </div>
     </div>
-    <div style="display:flex;gap:8px;align-items:center">
+    <div class="bets-controls" style="display:flex;gap:8px;align-items:center">
       <input id="bets-filter" placeholder="filter by ticker" style="background:var(--bg-elev);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:11px;padding:6px 10px;border-radius:3px;width:140px">
       <button class="btn btn-ghost" id="bets-refresh-btn" title="Fetch fresh live prices for open positions (Stooq/Finnhub), USD-converted">Refresh Prices</button>
       <button class="btn btn-ghost" id="bets-run-btn" title="Run today's signal scan now">Run Scan</button>
       <button class="btn btn-ghost" id="bets-retrain-btn" title="Retrain signal weights from settled bets — learns from wins and losses">Retrain</button>
       <button class="btn btn-ghost" id="bets-export-btn" title="Export full training journal as JSON to commit to the bot-data repo">⤓ Export Training</button>
-      <button class="btn btn-ghost" id="bets-import-btn" title="Import the bot's history from the bot-data repo (restores full journal on a fresh device)">⤒ Import Repo</button>
+      <button class="btn btn-ghost" id="bets-import-btn" title="Pull the bot's history from the TRAPP2-BOT repo on GitHub (restores the journal on a fresh device)">⤒ Import Repo</button>
+      <button class="btn btn-ghost" id="bets-import-file-btn" title="Import a bot_training_data.json file from your device (drag-drop or pick a file) — no GitHub needed">⤒ Import File</button>
+      <input type="file" id="bets-import-file-input" accept="application/json,.json" style="display:none">
+      <button class="btn btn-ghost" id="bets-commit-btn" title="Open the TRAPP2-BOT file editor on GitHub to paste/commit the exported JSON">Open Repo to Commit ↗</button>
+      <button class="btn btn-ghost" id="bets-repo-btn" title="Open the TRAPP2-BOT repository on GitHub">Open TRAPP2-BOT ↗</button>
       <button class="btn btn-ghost" id="bets-rebalance-btn" title="Trim open positions to restore positive cash (partial sells, largest first)">Rebalance Cash</button>
     </div>
   </div>
-  <div id="bets-body" style="padding:0 32px 60px;overflow-x:auto"></div>
+  <div id="bets-body" class="tab-body-pad" style="padding:0 32px 60px;overflow-x:auto"></div>
 </div><!-- /bets panel -->
 
 <!-- ===== RESEARCH PANEL =====
@@ -7952,7 +8098,7 @@
       </div>
     </div>
   </div>
-  <div id="research-body" style="padding:0 32px 60px;overflow-x:auto"></div>
+  <div id="research-body" class="tab-body-pad" style="padding:0 32px 60px;overflow-x:auto"></div>
 </div><!-- /research panel -->
 
 <!-- ===== REVIEW PANEL (human-in-the-loop) =====
@@ -7968,7 +8114,7 @@
       </div>
     </div>
   </div>
-  <div id="review-body" style="padding:0 32px 60px;overflow-x:auto"></div>
+  <div id="review-body" class="tab-body-pad" style="padding:0 32px 60px;overflow-x:auto"></div>
 </div><!-- /review panel -->
 
 <!-- ===== SCENARIOS PANEL =====
@@ -8359,6 +8505,18 @@
       <div class="modal-help">Free key: <a href="https://fcsapi.com/dashboard/api" target="_blank" style="color:var(--amber)">fcsapi.com</a>. <strong>500 calls/month</strong>, 30+ countries, 35K+ tickers, native logos via SVG. Pairs well with Polygon for non-US coverage.</div>
     </div>
 
+    <div class="modal-section" style="border-top:1px solid var(--rule);padding-top:14px">
+      <div class="modal-label">Supabase Auto-Backend (trading bot — optional, eliminates manual commits)</div>
+      <input type="text" class="modal-input" id="supabase-url-input" placeholder="Project URL — https://xxxx.supabase.co" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
+      <input type="text" class="modal-input" id="supabase-anon-input" placeholder="anon public key (safe in browser)" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn" id="supabase-save-btn">Save Supabase Config</button>
+        <button class="btn btn-ghost" id="supabase-sync-btn" title="Push every local trade to Supabase now (one-time backfill / manual sync)">Sync All Trades Now ↗</button>
+        <span id="supabase-status" style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);align-self:center"></span>
+      </div>
+      <div class="modal-help">When set, the bot <strong>writes every trade to Supabase the instant it happens</strong> and reads them all on load — no manual export/commit, no human error. GitHub (TRAPP2-BOT) stays as backup. The anon key is meant to be public; a row-level-security policy on the <code>bot_trades</code> table guards writes. One-time setup: create a project at <a href="https://supabase.com" target="_blank" style="color:var(--amber)">supabase.com</a>, add a <code>bot_trades</code> table (<code>id text primary key, trade jsonb, updated_at timestamptz default now()</code>), enable an anon insert/update/select policy, then paste the URL + anon key here. See SUPABASE-SETUP notes for the exact SQL.</div>
+    </div>
+
     <div class="modal-section">
       <div class="modal-label">FRED API Key (macro data — recommended)</div>
       <input type="text" class="modal-input" id="fred-key-input" placeholder="Paste FRED key here">
@@ -8602,6 +8760,18 @@
       </div>
     </div>
 
+    <!-- Section: Portfolio backend repo (TRAPP2-PORT) -->
+    <div class="home-section">
+      <div class="home-section-title">Portfolio Backend · TRAPP2-PORT</div>
+      <div class="home-section-sub">Durable, cross-device store for your holdings, watchlists, transaction ledger, cash position, and GoodGlobe Index. Export the JSON, commit it to the repo, and import it on any device to restore — same flow as the trading-bot repo.</div>
+      <div class="home-export-buttons">
+        <button class="btn" id="home-port-export-btn" title="Download portfolio_data.json (holdings, watching, transactions, cash, GoodGlobe Index) to commit to TRAPP2-PORT">⤓ Export Portfolio JSON</button>
+        <button class="btn" id="home-port-import-btn" title="Pull the latest portfolio_data.json from TRAPP2-PORT and restore it on this device">⤒ Import from Repo</button>
+        <button class="btn btn-ghost" id="home-port-commit-btn" title="Open the repo file editor on GitHub to paste/commit the exported JSON">Open Repo to Commit ↗</button>
+        <button class="btn btn-ghost" id="home-port-open-btn" title="Open the TRAPP2-PORT repository on GitHub">Open TRAPP2-PORT ↗</button>
+      </div>
+    </div>
+
     <!-- Section: Theme + display -->
     <div class="home-section">
       <div class="home-section-title">Display Preferences</div>
@@ -8664,6 +8834,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260615a"></script>
+<script src="app.js?v=20260615k"></script>
 </body>
 </html>
