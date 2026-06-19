@@ -5384,6 +5384,24 @@ function renderSummary(s) {
   if (s.marketCap != null) mcapEl.title = exactValue(s.marketCap, true);
   else mcapEl.removeAttribute('title');
 
+  // "Last price pulled at:" — the exact backend fetch timestamp (written by the
+  // pipeline into each row's fetched_at). This is the authoritative time the
+  // price was captured, and it's what we match news-article times against to
+  // estimate the price when an article was written.
+  const asofEl = document.getElementById('s-price-asof');
+  if (asofEl) {
+    const fa = s.fetched_at || s._fetchedAt || (s.rawRow && (s.rawRow['fetched_at'] || s.rawRow['fetchedat']));
+    if (fa) {
+      const d = new Date(fa);
+      if (!isNaN(d)) {
+        const ageMin = Math.round((Date.now() - d.getTime()) / 60000);
+        const ageStr = ageMin < 1 ? 'just now' : ageMin < 60 ? `${ageMin}m ago` : ageMin < 1440 ? `${Math.round(ageMin / 60)}h ago` : `${Math.round(ageMin / 1440)}d ago`;
+        asofEl.textContent = `pulled ${d.toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' })} · ${ageStr}`;
+        asofEl.title = `Exact time this price was fetched into the backend (data/master): ${d.toISOString()}. News articles are matched to the nearest price pull to estimate the price when each article was written.`;
+      } else { asofEl.textContent = ''; }
+    } else { asofEl.textContent = ''; }
+  }
+
   // Cross-source consensus rendering for P/E, Beta, EPS, Volume.
   // The fetcher captures raw per-source values in s._sources; consensusValue()
   // decides whether to show the consensus, an estimate (est), or unverified.
@@ -8499,17 +8517,24 @@ function _priceMoveAfter(ticker, dateStr, sessions) {
 function buildProxiedFredUrl(seriesId, proxyIdx) {
   const target = `https://fred.stlouisfed.org/graph/fredgraph.csv?id=${seriesId}`;
   const proxies = [
-    // 0: direct (rarely works due to CORS, but try anyway)
-    u => u,
-    // 1-6: proxies
-    u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
+    // 0: allorigins raw — generally the most permissive for CSV
     u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+    // 1: codetabs
     u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
-    u => `https://corsproxy.io/?${encodeURIComponent(u)}`, // legacy form
-    u => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`, // wrapped JSON form
+    // 2: corsproxy.io (url= form)
+    u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
+    // 3: corsproxy.io legacy form
+    u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+    // 4: allorigins wrapped JSON (contents field) — handled via wrapped flag
+    u => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`,
+    // 5: thingproxy
     u => `https://thingproxy.freeboard.io/fetch/${u}`,
+    // 6: whateverorigin-style fallback (cors.eu.org)
+    u => `https://cors.eu.org/${u}`,
+    // 7: direct (rarely works due to CORS, but try last)
+    u => u,
   ];
-  return proxies[proxyIdx] ? { url: proxies[proxyIdx](target), wrapped: proxyIdx === 5 } : null;
+  return proxies[proxyIdx] ? { url: proxies[proxyIdx](target), wrapped: proxyIdx === 4 } : null;
 }
 
 // Fetch a FRED series and return [{date, value}] sorted oldest → newest.
@@ -8904,13 +8929,11 @@ async function fetchMacroFromGitHub(setStatus) {
 // source (and catch a stale pipeline). Requires a FRED API key; returns a list
 // of { series, label, backendDate, backendValue, fredValue, deltaPct, status }.
 async function verifyMacroAgainstFred() {
-  if (!getFredKey()) {
-    return { ok: false, reason: 'no-key', message: 'Add a FRED API key in Data Sources to verify backend values against the live source.' };
-  }
   const gh = await fetchMacroFromGitHub(null);
   if (!gh) {
-    return { ok: false, reason: 'no-backend', message: 'No backend macro snapshot found to verify (the GitHub data/macro/ files are missing).' };
+    return { ok: false, reason: 'no-backend', message: 'No backend macro snapshot found to verify (the GitHub data/macro/ files are missing). Set your GitHub Data base URL in Data Sources.' };
   }
+  const hasKey = !!getFredKey();
   const series = [
     { id: FRED_SERIES.gdp, label: 'Real GDP', backend: gh.gdpRaw },
     { id: FRED_SERIES.cpi, label: 'CPI', backend: gh.cpiRaw },
@@ -8924,8 +8947,14 @@ async function verifyMacroAgainstFred() {
       continue;
     }
     let fred = [];
-    try { fred = await fetchFredSeries(s.id); } catch (e) {
-      results.push({ series: s.id, label: s.label, status: 'fred-fetch-failed', error: e.message });
+    let fredErr = null;
+    try {
+      fred = await fetchFredSeries(s.id);
+    } catch (e) {
+      fredErr = e.message;
+    }
+    if (!fred || !fred.length) {
+      results.push({ series: s.id, label: s.label, status: 'fred-fetch-failed', error: fredErr || 'no data', needsKey: !hasKey });
       continue;
     }
     // Compare on the latest date the backend has (FRED may be slightly newer).
@@ -8936,7 +8965,6 @@ async function verifyMacroAgainstFred() {
       continue;
     }
     const deltaPct = backendLast.value !== 0 ? ((fredMatch.value - backendLast.value) / Math.abs(backendLast.value)) * 100 : (fredMatch.value === backendLast.value ? 0 : 100);
-    // Tolerance: <0.5% delta = match (rounding/revision noise); else flag.
     const status = Math.abs(deltaPct) < 0.5 ? 'match' : (Math.abs(deltaPct) < 3 ? 'minor-diff' : 'mismatch');
     results.push({
       series: s.id, label: s.label,
@@ -8946,7 +8974,7 @@ async function verifyMacroAgainstFred() {
     });
   }
   const mismatches = results.filter(r => r.status === 'mismatch').length;
-  return { ok: true, results, mismatches, checked: results.length };
+  return { ok: true, results, mismatches, checked: results.length, hasKey };
 }
 if (typeof window !== 'undefined') window.verifyMacroAgainstFred = verifyMacroAgainstFred;
 
@@ -10053,9 +10081,22 @@ document.getElementById('macro-verify-btn')?.addEventListener('click', async () 
         <td style="font-family:var(--mono);font-size:9px;color:var(--ink-dim)">${detail}</td>
       </tr>`;
     }).join('');
-    const summary = v.mismatches > 0
-      ? `<span style="color:var(--neg)">${v.mismatches} mismatch(es) — backend may be stale; re-run the macro pipeline</span>`
-      : `<span style="color:var(--pos)">✓ Backend matches FRED across ${v.checked} series</span>`;
+    const matched = v.results.filter(r => r.status === 'match' || r.status === 'minor-diff').length;
+    const failed = v.results.filter(r => r.status === 'fred-fetch-failed').length;
+    const noData = v.results.filter(r => r.status === 'no-backend-data' || r.status === 'no-fred-match').length;
+    let summary;
+    if (v.mismatches > 0) {
+      summary = `<span style="color:var(--neg)">${v.mismatches} mismatch(es) — backend may be stale; re-run the macro pipeline</span>`;
+    } else if (failed === v.checked && v.checked > 0) {
+      // ALL series failed to fetch from FRED — nothing was actually verified.
+      summary = `<span style="color:var(--neg)">✗ Could not verify — every FRED fetch failed (the public proxies are throttling). Add a free FRED API key in Data Sources for a reliable connection.</span>`;
+    } else if (failed > 0 || noData > 0) {
+      summary = `<span style="color:var(--amber)">⚠ Verified ${matched}/${v.checked} series${failed ? ` · ${failed} FRED fetch${failed > 1 ? 'es' : ''} failed` : ''}${noData ? ` · ${noData} missing data` : ''}. ${failed ? 'Add a FRED API key for the series that failed.' : ''}</span>`;
+    } else if (matched === v.checked && v.checked > 0) {
+      summary = `<span style="color:var(--pos)">✓ Backend matches FRED across all ${v.checked} series</span>`;
+    } else {
+      summary = `<span style="color:var(--ink-dim)">No series could be compared.</span>`;
+    }
     if (host) host.innerHTML = `
       <div style="font-family:var(--mono);font-size:10px;margin-bottom:6px">${summary}</div>
       <table class="sb-table" style="width:100%"><tbody>${rows}</tbody></table>`;
@@ -14779,6 +14820,18 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if (!w.slug) w.slug = slugifyName(w.name);
     saveLeadershipPerson(w);
+    // Send the edit to Review for confirmation (same as the overview editor).
+    if (typeof flagForReview === 'function') {
+      const tk = (w.assignedTickers && w.assignedTickers[0]) || w.ticker || '';
+      flagForReview('leadershipEdit', {
+        key: `${tk}:${w.name}`,
+        label: `Leadership edit${tk ? ` (${tk})` : ''}: ${w.name}`,
+        detail: `Role: ${(w.assignedRoleByTicker && tk && w.assignedRoleByTicker[tk]) || w.role || '(none)'}`,
+        ticker: tk,
+        options: [{ label: 'Approve', action: 'approveLeadershipEdit' }, { label: 'Revert', action: 'revertLeadershipEdit' }],
+      });
+      if (typeof renderReviewHub === 'function') { try { renderReviewHub(); } catch {} }
+    }
     const cb = state.leadership.onEditComplete;
     closeLeadershipEditModal();
     if (cb) cb();
@@ -17331,10 +17384,50 @@ async function loadFinancials(ticker, forceRefresh = false) {
     return;
   }
 
-  el.innerHTML = '<div class="empty" style="padding:40px;text-align:center;color:var(--ink-dim);font-family:var(--mono);font-size:12px">Loading financials from FMP…</div>';
+  el.innerHTML = '<div class="empty" style="padding:40px;text-align:center;color:var(--ink-dim);font-family:var(--mono);font-size:12px">Loading financials…</div>';
+
+  const period = state.financials.period;
+  const wantQuarterly = period === 'quarter';
+
+  // ---- REPO FIRST: the pipeline (fetch_financials.py) commits BOTH annual and
+  // quarterly statements to data/financials/<TICKER>.json. The repo is free and
+  // has quarterly even when the FMP free tier doesn't — which is exactly why
+  // quarterly used to come up blank (FMP-only + quarterly is a paid FMP tier).
+  try {
+    const repoFin = await fetchRepoFinancials(ticker);
+    if (repoFin) {
+      const inc = wantQuarterly ? (repoFin.incomeQuarterly || []) : (repoFin.income || []);
+      const bal = wantQuarterly ? (repoFin.balanceQuarterly || []) : (repoFin.balance || []);
+      const cf  = wantQuarterly ? (repoFin.cashflowQuarterly || []) : (repoFin.cashflow || []);
+      if (inc.length || bal.length || cf.length) {
+        state.financials.ticker = cacheKey;
+        state.financials.data = { income: inc, balance: bal, cashflow: cf, _source: 'repo' };
+        renderFinancials();
+        return;
+      }
+      // Repo file exists but has no quarterly yet (pipeline not re-run since the
+      // quarterly update) — fall through to FMP for quarterly.
+    }
+  } catch {}
+
+  if (!getFmpKey()) {
+    el.innerHTML = `
+      <div class="empty" style="padding:40px;text-align:center;line-height:1.7">
+        <div style="color:var(--amber);font-size:16px;margin-bottom:12px">${wantQuarterly ? 'Quarterly financials not in the repo yet' : 'Financial Modeling Prep API key required'}</div>
+        <p style="color:var(--ink-dim);font-family:var(--mono);font-size:12px">
+          ${wantQuarterly
+            ? 'The backend pipeline needs to run with the quarterly update to populate quarterly statements. Annual works from the repo now. You can also add an FMP key as a live fallback.'
+            : 'Free tier: 250 calls/day · <a href="https://site.financialmodelingprep.com/register" target="_blank" style="color:var(--amber)">financialmodelingprep.com/register</a>'}
+        </p>
+        <p style="color:var(--ink-dim);font-family:var(--mono);font-size:11px;margin-top:14px">
+          Then click <strong>Data Sources</strong> → paste the FMP key → Save.
+        </p>
+      </div>
+    `;
+    return;
+  }
 
   try {
-    const period = state.financials.period;
     const limit = period === 'annual' ? 5 : 8; // 5 years annual, 8 quarters
     const [income, balance, cashflow] = await Promise.all([
       fetchFmpIncome(ticker, period, limit),
@@ -17349,7 +17442,7 @@ async function loadFinancials(ticker, forceRefresh = false) {
           <div style="color:var(--red);font-size:14px;margin-bottom:12px">No ${period} data returned for ${ticker}</div>
           <div style="color:var(--ink-dim);max-width:520px;margin:0 auto">
             ${isQuarterly
-              ? `Quarterly data may not be available on the FMP free tier for this ticker.<br>Try <strong style="color:var(--amber)">Annual</strong> instead, or check your FMP dashboard for daily quota usage.<br><br>Open browser DevTools (F12) → Console — FMP's exact error will be logged there.`
+              ? `Quarterly isn't in the repo for this ticker yet AND the FMP free tier didn't return it.<br>Re-run the backend <strong style="color:var(--amber)">fetch_financials.py</strong> (now quarterly-capable), or try <strong style="color:var(--amber)">Annual</strong>.<br><br>Open DevTools (F12) → Console for FMP's exact error.`
               : `Possible reasons: ticker symbol is wrong, FMP daily quota (250) exhausted, or this ticker isn't covered.<br>Open browser DevTools (F12) → Console for the exact error.`}
           </div>
         </div>
@@ -17358,7 +17451,7 @@ async function loadFinancials(ticker, forceRefresh = false) {
     }
 
     state.financials.ticker = cacheKey;
-    state.financials.data = { income: income || [], balance: balance || [], cashflow: cashflow || [] };
+    state.financials.data = { income: income || [], balance: balance || [], cashflow: cashflow || [], _source: 'fmp' };
     renderFinancials();
   } catch (e) {
     el.innerHTML = `<div class="empty" style="padding:40px;text-align:center;color:var(--red)">Error: ${e.message}</div>`;
@@ -29240,9 +29333,13 @@ async function renderCompanyOverview() {
         const tb = new Date(b.datetime || b.publishedAt || 0).getTime();
         return tb - ta;
       });
-      const articles = tickerArticles.slice(0, 8);
+      // Show 8 by default, all when expanded (per-ticker toggle).
+      const _expandKey = `_companyNewsExpanded_${tic}`;
+      const expanded = !!window[_expandKey];
+      const shown = expanded ? tickerArticles : tickerArticles.slice(0, 8);
+      const articles = shown;
       const articleStates = typeof loadArticleStates === 'function' ? loadArticleStates() : {};
-      const articleRows = articles.length === 0
+      const articleRows = tickerArticles.length === 0
         ? `<div style="color:var(--ink-faint);font-family:var(--mono);font-size:11px;padding:14px 0;font-style:italic">No news articles yet mentioning ${escapeHtml(tic)}. The news pipeline pulls market-cap-sorted articles nightly — check back after the next refresh.</div>`
         : articles.map(n => {
             const dt = n.datetime || n.publishedAt;
@@ -29252,10 +29349,11 @@ async function renderCompanyOverview() {
                                 : n.priority === 'medium'   ? '#7faaca'
                                 : 'var(--ink-faint)';
             const isRead = articleStates?.[typeof articleKey === 'function' ? articleKey(n) : '']?.status === 'read';
+            const aKey = (typeof articleKey === 'function' ? articleKey(n) : (n.url || n.headline || '')).replace(/'/g, "\\'");
             return `
-              <div class="ticker-news-row${isRead ? ' read' : ''}" onclick="switchTab('news')" style="cursor:pointer">
+              <div class="ticker-news-row${isRead ? ' read' : ''}" style="cursor:pointer;display:flex;align-items:flex-start;gap:6px">
                 <div class="ticker-news-priority" style="background:${priorityColor}"></div>
-                <div class="ticker-news-content">
+                <div class="ticker-news-content" onclick="switchTab('news')" style="flex:1">
                   <div class="ticker-news-headline">${escapeHtml(n.headline)}</div>
                   <div class="ticker-news-meta">
                     ${n.source ? `<span>${escapeHtml(n.source)}</span> · ` : ''}
@@ -29263,18 +29361,22 @@ async function renderCompanyOverview() {
                     ${n.priority ? ` · <span style="color:${priorityColor};text-transform:uppercase;font-weight:600">${escapeHtml(n.priority)}</span>` : ''}
                   </div>
                 </div>
+                <button onclick="event.stopPropagation();removeCompanyNewsArticle('${aKey}','${escapeHtml(tic)}')" title="Remove this article and send it to Review (wrong ticker / didn't pull right)" style="background:transparent;border:none;color:var(--ink-faint);cursor:pointer;font-size:13px;padding:2px 4px;flex-shrink:0" onmouseover="this.style.color='var(--neg)'" onmouseout="this.style.color='var(--ink-faint)'">✕</button>
               </div>
             `;
           }).join('');
       tickerNewsSection = `
         <div class="company-card">
           <h4>News for ${escapeHtml(tic)}
-            <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· articles where ${escapeHtml(tic)} appears · click any row to open News tab</span>
+            <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· articles where ${escapeHtml(tic)} appears · ✕ removes &amp; sends to Review</span>
           </h4>
           <div class="ticker-news-list">
             ${articleRows}
           </div>
-          ${articles.length > 0 ? `<div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:8px;text-transform:uppercase;letter-spacing:0.08em">Showing ${articles.length} of ${tickerArticles.length} total · sorted by recency</div>` : ''}
+          ${tickerArticles.length > 0 ? `<div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;gap:10px">
+            <span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.08em">Showing ${articles.length} of ${tickerArticles.length}</span>
+            ${tickerArticles.length > 8 ? `<button onclick="window['${_expandKey}']=${!expanded};loadCompany('${escapeHtml(tic)}')" style="background:transparent;border:1px solid var(--rule);color:var(--amber);font-family:var(--mono);font-size:9px;padding:4px 10px;border-radius:3px;cursor:pointer">${expanded ? '▲ Show less' : `▼ See all ${tickerArticles.length}`}</button>` : ''}
+          </div>` : ''}
         </div>
       `;
     }
@@ -30473,9 +30575,10 @@ function openLeadershipEditor(tic) {
     <label style="${_ceLbl}">${label}</label>
     <div id="le-${key}">
       ${(eff[key] || []).map(p => `
-        <div style="display:flex;align-items:center;gap:6px;padding:3px 0;border-bottom:1px dotted var(--rule)" data-name="${escapeHtml(p.name || p)}">
-          <span style="font-size:11px;color:var(--ink);flex:1">${escapeHtml(p.name || p)}${p._humanAdded ? ' <span style="color:var(--amber);font-size:9px">✎ added</span>' : ''}</span>
-          <span style="font-size:10px;color:var(--ink-dim)">${escapeHtml(p.role || '')}</span>
+        <div style="display:flex;align-items:center;gap:6px;padding:3px 0;border-bottom:1px dotted var(--rule)" data-name="${escapeHtml(p.name || p)}" data-role="${escapeHtml(p.role || '')}" data-group="${key}">
+          <span class="le-person-name" style="font-size:11px;color:var(--ink);flex:1;cursor:pointer" title="Click to edit this person">${escapeHtml(p.name || p)}${p._humanAdded ? ' <span style="color:var(--amber);font-size:9px">✎ added</span>' : ''}</span>
+          <span class="le-person-role" style="font-size:10px;color:var(--ink-dim)">${escapeHtml(p.role || '')}</span>
+          <button class="btn btn-ghost le-edit" style="font-size:10px;padding:1px 6px" title="Edit name / role">✎</button>
           <button class="btn btn-ghost le-rm" style="font-size:10px;padding:1px 6px" title="Remove (suppressed everywhere, reversible by re-adding)">✕</button>
         </div>`).join('') || '<div style="font-size:10px;color:var(--ink-faint)">none</div>'}
     </div>`;
@@ -30506,6 +30609,57 @@ function openLeadershipEditor(tic) {
     setRemovedLeadership(tic, removed);
     rerender();
   }));
+  // EDIT a person: clicking the ✎ (or the name) turns the row into name/role
+  // inputs; saving updates the shared leadership store AND sends the edit to
+  // Review for confirmation.
+  const startEdit = (rowEl) => {
+    const oldName = rowEl.dataset.name;
+    const oldRole = rowEl.dataset.role || '';
+    const group = rowEl.dataset.group || 'executives';
+    rowEl.innerHTML = `
+      <input class="le-edit-name" value="${escapeHtml(oldName)}" style="${_ceInp};flex:2;min-width:120px">
+      <input class="le-edit-role" value="${escapeHtml(oldRole)}" placeholder="Role" style="${_ceInp};flex:2;min-width:100px">
+      <button class="btn le-edit-save" style="font-size:10px;padding:1px 8px">Save</button>
+      <button class="btn btn-ghost le-edit-cancel" style="font-size:10px;padding:1px 6px">✕</button>`;
+    rowEl.querySelector('.le-edit-save').addEventListener('click', () => {
+      const newName = rowEl.querySelector('.le-edit-name').value.trim();
+      const newRole = rowEl.querySelector('.le-edit-role').value.trim();
+      if (!newName) { if (typeof flashStatus === 'function') flashStatus('Name required', 'error'); return; }
+      // If the name changed, suppress the old record and add the new one.
+      if (newName.toLowerCase() !== oldName.toLowerCase()) {
+        const removed = getRemovedLeadership(tic);
+        if (!removed.includes(oldName)) removed.push(oldName);
+        setRemovedLeadership(tic, removed);
+      }
+      saveLeadershipPerson({
+        name: newName,
+        assignedTickers: [tic],
+        assignedRoleByTicker: { [tic]: newRole },
+        sourceFieldByTicker: { [tic]: group },
+      });
+      if (/chief executive|^ceo$/i.test(newRole)) {
+        setOverride(tic, 'ceo', newName, { source: 'company-tab' });
+        const row = (state.stockbook?.rows || []).find(r => r.ticker === tic);
+        if (row) { delete row._preOverride; applyOverridesToRow(row); }
+      }
+      // Send the edit to Review.
+      if (typeof flagForReview === 'function') {
+        flagForReview('leadershipEdit', {
+          key: `${tic}:${newName}`,
+          label: `Leadership edit (${tic}): ${oldName}${newName !== oldName ? ' → ' + newName : ''}`,
+          detail: `Role: ${newRole || '(none)'} · group: ${group}`,
+          ticker: tic,
+          options: [{ label: 'Approve', action: 'approveLeadershipEdit' }, { label: 'Revert', action: 'revertLeadershipEdit' }],
+        });
+      }
+      if (typeof flashStatus === 'function') flashStatus(`Updated ${newName} — sent to Review`, 'success');
+      if (typeof renderReviewHub === 'function') { try { renderReviewHub(); } catch {} }
+      rerender();
+    });
+    rowEl.querySelector('.le-edit-cancel').addEventListener('click', rerender);
+  };
+  wrap.querySelectorAll('.le-edit').forEach(b => b.addEventListener('click', () => startEdit(b.parentElement)));
+  wrap.querySelectorAll('.le-person-name').forEach(span => span.addEventListener('click', () => startEdit(span.parentElement)));
   wrap.querySelector('#le-add').addEventListener('click', () => {
     const name = wrap.querySelector('#le-name').value.trim();
     const role = wrap.querySelector('#le-role').value.trim();
@@ -30683,6 +30837,41 @@ function openArticleEditor(key) {
   });
 }
 if (typeof window !== 'undefined') window.openArticleEditor = openArticleEditor;
+
+// Remove a news article from a company's feed and SEND IT TO REVIEW. Used by the
+// X button on company-tab news rows — for articles that didn't pull right (wrong
+// ticker, garbled, irrelevant). The article is marked dismissed (durable) AND
+// queued in the Review hub so the bad pull is logged for human confirmation.
+function removeCompanyNewsArticle(articleKeyStr, ticker) {
+  try {
+    const all = (state.news && state.news.items) || [];
+    const art = all.find(a => {
+      const k = (typeof articleKey === 'function' ? articleKey(a) : (a.url || a.headline || ''));
+      return k === articleKeyStr;
+    });
+    if (art) {
+      if (typeof markArticleState === 'function') markArticleState(art, 'dismissed');
+      if (typeof flagForReview === 'function') {
+        flagForReview('newsRemoved', {
+          key: articleKeyStr,
+          label: `Removed article (${ticker}): ${(art.headline || '').slice(0, 70)}`,
+          detail: `Source: ${art.source || '?'} - ${art.url || ''}`,
+          ticker: ticker,
+          options: [
+            { label: 'Confirm bad/irrelevant', action: 'confirmNewsRemoval' },
+            { label: 'Restore', action: 'restoreNewsArticle' },
+          ],
+        });
+      }
+      if (typeof flashStatus === 'function') flashStatus('Article removed & sent to Review', 'success');
+    } else if (typeof flashStatus === 'function') {
+      flashStatus('Could not find that article to remove', 'error');
+    }
+  } catch (e) { console.warn('removeCompanyNewsArticle failed', e); }
+  if (typeof loadCompany === 'function' && ticker) { try { loadCompany(ticker); } catch {} }
+  if (typeof renderReviewHub === 'function') { try { renderReviewHub(); } catch {} }
+}
+if (typeof window !== 'undefined') window.removeCompanyNewsArticle = removeCompanyNewsArticle;
 
 function queueArticleForReview(article) {
   if (typeof loadReviewQueue !== 'function') return;
@@ -31358,6 +31547,14 @@ async function fetchSocialActivity(ticker, companyName) {
     presenceScore,
     isCultLike,
     cultDirection,
+    // Actual time span the posts cover (oldest → newest), so the UI can say
+    // "30 posts over the last 4 hours" instead of just "30 recent posts".
+    timeframe: (() => {
+      const ts = items.map(it => it.datetime).filter(t => isFinite(t) && t > 0);
+      if (ts.length < 1) return null;
+      const newest = Math.max(...ts), oldest = Math.min(...ts);
+      return { newest, oldest, spanMs: newest - oldest };
+    })(),
     sources: {
       stocktwits: st ? { available: st.available, count: st.items?.length || 0, error: st.error || null } : null,
       reddit: rd ? { available: rd.available, count: rd.items?.length || 0, error: rd.error || null } : null,
@@ -31499,11 +31696,22 @@ function renderActivitySocial(body, ticker, force) {
     : '';
 
   const bullPct = s.bullPct;
+  // Human description of the time span the posts cover.
+  const tfStr = (() => {
+    if (!s.timeframe || !s.timeframe.spanMs) return 'recent';
+    const ms = s.timeframe.spanMs;
+    const h = ms / 3600000;
+    if (h < 1) return `last ${Math.max(1, Math.round(ms / 60000))} min`;
+    if (h < 48) return `last ${Math.round(h)}h`;
+    return `last ${Math.round(h / 24)}d`;
+  })();
+  const oldestStr = s.timeframe ? new Date(s.timeframe.oldest).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' }) : '';
+  const newestStr = s.timeframe ? new Date(s.timeframe.newest).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' }) : '';
   const summary = `<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px">
     <div class="company-card" style="margin:0;flex:1;min-width:130px">
       <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.05em">Social presence</div>
       <div style="font-family:var(--mono);font-size:22px;font-weight:800;color:${presenceColor};margin-top:3px">${s.presenceScore}<span style="font-size:11px;color:var(--ink-faint)">/100</span></div>
-      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">${s.counts.total} recent posts</div>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px" title="${oldestStr ? `Oldest post ${oldestStr} → newest ${newestStr}` : ''}">${s.counts.total} posts · ${tfStr}</div>
     </div>
     <div class="company-card" style="margin:0;flex:1;min-width:130px">
       <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.05em">Crowd lean</div>
@@ -31536,7 +31744,10 @@ function renderActivitySocial(body, ticker, force) {
       <div style="font-family:var(--mono);font-size:8px;color:var(--ink-faint);margin-top:5px">@${escapeHtml(it.author)} · ${timeAgo(it.datetime)}${it.likes?` · ♥ ${it.likes}`:''}${it.comments!=null?` · 💬 ${it.comments}`:''}</div>
     </a>`;
   }).join('');
-  body.innerHTML = cultBanner + summary + srcNote + `<div style="max-width:760px">${posts}</div>`;
+  const postsHeader = s.timeframe
+    ? `<div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--rule)">Showing ${Math.min(60, s.items.length)} of ${s.items.length} posts · ${tfStr} (${oldestStr} → ${newestStr})</div>`
+    : '';
+  body.innerHTML = cultBanner + summary + srcNote + `<div style="max-width:760px">${postsHeader}${posts}</div>`;
 }
 if (typeof window !== 'undefined') {
   window.onActivityTabActive = onActivityTabActive;
@@ -32268,22 +32479,24 @@ function renderNewsFeed() {
     let sincePublishedClass = '';
     let sincePublishedLabel = 'since written';
     if (currentPrice != null) {
-      let refPrice;
-      if (hoursAgo < 24) {
-        // fresh: from the prior close (before the news), so it reflects the move
-        // that has happened since the article hit.
+      let refPrice = null;
+      // BEST: the price the backend captured when it first archived this article
+      // (priceAtFirstSeen) — the closest thing to the price when it was written.
+      if (article.priceAtFirstSeen != null && isFinite(article.priceAtFirstSeen) && article.priceAtFirstSeen > 0) {
+        refPrice = article.priceAtFirstSeen;
+        sincePublishedLabel = 'since written';
+      } else if (hoursAgo < 24) {
+        // fresh, no archived price: use the prior close (before the news broke).
         refPrice = _getPriorCloseBefore(article.ticker, article.datetime);
-        sincePublishedLabel = 'since written';
       } else {
+        // older: close on/around the publish date.
         refPrice = _getPriceOnDate(article.ticker, article.datetime);
-        sincePublishedLabel = 'since written';
       }
       if (refPrice != null && refPrice > 0 && Math.abs(refPrice - currentPrice) > 1e-9) {
         const change = (currentPrice - refPrice) / refPrice;
         sincePublishedStr = (change >= 0 ? '+' : '') + (change * 100).toFixed(2) + '%';
         sincePublishedClass = change > 0 ? 'news-item-sentiment-positive' : change < 0 ? 'news-item-sentiment-negative' : '';
       } else if (refPrice != null && refPrice > 0) {
-        // Price unchanged from reference (or only the same single bar exists).
         sincePublishedStr = '0.00%';
         sincePublishedClass = '';
       }
@@ -33026,31 +33239,37 @@ function saveBondsCache(data) {
 // the same proxy chain we use for FRED. Returns parsed JSON or null.
 async function fetchJsonWithProxies(targetUrl) {
   const proxies = [
-    u => u, // direct (works in some envs)
-    u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
-    u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-    u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
-    u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
-    u => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`,
-    u => `https://thingproxy.freeboard.io/fetch/${u}`,
-    u => `https://proxy.cors.sh/${u}`,
-    u => `https://api.cors.lol/?url=${encodeURIComponent(u)}`,
-    u => `https://yacdn.org/serve/${u}`,
+    { build: u => u, direct: true }, // direct (Treasury fiscaldata + many APIs support CORS)
+    { build: u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` },
+    { build: u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}` },
+    { build: u => `https://corsproxy.io/?url=${encodeURIComponent(u)}` },
+    { build: u => `https://corsproxy.io/?${encodeURIComponent(u)}` },
+    { build: u => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`, wrapped: true },
+    { build: u => `https://thingproxy.freeboard.io/fetch/${u}` },
+    { build: u => `https://proxy.cors.sh/${u}`, corsKey: true },
+    { build: u => `https://api.cors.lol/?url=${encodeURIComponent(u)}` },
+    { build: u => `https://yacdn.org/serve/${u}` },
+    { build: u => `https://cors.eu.org/${u}` },
   ];
   const errors = [];
   for (let i = 0; i < proxies.length; i++) {
-    const url = proxies[i](targetUrl);
-    const wrapped = i === 5;
+    const p = proxies[i];
+    const url = p.build(targetUrl);
     try {
-      const r = await fetch(url, {
-        headers: { 'Accept': 'application/json,*/*', 'x-cors-api-key': 'temp_anything' },
-      });
+      // CRITICAL: only send the cors.sh custom header to cors.sh. Sending a
+      // custom header (x-cors-api-key) on a DIRECT cross-origin request forces a
+      // CORS preflight that many APIs (incl. Treasury fiscaldata) reject — which
+      // is why the direct attempt silently failed and we fell through to flaky
+      // proxies. A plain Accept-only request lets simple CORS succeed.
+      const headers = { 'Accept': 'application/json,*/*' };
+      if (p.corsKey) headers['x-cors-api-key'] = 'temp_anything';
+      const r = await fetch(url, { headers });
       if (!r.ok) {
         errors.push(`proxy ${i}: HTTP ${r.status}`);
         continue;
       }
       let json;
-      if (wrapped) {
+      if (p.wrapped) {
         const wrap = await r.json().catch(() => null);
         if (!wrap?.contents) { errors.push(`proxy ${i}: empty wrapped`); continue; }
         try { json = JSON.parse(wrap.contents); } catch { errors.push(`proxy ${i}: bad JSON in wrapper`); continue; }
@@ -33076,6 +33295,51 @@ const FRED_YIELD_SERIES = {
   '1yr':  'DGS1',    '2yr':  'DGS2',    '3yr':  'DGS3',    '5yr':  'DGS5',
   '7yr':  'DGS7',    '10yr': 'DGS10',   '20yr': 'DGS20',   '30yr': 'DGS30',
 };
+
+// GITHUB-STORED yield curve — reads the tenor series the backend macro pipeline
+// already committed to data/macro/<SERIES>.json. This is the MOST reliable
+// source (raw.githubusercontent.com, no CORS, no proxies) and is tried FIRST.
+// The backend currently stores a subset of tenors (e.g. 3mo/2yr/10yr); whatever
+// it has is used to build a partial curve, and the live sources below fill in
+// the remaining tenors when reachable.
+async function fetchGitHubYieldCurve() {
+  // Resolve the macro base the same way fetchMacroFromGitHub does.
+  let macroBase = null;
+  const manifestBase = state._historyManifest?.baseUrl;
+  if (manifestBase) {
+    macroBase = manifestBase.replace(/\/history\/?$/, '/').replace(/\/+$/, '/') + 'macro/';
+  } else {
+    const urls = (typeof getSheetUrls === 'function') ? getSheetUrls() : [];
+    const ghUrl = urls.find(u => /raw\.githubusercontent\.com.*\/data\//.test(u));
+    if (ghUrl) macroBase = ghUrl.replace(/\/data\/.*$/, '/data/macro/');
+  }
+  if (!macroBase) return null;
+
+  const tenors = Object.keys(FRED_YIELD_SERIES);
+  const results = await Promise.all(tenors.map(async (tenor) => {
+    try {
+      const r = await fetch(macroBase + FRED_YIELD_SERIES[tenor] + '.json');
+      if (!r.ok) return null;
+      const j = await r.json();
+      const obs = j?.observations;
+      if (!Array.isArray(obs)) return null;
+      return { tenor, obs: obs.map(o => ({ date: String(o.date).slice(0, 10), value: Number(o.value) })).filter(o => o.date && isFinite(o.value)) };
+    } catch { return null; }
+  }));
+  const byDate = {};
+  let any = false;
+  for (const res of results) {
+    if (!res) continue;
+    any = true;
+    for (const pt of res.obs.slice(-120)) {
+      if (!byDate[pt.date]) byDate[pt.date] = { date: pt.date };
+      byDate[pt.date][res.tenor] = pt.value;
+    }
+  }
+  if (!any) return null;
+  const arr = Object.values(byDate).filter(row => Object.keys(row).length > 1).sort((a, b) => a.date.localeCompare(b.date));
+  return arr.length > 0 ? arr : null;
+}
 
 async function fetchFredYieldCurve() {
   const tenors = Object.keys(FRED_YIELD_SERIES);
@@ -33150,6 +33414,12 @@ async function fetchStooqYieldCurve() {
 }
 
 async function fetchTreasuryYieldCurve() {
+  // SOURCE 1 (most reliable): the backend's GitHub-stored tenor series. No CORS,
+  // no proxies. May be a partial curve (subset of tenors) — we still take it and
+  // try to enrich it from a live source below.
+  let ghCurve = null;
+  try { ghCurve = await fetchGitHubYieldCurve(); } catch {}
+
   const endpoint = 'https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v2/accounting/od/daily_treasury_yield_curve_rates';
   const params = new URLSearchParams({
     sort: '-record_date',
@@ -33174,7 +33444,7 @@ async function fetchTreasuryYieldCurve() {
     })).reverse();
   }
 
-  // Treasury blocked — fall back to FRED
+  // Treasury blocked — fall back to FRED (live, via proxies)
   console.log('Treasury yield curve unreachable, falling back to FRED…');
   const fred = await fetchFredYieldCurve();
   if (fred && fred.length > 0) return fred;
@@ -33185,6 +33455,13 @@ async function fetchTreasuryYieldCurve() {
   if (stooq && stooq.length > 0) {
     console.log(`✓ Stooq returned ${stooq.length} days of yields (3M / 5Y / 10Y / 30Y only)`);
     return stooq;
+  }
+
+  // Every live source failed — use the GitHub partial curve if we got one. It's
+  // better to show a real (if partial) curve from the backend than nothing.
+  if (ghCurve && ghCurve.length > 0) {
+    console.log(`✓ Using GitHub-stored yield curve (${ghCurve.length} days, backend tenors only)`);
+    return ghCurve;
   }
 
   return null;
@@ -44928,8 +45205,12 @@ const GT_LOGISTICS = [
 ];
 
 function _gtGetRow(ticker) {
+  // Use the SAME canonical resolver every other tab uses (case-insensitive,
+  // indexed, alias-aware) instead of a raw exact-match find — that mismatch was
+  // why the trade pulse showed "no live data" even with the tickers loaded.
+  if (typeof getStockbookRow === 'function') return getStockbookRow(ticker);
   const rows = state.stockbook?.rows || [];
-  return rows.find(r => r.ticker === ticker);
+  return rows.find(r => r.ticker === ticker) || null;
 }
 function _gtSessionPct(ticker) {
   const r = _gtGetRow(ticker);
@@ -44938,6 +45219,19 @@ function _gtSessionPct(ticker) {
   if (isFinite(r.sessionPct)) return r.sessionPct;
   if (isFinite(r.price) && isFinite(r.priorClose) && r.priorClose > 0) {
     return ((r.price - r.priorClose) / r.priorClose) * 100;
+  }
+  // Raw-field fallbacks (in case normalization didn't populate the camelCase
+  // fields for this row): changepct from the sheet, or price vs closeyest.
+  const raw = r.rawRow || {};
+  const rawPct = parseFloat(raw['changepct'] ?? raw['changesPercentage']);
+  if (isFinite(rawPct)) return rawPct;
+  const px = isFinite(r.price) ? r.price : parseFloat(raw['price']);
+  const yest = parseFloat(raw['closeyest'] ?? raw['prev close'] ?? raw['priorClose']);
+  if (isFinite(px) && isFinite(yest) && yest > 0) return ((px - yest) / yest) * 100;
+  // Last resort: derive from cached price history (same as the ticker tape).
+  if (typeof _tapeChangePct === 'function') {
+    const tp = _tapeChangePct(ticker);
+    if (isFinite(tp)) return tp;
   }
   return null;
 }
