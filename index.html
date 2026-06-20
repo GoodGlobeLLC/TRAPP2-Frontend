@@ -119,13 +119,10 @@
   html[data-theme="light"] .tab-btn:hover { color: var(--ink); }
   html[data-theme="light"] .tab-num { color: var(--amber); }
 
-  /* Hard-coded greens/reds (price changes) */
-  html[data-theme="light"] [style*="color:var(--pos)"],
-  html[data-theme="light"] [style*="color: var(--pos)"] { color: var(--green) !important; }
-  html[data-theme="light"] [style*="color:var(--neg)"],
-  html[data-theme="light"] [style*="color: var(--neg)"] { color: var(--red) !important; }
-  html[data-theme="light"] [style*="color:#6b9b6f"] { color: var(--green) !important; }
-  html[data-theme="light"] [style*="color:#b56856"] { color: var(--red) !important; }
+  /* Hard-coded greens/reds (price changes) — targeted via .inline-pos/.inline-neg
+     classes added by tagMinWidthElements() (avoids colon-in-value selectors). */
+  html[data-theme="light"] .inline-pos { color: var(--green) !important; }
+  html[data-theme="light"] .inline-neg { color: var(--red) !important; }
 
   /* The body radial-gradient background needs a light variant too */
   html[data-theme="light"] body {
@@ -6660,7 +6657,6 @@
        collapse can never blank the tab (added with the 2026-06 diagnostics). */
     .company-content { display: block; min-height: 200px; overflow-y: auto; }
     .company-ctab { display: block; }
-    .company-ctab[style*="display:none"], .company-ctab[style*="display: none"] { display: none; }
 
     /* ============================================================
        MOBILE (≤640px) — fixes "punched together" layout + subtab scroll.
@@ -6714,7 +6710,6 @@
 
       /* Connected-companies rows stay readable */
       .company-card h4 { line-height: 1.5; }
-    }
 
     /* ============================================================
        FITS-TO-SCREEN GUARD (any zoom) — the page must never exceed the
@@ -6762,13 +6757,10 @@
        (minmax 120–160px) stay TWO-up — compact metrics like Portfolio Value /
        Cash / P&L read fine side-by-side and waste less vertical space.
        Default: any auto-fit/auto-fill grid → 2 columns; the larger-minmax ones
-       below override to 1. */
-    [style*="grid-template-columns:repeat(auto-fit"],
-    [style*="grid-template-columns: repeat(auto-fit"],
-    [style*="grid-template-columns:repeat(auto-fill"],
-    [style*="grid-template-columns: repeat(auto-fill"] {
-      grid-template-columns: repeat(2, 1fr) !important;
-    }
+       below override to 1. Targeted via .mobile-grid-collapse / .mobile-grid-1col
+       classes added by tagMinWidthElements() (avoids colon-in-value selectors). */
+    .mobile-grid-collapse { grid-template-columns: repeat(2, 1fr) !important; }
+    .mobile-grid-1col { grid-template-columns: 1fr !important; }
     /* Larger content-card grids → single column (these are the ones that cramp). */
     [style*="minmax(180px"], [style*="minmax(200px"], [style*="minmax(220px"],
     [style*="minmax(240px"], [style*="minmax(260px"], [style*="minmax(280px"],
@@ -6776,13 +6768,8 @@
     [style*="minmax(360px"] {
       grid-template-columns: 1fr !important;
     }
-    /* Fixed 2-/3-column grids also collapse to single column. */
-    [style*="grid-template-columns:1fr 1fr"],
-    [style*="grid-template-columns: 1fr 1fr"],
-    [style*="grid-template-columns:repeat(3"],
-    [style*="grid-template-columns: repeat(3"] {
-      grid-template-columns: 1fr !important;
-    }
+    /* Fixed 2-/3-column grids also collapse to single column — via
+       .mobile-grid-1col (added by JS for repeat(3)/1fr-1fr inline grids). */
 
     /* 4. Bot Bets tab: the big serif header + the control buttons. Shrink the
        header, stack it above the controls, and let the filter/buttons wrap to
@@ -6844,14 +6831,12 @@
 
     /* 13. Wide min-widths force horizontal scroll on phones — neutralize the
        common ones so content reflows to the viewport. (These are mostly chart
-       wrappers and tables that read fine narrower or can scroll internally.) */
-    [style*="min-width:560px"], [style*="min-width: 560px"],
-    [style*="min-width:520px"], [style*="min-width: 520px"],
-    [style*="min-width:600px"], [style*="min-width: 600px"],
-    [style*="min-width:620px"], [style*="min-width: 620px"],
-    [style*="min-width:680px"], [style*="min-width: 680px"] {
-      min-width: 0 !important;
-    }
+       wrappers and tables that read fine narrower or can scroll internally.)
+       Implemented via JS (tagMinWidthElements) which adds .mobile-shrink to any
+       element whose inline style sets a wide min-width — that avoids attribute
+       selectors with a colon in the value, which some editors' CSS linters
+       mis-parse. */
+    .mobile-shrink { min-width: 0 !important; }
   }
 
   /* ============================================================
@@ -6861,20 +6846,16 @@
   @media (max-width: 400px) {
     .tab-body-pad { padding-left: 8px !important; padding-right: 8px !important; }
     .workspace { padding: 8px !important; }
-    /* Everything single-column at this width — including the small stat cards. */
-    [style*="grid-template-columns:repeat(auto-fit"],
-    [style*="grid-template-columns: repeat(auto-fit"],
-    [style*="grid-template-columns:repeat(auto-fill"],
-    [style*="grid-template-columns: repeat(auto-fill"],
-    [style*="grid-template-columns:repeat(2"],
-    [style*="grid-template-columns: repeat(2"] {
-      grid-template-columns: 1fr !important;
-    }
+    /* Everything single-column at this width — via .mobile-grid-collapse which
+       JS already tags on auto-fit/auto-fill/repeat grids; at <=400px we force
+       those to one column. */
+    .mobile-grid-collapse { grid-template-columns: 1fr !important; }
     .masthead-title { font-size: 18px !important; }
     .company-card { padding: 10px !important; }
     #web-canvas { min-height: 300px; }
     /* The WEB graph's corner hint text is noise on a tiny screen — hide it. */
-    .fn-overlay-body [style*="position:absolute;bottom:8px;left:8px"] { display: none !important; }
+    .fn-overlay-body .fn-corner-hint { display: none !important; }
+  }
 
 </style>
 </head>
@@ -8480,6 +8461,16 @@
       <div class="modal-help">Adds <code>data/master.csv</code> and <code>data/history_manifest.json</code> to the URLs above. Manifest auto-loads all per-ticker 5-year history files. Works with both <code>main</code> and <code>master</code> branches.</div>
     </div>
 
+    <div class="modal-section" id="macro-base-section">
+      <div class="modal-label">Macro / FRED data base <span style="color:var(--ink-faint);font-weight:400;text-transform:none">(optional — defaults to TRAPP2-1)</span></div>
+      <input type="text" class="modal-input" id="macro-base-input" placeholder="https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-1/main/data/" style="font-family:var(--mono);font-size:11px;width:100%">
+      <div class="modal-help">
+        Where the macro / FRED series live (<code>data/macro/GDP.json</code>, <code>CPIAUCSL.json</code>, the <code>DGS*</code> yield tenors, etc.) — used by the Macro Quad and the Treasury yield curve.
+        These are <strong>FX / global data</strong>, so they belong in <strong>TRAPP2-1</strong>, not the equities repos. If a TRAPP2-1 URL is in the list above it's auto-detected; otherwise set the base here. The app never pulls macro from an equities repo, so if you move macro to a different/new repo later, just point this field at it.
+      </div>
+      <button class="btn btn-ghost" id="macro-base-save-btn" style="margin-top:6px">Save macro base</button>
+    </div>
+
     <div class="modal-section">
       <div class="modal-label">Finnhub API Key (recommended for sectors)</div>
       <input type="text" class="modal-input" id="finnhub-key-input" placeholder="Paste Finnhub key here">
@@ -8839,6 +8830,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260615u"></script>
+<script src="app.js?v=20260615z"></script>
 </body>
 </html>

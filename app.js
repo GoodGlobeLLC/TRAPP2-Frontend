@@ -2263,17 +2263,28 @@ async function loadRegimeSnapshot(baseDir) {
   }
 }
 // The ONE canonical regime source. The bot/badge/dashboard should all read the
-// same file so the regime is identical everywhere. Defaults to the analytics
-// repo (where compute_regime.py writes), overridable if the data base differs.
-const CANONICAL_REGIME_BASE = 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-ANALYTICS/main/data/';
+// same file so the regime is identical everywhere. Regime is computed alongside
+// the macro/FRED data in the FX/global repo (TRAPP2-1) — NOT the analytics repo
+// (which doesn't carry regime_current.json) and NOT the equities repos. We
+// resolve it from the same place the macro tab uses, so it always tracks
+// wherever macro/regime actually lives.
+const CANONICAL_REGIME_BASE = 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-1/main/data/';
 let _regimeLoadStarted = false;
 async function loadRegimeCanonical() {
   // Load the regime ONCE from the canonical source. Idempotent — repeated tab
-  // switches / refreshes won't re-fetch or risk a flip. Falls back to the
-  // history-manifest base only if the canonical fetch yields nothing.
+  // switches / refreshes won't re-fetch or risk a flip. Prefers the resolved
+  // macro/global base (TRAPP2-1), then the hardcoded canonical, then the
+  // history-manifest base — so it works whether or not Data Sources is set.
   if (_regimeLoadStarted && state.marketRegime) return;
   _regimeLoadStarted = true;
-  await loadRegimeSnapshot(CANONICAL_REGIME_BASE);
+  // 1. Resolved macro/global base (same repo as macro — TRAPP2-1).
+  let loadedFrom = null;
+  if (typeof resolveMacroBase === 'function') {
+    const mb = resolveMacroBase();
+    if (mb) { const baseDir = mb.replace(/\/macro\/?$/, '/'); await loadRegimeSnapshot(baseDir); loadedFrom = baseDir; }
+  }
+  // 2. Hardcoded canonical (TRAPP2-1) if the resolver gave nothing.
+  if (!state.marketRegime) await loadRegimeSnapshot(CANONICAL_REGIME_BASE);
   if (!state.marketRegime && state._historyManifest?.baseUrl) {
     const baseDir = state._historyManifest.baseUrl.replace(/\/history\/?$/, '/');
     await loadRegimeSnapshot(baseDir);
@@ -6827,6 +6838,8 @@ function openSourcesModal() {
   const sbStatus = document.getElementById('supabase-status');
   if (sbStatus) sbStatus.textContent = supabaseConfigured() ? '● connected' : '';
   document.getElementById('sheet-url-input').value = getSheetUrls().join('\n');
+  const macroBaseEl = document.getElementById('macro-base-input');
+  if (macroBaseEl) macroBaseEl.value = (typeof getMacroBaseOverride === 'function' ? getMacroBaseOverride() : '');
   const pref = getSourcePref();
   document.querySelectorAll('#source-pref-control .seg-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.val === pref);
@@ -6886,6 +6899,18 @@ document.getElementById('github-quick-add-btn')?.addEventListener('click', () =>
   const merged = [...new Set([...existing, ...urls])];
   ta.value = merged.join('\n');
   flashStatus(`Added 2 GitHub URLs for ${cleanUser}/${cleanRepo}`, 'success');
+});
+
+// Macro / FRED data base override — point at TRAPP2-1 (FX/global) explicitly.
+document.getElementById('macro-base-save-btn')?.addEventListener('click', () => {
+  const el = document.getElementById('macro-base-input');
+  if (!el || typeof setMacroBaseOverride !== 'function') return;
+  const v = el.value.trim();
+  setMacroBaseOverride(v);
+  // Clear any cached macro snapshot so the next render uses the new base.
+  if (state._macroCache) state._macroCache = null;
+  if (state._macroGitHub) state._macroGitHub = null;
+  flashStatus(v ? 'Macro data base saved — will use it for FRED/yield-curve pulls' : 'Macro base cleared — auto-detecting (prefers TRAPP2-1)', 'success');
 });
 
 document.getElementById('test-connection-btn').addEventListener('click', async () => {
@@ -8666,7 +8691,7 @@ function buildQuadHistory(gdpYoY, cpiYoY, lookbackPeriods = 24) {
 
 // ---------- MASTER MACRO FETCH ----------
 // Order of operations:
-//   1. Try TRAPP2 GitHub data/macro/*.json (CORS-safe, set by nightly pipeline)
+//   1. Try the FX/global repo (TRAPP2-1) GitHub data/macro/*.json (CORS-safe, set by nightly pipeline)
 //   2. Fall back to FRED via public CORS proxies (flaky)
 //   3. Persist trimmed cache so quota doesn't burst
 // ===== INFLATION ADJUSTMENT (CPI deflation) =====
@@ -8867,25 +8892,73 @@ async function fetchMacroData(forceRefresh = false) {
   return data;
 }
 
-// Pull pre-fetched FRED series from the TRAPP2 GitHub data/macro/ folder.
+// Pull pre-fetched FRED series from the FX/global repo (TRAPP2-1) data/macro/ folder.
 // File shape (written by pipeline/fetch_macro.py):
 //   { series_id, title, frequency, observations: [{date, value}, ...] }
 // Returns null if no manifest is registered or critical series are missing.
-async function fetchMacroFromGitHub(setStatus) {
-  // Need a registered manifest to know where data/macro lives.
-  // The manifest baseUrl is .../data/history/ — go up one and append /macro/.
-  let macroBase = null;
-  const manifestBase = state._historyManifest?.baseUrl;
-  if (manifestBase) {
-    macroBase = manifestBase.replace(/\/history\/?$/, '/').replace(/\/+$/, '/') + 'macro/';
-  } else {
-    // Fall back: try to derive from one of the data source URLs
-    const urls = (typeof getSheetUrls === 'function') ? getSheetUrls() : [];
-    const ghUrl = urls.find(u => /raw\.githubusercontent\.com.*\/data\//.test(u));
-    if (ghUrl) {
-      macroBase = ghUrl.replace(/\/data\/.*$/, '/data/macro/');
-    }
+// ============================================================
+//   MACRO / FRED DATA SOURCE RESOLVER
+//   Repo split (per the project's architecture):
+//     • TRAPP2, TRAPP2-2  = US EQUITIES only.
+//     • TRAPP2-1          = ETFs, FX, crypto, AND the macro/FRED/global data.
+//     • TRAPP2-3          = mixed universe.
+//   So macro/FRED series (GDP, CPI, the DGS* yield tenors, etc.) live in
+//   TRAPP2-1/data/macro/ — NOT in the equity repo where price history lives.
+//   The resolver finds macro/ from an explicit override or a configured TRAPP2-1
+//   URL, and never falls back to an equities/unknown repo. New repos can be
+//   pointed at via the override field, so this stays correct as repos are added.
+// ============================================================
+const MACRO_BASE_STORAGE = 'valuatio.macroBase.url';
+
+function getMacroBaseOverride() {
+  return (localStorage.getItem(MACRO_BASE_STORAGE) || '').replace(/\/+$/, '');
+}
+function setMacroBaseOverride(url) {
+  if (url) localStorage.setItem(MACRO_BASE_STORAGE, url.trim().replace(/\/+$/, ''));
+  else localStorage.removeItem(MACRO_BASE_STORAGE);
+}
+
+// Resolve the data/macro/ base URL. Order of preference:
+//   1. Explicit override (Data Sources → Macro data base).
+//   2. A configured data-source URL from the FX/global repo (…/TRAPP2-1/…).
+//   3. ANY configured raw.githubusercontent.com /data/ URL → its /data/macro/.
+//   4. The equity history manifest base (last resort — only works if macro was
+//      also committed to the equity repo).
+// Returns a string ending in '/macro/' or null.
+// Resolve the data/macro/ base URL. Deliberately simple — two clear sources, no
+// guessing:
+//   1. Explicit override (Data Sources → "Macro / FRED data base"). This is the
+//      future-proof mechanism: point it at whatever repo hosts macro now or
+//      later (new repos will be added over time).
+//   2. Auto-detect a configured TRAPP2-1 data-source URL (the current FX/global
+//      repo where macro lives) and derive its /data/macro/.
+// If neither is present we return null and the UI prompts to set the field. We
+// intentionally do NOT fall back to the equity history base or "any configured
+// repo" — that would risk pulling macro from an equities repo (or some unrelated
+// future repo), which is exactly the wrong data.
+function resolveMacroBase() {
+  // 1. Explicit override wins.
+  const ov = getMacroBaseOverride();
+  if (ov) return ov.replace(/\/macro\/?$/, '').replace(/\/+$/, '') + '/macro/';
+
+  // 2. Auto-detect the FX/global repo. The trailing slash in `TRAPP2-1/` bounds
+  //    the match to that exact repo segment (it won't match a longer name).
+  const urls = (typeof getSheetUrls === 'function') ? getSheetUrls() : [];
+  const fxUrl = urls.find(u => /raw\.githubusercontent\.com\/[^\/]+\/TRAPP2-1\//i.test(u));
+  if (fxUrl) {
+    const m = fxUrl.match(/^(https?:\/\/raw\.githubusercontent\.com\/[^\/]+\/[^\/]+\/[^\/]+\/(?:.*?\/)?data)\//i);
+    if (m) return m[1].replace(/\/+$/, '') + '/macro/';
   }
+
+  // Nothing explicit and no FX/global URL configured — don't guess.
+  return null;
+}
+if (typeof window !== 'undefined') { window.resolveMacroBase = resolveMacroBase; window.setMacroBaseOverride = setMacroBaseOverride; }
+
+async function fetchMacroFromGitHub(setStatus) {
+  // Resolve the macro/ base (prefers the FX/global repo TRAPP2-1; see
+  // resolveMacroBase). Independent of the equity history base.
+  const macroBase = resolveMacroBase();
   if (!macroBase) return null;
 
   const fetchSeries = async (sid) => {
@@ -10109,7 +10182,62 @@ document.getElementById('macro-verify-btn')?.addEventListener('click', async () 
 window.addEventListener('resize', () => {
   if (state.macro) renderQuadHistory();
   if (state.mcResults) renderMonteCarlo();
+  tagMinWidthElements();
 });
+
+// Tag elements by inline-style patterns so CSS can target them via CLASSES
+// instead of [style*="prop:value"] attribute selectors. Those attribute
+// selectors are valid CSS but contain a colon in the value, which trips some
+// editors' CSS linters into mis-parsing the file. Doing the matching in JS is
+// correct and linter-clean. Covers: wide min-width (mobile reflow), inline
+// green/red price colors (light-theme remap), hidden tabs, and auto-fit grids.
+function tagMinWidthElements() {
+  try {
+    const small = window.matchMedia ? window.matchMedia('(max-width: 768px)').matches : (window.innerWidth <= 768);
+    const small640 = window.matchMedia ? window.matchMedia('(max-width: 640px)').matches : (window.innerWidth <= 640);
+
+    // 1. Wide inline min-width → .mobile-shrink on small screens (min-width only,
+    //    never max-width/width).
+    document.querySelectorAll('[style*="min-width"]').forEach(el => {
+      const mw = el.style && el.style.minWidth;
+      const px = mw ? parseFloat(mw) : NaN;
+      if (small && mw && /px$/.test(mw) && isFinite(px) && px >= 480) el.classList.add('mobile-shrink');
+      else el.classList.remove('mobile-shrink');
+    });
+
+    // 2. Inline green/red price colors → classes so the light theme can remap
+    //    them (var(--pos)/var(--neg) and the two hard-coded hexes).
+    document.querySelectorAll('[style*="color"]').forEach(el => {
+      const c = (el.style && el.style.color || '').replace(/\s+/g, '');
+      const isPos = c.includes('var(--pos)') || c.includes('#6b9b6f');
+      const isNeg = c.includes('var(--neg)') || c.includes('#b56856');
+      el.classList.toggle('inline-pos', isPos);
+      el.classList.toggle('inline-neg', isNeg);
+    });
+
+    // 3. Multi-column inline grids → collapse on phones. Covers auto-fit/auto-fill
+    //    AND fixed repeat(2)/repeat(3)/"1fr 1fr" grids. Large-minmax ones go 1-col.
+    if (small640) {
+      document.querySelectorAll('[style*="grid-template-columns"]').forEach(el => {
+        const g = (el.style && el.style.gridTemplateColumns || '');
+        const isMulti = /repeat\(\s*auto-fi(t|ll)/.test(g) || /repeat\(\s*[23]/.test(g) || /1fr\s+1fr/.test(g);
+        if (isMulti) {
+          const big = /minmax\(\s*(1[89]\d|2\d\d|3[0-4]\d)px/.test(g) || /repeat\(\s*3/.test(g) || /1fr\s+1fr\s+1fr/.test(g);
+          el.classList.add('mobile-grid-collapse');
+          el.classList.toggle('mobile-grid-1col', big);
+        }
+      });
+    } else {
+      document.querySelectorAll('.mobile-grid-collapse').forEach(el => {
+        el.classList.remove('mobile-grid-collapse', 'mobile-grid-1col');
+      });
+    }
+  } catch {}
+}
+if (typeof window !== 'undefined') window.tagMinWidthElements = tagMinWidthElements;
+// Run on load + after the DOM settles. Also re-run after major re-renders via the
+// resize listener above; cheap enough to call liberally.
+document.addEventListener('DOMContentLoaded', () => { try { tagMinWidthElements(); } catch {} });
 
 // ============================================================
 //   STOCK BOOK
@@ -29375,7 +29503,7 @@ async function renderCompanyOverview() {
           </div>
           ${tickerArticles.length > 0 ? `<div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;gap:10px">
             <span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.08em">Showing ${articles.length} of ${tickerArticles.length}</span>
-            ${tickerArticles.length > 8 ? `<button onclick="window['${_expandKey}']=${!expanded};loadCompany('${escapeHtml(tic)}')" style="background:transparent;border:1px solid var(--rule);color:var(--amber);font-family:var(--mono);font-size:9px;padding:4px 10px;border-radius:3px;cursor:pointer">${expanded ? '▲ Show less' : `▼ See all ${tickerArticles.length}`}</button>` : ''}
+            ${tickerArticles.length > 8 ? `<button onclick="window['${_expandKey}']=${!expanded};renderCompanyOverview()" style="background:transparent;border:1px solid var(--rule);color:var(--amber);font-family:var(--mono);font-size:9px;padding:4px 10px;border-radius:3px;cursor:pointer">${expanded ? '▲ Show less' : `▼ See all ${tickerArticles.length}`}</button>` : ''}
           </div>` : ''}
         </div>
       `;
@@ -30850,7 +30978,7 @@ function removeCompanyNewsArticle(articleKeyStr, ticker) {
       return k === articleKeyStr;
     });
     if (art) {
-      if (typeof markArticleState === 'function') markArticleState(art, 'dismissed');
+      if (typeof setArticleState === 'function') setArticleState(art, 'dismissed');
       if (typeof flagForReview === 'function') {
         flagForReview('newsRemoved', {
           key: articleKeyStr,
@@ -30868,7 +30996,7 @@ function removeCompanyNewsArticle(articleKeyStr, ticker) {
       flashStatus('Could not find that article to remove', 'error');
     }
   } catch (e) { console.warn('removeCompanyNewsArticle failed', e); }
-  if (typeof loadCompany === 'function' && ticker) { try { loadCompany(ticker); } catch {} }
+  if (typeof renderCompanyOverview === 'function') { try { renderCompanyOverview(); } catch {} }
   if (typeof renderReviewHub === 'function') { try { renderReviewHub(); } catch {} }
 }
 if (typeof window !== 'undefined') window.removeCompanyNewsArticle = removeCompanyNewsArticle;
@@ -30914,6 +31042,7 @@ function flagForReview(kind, payload) {
     id: `rev-${kind}-${Date.now()}`,
     type: kind,                 // e.g. 'derivative', 'fxConvert', 'genericDoubt'
     _dedupe: dedupeKey,
+    key: payload.key || null,   // stable key the action handlers (revert/restore) read
     label: payload.label || `${kind} needs review`,
     detail: payload.detail || '',
     ticker: payload.ticker || null,
@@ -30923,6 +31052,7 @@ function flagForReview(kind, payload) {
     queuedAt: new Date().toISOString(),
   });
   saveReviewQueue(q);
+  if (typeof updateReviewBadge === 'function') { try { updateReviewBadge(); } catch {} }
 }
 
 // Log a FIELD EDIT (from the Editor, Research editor, Contact editor, etc.) into
@@ -33303,16 +33433,9 @@ const FRED_YIELD_SERIES = {
 // it has is used to build a partial curve, and the live sources below fill in
 // the remaining tenors when reachable.
 async function fetchGitHubYieldCurve() {
-  // Resolve the macro base the same way fetchMacroFromGitHub does.
-  let macroBase = null;
-  const manifestBase = state._historyManifest?.baseUrl;
-  if (manifestBase) {
-    macroBase = manifestBase.replace(/\/history\/?$/, '/').replace(/\/+$/, '/') + 'macro/';
-  } else {
-    const urls = (typeof getSheetUrls === 'function') ? getSheetUrls() : [];
-    const ghUrl = urls.find(u => /raw\.githubusercontent\.com.*\/data\//.test(u));
-    if (ghUrl) macroBase = ghUrl.replace(/\/data\/.*$/, '/data/macro/');
-  }
+  // Resolve the macro/ base the same way the macro tab does — prefers the
+  // FX/global repo (TRAPP2-1), independent of the equity history base.
+  const macroBase = resolveMacroBase();
   if (!macroBase) return null;
 
   const tenors = Object.keys(FRED_YIELD_SERIES);
@@ -37830,6 +37953,56 @@ function reviewGenericOption(id, optIdx) {
   renderReviewHub();
 }
 
+// ---- Action handlers for the news/leadership review items ----
+// "Approve" variants are acknowledgements — the change was already applied when
+// the user made it; approving just clears it from the queue (the dequeue in
+// reviewGenericOption does that). "Revert"/"Restore" variants actually undo.
+if (typeof window !== 'undefined') {
+  // News fix approve = accept the applied ticker/headline fix (no-op beyond dequeue).
+  window.approveNewsFix = function () {};
+  // News fix revert = drop the stored fix so the article reverts to its original.
+  window.revertNewsFix = function (item) {
+    try {
+      const key = item?.key;
+      if (key && typeof loadArticleFixes === 'function' && typeof saveArticleFixes === 'function') {
+        const fixes = loadArticleFixes() || {};
+        if (fixes[key]) { delete fixes[key]; saveArticleFixes(fixes); }
+      }
+      if (typeof renderNewsFeed === 'function') renderNewsFeed();
+      if (typeof flashStatus === 'function') flashStatus('News fix reverted', 'success');
+    } catch (e) { console.warn('revertNewsFix failed', e); }
+  };
+  // Removal confirm = the article stays dismissed (no-op beyond dequeue).
+  window.confirmNewsRemoval = function () {};
+  // Restore a removed article = clear its dismissed state so it returns to the feed.
+  window.restoreNewsArticle = function (item) {
+    try {
+      const key = item?.key;
+      if (key && typeof loadArticleStates === 'function' && typeof saveArticleStates === 'function') {
+        const states = loadArticleStates() || {};
+        if (states[key]) { delete states[key]; saveArticleStates(states); }
+      }
+      if (typeof renderCompanyOverview === 'function') renderCompanyOverview();
+      if (typeof renderNewsFeed === 'function') renderNewsFeed();
+      if (typeof flashStatus === 'function') flashStatus('Article restored', 'success');
+    } catch (e) { console.warn('restoreNewsArticle failed', e); }
+  };
+  // Leadership edit approve = accept (no-op beyond dequeue).
+  window.approveLeadershipEdit = function () {};
+  // Leadership edit revert = remove the human override for that person.
+  window.revertLeadershipEdit = function (item) {
+    try {
+      const parts = String(item?.key || '').split(':');
+      const name = parts[1] || '';
+      if (name && typeof deleteLeadershipPerson === 'function' && typeof slugifyName === 'function') {
+        deleteLeadershipPerson(slugifyName(name));
+      }
+      if (typeof renderCompanyOverview === 'function') renderCompanyOverview();
+      if (typeof flashStatus === 'function') flashStatus('Leadership edit reverted', 'success');
+    } catch (e) { console.warn('revertLeadershipEdit failed', e); }
+  };
+}
+
 
 // Export the lexicon + tracked posts for the XTRAPP backend repo. XTRAPP hosts
 // the post data (data/posts.json) and the learned lexicon (data/lexicon.json),
@@ -41952,7 +42125,7 @@ function fnWEB() {
       <div style="position:relative;flex:1;min-height:480px;background:radial-gradient(ellipse at center, rgba(40,42,54,0.4), var(--bg))">
         <canvas id="web-canvas" style="width:100%;height:100%;display:block;cursor:grab"></canvas>
         <div id="web-tooltip" style="position:absolute;display:none;background:var(--bg);border:1px solid var(--amber);border-radius:4px;padding:8px 10px;font-family:var(--mono);font-size:11px;color:var(--ink);pointer-events:none;z-index:10;max-width:240px;line-height:1.5"></div>
-        <div style="position:absolute;bottom:8px;left:8px;font-family:var(--mono);font-size:9px;color:var(--ink-faint);line-height:1.5;pointer-events:none">
+        <div class="fn-corner-hint" style="position:absolute;bottom:8px;left:8px;font-family:var(--mono);font-size:9px;color:var(--ink-faint);line-height:1.5;pointer-events:none">
           drag to rotate · node size = # chains · edges = shared chain<br>
           double-click a node → valuate it
         </div>
