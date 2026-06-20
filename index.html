@@ -8054,17 +8054,13 @@
       </div>
     </div>
     <div class="bets-controls" style="display:flex;gap:8px;align-items:center">
+      <!-- Primary, most-used action lives up here next to the title; the full
+           toolbar (run / retrain / sync / maintenance) renders below the live
+           data in renderBetsTab() so the header stays clean. -->
       <input id="bets-filter" placeholder="filter by ticker" style="background:var(--bg-elev);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:11px;padding:6px 10px;border-radius:3px;width:140px">
-      <button class="btn btn-ghost" id="bets-refresh-btn" title="Fetch fresh live prices for open positions (Stooq/Finnhub), USD-converted">Refresh Prices</button>
-      <button class="btn btn-ghost" id="bets-run-btn" title="Run today's signal scan now">Run Scan</button>
-      <button class="btn btn-ghost" id="bets-retrain-btn" title="Retrain signal weights from settled bets — learns from wins and losses">Retrain</button>
-      <button class="btn btn-ghost" id="bets-export-btn" title="Export full training journal as JSON to commit to the bot-data repo">⤓ Export Training</button>
-      <button class="btn btn-ghost" id="bets-import-btn" title="Pull the bot's history from the TRAPP2-BOT repo on GitHub (restores the journal on a fresh device)">⤒ Import Repo</button>
-      <button class="btn btn-ghost" id="bets-import-file-btn" title="Import a bot_training_data.json file from your device (drag-drop or pick a file) — no GitHub needed">⤒ Import File</button>
+      <button class="btn" id="bets-refresh-btn" title="Fetch fresh live prices for open positions (Stooq/Finnhub), USD-converted">↻ Refresh Prices</button>
+      <!-- Hidden file input used by the Import File button in the toolbar below. -->
       <input type="file" id="bets-import-file-input" accept="application/json,.json" style="display:none">
-      <button class="btn btn-ghost" id="bets-commit-btn" title="Open the TRAPP2-BOT file editor on GitHub to paste/commit the exported JSON">Open Repo to Commit ↗</button>
-      <button class="btn btn-ghost" id="bets-repo-btn" title="Open the TRAPP2-BOT repository on GitHub">Open TRAPP2-BOT ↗</button>
-      <button class="btn btn-ghost" id="bets-rebalance-btn" title="Trim open positions to restore positive cash (partial sells, largest first)">Rebalance Cash</button>
     </div>
   </div>
   <div id="bets-body" class="tab-body-pad" style="padding:0 32px 60px;overflow-x:auto"></div>
@@ -8830,6 +8826,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260615z2"></script>
+<script src="app.js?v=20260615z3"></script>
 </body>
 </html>

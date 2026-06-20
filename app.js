@@ -3207,42 +3207,36 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(() => { fetchCryptoPricesFile().catch(() => {}); }, 15 * 60 * 1000);
   }
 
-  // Bets tab buttons
-  document.getElementById('bets-run-btn')?.addEventListener('click', async () => {
-    const btn = document.getElementById('bets-run-btn');
-    if (btn) { btn.textContent = 'Scanning…'; btn.disabled = true; }
-    try {
-      if (typeof botDailyRun === 'function') await botDailyRun(true);
-    } catch (e) { console.warn('[bot] run failed', e); }
-    if (btn) { btn.textContent = 'Run Scan'; btn.disabled = false; }
-    if (typeof renderBetsTab === 'function') renderBetsTab();
-    if (typeof renderTodaysBetsBanner === 'function') renderTodaysBetsBanner();
-  });
+  // Bets tab buttons.
+  // bets-refresh-btn + bets-filter + the hidden file input live in the STATIC
+  // header, so they're bound once by id here. The TOOLBAR buttons (Run / Retrain
+  // / Export / Import Repo / Import File / Commit / Repo / Rebalance) are
+  // re-created by renderBetsTab() on every render, so binding them once by id
+  // would break after the first re-render — they're delegated from #bets-body.
   document.getElementById('bets-refresh-btn')?.addEventListener('click', async () => {
     const btn = document.getElementById('bets-refresh-btn');
-    if (btn) { btn.textContent = 'Refreshing…'; btn.disabled = true; }
+    if (btn) { btn.textContent = '\u21bb Refreshing\u2026'; btn.disabled = true; }
     try { if (typeof botRefreshLiveQuotes === 'function') await botRefreshLiveQuotes(); }
     catch (e) { console.warn('[bot] price refresh failed', e); }
-    if (btn) { btn.textContent = 'Refresh Prices'; btn.disabled = false; }
+    if (btn) { btn.textContent = '\u21bb Refresh Prices'; btn.disabled = false; }
+    if (typeof renderBetsTab === 'function') renderBetsTab();
   });
-  document.getElementById('bets-retrain-btn')?.addEventListener('click', () => {
+
+  const _betsRetrainHandler = () => {
     if (typeof botRetrain !== 'function') return;
-    // Tell the user how many settled trades exist — retrain only learns from
-    // CLOSED trades, so if the bot has only opened/added positions so far there's
-    // nothing to learn yet (and that's fine).
     const bot = (typeof loadBotState === 'function') ? loadBotState() : { bets: [] };
     const settledCount = (bot.bets || []).filter(b => b.status === 'closed' && b.components && isFinite(b.pnl)).length;
     const untrainedCount = (bot.bets || []).filter(b => b.status === 'closed' && b.components && isFinite(b.pnl) && !b._trained).length;
     if (settledCount === 0) {
-      if (typeof flashStatus === 'function') flashStatus('Nothing to retrain yet — the bot learns from CLOSED trades, and none have closed so far. Open positions don\'t teach until they settle.', '');
+      if (typeof flashStatus === 'function') flashStatus("Nothing to retrain yet \u2014 the bot learns from CLOSED trades, and none have closed so far. Open positions don't teach until they settle.", '');
       return;
     }
     const w = botRetrain();
     try {
       const entries = Object.entries(w || {}).filter(([,v]) => isFinite(v));
       entries.sort((a, b) => b[1] - a[1]);
-      const top = entries.slice(0, 3).map(([k,v]) => `${k} ×${v.toFixed(2)}`).join(', ');
-      const bottom = entries.slice(-3).map(([k,v]) => `${k} ×${v.toFixed(2)}`).join(', ');
+      const top = entries.slice(0, 3).map(([k,v]) => `${k} \u00d7${v.toFixed(2)}`).join(', ');
+      const bottom = entries.slice(-3).map(([k,v]) => `${k} \u00d7${v.toFixed(2)}`).join(', ');
       if (typeof flashStatus === 'function' && entries.length) {
         flashStatus(untrainedCount > 0
           ? `Retrained on ${untrainedCount} newly-settled trade${untrainedCount !== 1 ? 's' : ''} (${settledCount} total). Most trusted: ${top}. Least: ${bottom}`
@@ -3250,38 +3244,61 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     } catch {}
     if (typeof renderBetsTab === 'function') renderBetsTab();
-  });
-  document.getElementById('bets-export-btn')?.addEventListener('click', () => {
-    if (typeof exportBotTrainingData === 'function') exportBotTrainingData();
-  });
-  document.getElementById('bets-import-btn')?.addEventListener('click', async () => {
-    const btn = document.getElementById('bets-import-btn');
-    if (btn) { btn.textContent = 'Importing…'; btn.disabled = true; }
-    try { if (typeof importBotTrainingData === 'function') await importBotTrainingData(); }
-    catch (e) { console.warn('import failed', e); }
-    if (btn) { btn.textContent = '⤒ Import Repo'; btn.disabled = false; }
-    if (typeof renderBetsTab === 'function') renderBetsTab();
-  });
-  // Import-from-file: opens a picker; also accepts drag-and-drop onto the button.
-  document.getElementById('bets-import-file-btn')?.addEventListener('click', () => {
-    document.getElementById('bets-import-file-input')?.click();
-  });
-  document.getElementById('bets-import-file-input')?.addEventListener('change', async (e) => {
-    const file = e.target.files && e.target.files[0];
-    if (file && typeof importBotTrainingFromFile === 'function') {
-      await importBotTrainingFromFile(file);
-      if (typeof renderBetsTab === 'function') renderBetsTab();
-      if (typeof renderTodaysBetsBanner === 'function') renderTodaysBetsBanner();
-    }
-    e.target.value = '';  // allow re-importing the same filename
-  });
-  // Drag-and-drop a JSON file straight onto the Import File button.
-  const _impFileBtn = document.getElementById('bets-import-file-btn');
-  if (_impFileBtn) {
-    ['dragover', 'dragenter'].forEach(ev => _impFileBtn.addEventListener(ev, (e) => { e.preventDefault(); _impFileBtn.style.outline = '2px solid var(--amber)'; }));
-    ['dragleave', 'drop'].forEach(ev => _impFileBtn.addEventListener(ev, () => { _impFileBtn.style.outline = ''; }));
-    _impFileBtn.addEventListener('drop', async (e) => {
-      e.preventDefault();
+  };
+
+  const _betsBody = document.getElementById('bets-body');
+  if (_betsBody) {
+    _betsBody.addEventListener('click', async (e) => {
+      const btn = e.target.closest('button');
+      if (!btn || !_betsBody.contains(btn)) return;
+      switch (btn.id) {
+        case 'bets-run-btn': {
+          btn.textContent = '\u25b6 Running\u2026'; btn.disabled = true;
+          try { if (typeof botDailyRun === 'function') await botDailyRun(true); }
+          catch (err) { console.warn('[bot] run failed', err); }
+          if (typeof renderBetsTab === 'function') renderBetsTab();
+          if (typeof renderTodaysBetsBanner === 'function') renderTodaysBetsBanner();
+          break;
+        }
+        case 'bets-retrain-btn': _betsRetrainHandler(); break;
+        case 'bets-export-btn':
+          if (typeof exportBotTrainingData === 'function') exportBotTrainingData();
+          break;
+        case 'bets-import-btn': {
+          btn.textContent = '\u2692 Importing\u2026'; btn.disabled = true;
+          try { if (typeof importBotTrainingData === 'function') await importBotTrainingData(); }
+          catch (err) { console.warn('import failed', err); }
+          if (typeof renderBetsTab === 'function') renderBetsTab();
+          break;
+        }
+        case 'bets-import-file-btn':
+          document.getElementById('bets-import-file-input')?.click();
+          break;
+        case 'bets-rebalance-btn':
+          if (typeof botRebalanceToPositiveCash === 'function') botRebalanceToPositiveCash(0.10);
+          if (typeof renderBetsTab === 'function') renderBetsTab();
+          if (typeof renderTodaysBetsBanner === 'function') renderTodaysBetsBanner();
+          break;
+        case 'bets-commit-btn':
+          window.open(BOT_DATA_REPO_EDIT, '_blank', 'noopener');
+          break;
+        case 'bets-repo-btn':
+          window.open(BOT_DATA_REPO, '_blank', 'noopener');
+          break;
+      }
+    });
+    _betsBody.addEventListener('dragover', (e) => {
+      const t = e.target.closest('#bets-import-file-btn');
+      if (t) { e.preventDefault(); t.style.outline = '2px solid var(--amber)'; }
+    });
+    _betsBody.addEventListener('dragleave', (e) => {
+      const t = e.target.closest('#bets-import-file-btn');
+      if (t) t.style.outline = '';
+    });
+    _betsBody.addEventListener('drop', async (e) => {
+      const t = e.target.closest('#bets-import-file-btn');
+      if (!t) return;
+      e.preventDefault(); t.style.outline = '';
       const file = e.dataTransfer?.files && e.dataTransfer.files[0];
       if (file && typeof importBotTrainingFromFile === 'function') {
         await importBotTrainingFromFile(file);
@@ -3290,16 +3307,15 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     });
   }
-  document.getElementById('bets-rebalance-btn')?.addEventListener('click', () => {
-    if (typeof botRebalanceToPositiveCash === 'function') botRebalanceToPositiveCash(0.10);
-    if (typeof renderBetsTab === 'function') renderBetsTab();
-    if (typeof renderTodaysBetsBanner === 'function') renderTodaysBetsBanner();
-  });
-  document.getElementById('bets-commit-btn')?.addEventListener('click', () => {
-    window.open(BOT_DATA_REPO_EDIT, '_blank', 'noopener');
-  });
-  document.getElementById('bets-repo-btn')?.addEventListener('click', () => {
-    window.open(BOT_DATA_REPO, '_blank', 'noopener');
+
+  document.getElementById('bets-import-file-input')?.addEventListener('change', async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (file && typeof importBotTrainingFromFile === 'function') {
+      await importBotTrainingFromFile(file);
+      if (typeof renderBetsTab === 'function') renderBetsTab();
+      if (typeof renderTodaysBetsBanner === 'function') renderTodaysBetsBanner();
+    }
+    e.target.value = '';
   });
   let _betsFilterTimer = null;
   document.getElementById('bets-filter')?.addEventListener('input', () => {
@@ -41811,10 +41827,37 @@ function renderBetsTab() {
       <button class="bets-view-btn" data-view="ledger" style="font-family:var(--mono);font-size:11px;padding:8px 18px;border:none;cursor:pointer;background:${view==='ledger'?'var(--amber)':'transparent'};color:${view==='ledger'?'#000':'var(--ink-dim)'};font-weight:${view==='ledger'?'700':'400'}">▤ Ledger (${perf.bets.length})</button>
     </div>`;
 
+  // ---- Action toolbar (sits BELOW the live summary cards, grouped by purpose)
+  // The header used to carry 10 buttons in one cramped row. Here they're grouped:
+  // Actions (run/retrain) · Sync (export/import/commit) · Maintenance (rebalance),
+  // each cluster visually separated so the bar reads cleanly.
+  const betsToolbar = `
+    <div class="bets-toolbar" style="display:flex;flex-wrap:wrap;align-items:center;gap:14px;margin:0 0 20px;padding:12px 14px;background:var(--bg-elev);border:1px solid var(--rule);border-radius:8px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="font-family:var(--mono);font-size:8px;color:var(--ink-faint);letter-spacing:0.12em;text-transform:uppercase">Actions</span>
+        <button class="btn" id="bets-run-btn" title="Run today's signal scan now">▶ Run Scan</button>
+        <button class="btn" id="bets-retrain-btn" title="Retrain signal weights from settled bets — learns from wins and losses">⟳ Retrain</button>
+      </div>
+      <div style="width:1px;align-self:stretch;background:var(--rule)"></div>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <span style="font-family:var(--mono);font-size:8px;color:var(--ink-faint);letter-spacing:0.12em;text-transform:uppercase">Sync</span>
+        <button class="btn btn-ghost" id="bets-export-btn" title="Export full training journal as JSON to commit to the bot-data repo">⤓ Export</button>
+        <button class="btn btn-ghost" id="bets-import-btn" title="Pull the bot's history from the TRAPP2-BOT repo on GitHub (restores the journal on a fresh device)">⤒ Import Repo</button>
+        <button class="btn btn-ghost" id="bets-import-file-btn" title="Import a bot_training_data.json file from your device — no GitHub needed">⤒ Import File</button>
+        <button class="btn btn-ghost" id="bets-commit-btn" title="Open the TRAPP2-BOT file editor on GitHub to paste/commit the exported JSON">Commit ↗</button>
+        <button class="btn btn-ghost" id="bets-repo-btn" title="Open the TRAPP2-BOT repository on GitHub">Repo ↗</button>
+      </div>
+      <div style="width:1px;align-self:stretch;background:var(--rule)"></div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="font-family:var(--mono);font-size:8px;color:var(--ink-faint);letter-spacing:0.12em;text-transform:uppercase">Maintain</span>
+        <button class="btn btn-ghost" id="bets-rebalance-btn" title="Trim open positions to restore positive cash (partial sells, largest first)">⚖ Rebalance Cash</button>
+      </div>
+    </div>`;
+
   if (view === 'ledger') {
     body.innerHTML = toggle + ledger + note;
   } else {
-    body.innerHTML = toggle + summary + chartHtml + balanceHtml + positionsHtml + activityHtml + insightsHtml + todayHtml + note;
+    body.innerHTML = toggle + summary + betsToolbar + chartHtml + balanceHtml + positionsHtml + activityHtml + insightsHtml + todayHtml + note;
   }
   // Wire the view toggle.
   body.querySelectorAll('.bets-view-btn').forEach(btn => {
