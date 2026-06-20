@@ -7463,10 +7463,10 @@
           <button type="button" data-val="3M"  class="seg-btn">3M</button>
           <button type="button" data-val="6M"  class="seg-btn">6M</button>
           <button type="button" data-val="YTD" class="seg-btn">YTD</button>
-          <button type="button" data-val="1Y"  class="seg-btn active">1Y</button>
+          <button type="button" data-val="1Y"  class="seg-btn">1Y</button>
           <button type="button" data-val="3Y"  class="seg-btn">3Y</button>
           <button type="button" data-val="5Y"  class="seg-btn">5Y</button>
-          <button type="button" data-val="ALL" class="seg-btn">ALL</button>
+          <button type="button" data-val="ALL" class="seg-btn active">ALL</button>
         </div>
       </div>
       <div class="ta-input-group" style="flex:0 0 auto">
@@ -8054,12 +8054,9 @@
       </div>
     </div>
     <div class="bets-controls" style="display:flex;gap:8px;align-items:center">
-      <!-- Primary, most-used action lives up here next to the title; the full
-           toolbar (run / retrain / sync / maintenance) renders below the live
-           data in renderBetsTab() so the header stays clean. -->
+      <!-- Primary action next to the title; full toolbar renders below the live data in renderBetsTab(). -->
       <input id="bets-filter" placeholder="filter by ticker" style="background:var(--bg-elev);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:11px;padding:6px 10px;border-radius:3px;width:140px">
       <button class="btn" id="bets-refresh-btn" title="Fetch fresh live prices for open positions (Stooq/Finnhub), USD-converted">↻ Refresh Prices</button>
-      <!-- Hidden file input used by the Import File button in the toolbar below. -->
       <input type="file" id="bets-import-file-input" accept="application/json,.json" style="display:none">
     </div>
   </div>
@@ -8826,6 +8823,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260615z3"></script>
+<script src="app.js?v=20260615z5"></script>
 </body>
 </html>

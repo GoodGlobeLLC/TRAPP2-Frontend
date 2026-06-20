@@ -4727,12 +4727,16 @@ function normalizeStock(envelope) {
       : null,
     evToRevenue: avNum(ov.EVToRevenue),
     evToEbitda: pick(sheetEvEbitda, avNum(ov.EVToEBITDA)),
-    // Normalize dividend yield: if value > 1 it's percent units (e.g. 0.42),
-    // if <= 1 it's already a decimal fraction (e.g. 0.0042). Output is decimal.
+    // Normalize dividend yield. The pipeline (and AlphaVantage's DividendYield)
+    // emit a PERCENT number: GIS 7.09 = 7.09%, AAPL 0.36 = 0.36%. The app stores
+    // dividendYield as a DECIMAL (0.0709, 0.0036). The OLD ">1 means percent"
+    // heuristic was wrong: it left sub-1% yields like AAPL 0.36 as 0.36 →
+    // displayed 36%. Treat any plausible percent (0–40) as percent; >40 is bad
+    // data → 0. This matches the normalizer used on the master.json load path.
     dividendYield: (() => {
       const raw = sheetDiv ?? avNum(ov.DividendYield);
-      if (raw == null || !isFinite(raw)) return 0;
-      return raw > 1 ? raw / 100 : raw;
+      if (raw == null || !isFinite(raw) || raw <= 0) return 0;
+      return raw <= 40 ? raw / 100 : 0;
     })(),
     // 52-week range. Prefer reported values; fall back to computing from
     // available price history (~252 trading days = 1 year).
@@ -20970,12 +20974,19 @@ function normalizeRowFields(row) {
       // Source is percent if it's a plausible percent (0–40). Convert to decimal.
       row.dividendYield = dy > 0 && dy <= 40 ? dy / 100 : null;
       row._divYieldNormalized = true;
-    } else if (typeof row.dividendYield === 'number' && row.dividendYield > 1 && row.dividendYield <= 40) {
-      // No snake source but camel looks like a percent — convert.
+    } else if (typeof row.dividendYield === 'number' && row.dividendYield > 0 && row.dividendYield <= 40) {
+      // No snake source, camel field holds the raw percent number (the stockbook
+      // row builder reads the sheet's percent straight into dividendYield). The
+      // pipeline/sheet are UNIFORMLY percent — AAPL 0.36 = 0.36%, GIS 7.09 =
+      // 7.09% — so convert any plausible-percent value (0–40), not just >1. The
+      // OLD ">1" test left sub-1% yields (AAPL 0.36) as 0.36 → displayed 36%.
       row.dividendYield = row.dividendYield / 100;
       row._divYieldNormalized = true;
     } else {
-      row._divYieldNormalized = true;  // already decimal or absent; leave as-is
+      // >40 is implausible as a yield → treat as bad data (null); otherwise
+      // already decimal/absent — leave as-is.
+      if (typeof row.dividendYield === 'number' && row.dividendYield > 40) row.dividendYield = null;
+      row._divYieldNormalized = true;
     }
   }
   return row;
@@ -25923,7 +25934,7 @@ function _saveImportFromModal() {
 state.ta = {
   primary: null,
   compare: [],
-  range: '1Y',
+  range: 'ALL',
   displayMode: 'price',
   activeTools: new Set(),
   fibAnchors: null,
@@ -36576,47 +36587,95 @@ function renderResearchScreener(data) {
     </div>
     ${catTableHtml}`;
 
-  // ===== SECONDARY: metric-threshold filter (unchanged) =====
+  // ===== METRIC RANKER — select metric(s) to instantly rank; thresholds optional
+  // New model (per the user's ask):
+  //  • Selecting a metric IMMEDIATELY ranks every ticker by that metric — no
+  //    value required. Multiple metrics → ranked by the AVERAGE of their
+  //    percentile ranks (grade-weighted blend), best first.
+  //  • A value threshold is OPTIONAL: each selected metric has a "+ filter"
+  //    toggle that reveals an op + value box. Empty threshold = rank only.
+  //  • Metrics with little/no data in the loaded universe are shown but marked
+  //    "no data" so dead metrics are obvious (only ~P/E, market cap, dividend
+  //    yield are populated from the basic sheet feed; the rest need the richer
+  //    backend fields).
+  // RESEARCH_STATE.filters entries: { metric, op, val, threshold:bool }.
   const cats = [...new Set(RESEARCH_METRICS.map(x => x.cat))];
+
+  // Per-metric data coverage across the loaded universe (how many tickers have a
+  // finite value). Used to flag dead metrics and to weight blends sensibly.
+  const metricCoverage = {};
+  for (const m of RESEARCH_METRICS) {
+    const pm = data.perMetric[m.key];
+    metricCoverage[m.key] = pm && Array.isArray(pm.ranked) ? pm.ranked.length : 0;
+  }
+  const totalTickers = allRows.length || 1;
+
   const metricOptionsFor = (sel) => cats.map(cat =>
     `<optgroup label="${cat}">` +
-    RESEARCH_METRICS.filter(x => x.cat === cat).map(x =>
-      `<option value="${x.key}" ${x.key === sel ? 'selected' : ''}>${x.label}</option>`).join('') +
+    RESEARCH_METRICS.filter(x => x.cat === cat).map(x => {
+      const cov = metricCoverage[x.key] || 0;
+      const covPct = Math.round((cov / totalTickers) * 100);
+      const dead = cov < 3;
+      return `<option value="${x.key}" ${x.key === sel ? 'selected' : ''}>${x.label}${dead ? ' — no data' : ` (${covPct}% have data)`}</option>`;
+    }).join('') +
     `</optgroup>`
   ).join('');
 
+  // Default to a metric that actually HAS data so the screen isn't empty on open.
+  const firstLiveMetric = (RESEARCH_METRICS.find(m => (metricCoverage[m.key] || 0) >= 3) || RESEARCH_METRICS[0]).key;
   if (!RESEARCH_STATE.filters || !RESEARCH_STATE.filters.length) {
-    RESEARCH_STATE.filters = [{ metric: 'roe', op: 'gte', val: '' }];
+    RESEARCH_STATE.filters = [{ metric: firstLiveMetric, op: 'gte', val: '', threshold: false }];
   }
+  // Back-compat: older filter entries may lack the threshold flag.
+  RESEARCH_STATE.filters.forEach(f => { if (f.threshold === undefined) f.threshold = (f.val !== '' && f.val != null); });
 
-  // Helper: read a metric's raw numeric value for a ticker (from perMetric).
   const metricVal = (metricKey, ticker) => {
     const pm = data.perMetric[metricKey];
     if (!pm) return null;
-    // O(1) via the byTicker Map (falls back to scan only for older cached data).
     const hit = pm.byTicker ? pm.byTicker.get(ticker) : pm.ranked.find(r => r.ticker === ticker);
     return hit ? hit.value : null;
   };
+  // Percentile rank (0-100, higher=better after direction) of a ticker for a metric.
+  const metricPct = (metricKey, ticker) => {
+    const pm = data.perMetric[metricKey];
+    if (!pm || !pm.byTicker) return null;
+    const hit = pm.byTicker.get(ticker);
+    return hit && hit.pct != null ? hit.pct : null;   // perMetric entries store the percentile as `pct`
+  };
 
-  // Apply all active filters (those with a numeric threshold).
-  const active = RESEARCH_STATE.filters.filter(f => f.val !== '' && isFinite(+f.val));
+  // The metrics the user has selected (dedupe).
+  const selectedMetrics = [...new Set(RESEARCH_STATE.filters.map(f => f.metric))];
+  // Active THRESHOLDS only (metric + a real numeric value the user opted into).
+  const activeThresholds = RESEARCH_STATE.filters.filter(f => f.threshold && f.val !== '' && isFinite(+f.val));
+
+  // 1. Apply any opted-in thresholds as hard filters.
   let results = allRows.filter(t => {
-    for (const f of active) {
+    for (const f of activeThresholds) {
       const v = metricVal(f.metric, t.ticker);
       if (v == null || !isFinite(v)) return false;
       const thr = +f.val;
       if (f.op === 'gte' && !(v >= thr)) return false;
       if (f.op === 'lte' && !(v <= thr)) return false;
-      if (f.op === 'gt' && !(v > thr)) return false;
-      if (f.op === 'lt' && !(v < thr)) return false;
+      if (f.op === 'gt'  && !(v >  thr)) return false;
+      if (f.op === 'lt'  && !(v <  thr)) return false;
     }
     return true;
   });
-  // Sort by grade score desc (best first) when no single metric is the focus.
-  // When exactly one filter is active, sort by THAT metric so the screen reads
-  // like a ranking on the thing you filtered by.
-  if (active.length === 1) {
-    const fk = active[0].metric;
+  // A ticker must have data for at least one selected metric to be ranked.
+  results = results.filter(t => selectedMetrics.some(mk => metricVal(mk, t.ticker) != null));
+
+  // 2. Rank. Single metric → by that metric's value (direction-aware). Multiple →
+  //    by the AVERAGE percentile across the selected metrics (grade-weighted blend).
+  const blendPct = (ticker) => {
+    let sum = 0, n = 0;
+    for (const mk of selectedMetrics) {
+      const p = metricPct(mk, ticker);
+      if (p != null) { sum += p; n++; }
+    }
+    return n ? sum / n : null;
+  };
+  if (selectedMetrics.length === 1) {
+    const fk = selectedMetrics[0];
     const mObj = RESEARCH_METRICS.find(x => x.key === fk);
     const higher = mObj ? mObj.higher : true;
     results.sort((a, b) => {
@@ -36625,65 +36684,78 @@ function renderResearchScreener(data) {
       return higher ? vb - va : va - vb;
     });
   } else {
-    results.sort((a, b) => (b.gradeScore || 0) - (a.gradeScore || 0));
+    results.sort((a, b) => {
+      const pa = blendPct(a.ticker), pb = blendPct(b.ticker);
+      if (pa == null) return 1; if (pb == null) return -1;
+      return pb - pa;
+    });
   }
-  // Show ALL matches (no 200 cap). At 10k tickers a filtered set is usually far
-  // smaller, and the user asked to see everything that passes.
   const shown = results;
 
-  // Filter-row UI.
-  const opLabel = { gte: '≥', lte: '≤', gt: '>', lt: '<' };
+  // ---- Filter-row UI (one row per selected metric) ----
   const filterRowsHtml = RESEARCH_STATE.filters.map((f, i) => {
     const mObj = RESEARCH_METRICS.find(x => x.key === f.metric) || RESEARCH_METRICS[0];
+    const cov = metricCoverage[f.metric] || 0;
+    const dead = cov < 3;
+    const isPctMetric = mObj.key.includes('Margin') || ['roe','roa','rotce','revGrowth','epsGrowth','divYield','fcfMargin','cashRatio','sbcPctRev'].includes(mObj.key);
     return `
-    <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px" data-filter-row="${i}">
-      <select class="heat-filter-select rf-metric" data-i="${i}" style="min-width:200px">${metricOptionsFor(f.metric)}</select>
-      <select class="heat-filter-select rf-op" data-i="${i}" style="width:64px">
-        <option value="gte" ${f.op === 'gte' ? 'selected' : ''}>≥</option>
-        <option value="lte" ${f.op === 'lte' ? 'selected' : ''}>≤</option>
-        <option value="gt" ${f.op === 'gt' ? 'selected' : ''}>&gt;</option>
-        <option value="lt" ${f.op === 'lt' ? 'selected' : ''}>&lt;</option>
-      </select>
-      <input class="rf-val" data-i="${i}" value="${f.val}" placeholder="value" inputmode="decimal"
-        style="width:90px;background:var(--bg-card);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:11px;padding:5px 8px;border-radius:3px">
-      <span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint)">${mObj.higher ? 'higher=better' : 'lower=better'}${mObj.key.includes('Margin') || mObj.key === 'roe' || mObj.key === 'roa' ? ' · decimal (0.2=20%)' : ''}</span>
-      <button class="btn btn-ghost rf-del" data-i="${i}" style="font-size:11px;padding:2px 8px" title="Remove filter">✕</button>
+    <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;flex-wrap:wrap" data-filter-row="${i}">
+      <select class="heat-filter-select rf-metric" data-i="${i}" style="min-width:230px">${metricOptionsFor(f.metric)}</select>
+      ${dead
+        ? `<span style="font-family:var(--mono);font-size:9px;color:var(--neg)">no data in this universe</span>`
+        : f.threshold
+          ? `<select class="heat-filter-select rf-op" data-i="${i}" style="width:60px">
+               <option value="gte" ${f.op==='gte'?'selected':''}>≥</option>
+               <option value="lte" ${f.op==='lte'?'selected':''}>≤</option>
+               <option value="gt"  ${f.op==='gt' ?'selected':''}>&gt;</option>
+               <option value="lt"  ${f.op==='lt' ?'selected':''}>&lt;</option>
+             </select>
+             <input class="rf-val" data-i="${i}" value="${f.val}" placeholder="value" inputmode="decimal"
+               style="width:84px;background:var(--bg-card);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:11px;padding:5px 8px;border-radius:3px">
+             <span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint)">${mObj.higher?'higher=better':'lower=better'}${isPctMetric?' · decimal (0.2=20%)':''}</span>
+             <button class="btn btn-ghost rf-nothresh" data-i="${i}" style="font-size:9px;padding:2px 7px" title="Remove the value threshold — keep ranking by this metric">− value</button>`
+          : `<button class="btn btn-ghost rf-addthresh" data-i="${i}" style="font-size:10px;padding:3px 9px" title="Add an optional value cutoff for this metric">+ value</button>
+             <span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint)">ranking by ${mObj.higher?'highest':'lowest'} · ${Math.round((cov/totalTickers)*100)}% have data</span>`
+      }
+      <button class="btn btn-ghost rf-del" data-i="${i}" style="font-size:11px;padding:2px 8px;margin-left:auto" title="Remove this metric">✕</button>
     </div>`;
   }).join('');
 
+  // ---- Result rows: show grade + each selected metric's value ----
   const rowsHtml = shown.map((t, idx) => {
-    // Show each active filter's value for this ticker, plus grade.
-    const filterCells = active.map(f => {
-      const mObj = RESEARCH_METRICS.find(x => x.key === f.metric);
-      const v = metricVal(f.metric, t.ticker);
+    const metricCells = selectedMetrics.map(mk => {
+      const mObj = RESEARCH_METRICS.find(x => x.key === mk);
+      const v = metricVal(mk, t.ticker);
       return `<td style="text-align:right;font-family:var(--mono);font-size:11px">${v != null && mObj ? mObj.fmt(v) : '—'}</td>`;
     }).join('');
+    const blend = selectedMetrics.length > 1 ? blendPct(t.ticker) : null;
     return `<tr class="research-screen-row" data-ticker="${escapeHtml(t.ticker)}" style="cursor:pointer">
       <td style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);text-align:right">${idx + 1}</td>
       <td style="font-family:var(--mono);font-weight:700">${escapeHtml(t.ticker)}</td>
-      <td style="font-size:11px;color:var(--ink-dim);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(t.name)}</td>
+      <td style="font-size:11px;color:var(--ink-dim);max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(t.name)}</td>
       <td style="text-align:center"><span style="font-family:var(--mono);font-weight:700;color:${researchGradeColor(t.grade)}">${t.grade || '—'}</span></td>
-      <td style="text-align:right;font-family:var(--mono);font-size:11px">${t.gradeScore != null ? t.gradeScore.toFixed(0) : '—'}</td>
-      ${filterCells}
-      <td style="text-align:center;font-family:var(--mono);font-size:9px;color:var(--amber)">value →</td>
+      ${blend != null ? `<td style="text-align:right;font-family:var(--mono);font-size:11px;font-weight:700" title="Average percentile across selected metrics">${blend.toFixed(0)}</td>` : `<td style="text-align:right;font-family:var(--mono);font-size:11px">${t.gradeScore != null ? t.gradeScore.toFixed(0) : '—'}</td>`}
+      ${metricCells}
+      <td style="text-align:center;font-family:var(--mono);font-size:9px;color:var(--amber)">open →</td>
     </tr>`;
   }).join('');
 
-  const filterHeaderCols = active.map(f => {
-    const mObj = RESEARCH_METRICS.find(x => x.key === f.metric);
+  const metricHeaderCols = selectedMetrics.map(mk => {
+    const mObj = RESEARCH_METRICS.find(x => x.key === mk);
     return `<th style="text-align:right">${mObj ? escapeHtml(mObj.label) : ''}</th>`;
   }).join('');
+  const scoreColLabel = selectedMetrics.length > 1 ? 'Blend' : 'Score';
 
   return `
     ${catScreenerHtml}
     <div class="company-card" style="margin:0 0 14px">
-      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:10px">Metric filter — companies must pass ALL filters</div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:4px">Metric ranker</div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);margin-bottom:10px;line-height:1.5">Pick a metric to rank every ticker by it instantly — no value needed. Add more metrics to rank by their blended percentile. Use <strong>+ value</strong> on any metric only if you also want a hard cutoff.${activeThresholds.length ? ` <span style="color:var(--amber)">${activeThresholds.length} threshold${activeThresholds.length>1?'s':''} active.</span>` : ''}</div>
       ${filterRowsHtml}
-      <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
-        <button class="btn btn-ghost" id="rf-add" style="font-size:10px">+ Add filter</button>
-        <button class="btn" id="rf-apply" style="font-size:10px;background:var(--pos)">Apply</button>
-        <button class="btn btn-ghost" id="rf-clear" style="font-size:10px">Clear all</button>
-        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-left:auto;align-self:center">${results.length} match${results.length === 1 ? '' : 'es'}${active.length === 1 ? ' · ranked by ' + (RESEARCH_METRICS.find(x=>x.key===active[0].metric)?.label || '') : ''}</span>
+      <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center">
+        <button class="btn btn-ghost" id="rf-add" style="font-size:10px">+ Add metric</button>
+        <button class="btn btn-ghost" id="rf-clear" style="font-size:10px">Reset</button>
+        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-left:auto;align-self:center">${results.length} ranked${selectedMetrics.length === 1 ? ' · by ' + (RESEARCH_METRICS.find(x=>x.key===selectedMetrics[0])?.label || '') : selectedMetrics.length > 1 ? ' · blended ' + selectedMetrics.length + ' metrics' : ''}</span>
       </div>
     </div>
     <div class="company-card" style="margin:0">
@@ -36691,11 +36763,11 @@ function renderResearchScreener(data) {
       <table class="sb-table" style="width:100%;min-width:0">
         <thead><tr>
           <th style="text-align:right">#</th><th>Ticker</th><th>Company</th>
-          <th style="text-align:center">Grade</th><th style="text-align:right">Score</th>
-          ${filterHeaderCols}
+          <th style="text-align:center">Grade</th><th style="text-align:right">${scoreColLabel}</th>
+          ${metricHeaderCols}
           <th></th>
         </tr></thead>
-        <tbody>${rowsHtml || `<tr><td colspan="${6 + active.length}" style="padding:20px;text-align:center;color:var(--ink-faint)">No companies match these filters. Loosen a threshold.</td></tr>`}</tbody>
+        <tbody>${rowsHtml || `<tr><td colspan="${6 + selectedMetrics.length}" style="padding:20px;text-align:center;color:var(--ink-faint)">No tickers have data for the selected metric(s). Pick P/E, Market Cap, or Dividend Yield — those are populated from the basic feed.</td></tr>`}</tbody>
       </table>
       </div>
     </div>`;
@@ -36716,17 +36788,39 @@ function wireResearchScreener() {
     document.querySelectorAll('.rf-op').forEach(el => { const i = +el.dataset.i; if (RESEARCH_STATE.filters[i]) RESEARCH_STATE.filters[i].op = el.value; });
     document.querySelectorAll('.rf-val').forEach(el => { const i = +el.dataset.i; if (RESEARCH_STATE.filters[i]) RESEARCH_STATE.filters[i].val = el.value.trim(); });
   };
-  document.getElementById('rf-add')?.addEventListener('click', () => { syncFromInputs(); RESEARCH_STATE.filters.push({ metric: 'grossMargin', op: 'gte', val: '' }); renderResearchTab(); });
-  document.getElementById('rf-apply')?.addEventListener('click', () => { syncFromInputs(); renderResearchTab(); });
-  document.getElementById('rf-clear')?.addEventListener('click', () => { RESEARCH_STATE.filters = [{ metric: 'roe', op: 'gte', val: '' }]; renderResearchTab(); });
-  document.querySelectorAll('.rf-del').forEach(b => b.addEventListener('click', () => {
-    syncFromInputs(); const i = +b.dataset.i; RESEARCH_STATE.filters.splice(i, 1);
-    if (!RESEARCH_STATE.filters.length) RESEARCH_STATE.filters = [{ metric: 'roe', op: 'gte', val: '' }];
+  // CHANGING A METRIC re-ranks instantly (no Apply needed — that's the point).
+  document.querySelectorAll('.rf-metric').forEach(el => el.addEventListener('change', () => { syncFromInputs(); renderResearchTab(); }));
+  // Changing an operator while a threshold is open also re-applies live.
+  document.querySelectorAll('.rf-op').forEach(el => el.addEventListener('change', () => { syncFromInputs(); renderResearchTab(); }));
+  // + value / − value: toggle the optional threshold for a metric row.
+  document.querySelectorAll('.rf-addthresh').forEach(b => b.addEventListener('click', () => {
+    syncFromInputs(); const i = +b.dataset.i;
+    if (RESEARCH_STATE.filters[i]) { RESEARCH_STATE.filters[i].threshold = true; }
     renderResearchTab();
   }));
-  // Apply on Enter in any value field.
-  document.querySelectorAll('.rf-val').forEach(el => el.addEventListener('keydown', e => { if (e.key === 'Enter') { syncFromInputs(); renderResearchTab(); } }));
-  // CLICK A RESULT → value that ticker (the connection the user asked for).
+  document.querySelectorAll('.rf-nothresh').forEach(b => b.addEventListener('click', () => {
+    syncFromInputs(); const i = +b.dataset.i;
+    if (RESEARCH_STATE.filters[i]) { RESEARCH_STATE.filters[i].threshold = false; RESEARCH_STATE.filters[i].val = ''; }
+    renderResearchTab();
+  }));
+  // Add another metric (defaults to a metric that has data so the screen stays live).
+  document.getElementById('rf-add')?.addEventListener('click', () => {
+    syncFromInputs();
+    RESEARCH_STATE.filters.push({ metric: 'marketCap', op: 'gte', val: '', threshold: false });
+    renderResearchTab();
+  });
+  document.getElementById('rf-clear')?.addEventListener('click', () => { RESEARCH_STATE.filters = []; renderResearchTab(); });
+  document.querySelectorAll('.rf-del').forEach(b => b.addEventListener('click', () => {
+    syncFromInputs(); const i = +b.dataset.i; RESEARCH_STATE.filters.splice(i, 1);
+    renderResearchTab();
+  }));
+  // Typing a threshold value re-applies live on input (debounced) and on Enter.
+  let _rfValTimer = null;
+  document.querySelectorAll('.rf-val').forEach(el => {
+    el.addEventListener('input', () => { clearTimeout(_rfValTimer); _rfValTimer = setTimeout(() => { syncFromInputs(); renderResearchTab(); }, 350); });
+    el.addEventListener('keydown', e => { if (e.key === 'Enter') { clearTimeout(_rfValTimer); syncFromInputs(); renderResearchTab(); } });
+  });
+  // CLICK A RESULT → open that ticker.
   document.querySelectorAll('.research-screen-row').forEach(r => r.addEventListener('click', () => {
     const tk = r.dataset.ticker;
     if (tk && typeof executeCommand === 'function') executeCommand(tk);
