@@ -4165,9 +4165,13 @@ function loadPriceHistCache() {
   return _priceHistMemCache;
 }
 function savePriceHistCache(c) {
-  // Trim each history to the last ~260 points (≈1 trading year) — enough for
-  // every chart/correlation/probability model while keeping the store compact.
-  const MAX_POINTS = 260;
+  // Cap each series at ~21 years of daily bars. The OLD cap was 260 (~1 year),
+  // which silently truncated deep 20-year series on write — so getPriceHistory
+  // would fetch BAC's full 5,000-bar file, cache only the last 260, and then the
+  // TA chart (which reads this cache) showed just 1 year. That was the
+  // "BAC only goes back to June 6th" regression. The cache lives in IndexedDB
+  // now (not the 5MB localStorage), so keeping full history is fine.
+  const MAX_POINTS = 5500;
   for (const [k, v] of Object.entries(c)) {
     if (v && Array.isArray(v.data) && v.data.length > MAX_POINTS) {
       _priceHistMemCache[k] = { ...v, data: v.data.slice(-MAX_POINTS) };
