@@ -6861,6 +6861,20 @@ function openSourcesModal() {
   if (sbAnonEl) sbAnonEl.value = getSupabaseAnon();
   const sbStatus = document.getElementById('supabase-status');
   if (sbStatus) sbStatus.textContent = supabaseConfigured() ? '● connected' : '';
+  // Portfolio (TRAPP2-PORT) Supabase fields.
+  const portUrlEl = document.getElementById('port-supabase-url-input');
+  if (portUrlEl && typeof getPortSupabaseUrl === 'function') portUrlEl.value = getPortSupabaseUrl();
+  const portAnonEl = document.getElementById('port-supabase-anon-input');
+  if (portAnonEl && typeof getPortSupabaseAnon === 'function') portAnonEl.value = getPortSupabaseAnon();
+  const portStatus = document.getElementById('port-supabase-status');
+  if (portStatus) portStatus.textContent = (typeof portSupabaseConfigured === 'function' && portSupabaseConfigured()) ? '● connected' : '';
+  // Analytics (TRAPP2-ANALYTICS) Supabase fields.
+  const anUrlEl = document.getElementById('analytics-supabase-url-input');
+  if (anUrlEl && typeof getAnalyticsSupabaseUrl === 'function') anUrlEl.value = getAnalyticsSupabaseUrl();
+  const anAnonEl = document.getElementById('analytics-supabase-anon-input');
+  if (anAnonEl && typeof getAnalyticsSupabaseAnon === 'function') anAnonEl.value = getAnalyticsSupabaseAnon();
+  const anStatus = document.getElementById('analytics-supabase-status');
+  if (anStatus) anStatus.textContent = (typeof analyticsSupabaseConfigured === 'function' && analyticsSupabaseConfigured()) ? '● connected' : '';
   document.getElementById('sheet-url-input').value = getSheetUrls().join('\n');
   const macroBaseEl = document.getElementById('macro-base-input');
   if (macroBaseEl) macroBaseEl.value = (typeof getMacroBaseOverride === 'function' ? getMacroBaseOverride() : '');
@@ -6908,6 +6922,37 @@ document.getElementById('supabase-sync-btn')?.addEventListener('click', async ()
   if (typeof supabaseLoadTrades === 'function') await supabaseLoadTrades();
   if (btn) { btn.textContent = 'Sync All Trades Now ↗'; btn.disabled = false; }
   if (typeof renderBetsTab === 'function') renderBetsTab();
+});
+
+// Portfolio Supabase (TRAPP2-PORT — separate project).
+document.getElementById('port-supabase-save-btn')?.addEventListener('click', () => {
+  const url = document.getElementById('port-supabase-url-input')?.value.trim() || '';
+  const anon = document.getElementById('port-supabase-anon-input')?.value.trim() || '';
+  if (typeof setPortSupabaseConfig === 'function') setPortSupabaseConfig(url, anon);
+  const st = document.getElementById('port-supabase-status');
+  if (st) st.textContent = (typeof portSupabaseConfigured === 'function' && portSupabaseConfigured()) ? '● connected' : '';
+  if (typeof flashStatus === 'function') flashStatus((typeof portSupabaseConfigured === 'function' && portSupabaseConfigured()) ? 'Portfolio Supabase connected — positions will auto-save' : 'Portfolio Supabase config cleared', 'success');
+});
+document.getElementById('port-supabase-sync-btn')?.addEventListener('click', async () => {
+  const btn = document.getElementById('port-supabase-sync-btn');
+  if (btn) { btn.textContent = 'Syncing…'; btn.disabled = true; }
+  if (typeof portSupabaseSyncAll === 'function') await portSupabaseSyncAll();
+  if (typeof portSupabaseLoad === 'function') await portSupabaseLoad();
+  if (btn) { btn.textContent = 'Sync Portfolio Now ↗'; btn.disabled = false; }
+  if (typeof renderPortfolioTab === 'function') renderPortfolioTab();
+});
+
+// Analytics Supabase (read-only — pipeline writes, app reads).
+document.getElementById('analytics-supabase-save-btn')?.addEventListener('click', () => {
+  const url = document.getElementById('analytics-supabase-url-input')?.value.trim() || '';
+  const anon = document.getElementById('analytics-supabase-anon-input')?.value.trim() || '';
+  if (typeof setAnalyticsSupabaseConfig === 'function') setAnalyticsSupabaseConfig(url, anon);
+  const st = document.getElementById('analytics-supabase-status');
+  const ok = (typeof analyticsSupabaseConfigured === 'function' && analyticsSupabaseConfigured());
+  if (st) st.textContent = ok ? '● connected' : '';
+  // Force a re-pull of grades from the new source on next render.
+  try { _backendResearchFetched = false; if (typeof loadBackendResearch === 'function') loadBackendResearch().catch(() => {}); } catch {}
+  if (typeof flashStatus === 'function') flashStatus(ok ? 'Analytics Supabase connected — grades + regime will load from here' : 'Analytics Supabase config cleared', 'success');
 });
 
 document.getElementById('github-quick-add-btn')?.addEventListener('click', () => {
@@ -23074,7 +23119,126 @@ function buildPortfolioData() {
   };
 }
 
-// Export the portfolio snapshot as a downloadable JSON for the TRAPP2-PORT repo.
+// ============================================================
+//   RAY DALIO "ALL WEATHER" CALCULATOR
+//   Compares the user's current portfolio allocation to Dalio's All Weather
+//   target (built to perform across all economic environments — growth/
+//   inflation rising or falling). Computes the gap per sleeve and the dollar
+//   rebalance to reach target. Also reports a simple environment-balance read.
+//
+//   All Weather target (Dalio's widely-published allocation):
+//     30% stocks · 40% long-term bonds · 15% intermediate bonds ·
+//     7.5% gold · 7.5% broad commodities
+// ============================================================
+const ALL_WEATHER_TARGET = [
+  { sleeve: 'Stocks',              pct: 0.30, examples: 'VTI, SPY, equities', match: r => _awIsStock(r) },
+  { sleeve: 'Long-term bonds',     pct: 0.40, examples: 'TLT, EDV (20-30yr)',  match: r => _awIsLongBond(r) },
+  { sleeve: 'Intermediate bonds',  pct: 0.15, examples: 'IEF, BIV (7-10yr)',   match: r => _awIsIntBond(r) },
+  { sleeve: 'Gold',                pct: 0.075, examples: 'GLD, IAU',            match: r => _awIsGold(r) },
+  { sleeve: 'Commodities',         pct: 0.075, examples: 'DBC, PDBC, GSG',     match: r => _awIsCommodity(r) },
+];
+function _awTicker(r) { return (r.ticker || '').toUpperCase(); }
+function _awIsLongBond(r) { return /\b(TLT|EDV|ZROZ|GOVZ|VGLT|SPTL|TLH)\b/.test(_awTicker(r)) || /long.*(treasur|bond)|20\+|25\+|30.year/i.test(r.name || ''); }
+function _awIsIntBond(r) { return /\b(IEF|IEI|BIV|VGIT|SPTI|GOVT|BND|AGG|SCHZ|VGIT)\b/.test(_awTicker(r)) || /intermediate.*(treasur|bond)|7-10|aggregate bond/i.test(r.name || ''); }
+function _awIsGold(r) { return /\b(GLD|IAU|SGOL|GLDM|BAR|AAAU|GOLD|PHYS)\b/.test(_awTicker(r)) || /\bgold\b/i.test(r.name || ''); }
+function _awIsCommodity(r) { return /\b(DBC|PDBC|GSG|DJP|COMT|BCI|USO|UNG|CPER|DBA|PALL|SLV)\b/.test(_awTicker(r)) || /commodit|crude|natural gas|silver|copper/i.test(r.name || ''); }
+function _awIsStock(r) {
+  // Anything that isn't a bond/gold/commodity and trades as equity/ETF counts as
+  // the "stocks" sleeve (the All Weather growth bucket).
+  if (_awIsLongBond(r) || _awIsIntBond(r) || _awIsGold(r) || _awIsCommodity(r)) return false;
+  const cls = (typeof classifyAssetRow === 'function') ? classifyAssetRow(r) : 'equity';
+  return cls === 'equity' || cls === 'etf' || cls === 'foreign';
+}
+
+// Compute the All Weather comparison from current holdings (uses market value;
+// falls back to cost basis when no live mark). Returns per-sleeve current/target
+// weights + the dollar move to reach target.
+function computeAllWeather() {
+  let portfolio = []; try { portfolio = loadPortfolio(); } catch {}
+  // Only funded holdings (shares > 0 or active positions) count toward allocation.
+  const holdings = portfolio.filter(e => {
+    const role = (e.position || '').toLowerCase();
+    return (e.qty > 0 || ['holding', 'trading', 'long', 'active'].includes(role)) && role !== 'watching' && role !== 'tracking' && role !== 'avoid';
+  });
+  const valueOf = (e) => {
+    const px = (typeof getRowLivePrice === 'function' ? getRowLivePrice(e.ticker) : null) || e.lastPrice || e.costBasis || 0;
+    const qty = e.qty || 0;
+    const v = px * qty;
+    return isFinite(v) && v > 0 ? v : (e.marketValue || 0);
+  };
+  let cash = 0; try { cash = (typeof getCashPosition === 'function') ? (getCashPosition() || 0) : 0; } catch {}
+  const sleeveValue = {};
+  let invested = 0;
+  for (const s of ALL_WEATHER_TARGET) sleeveValue[s.sleeve] = 0;
+  for (const e of holdings) {
+    const v = valueOf(e);
+    if (v <= 0) continue;
+    invested += v;
+    const s = ALL_WEATHER_TARGET.find(s => s.match(e));
+    if (s) sleeveValue[s.sleeve] += v;
+  }
+  const total = invested + Math.max(0, cash);
+  if (total <= 0) return null;
+  const rows = ALL_WEATHER_TARGET.map(s => {
+    const cur = sleeveValue[s.sleeve] || 0;
+    const curPct = cur / total;
+    const tgtVal = s.pct * total;
+    return {
+      sleeve: s.sleeve, examples: s.examples,
+      currentValue: cur, currentPct: curPct,
+      targetPct: s.pct, targetValue: tgtVal,
+      deltaValue: tgtVal - cur,           // + = buy more, - = trim
+      deltaPct: s.pct - curPct,
+    };
+  });
+  // Cash is "unallocated" relative to All Weather (it holds none).
+  const cashPct = Math.max(0, cash) / total;
+  return { rows, total, invested, cash, cashPct };
+}
+
+// Render the All Weather panel (called from the portfolio tab).
+function renderAllWeatherPanel() {
+  const aw = computeAllWeather();
+  if (!aw) {
+    return `<div class="company-card" style="margin:0 0 14px">
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:6px">Ray Dalio · All Weather</div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);line-height:1.5">Add some funded holdings to see how your allocation compares to the All Weather target (30% stocks · 40% long bonds · 15% intermediate bonds · 7.5% gold · 7.5% commodities).</div>
+    </div>`;
+  }
+  const fmtPct = (p) => (p * 100).toFixed(1) + '%';
+  const rowsHtml = aw.rows.map(r => {
+    const off = Math.abs(r.deltaPct) > 0.05;   // >5 points off target
+    const dir = r.deltaValue > 0 ? 'var(--pos)' : r.deltaValue < 0 ? 'var(--neg)' : 'var(--ink-faint)';
+    const action = Math.abs(r.deltaValue) < 1 ? '—' : (r.deltaValue > 0 ? `buy ${fmt$(r.deltaValue)}` : `trim ${fmt$(-r.deltaValue)}`);
+    return `<tr>
+      <td style="font-family:var(--mono);font-weight:700">${r.sleeve}<div style="font-weight:400;color:var(--ink-faint);font-size:9px">${r.examples}</div></td>
+      <td style="text-align:right;font-family:var(--mono)">${fmtPct(r.currentPct)}</td>
+      <td style="text-align:right;font-family:var(--mono);color:var(--ink-dim)">${fmtPct(r.targetPct)}</td>
+      <td style="text-align:right;font-family:var(--mono);color:${off ? dir : 'var(--ink-faint)'}">${r.deltaPct > 0 ? '+' : ''}${fmtPct(r.deltaPct)}</td>
+      <td style="text-align:right;font-family:var(--mono);font-size:11px;color:${dir}">${action}</td>
+    </tr>`;
+  }).join('');
+  // Simple "balance" read: how far the portfolio is from target in aggregate.
+  const totalDrift = aw.rows.reduce((s, r) => s + Math.abs(r.deltaPct), 0) / 2;  // /2 = one-sided turnover
+  const balanceLabel = totalDrift < 0.10 ? 'Well balanced' : totalDrift < 0.25 ? 'Moderately off target' : 'Far from All Weather';
+  const balanceColor = totalDrift < 0.10 ? 'var(--pos)' : totalDrift < 0.25 ? 'var(--data-amber)' : 'var(--neg)';
+  return `<div class="company-card" style="margin:0 0 14px">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;flex-wrap:wrap;gap:6px">
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Ray Dalio · All Weather</div>
+      <div style="font-family:var(--mono);font-size:10px;color:${balanceColor}">${balanceLabel} · ${fmtPct(totalDrift)} to rebalance</div>
+    </div>
+    <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%">
+    <table class="sb-table" style="width:100%;min-width:0">
+      <thead><tr><th>Sleeve</th><th style="text-align:right">You</th><th style="text-align:right">Target</th><th style="text-align:right">Δ</th><th style="text-align:right">To target</th></tr></thead>
+      <tbody>${rowsHtml}</tbody>
+    </table>
+    </div>
+    <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:8px;line-height:1.5">
+      Allocation across ${fmt$(aw.total)} (incl. ${fmt$(aw.cash)} cash · ${fmtPct(aw.cashPct)}). All Weather is built to hold up across growth/inflation regimes via risk balance, not return-chasing. Δ shows how far each sleeve sits from target; "To target" is the rough dollar move to rebalance.
+    </div>
+  </div>`;
+}
+if (typeof window !== 'undefined') { window.computeAllWeather = computeAllWeather; window.renderAllWeatherPanel = renderAllWeatherPanel; }
 function exportPortfolioData() {
   const data = buildPortfolioData();
   const json = JSON.stringify(data, null, 2);
@@ -23238,6 +23402,7 @@ function addToPortfolio(entry) {
     if (existing >= 0) {
       arr[existing] = { ...arr[existing], ...entry, id: arr[existing].id };
       savePortfolio(arr);
+      _portUpsertSafe(arr[existing]);
       return arr[existing].id;
     }
   }
@@ -23246,7 +23411,17 @@ function addToPortfolio(entry) {
   const newEntry = { id, addedAt: new Date().toISOString(), ...entry };
   arr.push(newEntry);
   savePortfolio(arr);
+  _portUpsertSafe(newEntry);
   return id;
+}
+// Best-effort immediate upsert of a single portfolio entry to the portfolio
+// Supabase (no-op if not configured) — so adds/edits land in the DB instantly.
+function _portUpsertSafe(entry) {
+  try {
+    if (typeof portSupabaseUpsert === 'function' && typeof portSupabaseConfigured === 'function' && portSupabaseConfigured()) {
+      portSupabaseUpsert(Object.assign({ _kind: 'entry' }, entry));
+    }
+  } catch {}
 }
 function removeFromPortfolio(idOrTicker) {
   // Accept either an id (preferred) or a ticker (legacy)
@@ -23665,7 +23840,11 @@ function renderStockBookPortfolio(content) {
     `;
   }).join('');
 
-  content.innerHTML = summary + chartHtml + subTabs + toolbar + `
+  // Ray Dalio All Weather comparison — shown on the funded-portfolio views.
+  const awPanelHtml = (['all', 'trading'].includes(state.portfolioSubTab || 'all') && typeof renderAllWeatherPanel === 'function')
+    ? renderAllWeatherPanel() : '';
+
+  content.innerHTML = summary + chartHtml + subTabs + awPanelHtml + toolbar + `
     <div class="sb-table-wrap">
       <table class="sb-table portfolio-table">
         <thead>
@@ -24391,6 +24570,11 @@ function wirePortfolioToolbar() {
     renderStockBook();
   });
   document.getElementById('portfolio-export')?.addEventListener('click', () => {
+    // Use the FULL snapshot (positions + transactions + cash + GoodGlobe index),
+    // not just the raw positions array — this is the shape importPortfolioData()
+    // reads, so Export → Import round-trips cleanly. (The old handler dumped only
+    // loadPortfolio(), which the importer couldn't restore.)
+    if (typeof exportPortfolioData === 'function') { exportPortfolioData(); return; }
     const data = loadPortfolio();
     const json = JSON.stringify(data, null, 2);
     const blob = new Blob([json], { type: 'application/json' });
@@ -25194,6 +25378,12 @@ function openEditPositionModal(entryId) {
           <div class="modal-label">Broker Fees</div>
           <input type="number" class="modal-input" id="port-edit-fees" step="0.01" value="${e.fees || ''}" placeholder="1.37">
         </div>
+        <div class="modal-section">
+          <div class="modal-label">Conviction <span id="port-edit-conviction-val" style="color:var(--amber);font-family:var(--mono)">${e.conviction != null ? e.conviction : 50}</span><span style="color:var(--ink-faint);font-family:var(--mono);font-size:10px">/100</span></div>
+          <input type="range" id="port-edit-conviction" min="0" max="100" step="1" value="${e.conviction != null ? e.conviction : 50}" style="width:100%;accent-color:var(--amber)">
+          <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px"><span>spec</span><span>neutral</span><span>high conviction</span></div>
+          <input type="text" class="modal-input" id="port-edit-thesis" value="${(e.thesis || '').replace(/"/g, '&quot;')}" placeholder="one-line thesis (optional)" style="margin-top:8px;font-size:11px">
+        </div>
         <div class="modal-section" style="display:flex;gap:8px;justify-content:flex-end;border-top:1px solid var(--rule);padding-top:14px">
           <button class="btn btn-ghost" onclick="document.getElementById('portfolio-edit-modal').remove()">Cancel</button>
           <button class="btn" id="port-edit-save">Save</button>
@@ -25202,6 +25392,10 @@ function openEditPositionModal(entryId) {
     </div>
   `;
   document.body.insertAdjacentHTML('beforeend', html);
+  // Live conviction readout.
+  const convEl = document.getElementById('port-edit-conviction');
+  const convValEl = document.getElementById('port-edit-conviction-val');
+  if (convEl && convValEl) convEl.addEventListener('input', () => { convValEl.textContent = convEl.value; });
   document.getElementById('port-edit-save').addEventListener('click', () => {
     const patch = {};
     if (isActive) {
@@ -25210,7 +25404,20 @@ function openEditPositionModal(entryId) {
     }
     const f = parseFloat(document.getElementById('port-edit-fees').value);
     patch.fees = isFinite(f) ? f : 0;
+    // Conviction slider (0-100) + optional thesis.
+    const conv = parseInt(document.getElementById('port-edit-conviction')?.value, 10);
+    if (isFinite(conv)) patch.conviction = conv;
+    const thesis = document.getElementById('port-edit-thesis')?.value.trim();
+    patch.thesis = thesis || '';
     updatePortfolioEntry(entryId, patch);
+    // Upsert this edited position to the portfolio Supabase immediately (the
+    // "sync on demand / instantly" the user asked for — no manual step).
+    try {
+      if (typeof portSupabaseUpsert === 'function' && typeof portSupabaseConfigured === 'function' && portSupabaseConfigured()) {
+        const updated = Object.assign({}, e, patch);
+        portSupabaseUpsert(updated);
+      }
+    } catch {}
     document.getElementById('portfolio-edit-modal').remove();
     flashStatus(`${ticker} updated`, 'success');
     renderStockBook();
@@ -35407,6 +35614,62 @@ const _refreshTasks = [
   },
 ];
 
+// "Sync Everything" — the one-tap, on-demand refresh the user asked for. Does
+// PRICES + both Supabase projects (bot + portfolio) + XTRAPP + portfolio repo +
+// bot repo. Deliberately EXCLUDES news (slow + not needed here). Each step is
+// best-effort and reported; one failure doesn't abort the rest. This removes the
+// multi-step Supabase dance — push local→Supabase AND pull Supabase→local for
+// both projects in a single action.
+const _syncAllTasks = [
+  { id: 'prices',   label: 'Live prices (positions + bot)', run: async () => {
+      if (typeof botRefreshLiveQuotes === 'function') await botRefreshLiveQuotes();
+      if (typeof refreshPortfolioQuotes === 'function') await refreshPortfolioQuotes();
+    } },
+  { id: 'stockbook', label: 'Stock Book',     run: () => (typeof loadStockBook === 'function' ? loadStockBook(true) : Promise.resolve()) },
+  { id: 'botpush',  label: 'Bot → Supabase',  run: () => (typeof supabaseSyncAllTrades === 'function' ? supabaseSyncAllTrades() : Promise.resolve()) },
+  { id: 'botpull',  label: 'Supabase → Bot',  run: () => (typeof supabaseLoadTrades === 'function' ? supabaseLoadTrades() : Promise.resolve()) },
+  { id: 'portpush', label: 'Portfolio → Supabase', run: () => (typeof portSupabaseSyncAll === 'function' ? portSupabaseSyncAll() : Promise.resolve()) },
+  { id: 'portpull', label: 'Supabase → Portfolio', run: () => (typeof portSupabaseLoad === 'function' ? portSupabaseLoad() : Promise.resolve()) },
+  { id: 'portrepo', label: 'Portfolio repo (TRAPP2-PORT)', run: () => (typeof importPortfolioData === 'function' ? importPortfolioData() : Promise.resolve()) },
+  { id: 'botrepo',  label: 'Bot repo (TRAPP2-BOT)', run: () => (typeof importBotTrainingData === 'function' ? importBotTrainingData() : Promise.resolve()) },
+  { id: 'xtrapp',   label: 'XTRAPP (lexicon + posts)', run: () => (typeof fetchXtrappData === 'function' ? fetchXtrappData(true) : Promise.resolve()) },
+  { id: 'analytics', label: 'Analytics (grades + regime)', run: async () => {
+      // Re-pull research grades (Supabase-first, repo fallback) + regime.
+      try { _backendResearchFetched = false; if (typeof loadBackendResearch === 'function') await loadBackendResearch(); } catch {}
+      try { if (typeof analyticsSupabaseLoadRegime === 'function' && typeof analyticsSupabaseConfigured === 'function' && analyticsSupabaseConfigured()) await analyticsSupabaseLoadRegime(); } catch {}
+    } },
+];
+
+let _syncAllRunning = false;
+async function syncEverythingNow() {
+  if (_syncAllRunning) return;
+  _syncAllRunning = true;
+  const btn = document.getElementById('sync-all-btn');
+  const origHtml = btn ? btn.innerHTML : '';
+  const results = [];
+  for (let i = 0; i < _syncAllTasks.length; i++) {
+    const task = _syncAllTasks[i];
+    if (btn) btn.innerHTML = `<span class="home-action-icon">⟳</span> Syncing… ${i + 1}/${_syncAllTasks.length} · ${task.label}`;
+    try { await task.run(); results.push(`✓ ${task.label}`); }
+    catch (e) { console.warn('[syncAll]', task.id, 'failed', e); results.push(`✕ ${task.label}`); }
+  }
+  if (btn) {
+    btn.innerHTML = `<span class="home-action-icon">✓</span> Synced everything`;
+    setTimeout(() => { if (btn) btn.innerHTML = origHtml; }, 2500);
+  }
+  if (typeof flashStatus === 'function') {
+    const ok = results.filter(r => r.startsWith('✓')).length;
+    flashStatus(`Synced ${ok}/${_syncAllTasks.length}: prices, bot + portfolio Supabase, repos, XTRAPP (news skipped)`, ok === _syncAllTasks.length ? 'success' : '');
+  }
+  // Refresh the visible tab so new data shows immediately.
+  try {
+    if (typeof renderBetsTab === 'function' && document.querySelector('[data-panel="bets"]')) renderBetsTab();
+    if (typeof renderPortfolioTab === 'function') renderPortfolioTab();
+  } catch {}
+  _syncAllRunning = false;
+}
+if (typeof window !== 'undefined') window.syncEverythingNow = syncEverythingNow;
+
 let _refreshRunning = false;
 
 async function runRefreshAll() {
@@ -35557,6 +35820,9 @@ function clearAllCaches() {
 document.addEventListener('DOMContentLoaded', () => {
   const refreshBtn = document.getElementById('refresh-all-btn');
   if (refreshBtn) refreshBtn.addEventListener('click', runRefreshAll);
+
+  const syncAllBtn = document.getElementById('sync-all-btn');
+  if (syncAllBtn) syncAllBtn.addEventListener('click', () => { if (typeof syncEverythingNow === 'function') syncEverythingNow(); });
 
   const clearBtn = document.getElementById('clear-cache-btn');
   if (clearBtn) clearBtn.addEventListener('click', () => {
@@ -36013,22 +36279,173 @@ const RESEARCH_GRADED_CATEGORIES = new Set(Object.keys(RESEARCH_CATEGORY_WEIGHTS
 // moderately-high P/E shouldn't crater a grade. EV/EBITDA and EV/Revenue are
 // better, cleaner valuation signals, so they carry more of the Valuation weight.
 const RESEARCH_METRIC_WEIGHTS = {
-  pe:       0.5,   // P/E counts HALF — high P/E is common now and weakly predictive
-  pb:       0.8,   // price/book — useful but distorted for asset-light firms
+  pe:       0.35,  // P/E counts about a third — high P/E is the market norm now and
+                   //   weakly predictive of quality (a 400+ P/E monopoly like TSM
+                   //   shouldn't be punished as if it were distressed).
+  pb:       0.4,   // price/book — heavily distorted for asset-light / IP-heavy firms
+                   //   (TSM, software, brands), so it carries little weight.
   evEbitda: 1.3,   // cleaner valuation signal → counts more
   evRev:    1.2,   // useful for unprofitable/growth names where P/E is N/A
 };
 
-// Compress a metric's percentile toward the middle so extreme ranks matter less.
-// For P/E: a bottom-decile (expensive) P/E shouldn't score 5/100 and tank the
-// grade — in a market where high multiples are normal, we pull it toward ~35.
-// amount=0 → no change; amount=1 → fully flattened to 50. Applied only to metrics
-// listed in RESEARCH_METRIC_DAMPEN.
-const RESEARCH_METRIC_DAMPEN = { pe: 0.45 };
+// Compress a metric's percentile toward neutral so EXTREME ranks barely move the
+// grade. This is the fix for "high P/E / P/B tanks an otherwise great company":
+// in a market where premium multiples are normal — and for near-monopolies with
+// huge moats (TSM at 438 P/E, 70 P/B) — an expensive multiple is closer to a
+// non-signal than a red flag. amount=0 → no change; amount=1 → fully flattened to
+// 50 (no effect at all). P/E and P/B are now strongly dampened toward neutral, so
+// a bottom-percentile multiple lands near ~45 instead of ~5 and can't crater the
+// Valuation category. EV/EBITDA and EV/Revenue stay UN-dampened — they're the
+// valuation signals we actually trust.
+const RESEARCH_METRIC_DAMPEN = { pe: 0.78, pb: 0.72 };
 function _dampenPct(pct, amount) {
   if (!amount) return pct;
   return pct + (50 - pct) * amount;
 }
+
+// ============================================================
+//   HUMAN GRADE REVIEW
+//   The frontend grade is auto-computed; the backend grade VERIFIES it. Instead
+//   of a permanent Backend column, the Verify column shows:
+//     • green ✓  — a human confirmed the frontend grade (or it matches review)
+//     • red ✗ + grade — a human assigned a DIFFERENT grade (shown next to the
+//                        frontend grade so the discrepancy is explicit)
+//     • clock ◷  — submitted for review, awaiting a human grade
+//     • (Review) — not yet reviewed; click to submit
+//   Human grades persist locally AND are queued for the XTRAPP repo so the
+//   frontend can be fine-tuned: on reload with trained XTRAPP data, a human
+//   grade overrides/anchors the auto grade. Reviews also take effect immediately.
+// ============================================================
+const HUMAN_GRADES_STORAGE = 'valuatio.humanGrades.v1';
+function loadHumanGrades() {
+  try { return JSON.parse(localStorage.getItem(HUMAN_GRADES_STORAGE) || '{}'); } catch { return {}; }
+}
+function saveHumanGrades(g) {
+  try { localStorage.setItem(HUMAN_GRADES_STORAGE, JSON.stringify(g)); } catch (e) { console.warn('[humanGrade] save failed', e.message); }
+}
+// status: 'review' (clock) | 'confirmed' (green ✓) | 'graded' (human grade set)
+function getHumanGrade(ticker) {
+  const g = loadHumanGrades();
+  return g[(ticker || '').toUpperCase()] || null;
+}
+function setHumanGrade(ticker, { grade, status, note }) {
+  const tk = (ticker || '').toUpperCase();
+  if (!tk) return;
+  const all = loadHumanGrades();
+  const prev = all[tk] || {};
+  all[tk] = {
+    ticker: tk,
+    grade: grade != null ? grade : prev.grade || null,
+    status: status || prev.status || 'review',
+    note: note != null ? note : prev.note || '',
+    updatedAt: new Date().toISOString(),
+  };
+  saveHumanGrades(all);
+  // Queue for XTRAPP so a retrain can fold human grades back into the model.
+  try { if (typeof queueHumanGradeForXtrapp === 'function') queueHumanGradeForXtrapp(all[tk]); } catch {}
+  return all[tk];
+}
+function clearHumanGrade(ticker) {
+  const tk = (ticker || '').toUpperCase();
+  const all = loadHumanGrades();
+  delete all[tk];
+  saveHumanGrades(all);
+}
+
+// Submit a ticker for review (sets the clock). The detail modal lets the user
+// then type a human grade, which flips it to 'graded'/'confirmed'.
+function submitGradeForReview(ticker) {
+  const existing = getHumanGrade(ticker);
+  // If already graded, toggle back to confirmed; otherwise start a review.
+  setHumanGrade(ticker, { status: existing && existing.grade ? 'confirmed' : 'review' });
+  if (typeof flashStatus === 'function') flashStatus(`${(ticker||'').toUpperCase()} submitted for grade review`, '');
+  if (typeof renderResearchTab === 'function') renderResearchTab();
+}
+
+// Queue a human grade into the XTRAPP imitation DB (so trained reloads honor it).
+const XTRAPP_HUMAN_GRADES_KEY = 'valuatio.xtrapp.humanGrades.queue.v1';
+function queueHumanGradeForXtrapp(entry) {
+  try {
+    const q = JSON.parse(localStorage.getItem(XTRAPP_HUMAN_GRADES_KEY) || '{}');
+    q[entry.ticker] = entry;
+    localStorage.setItem(XTRAPP_HUMAN_GRADES_KEY, JSON.stringify(q));
+  } catch {}
+}
+// Export the human-grade queue as JSON for committing to the XTRAPP repo.
+function exportHumanGradesForXtrapp() {
+  const all = loadHumanGrades();
+  const payload = { schema: 'valuatio-human-grades/v1', generatedAt: new Date().toISOString(), grades: all };
+  try {
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = 'human_grades.json';
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    if (typeof flashStatus === 'function') flashStatus(`Exported ${Object.keys(all).length} human grades for XTRAPP`, 'success');
+  } catch (e) { console.warn('[humanGrade] export failed', e.message); }
+  return payload;
+}
+if (typeof window !== 'undefined') {
+  window.getHumanGrade = getHumanGrade;
+  window.setHumanGrade = setHumanGrade;
+  window.submitGradeForReview = submitGradeForReview;
+  window.clearHumanGrade = clearHumanGrade;
+  window.exportHumanGradesForXtrapp = exportHumanGradesForXtrapp;
+}
+
+// Popover to set a human grade for a ticker. Letter buttons + Confirm-as-is +
+// Clear. Applies immediately (the frontend honors human grades on the spot) and
+// queues for XTRAPP.
+function openHumanGradePrompt(ticker, anchorEl) {
+  const tk = (ticker || '').toUpperCase();
+  if (!tk) return;
+  document.getElementById('human-grade-modal')?.remove();
+  const existing = getHumanGrade(tk);
+  const LETTERS = ['A+','A','A-','B+','B','B-','C+','C','C-','D+','D','D-','F'];
+  const gradeBtns = LETTERS.map(L => `<button class="hg-letter" data-grade="${L}" style="font-family:var(--mono);font-size:12px;font-weight:700;padding:6px 0;border:1px solid ${existing && existing.grade === L ? 'var(--amber)' : 'var(--rule)'};background:${existing && existing.grade === L ? 'var(--amber)' : 'transparent'};color:${existing && existing.grade === L ? '#1a1a1a' : researchGradeColor(L)};border-radius:3px;cursor:pointer">${L}</button>`).join('');
+  const html = `
+    <div class="modal-backdrop" id="human-grade-modal" style="display:flex" onclick="if(event.target.id==='human-grade-modal')this.remove()">
+      <div class="modal-box" style="max-width:360px">
+        <div class="modal-head">
+          <div class="modal-title">Human grade · ${tk}</div>
+          <button class="modal-close" onclick="document.getElementById('human-grade-modal').remove()">×</button>
+        </div>
+        <div class="modal-section" style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);line-height:1.5">
+          Set the grade you believe is correct. It overrides the auto grade immediately (green ✓ if it matches, red ✗ + your grade if it differs) and is queued for XTRAPP so trained reloads honor it.
+        </div>
+        <div class="modal-section">
+          <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:5px">${gradeBtns}</div>
+          <input type="text" id="hg-note" class="modal-input" placeholder="reason (optional, feeds XTRAPP)" value="${(existing?.note || '').replace(/"/g,'&quot;')}" style="margin-top:10px;font-size:11px">
+        </div>
+        <div class="modal-section" style="display:flex;gap:6px;justify-content:flex-end;border-top:1px solid var(--rule);padding-top:12px;flex-wrap:wrap">
+          ${existing ? `<button class="btn btn-ghost" id="hg-clear" style="margin-right:auto;font-size:10px">Clear</button>` : ''}
+          <button class="btn btn-ghost" id="hg-confirm" style="font-size:10px" title="Confirm the auto grade is correct (green ✓)">Confirm auto</button>
+        </div>
+      </div>
+    </div>`;
+  document.body.insertAdjacentHTML('beforeend', html);
+  const close = () => document.getElementById('human-grade-modal')?.remove();
+  document.querySelectorAll('#human-grade-modal .hg-letter').forEach(btn => btn.addEventListener('click', () => {
+    const note = document.getElementById('hg-note')?.value.trim() || '';
+    setHumanGrade(tk, { grade: btn.dataset.grade, status: 'graded', note });
+    if (typeof flashStatus === 'function') flashStatus(`${tk} graded ${btn.dataset.grade} (human)`, 'success');
+    close();
+    if (typeof renderResearchTab === 'function') renderResearchTab();
+  }));
+  document.getElementById('hg-confirm')?.addEventListener('click', () => {
+    const note = document.getElementById('hg-note')?.value.trim() || '';
+    setHumanGrade(tk, { status: 'confirmed', note });
+    if (typeof flashStatus === 'function') flashStatus(`${tk} grade confirmed`, 'success');
+    close();
+    if (typeof renderResearchTab === 'function') renderResearchTab();
+  });
+  document.getElementById('hg-clear')?.addEventListener('click', () => {
+    clearHumanGrade(tk);
+    if (typeof flashStatus === 'function') flashStatus(`${tk} human grade cleared`, '');
+    close();
+    if (typeof renderResearchTab === 'function') renderResearchTab();
+  });
+}
+if (typeof window !== 'undefined') window.openHumanGradePrompt = openHumanGradePrompt;
 
 function _num(v) {
   if (typeof v === 'number') return isFinite(v) ? v : null;
@@ -36136,6 +36553,22 @@ if (typeof window !== 'undefined') window.mergeBackendGradesOverLocal = mergeBac
 async function loadBackendResearch() {
   if (_backendResearchFetched) return _backendResearch;
   _backendResearchFetched = true;
+  // Prefer the Analytics Supabase if configured (indexed, cross-device); fall
+  // back to the repo JSON. Either way the shape is {byTicker, generatedAt}.
+  try {
+    if (typeof analyticsSupabaseLoadGrades === 'function' && typeof analyticsSupabaseConfigured === 'function' && analyticsSupabaseConfigured()) {
+      const sb = await analyticsSupabaseLoadGrades();
+      if (sb && sb.byTicker && Object.keys(sb.byTicker).length) {
+        _backendResearch = sb;
+        idbSet('backendResearch', sb);
+        if (typeof renderResearchTab === 'function' &&
+            (document.querySelector('.research-row') || document.querySelector('.research-screen-row') || document.querySelector('.rf-cat-chip'))) {
+          try { renderResearchTab(); } catch {}
+        }
+        return _backendResearch;
+      }
+    }
+  } catch (e) { console.warn('[analytics] Supabase grades unavailable, using repo JSON', e.message); }
   try {
     const j = await fetchJsonMaybeGz(ANALYTICS_BASE + 'research_grades.json');
     if (j?.byTicker) {
@@ -36145,7 +36578,13 @@ async function loadBackendResearch() {
       _backendResearch = j;
       console.log(`[analytics] research grades loaded: ${Object.keys(j.byTicker).length} tickers, ${j._ageHours}h old${j._fresh ? '' : ' (STALE — using local only)'}`);
       idbSet('backendResearch', j);
-      if (typeof renderResearchTab === 'function' && document.querySelector('.research-row')) { try { renderResearchTab(); } catch {} }
+      // Re-render if ANY research view is visible — grades (.research-row) OR the
+      // screener/category tables (.research-screen-row) — so the category screen
+      // fills in the moment the backend's fundamentals arrive.
+      if (typeof renderResearchTab === 'function' &&
+          (document.querySelector('.research-row') || document.querySelector('.research-screen-row') || document.querySelector('.rf-cat-chip'))) {
+        try { renderResearchTab(); } catch {}
+      }
     }
   } catch (e) {
     console.warn('[analytics] research grades unavailable:', e.message);
@@ -36203,11 +36642,27 @@ function computeResearchRankings(force = false) {
   const nonEquityRows = rows.filter(r => classifyAssetRow(r) !== 'equity');
 
   const perMetric = {};
+  // Backend research (research_grades.json) carries full per-metric values for
+  // ~650 tickers — ROE, margins, growth, debt/equity, etc. — that the basic
+  // sheet feed doesn't include. Without this, Profitability/Growth/Balance-Sheet
+  // come up empty for every ticker you haven't individually Valuated (valuating
+  // a ticker deep-fetches its fundamentals onto its row). We fall back to the
+  // backend's stored value whenever the live row lacks a metric, so the category
+  // screen is populated for the whole backend universe out of the box.
+  const beBT = (_backendResearch && _backendResearch.byTicker) ? _backendResearch.byTicker : null;
+  const backendMetricVal = (metricKey, ticker) => {
+    if (!beBT) return null;
+    const row = beBT[ticker];
+    const r = row && row.ranks ? row.ranks[metricKey] : null;
+    return (r && r.value != null && isFinite(r.value)) ? r.value : null;
+  };
   for (const m of RESEARCH_METRICS) {
-    // Collect (ticker, value) for rows that HAVE this metric
+    // Collect (ticker, value) for rows that HAVE this metric — preferring the
+    // live row, falling back to the backend's stored fundamental value.
     const vals = [];
     for (const r of equities) {
-      const v = m.get(r);
+      let v = m.get(r);
+      if (v == null || !isFinite(v)) v = backendMetricVal(m.key, r.ticker);
       if (v != null && isFinite(v)) vals.push({ ticker: r.ticker, name: r.name || r.ticker, value: v });
     }
     // Sort by direction
@@ -36454,6 +36909,13 @@ function renderResearchTab() {
     return;
   }
   const data = computeResearchRankings(true);  // always fresh — never serve a pre-normalization empty cache
+  // Ensure the backend research (full fundamentals for ~650 tickers) is loading.
+  // The category screen + metric ranker fall back to these values for tickers
+  // whose live rows lack fundamentals, so kick the fetch off the first time the
+  // research tab renders; it re-renders this tab when it lands.
+  if (typeof loadBackendResearch === 'function' && !_backendResearchFetched) {
+    loadBackendResearch().catch(() => {});
+  }
   // BACKEND GRADES WIN. The analytics backend computes grades nightly from the
   // full, clean dataset; the local computation can be wrong when this browser
   // has stale/sparse rows (that's how BIGGQ showed A+ locally while the backend
@@ -36462,6 +36924,21 @@ function renderResearchTab() {
   // backend hasn't graded yet. Each overridden row is marked so the UI can note
   // the source.
   mergeBackendGradesOverLocal(data);
+  // Human grades anchor the displayed grade. Where a human has graded a ticker,
+  // that grade becomes the headline grade (the user's judgment wins); the auto
+  // grade is kept as _autoGrade so the Verify cell can show the discrepancy.
+  if (typeof loadHumanGrades === 'function') {
+    const hg = loadHumanGrades();
+    for (const tk of Object.keys(hg)) {
+      const row = data.byTicker[tk];
+      const h = hg[tk];
+      if (row && h && h.grade && h.status === 'graded') {
+        row._autoGrade = row.grade;
+        row.grade = h.grade;
+        row._humanGraded = true;
+      }
+    }
+  }
 
   // View toggle
   const head = `
@@ -36841,17 +37318,42 @@ function renderResearchGrades(data) {
   all.sort((a, b) => sortScore(b) - sortScore(a));
   const hiddenCount = allUnfiltered.length - all.length;
 
-  const rowsHtml = all.map((t, i) => `
+  const rowsHtml = all.map((t, i) => {
+    const hg = (typeof getHumanGrade === 'function') ? getHumanGrade(t.ticker) : null;
+    // Verify cell: human grade takes precedence; else backend agreement; else —.
+    let verifyCell;
+    if (hg && hg.status === 'review') {
+      verifyCell = `<span title="Submitted for review — awaiting a human grade" style="color:var(--data-amber);font-size:13px">\u25f7</span>`;
+    } else if (hg && hg.grade && hg.grade !== t.grade) {
+      // Human assigned a DIFFERENT grade → red ✗ + the human grade next to it.
+      verifyCell = `<span title="A human graded this ${hg.grade}, differing from the frontend ${t.grade}" style="color:var(--neg);font-weight:700">\u2717</span> <span style="font-family:var(--mono);font-weight:700;color:${researchGradeColor(hg.grade)}">${hg.grade}</span>`;
+    } else if (hg && (hg.status === 'confirmed' || (hg.grade && hg.grade === t.grade))) {
+      verifyCell = `<span title="Confirmed by human review" style="color:var(--pos);font-weight:700;font-size:13px">\u2713</span>`;
+    } else if (t.backendGrade && !t.diverged) {
+      verifyCell = `<span title="Backend agrees with the frontend grade" style="color:var(--pos);font-size:12px">\u2713</span>`;
+    } else if (t.backendGrade && t.diverged) {
+      verifyCell = `<span title="Backend grades this ${t.backendGrade} (Δ${t.divergence.toFixed(0)} pts) — review to set a human grade" style="color:var(--neg);font-weight:700">\u2717</span> <span style="font-family:var(--mono);font-size:11px;font-weight:700;color:${researchGradeColor(t.backendGrade)}">${t.backendGrade}</span>`;
+    } else {
+      verifyCell = `<span style="color:var(--ink-faint);font-size:10px">\u2014</span>`;
+    }
+    const reviewBtn = (hg && hg.status === 'review')
+      ? `<button class="research-review-btn" data-ticker="${escapeHtml(t.ticker)}" title="Open to set the human grade" style="background:none;border:1px solid var(--data-amber);color:var(--data-amber);border-radius:3px;font-family:var(--mono);font-size:9px;padding:2px 7px;cursor:pointer">grade…</button>`
+      : (hg && hg.grade)
+        ? `<button class="research-review-btn" data-ticker="${escapeHtml(t.ticker)}" title="Edit the human grade" style="background:none;border:1px solid var(--rule);color:var(--ink-dim);border-radius:3px;font-family:var(--mono);font-size:9px;padding:2px 7px;cursor:pointer">edit</button>`
+        : `<button class="research-review-btn" data-ticker="${escapeHtml(t.ticker)}" title="Submit this grade for human review" style="background:none;border:1px solid var(--rule);color:var(--ink-faint);border-radius:3px;font-family:var(--mono);font-size:9px;padding:2px 7px;cursor:pointer">review</button>`;
+    return `
     <tr class="research-row" data-ticker="${t.ticker}" style="cursor:pointer">
       <td style="text-align:center;width:28px" onclick="event.stopPropagation()"><input type="checkbox" class="research-select" data-ticker="${escapeHtml(t.ticker)}" ${RESEARCH_SELECTED.has(t.ticker)?'checked':''} style="cursor:pointer"></td>
       <td style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);text-align:right">${i+1}</td>
       <td style="font-family:var(--mono);font-weight:700">${escapeHtml(t.ticker)}</td>
       <td style="font-size:11px;color:var(--ink-dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(t.name)}</td>
       <td style="text-align:center"><span style="font-family:var(--mono);font-size:15px;font-weight:700;color:${researchGradeColor(t.grade)}">${t.grade}</span></td>
-      <td style="text-align:center">${t.backendGrade ? `<span style="font-family:var(--mono);font-size:12px;font-weight:700;color:${researchGradeColor(t.backendGrade)}" title="Backend (TRAPP2-ANALYTICS nightly) grade">${t.backendGrade}</span>${t.diverged ? `<span style="font-family:var(--mono);font-size:9px;color:var(--neg);margin-left:4px" title="Backend and local grades disagree by ${t.divergence} pts — data drift between what the backend saw and what this browser sees">Δ${t.divergence.toFixed(0)}</span>` : ''}` : '<span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint)">—</span>'}</td>
+      <td style="text-align:center">${verifyCell}</td>
       <td style="text-align:right;font-family:var(--mono);font-size:11px">${t.gradeScore.toFixed(0)}<span style="color:var(--ink-faint);font-size:9px">/100</span></td>
       <td style="text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${t.coverage}/${t.coverageTotal} metrics</td>
-    </tr>`).join('');
+      <td style="text-align:center" onclick="event.stopPropagation()">${reviewBtn}</td>
+    </tr>`;
+  }).join('');
 
   const be = data.backend;
   // ---- Non-equity cohort (backend-graded on conduct, not fundamentals) ----
@@ -36904,6 +37406,7 @@ function renderResearchGrades(data) {
           ${[0,5,8,10,12,15,18].map(n => `<option value="${n}" ${minCov===n?'selected':''}>${n===0?'All':n+'+ metrics'}</option>`).join('')}
         </select>
         <span style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${all.length} shown${hiddenCount?` · ${hiddenCount} hidden (sparse data)`:''}</span>
+        ${(typeof loadHumanGrades === 'function' && Object.keys(loadHumanGrades()).length) ? `<button id="research-export-human" class="btn btn-ghost" style="font-size:9px;margin-left:auto;padding:2px 8px" title="Export human grades as JSON to commit to the XTRAPP repo (so trained reloads honor them)">⤓ Human grades (${Object.keys(loadHumanGrades()).length}) for XTRAPP</button>` : ''}
       </div>
       ${be ? `<span style="color:var(--pos)">● Backend verified</span> — grades cross-checked against the analytics backend (computed ${be.ageHours}h ago, all three books).${be.divergedCount ? ` <span style="color:var(--neg)">${be.divergedCount} divergence${be.divergedCount > 1 ? 's' : ''} flagged (Δ)</span> — backend and this browser disagree on those names; usually stale data on one side.` : ' All grades agree.'}<br>` : `<span style="color:var(--ink-faint)">○ Backend grades unavailable — showing local computation only.</span><br>`}
       Composite grade = category-weighted percentile across the metrics a company reports. Categories carry fixed weights (Profitability 30% · Growth 22% · Valuation 22% · Balance Sheet 16% · Income 10%) so one over-populated category can't dominate, and a missing category is re-normalized away rather than penalized. Size/Scale metrics are shown as context but excluded from the grade — bigger isn't better. Click any company for its per-category breakdown.
@@ -36913,7 +37416,7 @@ function renderResearchGrades(data) {
         <thead><tr>
           <th style="text-align:center;width:28px"><input type="checkbox" id="research-select-all" title="Select all shown" style="cursor:pointer"></th>
           <th style="text-align:right">#</th><th>Ticker</th><th>Company</th>
-          <th style="text-align:center" title="Frontend grade — computed live in this browser from the metrics it currently has. Can differ from the backend (different data freshness/coverage).">Grade</th><th style="text-align:center" title="Backend grade — computed nightly by the analytics backend across all three books. The table is sorted by this score.">Backend ↓</th><th style="text-align:right">Score</th><th style="text-align:right">Coverage</th>
+          <th style="text-align:center" title="Frontend grade — computed live in this browser from the metrics it currently has.">Grade</th><th style="text-align:center" title="Verification: green ✓ = confirmed (human or backend agrees); red ✗ = a human assigned a different grade (shown next to Grade); ◷ = awaiting review.">Verify</th><th style="text-align:right">Score</th><th style="text-align:right">Coverage</th><th style="text-align:center" title="Submit this grade for human review, or set a human grade.">Review</th>
         </tr></thead>
         <tbody>${rowsHtml}</tbody>
       </table>
@@ -36978,8 +37481,18 @@ function wireResearchGrades() {
   document.querySelectorAll('.research-row').forEach(r => r.addEventListener('click', () => {
     RESEARCH_STATE.detailTicker = r.dataset.ticker; renderResearchTab();
   }));
+  // Review buttons — open a grade-input popover for the human grade.
+  document.querySelectorAll('.research-review-btn').forEach(b => b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openHumanGradePrompt(b.dataset.ticker, b);
+  }));
   const mc = document.getElementById('research-mincov');
   if (mc) mc.addEventListener('change', () => { RESEARCH_STATE.minCoverage = +mc.value; renderResearchTab(); });
+  // Export human grades for the XTRAPP repo.
+  document.getElementById('research-export-human')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (typeof exportHumanGradesForXtrapp === 'function') exportHumanGradesForXtrapp();
+  });
 
   // Multi-select checkboxes — toggle selection without opening the detail.
   document.querySelectorAll('.research-select').forEach(cb => {
@@ -39114,6 +39627,277 @@ if (typeof window !== 'undefined') {
 }
 
 
+// ============================================================
+//   PORTFOLIO SUPABASE (TRAPP2-PORT) — separate project from the bot.
+//   Mirrors the bot's Supabase pattern but with its OWN url/anon key and its
+//   own table (`portfolio_positions`). This keeps the user's paper-trading data
+//   in a DEDICATED project, fully separate from the bot, XTRAPP, and analytics.
+// ============================================================
+const PORT_SUPABASE_URL_STORAGE = 'valuatio.portSupabase.url';
+const PORT_SUPABASE_ANON_STORAGE = 'valuatio.portSupabase.anon';
+const PORT_SUPABASE_TABLE = 'portfolio_positions';
+
+function getPortSupabaseUrl() { return (localStorage.getItem(PORT_SUPABASE_URL_STORAGE) || '').replace(/\/+$/, ''); }
+function getPortSupabaseAnon() { return localStorage.getItem(PORT_SUPABASE_ANON_STORAGE) || ''; }
+function setPortSupabaseConfig(url, anon) {
+  if (url) localStorage.setItem(PORT_SUPABASE_URL_STORAGE, url.trim().replace(/\/+$/, '')); else localStorage.removeItem(PORT_SUPABASE_URL_STORAGE);
+  if (anon) localStorage.setItem(PORT_SUPABASE_ANON_STORAGE, anon.trim()); else localStorage.removeItem(PORT_SUPABASE_ANON_STORAGE);
+}
+function portSupabaseConfigured() { return !!(getPortSupabaseUrl() && getPortSupabaseAnon()); }
+
+function _portSupabaseHeaders(extra) {
+  const anon = getPortSupabaseAnon();
+  return Object.assign({
+    'apikey': anon,
+    'Authorization': `Bearer ${anon}`,
+    'Content-Type': 'application/json',
+  }, extra || {});
+}
+
+// Stable id for a portfolio position/record. Prefer an explicit id; else build
+// one from ticker + the lot/open date so re-syncs upsert rather than duplicate.
+function _ensurePortId(rec) {
+  if (rec.id && String(rec.id).trim()) return rec.id;
+  const tk = (rec.ticker || rec.symbol || 'POS').toUpperCase();
+  const d = rec.openDate || rec.date || rec.addedAt || '';
+  rec.id = `${tk}-${d || Math.random().toString(36).slice(2, 8)}`;
+  return rec.id;
+}
+
+// Map a portfolio record to the Supabase row shape (mirrors the bot's
+// {id, trade(jsonb), updated_at} → here {id, position(jsonb), updated_at}). The
+// generated columns in the SQL schema extract ticker/side/size/conviction/pnl
+// from the jsonb automatically.
+function _portSupabaseRow(rec) {
+  _ensurePortId(rec);
+  return { id: rec.id, position: rec, updated_at: new Date().toISOString() };
+}
+
+// Upsert a SINGLE portfolio record immediately (called on add/edit so a change
+// lands in Supabase on the spot — no bulk step needed).
+async function portSupabaseUpsert(rec) {
+  if (!portSupabaseConfigured()) return false;
+  try {
+    const r = await fetch(`${getPortSupabaseUrl()}/rest/v1/${PORT_SUPABASE_TABLE}`, {
+      method: 'POST',
+      headers: _portSupabaseHeaders({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+      body: JSON.stringify([_portSupabaseRow(rec)]),
+    });
+    if (!r.ok && r.status !== 409) { console.warn('[port-supabase] upsert failed', r.status); return false; }
+    return true;
+  } catch (e) { console.warn('[port-supabase] upsert error', e.message); return false; }
+}
+
+// Existing ids in the portfolio table (for dedup on bulk sync).
+async function _portSupabaseExistingIds() {
+  const ids = new Set();
+  try {
+    const r = await fetch(`${getPortSupabaseUrl()}/rest/v1/${PORT_SUPABASE_TABLE}?select=id`, { headers: _portSupabaseHeaders() });
+    if (r.ok) { const rows = await r.json(); if (Array.isArray(rows)) for (const x of rows) ids.add(x.id); }
+  } catch {}
+  return ids;
+}
+
+// Bulk-sync the WHOLE portfolio to Supabase. The portfolio is ONE list whose
+// entries carry a `position` role (holding/watching/tracking/avoid) — that's
+// everything the user tracks: positions, watchlist, tracking, plus the cash,
+// transactions ledger, and GoodGlobe index as singleton records. Open holdings
+// always re-upsert (marks move); the rest upsert if new.
+async function portSupabaseSyncAll() {
+  if (!portSupabaseConfigured()) { if (typeof flashStatus === 'function') flashStatus('Portfolio Supabase not configured — add the TRAPP2-PORT URL + anon key in Data Sources', 'error'); return 0; }
+  const snap = (typeof buildPortfolioData === 'function') ? buildPortfolioData() : null;
+  if (!snap) { if (typeof flashStatus === 'function') flashStatus('No portfolio data to sync', ''); return 0; }
+  const records = [];
+  // Each portfolio entry → one row (the entry already carries its role + ticker).
+  for (const e of (snap.portfolio || [])) {
+    const rec = Object.assign({ _kind: 'entry' }, e);
+    if (!rec.ticker && e.ticker) rec.ticker = e.ticker;
+    records.push(rec);
+  }
+  // Transactions ledger (immutable history).
+  for (const t of (snap.transactions || [])) records.push(Object.assign({ _kind: 'transaction' }, t));
+  // Singletons: cash, GoodGlobe index + curve, and a full snapshot for restore.
+  if (snap.cashPosition != null) records.push({ id: '__cash__', _kind: 'cash', value: snap.cashPosition });
+  if (snap.goodGlobeIndex != null) records.push({ id: '__goodglobe_index__', _kind: 'index', value: snap.goodGlobeIndex });
+  if (snap.goodGlobeCurve != null) records.push({ id: '__goodglobe_curve__', _kind: 'indexCurve', value: snap.goodGlobeCurve });
+  records.push({ id: '__portfolio_snapshot__', _kind: 'snapshot', counts: snap.counts, generatedAt: snap.generatedAt, schema: snap.schema });
+  if (!records.length) { if (typeof flashStatus === 'function') flashStatus('Portfolio is empty — nothing to sync', ''); return 0; }
+  try {
+    const existing = await _portSupabaseExistingIds();
+    const rows = [];
+    for (const rec of records) {
+      const row = _portSupabaseRow(rec);
+      const isOpenHolding = rec._kind === 'entry' && !rec.exitDate && !rec.closed;
+      const mutable = ['cash', 'index', 'indexCurve', 'snapshot'].includes(rec._kind);
+      if (!existing.has(row.id) || isOpenHolding || mutable) rows.push(row);
+    }
+    if (!rows.length) { if (typeof flashStatus === 'function') flashStatus('Portfolio Supabase already up to date', 'success'); return 0; }
+    let sent = 0;
+    for (let i = 0; i < rows.length; i += 100) {
+      const chunk = rows.slice(i, i + 100);
+      const r = await fetch(`${getPortSupabaseUrl()}/rest/v1/${PORT_SUPABASE_TABLE}`, {
+        method: 'POST',
+        headers: _portSupabaseHeaders({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+        body: JSON.stringify(chunk),
+      });
+      if (!r.ok && r.status !== 409) { console.warn('[port-supabase] bulk chunk failed', r.status); if (typeof flashStatus === 'function') flashStatus(`Portfolio sync failed at row ${i} (HTTP ${r.status})`, 'error'); break; }
+      sent += chunk.length;
+    }
+    if (typeof flashStatus === 'function') flashStatus(`Synced ${sent} portfolio record${sent !== 1 ? 's' : ''} to TRAPP2-PORT Supabase`, 'success');
+    return sent;
+  } catch (e) { console.warn('[port-supabase] bulk error', e.message); if (typeof flashStatus === 'function') flashStatus('Portfolio Supabase sync error — see console', 'error'); return 0; }
+}
+
+// Restore portfolio entries from Supabase records (fresh-device load). Merges
+// entries back into the portfolio list by ticker+role, appends unseen
+// transactions, and restores cash/index singletons. Never drops local data.
+function mergePortfolioRecords(records) {
+  if (!Array.isArray(records) || !records.length) return 0;
+  let added = 0;
+  let portfolio = []; try { portfolio = loadPortfolio(); } catch {}
+  let txns = []; try { txns = loadTransactions(); } catch {}
+  const entryKey = (e) => `${(e.ticker || '').toUpperCase()}|${(e.position || '').toLowerCase()}`;
+  const haveEntries = new Set(portfolio.map(entryKey));
+  const haveTxn = new Set(txns.map(t => t.id || `${t.ticker}|${t.date}|${t.shares}|${t.price}`));
+  for (const rec of records) {
+    if (!rec || !rec._kind) {
+      // Bare entry (older shape) — treat as a portfolio entry.
+      if (rec && rec.ticker) { const k = entryKey(rec); if (!haveEntries.has(k)) { portfolio.push(rec); haveEntries.add(k); added++; } }
+      continue;
+    }
+    if (rec._kind === 'entry') {
+      const k = entryKey(rec); if (!haveEntries.has(k)) { const { _kind, id, ...e } = rec; portfolio.push(e); haveEntries.add(k); added++; }
+    } else if (rec._kind === 'transaction') {
+      const tk = rec.id || `${rec.ticker}|${rec.date}|${rec.shares}|${rec.price}`;
+      if (!haveTxn.has(tk)) { const { _kind, ...t } = rec; txns.push(t); haveTxn.add(tk); added++; }
+    } else if (rec._kind === 'cash' && rec.value != null) {
+      try { if (typeof setCashPosition === 'function') setCashPosition(rec.value); } catch {}
+    } else if (rec._kind === 'index' && rec.value != null) {
+      try { if (typeof saveGoodGlobeIndex === 'function') saveGoodGlobeIndex(rec.value); } catch {}
+    }
+  }
+  try { if (typeof savePortfolio === 'function') savePortfolio(portfolio); } catch {}
+  try { if (typeof saveTransactions === 'function') saveTransactions(txns); } catch {}
+  if (added && typeof renderPortfolioTab === 'function') { try { renderPortfolioTab(); } catch {} }
+  return added;
+}
+if (typeof window !== 'undefined') window.mergePortfolioRecords = mergePortfolioRecords;
+
+// Load the portfolio back from Supabase (fresh-device restore).
+async function portSupabaseLoad() {
+  if (!portSupabaseConfigured()) return null;
+  try {
+    const r = await fetch(`${getPortSupabaseUrl()}/rest/v1/${PORT_SUPABASE_TABLE}?select=id,position&order=updated_at.asc`, { headers: _portSupabaseHeaders() });
+    if (!r.ok) { console.warn('[port-supabase] load failed', r.status); return null; }
+    const rows = await r.json();
+    if (!Array.isArray(rows)) return null;
+    const added = mergePortfolioRecords(rows.map(x => x.position).filter(Boolean));
+    if (typeof flashStatus === 'function' && added) flashStatus(`Loaded ${added} portfolio records from Supabase`, 'success');
+    return { total: rows.length, added };
+  } catch (e) { console.warn('[port-supabase] load error', e.message); return null; }
+}
+
+if (typeof window !== 'undefined') {
+  window.getPortSupabaseUrl = getPortSupabaseUrl;
+  window.portSupabaseConfigured = portSupabaseConfigured;
+  window.portSupabaseUpsert = portSupabaseUpsert;
+  window.portSupabaseSyncAll = portSupabaseSyncAll;
+  window.portSupabaseLoad = portSupabaseLoad;
+  window.setPortSupabaseConfig = setPortSupabaseConfig;
+}
+
+
+// ============================================================
+//   ANALYTICS SUPABASE (TRAPP2-ANALYTICS) — READ-ONLY from the frontend.
+//   Analytics data (research grades, regime, probability features, triggers,
+//   formulas) is computed by the PIPELINE and pushed to Supabase by
+//   push_analytics_to_supabase.py. The frontend only READS it here, and falls
+//   back to the repo JSON if the Analytics Supabase isn't configured or is
+//   empty. Can point at the SAME project as the bot (different tables) or its
+//   own project — the URL/key are independent.
+// ============================================================
+const ANALYTICS_SUPABASE_URL_STORAGE = 'valuatio.analyticsSupabase.url';
+const ANALYTICS_SUPABASE_ANON_STORAGE = 'valuatio.analyticsSupabase.anon';
+
+function getAnalyticsSupabaseUrl() { return (localStorage.getItem(ANALYTICS_SUPABASE_URL_STORAGE) || '').replace(/\/+$/, ''); }
+function getAnalyticsSupabaseAnon() { return localStorage.getItem(ANALYTICS_SUPABASE_ANON_STORAGE) || ''; }
+function setAnalyticsSupabaseConfig(url, anon) {
+  if (url) localStorage.setItem(ANALYTICS_SUPABASE_URL_STORAGE, url.trim().replace(/\/+$/, '')); else localStorage.removeItem(ANALYTICS_SUPABASE_URL_STORAGE);
+  if (anon) localStorage.setItem(ANALYTICS_SUPABASE_ANON_STORAGE, anon.trim()); else localStorage.removeItem(ANALYTICS_SUPABASE_ANON_STORAGE);
+}
+function analyticsSupabaseConfigured() { return !!(getAnalyticsSupabaseUrl() && getAnalyticsSupabaseAnon()); }
+function _analyticsSupabaseHeaders() {
+  const anon = getAnalyticsSupabaseAnon();
+  return { 'apikey': anon, 'Authorization': `Bearer ${anon}` };
+}
+
+// Pull research grades from Supabase → reshape into the same {byTicker, metrics}
+// shape the app's loadBackendResearch produces, so the rest of the research code
+// (category screen, metric ranker, grade merge) reads it unchanged.
+async function analyticsSupabaseLoadGrades() {
+  if (!analyticsSupabaseConfigured()) return null;
+  try {
+    const r = await fetch(`${getAnalyticsSupabaseUrl()}/rest/v1/research_grades?select=ticker,grades,updated_at`, { headers: _analyticsSupabaseHeaders() });
+    if (!r.ok) { console.warn('[analytics-supabase] grades load failed', r.status); return null; }
+    const rows = await r.json();
+    if (!Array.isArray(rows) || !rows.length) return null;
+    const byTicker = {};
+    let newest = 0;
+    for (const row of rows) {
+      if (row.ticker && row.grades) {
+        byTicker[row.ticker] = row.grades;
+        const t = new Date(row.updated_at).getTime();
+        if (t > newest) newest = t;
+      }
+    }
+    const out = { byTicker, generatedAt: newest ? new Date(newest).toISOString() : new Date().toISOString(), _source: 'supabase' };
+    out._ageHours = Math.round((Date.now() - new Date(out.generatedAt).getTime()) / 3600000);
+    out._fresh = out._ageHours < 48;
+    console.log(`[analytics-supabase] grades loaded: ${Object.keys(byTicker).length} tickers, ${out._ageHours}h old`);
+    return out;
+  } catch (e) { console.warn('[analytics-supabase] grades error', e.message); return null; }
+}
+
+// Pull the current regime snapshot from Supabase.
+async function analyticsSupabaseLoadRegime() {
+  if (!analyticsSupabaseConfigured()) return null;
+  try {
+    const r = await fetch(`${getAnalyticsSupabaseUrl()}/rest/v1/regime_snapshots?id=eq.current&select=snapshot`, { headers: _analyticsSupabaseHeaders() });
+    if (!r.ok) return null;
+    const rows = await r.json();
+    if (Array.isArray(rows) && rows.length && rows[0].snapshot) {
+      console.log('[analytics-supabase] regime loaded from Supabase');
+      return rows[0].snapshot;
+    }
+    return null;
+  } catch (e) { console.warn('[analytics-supabase] regime error', e.message); return null; }
+}
+
+// Generic analytics_kv reader (probability features, triggers, formulas).
+async function analyticsSupabaseLoadKV(category) {
+  if (!analyticsSupabaseConfigured()) return null;
+  try {
+    const q = category ? `?category=eq.${encodeURIComponent(category)}&select=key,value` : '?select=key,value';
+    const r = await fetch(`${getAnalyticsSupabaseUrl()}/rest/v1/analytics_kv${q}`, { headers: _analyticsSupabaseHeaders() });
+    if (!r.ok) return null;
+    const rows = await r.json();
+    if (!Array.isArray(rows)) return null;
+    const out = {};
+    for (const row of rows) if (row.key) out[row.key] = row.value;
+    return out;
+  } catch (e) { console.warn('[analytics-supabase] kv error', e.message); return null; }
+}
+
+if (typeof window !== 'undefined') {
+  window.getAnalyticsSupabaseUrl = getAnalyticsSupabaseUrl;
+  window.analyticsSupabaseConfigured = analyticsSupabaseConfigured;
+  window.setAnalyticsSupabaseConfig = setAnalyticsSupabaseConfig;
+  window.analyticsSupabaseLoadGrades = analyticsSupabaseLoadGrades;
+  window.analyticsSupabaseLoadRegime = analyticsSupabaseLoadRegime;
+  window.analyticsSupabaseLoadKV = analyticsSupabaseLoadKV;
+}
+
+
 // Render the bot's learnings as a readable panel (the human/bot view of the
 // training corpus). Shows takeaways, which signals predict wins, and which
 // styles make money — the actionable distillation of the bot-data repo.
@@ -40335,6 +41119,37 @@ async function botScoreTicker(ticker) {
 
   if (weightSum === 0) return null;
   let conviction = score / weightSum;  // -1..+1
+
+  // SIGNAL-AGREEMENT BOOST. Raw conviction is a weighted average, so a handful of
+  // mildly-positive signals with NOTHING opposing still averages out to a middling
+  // number (~0.4) — which is why a clean setup with no hurting signals looked
+  // weak. That under-counts agreement: when the signals broadly point the SAME
+  // way and few/none push back, the bot should be MORE convinced, not stuck at the
+  // mean. We measure how one-sided the components are (share of weighted evidence
+  // agreeing with the net direction) and nudge conviction toward the strongest
+  // contributing signal in proportion to that agreement. Disagreement (signals
+  // fighting each other) gets NO boost — conviction stays muted, as it should.
+  {
+    const comps = Object.values(components).filter(v => isFinite(v) && Math.abs(v) > 0.001);
+    if (comps.length >= 2) {
+      const net = conviction >= 0 ? 1 : -1;
+      const agreeMag = comps.filter(v => v * net > 0).reduce((s, v) => s + Math.abs(v), 0);
+      const totalMag = comps.reduce((s, v) => s + Math.abs(v), 0);
+      const agreement = totalMag > 0 ? agreeMag / totalMag : 0.5;   // 1 = unanimous, 0.5 = split
+      // Only boost when there's real consensus (agreement > 0.6). Pull conviction
+      // a fraction of the way toward the strongest aligned signal, scaled by how
+      // lopsided the agreement is. Caps keep it honest (never fabricates >|0.9|).
+      if (agreement > 0.6) {
+        const peak = Math.max(...comps.filter(v => v * net > 0).map(v => Math.abs(v)));
+        const target = net * Math.min(0.9, peak);            // strongest aligned signal
+        const pull = (agreement - 0.6) / 0.4 * 0.5;          // 0 at 0.6 agreement → 0.5 at unanimous
+        conviction = conviction + (target - conviction) * Math.max(0, Math.min(0.5, pull));
+        if (Math.abs(conviction) > Math.abs(score / weightSum) + 0.02) {
+          decisionPath.push(`agreement:${(agreement * 100).toFixed(0)}% one-sided → conviction boosted to ${conviction.toFixed(2)}`);
+        }
+      }
+    }
+  }
   let direction = conviction >= 0 ? 'long' : 'short';
 
   // SHORT carry penalty: a short on a dividend-payer owes that dividend (negative
@@ -40423,6 +41238,23 @@ async function botScoreTicker(ticker) {
   }
   if (instrument === 'shares') decisionPath.push('instrument:shares');
 
+  // Build topDrivers from the signal components — the signals that most pushed
+  // the decision, sorted by absolute strength. Without this the bet receipt's
+  // "top signals" was always empty (it read r.topDrivers, which didn't exist).
+  // Each entry: {signal, lean (signed, 2dp), direction}. This is what the UI
+  // shows as "what it saw", and it makes the help/hurt split precise.
+  const topDrivers = Object.entries(components)
+    .filter(([, v]) => isFinite(v) && Math.abs(v) > 0.001)
+    .map(([signal, v]) => ({ signal, lean: +v.toFixed(2), direction: v > 0 ? 'bullish' : 'bearish' }))
+    .sort((a, b) => Math.abs(b.lean) - Math.abs(a.lean));
+  // Signals helping vs hurting THIS direction (long: positive helps; short: negative helps).
+  const dirSign = direction === 'long' ? 1 : -1;
+  const signalsHelping = topDrivers.filter(d => d.lean * dirSign > 0).map(d => d.signal);
+  const signalsHurting = topDrivers.filter(d => d.lean * dirSign < 0).map(d => d.signal);
+
+  // The bot's earned confidence (track record) — cached, so cheap to read here.
+  const _scoreConf = (typeof botConfidenceFactor === 'function') ? botConfidenceFactor() : { factor: 1, label: null };
+
   return {
     decisionPath,
     ticker: t,
@@ -40431,6 +41263,8 @@ async function botScoreTicker(ticker) {
     price: row.price,
     conviction,
     confidence,
+    confidenceFactor: _scoreConf.factor,   // the bot's earned aggressiveness (track record)
+    confidenceLabel: _scoreConf.label,
     direction,
     leverage,
     hedge,
@@ -40440,6 +41274,9 @@ async function botScoreTicker(ticker) {
     volRegime: volRegime != null ? +volRegime.toFixed(2) : null,
     rationale,
     components,
+    topDrivers,            // sorted signal contributions (what the UI shows)
+    signalsHelping,        // signals pushing the chosen direction
+    signalsHurting,        // signals pushing against it
   };
 }
 
@@ -40519,7 +41356,16 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
   const betToday = new Set(bot.bets.filter(b => b.entryDate === today).map(b => b.ticker));
 
   // Regime-adjusted conviction bar: choppy/risk-off raises it (sit out more).
-  const effThreshold = BOT_CONVICTION_THRESHOLD + (regime.thresholdMod || 0);
+  // Then the bot's EARNED CONFIDENCE adjusts it further: a weak track record
+  // (conservative mode) raises the bar so the bot trades less and only on strong
+  // signals; a strong record (aggressive) lowers it slightly so it can act on
+  // good-but-not-perfect setups. This is the poker player tightening up after a
+  // bad run vs opening up when running well — SEPARATE from any single signal.
+  const _conf = (typeof botConfidenceFactor === 'function') ? botConfidenceFactor() : { factor: 1, conservative: false, aggressive: false };
+  let confBarMod = 0;
+  if (_conf.conservative) confBarMod = 0.08;        // weak record → +0.08 to the bar
+  else if (_conf.aggressive) confBarMod = -0.04;    // strong record → slightly lower bar
+  const effThreshold = BOT_CONVICTION_THRESHOLD + (regime.thresholdMod || 0) + confBarMod;
 
   // ---- PASS 1: fundamentals-only scan over the whole universe (in-memory,
   // no network). Establishes a conviction ranking from financials alone. ----
@@ -40689,9 +41535,13 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
     picks.length = 0;   // no new bets this run
   }
   const equity = deployableCash;                    // size against FREE cash, not full book
-  const MAX_SINGLE = 0.35;                           // ≤35% of deployable in one position normally
-  const MAX_SINGLE_HIGH_CONV = 0.60;                 // up to 60% if conviction ≥ 0.75
-  const MAX_GROSS = 0.95;                             // deploy ≤95% of DEPLOYABLE cash (sidelines already held back)
+  // The bot's earned confidence scales how big it sizes. Conservative mode (poor
+  // track record) shrinks every position toward dry-powder safety; aggressive
+  // mode (strong record) lets winners be bet bigger. _conf.factor is ~0.5–1.5.
+  const _confSizeMult = Math.max(0.5, Math.min(1.4, _conf.factor));
+  const MAX_SINGLE = 0.35 * _confSizeMult;           // ≤35% normally, scaled by confidence
+  const MAX_SINGLE_HIGH_CONV = 0.60 * _confSizeMult; // up to 60% if conviction ≥ 0.75, scaled
+  const MAX_GROSS = (_conf.conservative ? 0.75 : 0.95);  // hold MORE cash back when running poorly
 
   // Per-pick RISK weight: conviction ÷ volatility (vol from history if available,
   // else a regime-based default). Higher conviction + lower vol → bigger weight.
@@ -41550,6 +42400,86 @@ function botPerformance(filterTicker = null) {
   };
 }
 
+// ============================================================
+//   BOT CONFIDENCE FACTOR — distinct from per-trade CONVICTION.
+//
+//   Conviction = the strength of the signal edge on ONE trade (computed fresh
+//   each time from the signals). Confidence = how much the bot has EARNED THE
+//   RIGHT to be aggressive, built up over its trading history. The poker analogy:
+//   a pro staked $100k plays bigger when running well and tightens up after a
+//   bad run — same hand (conviction) gets sized differently depending on
+//   confidence. Good track record → can hit big; poor track record → conservative
+//   mode (smaller sizing, higher bar to act). Confidence is SLOW (history), not a
+//   re-skin of conviction (the signal).
+//
+//   Inputs (all from settled trades): win rate, profit factor, recent streak,
+//   and sample size (few trades → stay near neutral, don't over-trust a small
+//   record). Output: a multiplier roughly in [0.5, 1.5] around 1.0 (neutral),
+//   plus a label + a 'conservative' flag the scan/sizing can read.
+// ============================================================
+let _botConfidenceCache = null;
+let _botConfidenceCacheKey = '';
+function botConfidenceFactor() {
+  const perf = botPerformance();
+  const bot = (typeof loadBotState === 'function') ? loadBotState() : { bets: [] };
+  const closed = (bot.bets || []).filter(b => b.status === 'closed' && isFinite(b.pnl));
+  const n = closed.length;
+  // Cache keyed on settled-trade count + realized P&L so it only recomputes when
+  // the record actually changes.
+  const key = `${n}|${perf.realizedPnl}`;
+  if (_botConfidenceCacheKey === key && _botConfidenceCache) return _botConfidenceCache;
+
+  // Not enough history → neutral confidence (the bot hasn't earned aggression yet,
+  // but isn't punished either). Below ~8 settled trades we stay close to 1.0.
+  const SAMPLE_FULL = 20;   // full trust at 20+ settled trades
+  const sampleTrust = Math.min(1, n / SAMPLE_FULL);
+
+  const winRate = perf.winRate != null ? perf.winRate / 100 : 0.5;   // 0..1
+  // Profit factor: gross win $ / gross loss $. >1 is profitable. Normalize to a
+  // 0..1 "edge" score centered so PF≈1 → 0.5.
+  const wins = closed.filter(b => b.pnl > 0);
+  const losses = closed.filter(b => b.pnl < 0);
+  const grossWin = wins.reduce((s, b) => s + b.pnl, 0);
+  const grossLoss = Math.abs(losses.reduce((s, b) => s + b.pnl, 0));
+  const pf = grossLoss > 0 ? grossWin / grossLoss : (grossWin > 0 ? 2.5 : 1);
+  const pfScore = Math.max(0, Math.min(1, (pf - 0.6) / (2.0 - 0.6)));   // PF 0.6→0, 2.0→1
+
+  // Recent streak: look at the last 6 settled trades by exit date. A hot streak
+  // adds confidence, a cold streak removes it (this is the "running well" part).
+  const recent = closed.slice().sort((a, b) => new Date(a.exitDate || 0) - new Date(b.exitDate || 0)).slice(-6);
+  const recentWins = recent.filter(b => b.pnl > 0).length;
+  const streakScore = recent.length ? recentWins / recent.length : 0.5;   // 0..1
+
+  // Blend the three signals (win rate, profit factor, recent streak), then scale
+  // how far it can deviate from neutral by sample trust.
+  const raw = 0.40 * winRate + 0.35 * pfScore + 0.25 * streakScore;   // 0..1, ~0.5 neutral
+  const deviation = (raw - 0.5) * 2;                                  // -1..+1
+  const trustedDeviation = deviation * sampleTrust;                   // shrink toward 0 when few trades
+  // Map to a multiplier in ~[0.5, 1.5].
+  const factor = +(1 + trustedDeviation * 0.5).toFixed(3);
+
+  // Conservative mode when the EARNED confidence is poor (not just one bad trade).
+  const conservative = n >= 8 && factor < 0.85;
+  const aggressive = n >= 8 && factor > 1.15;
+  let label;
+  if (n < 8) label = `Warming up (${n} settled) — neutral sizing`;
+  else if (conservative) label = `Conservative — track record is weak (${(winRate*100).toFixed(0)}% win, PF ${pf.toFixed(2)})`;
+  else if (aggressive) label = `Confident — earned aggression (${(winRate*100).toFixed(0)}% win, PF ${pf.toFixed(2)})`;
+  else label = `Steady (${(winRate*100).toFixed(0)}% win, PF ${pf.toFixed(2)})`;
+
+  const out = {
+    factor,                 // sizing/aggressiveness multiplier (~0.5–1.5)
+    conservative,           // true → tighten up (smaller size, higher bar)
+    aggressive,             // true → allow bigger swings
+    label,
+    winRate, profitFactor: +pf.toFixed(2), recentWinRate: +streakScore.toFixed(2),
+    sampleSize: n, sampleTrust: +sampleTrust.toFixed(2),
+  };
+  _botConfidenceCache = out; _botConfidenceCacheKey = key;
+  return out;
+}
+if (typeof window !== 'undefined') window.botConfidenceFactor = botConfidenceFactor;
+
 // ---- Windowed performance from the equity curve ----
 // Returns the bot's book-value and return over a time window. The ALL-TIME and
 // every windowed % is computed against the FIXED $100k basis for the headline,
@@ -41636,6 +42566,13 @@ function renderBetsTab() {
           if (res && res.added && typeof renderBetsTab === 'function') renderBetsTab();
         }).catch(() => {}), 600);
       }
+      // Same for the portfolio Supabase (TRAPP2-PORT) — restore the user's
+      // positions/watchlist/transactions on a fresh device with no manual import.
+      if (typeof portSupabaseLoad === 'function' && typeof portSupabaseConfigured === 'function' && portSupabaseConfigured()) {
+        setTimeout(() => portSupabaseLoad().then((res) => {
+          if (res && res.added && typeof renderPortfolioTab === 'function') renderPortfolioTab();
+        }).catch(() => {}), 800);
+      }
     }
   }
   const filter = (document.getElementById('bets-filter')?.value || '').trim().toUpperCase() || null;
@@ -41685,6 +42622,20 @@ function renderBetsTab() {
         <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:${vsSpyColor};margin-top:4px">${perf.spyReturn != null ? (perf.spyReturn >= 0 ? '+' : '') + perf.spyReturn + '%' : '—'}</div>
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">${perf.totalReturnPct != null && perf.spyReturn != null ? (perf.totalReturnPct > perf.spyReturn ? 'bot winning' : 'SPY winning') : 'benchmark'}</div>
       </div>
+      ${(() => {
+        // Confidence card — the bot's EARNED aggressiveness (distinct from any
+        // single trade's conviction). Green when confident, amber when warming up,
+        // red when in conservative mode after a weak run (poker player tightening).
+        const cf = (typeof botConfidenceFactor === 'function') ? botConfidenceFactor() : null;
+        if (!cf) return '';
+        const col = cf.conservative ? 'var(--neg)' : cf.aggressive ? 'var(--pos)' : cf.sampleSize < 8 ? 'var(--data-amber)' : 'var(--ink)';
+        const mode = cf.conservative ? 'Conservative' : cf.aggressive ? 'Aggressive' : cf.sampleSize < 8 ? 'Warming up' : 'Steady';
+        return `<div class="company-card" style="margin:0;border-left:3px solid ${col}" title="${escapeHtml(cf.label)}">
+          <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Confidence</div>
+          <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:${col};margin-top:4px">${mode}</div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">×${cf.factor.toFixed(2)} sizing · ${cf.sampleSize} settled · PF ${cf.profitFactor}</div>
+        </div>`;
+      })()}
     </div>`;
 
   // ---- Equity curve chart + time-window performance ----
