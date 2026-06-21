@@ -8513,26 +8513,26 @@
     </div>
 
     <div class="modal-section" style="border-top:1px solid var(--rule);padding-top:14px">
-      <div class="modal-label">Portfolio Supabase (TRAPP2-PORT — your paper-trading backend, separate project)</div>
-      <input type="text" class="modal-input" id="port-supabase-url-input" placeholder="Portfolio project URL — https://yyyy.supabase.co" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
-      <input type="text" class="modal-input" id="port-supabase-anon-input" placeholder="anon public key for the portfolio project" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
+      <div class="modal-label">Portfolio Supabase (TRAPP2-PORT — your paper-trading backend)</div>
+      <input type="text" class="modal-input" id="port-supabase-url-input" placeholder="Portfolio project URL — can be its OWN project or shared (e.g. the Analytics project)" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
+      <input type="text" class="modal-input" id="port-supabase-anon-input" placeholder="anon public key for that project" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         <button class="btn" id="port-supabase-save-btn">Save Portfolio Config</button>
         <button class="btn btn-ghost" id="port-supabase-sync-btn" title="Push every portfolio position, watchlist item, transaction + GoodGlobe index to the portfolio Supabase now">Sync Portfolio Now ↗</button>
         <span id="port-supabase-status" style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);align-self:center"></span>
       </div>
-      <div class="modal-help">A <strong>second, dedicated Supabase project</strong> for your portfolio (positions, watchlist, tracking, transactions, GoodGlobe index, conviction) — kept entirely separate from the bot, XTRAPP, and analytics. Positions <strong>upsert the instant you add or edit them</strong>, and the whole portfolio reloads on a fresh device. GitHub (TRAPP2-PORT) stays as the backup/training repo. Same one-time setup as the bot, but in a NEW project: create a <code>portfolio_positions</code> table (<code>id text primary key, position jsonb, updated_at timestamptz default now()</code>), enable the anon policy, paste URL + anon key here. The exact SQL (with generated columns + conviction tracking) is in the SUPABASE-PORT schema file.</div>
+      <div class="modal-help">Holds your portfolio in the <code>portfolio_positions</code> table. It can live in <strong>its own Supabase project OR share one with the bot or analytics</strong> — the table name is unique, so sharing a project never collides. On the free tier (2 projects max) you can run the portfolio table inside the analytics project: just paste the <strong>same URL + anon key</strong> as Analytics (use the button below). Positions upsert the instant you add/edit them. Run <code>portfolio_positions_schema.sql</code> once in whichever project hosts it.</div>
     </div>
 
     <div class="modal-section" style="border-top:1px solid var(--rule);padding-top:14px">
-      <div class="modal-label">Analytics Supabase (TRAPP2-ANALYTICS — research grades, regime, probability · read-only)</div>
-      <input type="text" class="modal-input" id="analytics-supabase-url-input" placeholder="Analytics project URL — can be the bot project or its own" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
+      <div class="modal-label">Analytics Supabase (TRAPP2-ANALYTICS — research grades, regime · read-only)</div>
+      <input type="text" class="modal-input" id="analytics-supabase-url-input" placeholder="Analytics project URL — its own project, or shared with bot/portfolio" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
       <input type="text" class="modal-input" id="analytics-supabase-anon-input" placeholder="anon public key (read-only)" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         <button class="btn" id="analytics-supabase-save-btn">Save Analytics Config</button>
         <span id="analytics-supabase-status" style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);align-self:center"></span>
       </div>
-      <div class="modal-help">The analytics layer (research grades, composite grades, regime, probability features, bot triggers, formulas) is computed by the <strong>pipeline</strong> and pushed to Supabase by <code>push_analytics_to_supabase.py</code> — so this slot is <strong>read-only</strong> from the app. When set, research grades + regime load from Supabase (indexed, fast, cross-device) and fall back to the TRAPP2-ANALYTICS repo JSON if empty. This can live in the <strong>same project as the bot</strong> (just different tables) or its own project. Run <code>analytics_schema.sql</code> once, add <code>SUPABASE_URL</code> + <code>SUPABASE_SERVICE_KEY</code> as workflow secrets, then paste the URL + anon (read) key here.</div>
+      <div class="modal-help">Research grades + regime in the <code>research_grades</code> / <code>regime_snapshots</code> tables, written by the pipeline (<code>push_analytics_to_supabase.py</code>) and read here read-only. <strong>Shares cleanly with the portfolio or bot</strong> — unique table names. On the free tier, the portfolio table commonly lives in this same project. App reads grades from here, falling back to the repo JSON if empty. Paste the URL + <strong>anon (read) key</strong>; the pipeline uses the service-role key (secret, never in the app).</div>
     </div>
 
     <!-- Repository Backup & Sync — Update + Export for all four repos (populated by renderRepoSyncPanel) -->
@@ -8794,6 +8794,8 @@
       <div class="home-export-buttons">
         <button class="btn" id="home-port-export-btn" title="Download portfolio_data.json (holdings, watching, transactions, cash, GoodGlobe Index) to commit to TRAPP2-PORT">⤓ Export Portfolio JSON</button>
         <button class="btn" id="home-port-import-btn" title="Pull the latest portfolio_data.json from TRAPP2-PORT and restore it on this device">⤒ Import from Repo</button>
+        <button class="btn" id="home-port-import-file-btn" title="Import a portfolio_data.json file from your device (no GitHub needed)">⤒ Import Portfolio File</button>
+        <input type="file" id="home-port-import-file-input" accept="application/json,.json" style="display:none">
         <button class="btn btn-ghost" id="home-port-commit-btn" title="Open the repo file editor on GitHub to paste/commit the exported JSON">Open Repo to Commit ↗</button>
         <button class="btn btn-ghost" id="home-port-open-btn" title="Open the TRAPP2-PORT repository on GitHub">Open TRAPP2-PORT ↗</button>
       </div>
@@ -8861,6 +8863,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260615z14"></script>
+<script src="app.js?v=20260615z17"></script>
 </body>
 </html>

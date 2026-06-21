@@ -6888,6 +6888,10 @@ function openSourcesModal() {
       if (typeof wireRepoSyncPanel === 'function') wireRepoSyncPanel(mount);
     }
   } catch (e) { console.warn('[repo-sync] mount failed', e.message); }
+  // Inject "share project" controls + a shared-with hint into each Supabase slot,
+  // so the 2-project free tier is easy to manage (e.g. point Portfolio at the
+  // Analytics project). Idempotent — only injects once per slot.
+  try { _injectSupabaseShareControls(); } catch (e) { console.warn('[supabase-share] inject failed', e.message); }
   document.getElementById('av-key-input').value = getApiKey();
   document.getElementById('finnhub-key-input').value = getFinnhubKey();
   document.getElementById('fmp-key-input').value = getFmpKey();
@@ -10859,6 +10863,22 @@ async function loadStockBook(forceRefresh = false) {
   renderStockBook();
   maybeShowTickerTape();
 }
+
+// renderPortfolioTab — the portfolio lives inside the Stock Book ("portfolio"
+// section). Many call sites (imports, Supabase loads, repo pulls) call
+// renderPortfolioTab() to refresh it; this defines it so those calls actually
+// repaint instead of silently no-op'ing. If the Stock Book is showing another
+// section we switch it to portfolio first so freshly-imported positions appear.
+function renderPortfolioTab() {
+  try {
+    if (state.stockbook && state.stockbook.section !== 'portfolio') {
+      // Only auto-switch if the user is actually on the Stock Book tab.
+      if (state.tab === 'stockbook' || state.tab === 'portfolio') state.stockbook.section = 'portfolio';
+    }
+    if (typeof renderStockBook === 'function') renderStockBook();
+  } catch (e) { console.warn('[portfolio] render failed', e.message); }
+}
+if (typeof window !== 'undefined') window.renderPortfolioTab = renderPortfolioTab;
 
 function renderStockBook() {
   const content = document.getElementById('stockbook-content');
@@ -23713,10 +23733,46 @@ function exportPortfolioData() {
   return data;
 }
 
+// Apply a portfolio import from EITHER format:
+//   • bare array of positions  [{ticker, position, qty, costBasis, …}]
+//   • wrapped snapshot         {schema, portfolio:[…], transactions, cash, …}
+// Returns the number of positions restored. Shared by the repo import + the
+// home-drawer file import so both read the same shapes.
+function applyPortfolioImport(parsed) {
+  if (!parsed) return 0;
+  let positions = null, snapshot = null;
+  if (Array.isArray(parsed)) {
+    positions = parsed;                 // bare array (the raw repo file format)
+  } else if (typeof parsed === 'object') {
+    snapshot = parsed;
+    if (Array.isArray(parsed.portfolio)) positions = parsed.portfolio;
+    else if (Array.isArray(parsed.positions)) positions = parsed.positions;
+  }
+  if (Array.isArray(positions)) {
+    if (typeof savePortfolio === 'function') savePortfolio(positions);
+  }
+  // If it's a full snapshot, also restore transactions / cash / GoodGlobe.
+  if (snapshot) {
+    if (Array.isArray(snapshot.transactions)) {
+      const local = (typeof loadTransactions === 'function') ? loadTransactions() : [];
+      const seen = new Set(local.map(t => t.id));
+      const merged = local.slice();
+      for (const t of snapshot.transactions) { if (t && !seen.has(t.id)) { merged.push(t); seen.add(t.id); } }
+      merged.sort((a, b) => String(a.ts || '').localeCompare(String(b.ts || '')));
+      if (typeof saveTransactions === 'function') saveTransactions(merged);
+    }
+    if (typeof snapshot.cashPosition === 'number' && typeof setCashPosition === 'function') setCashPosition(snapshot.cashPosition);
+    if (snapshot.goodGlobeIndex && typeof saveGoodGlobeIndex === 'function') saveGoodGlobeIndex(snapshot.goodGlobeIndex);
+    if (snapshot.goodGlobeCurve) { try { localStorage.setItem(GOODGLOBE_INDEX_CURVE_KEY, JSON.stringify(snapshot.goodGlobeCurve)); } catch {} }
+  }
+  return Array.isArray(positions) ? positions.length : 0;
+}
+if (typeof window !== 'undefined') window.applyPortfolioImport = applyPortfolioImport;
+
 // Import the portfolio snapshot from the TRAPP2-PORT repo (the durable source of
 // truth). Restores holdings, watchlists, transactions, cash, and the GoodGlobe
-// Index. The repo snapshot REPLACES local portfolio state (it's a full snapshot,
-// not a partial merge) — transactions are unioned by id so none are lost.
+// Index. Accepts BOTH the wrapped snapshot AND a bare position array (the raw
+// repo file format), so a hand-maintained portfolio_data.json still loads.
 async function importPortfolioData(repoUrl) {
   const url = repoUrl || PORT_DATA_REPO_RAW;
   try {
@@ -23727,40 +23783,19 @@ async function importPortfolioData(repoUrl) {
       return null;
     }
     const data = await r.json();
-    if (!data || (data.schema || '').indexOf('valuatio-portfolio') !== 0) {
+    // Accept bare array OR wrapped snapshot.
+    const isWrapped = data && typeof data === 'object' && !Array.isArray(data) && (String(data.schema || '').indexOf('valuatio-portfolio') === 0 || Array.isArray(data.portfolio));
+    const isBareArray = Array.isArray(data);
+    if (!isWrapped && !isBareArray) {
       console.warn('[portfolio] unexpected schema');
-      if (typeof flashStatus === 'function') flashStatus('Import failed — unexpected file schema', 'error');
+      if (typeof flashStatus === 'function') flashStatus('Import failed — unexpected file format', 'error');
       return null;
     }
-    // Restore portfolio list (authoritative full snapshot).
-    if (Array.isArray(data.portfolio)) {
-      savePortfolio(data.portfolio);
-    }
-    // Union transactions by id so we never drop a locally-recorded trade that
-    // isn't yet in the repo snapshot.
-    if (Array.isArray(data.transactions)) {
-      const local = (typeof loadTransactions === 'function') ? loadTransactions() : [];
-      const seen = new Set(local.map(t => t.id));
-      const merged = local.slice();
-      for (const t of data.transactions) { if (t && !seen.has(t.id)) { merged.push(t); seen.add(t.id); } }
-      // Keep chronological order.
-      merged.sort((a, b) => String(a.ts || '').localeCompare(String(b.ts || '')));
-      if (typeof saveTransactions === 'function') saveTransactions(merged);
-    }
-    // Cash position.
-    if (typeof data.cashPosition === 'number' && typeof setCashPosition === 'function') {
-      setCashPosition(data.cashPosition);
-    }
-    // GoodGlobe Index + curve.
-    if (data.goodGlobeIndex && typeof saveGoodGlobeIndex === 'function') {
-      saveGoodGlobeIndex(data.goodGlobeIndex);
-    }
-    if (data.goodGlobeCurve) {
-      try { localStorage.setItem(GOODGLOBE_INDEX_CURVE_KEY, JSON.stringify(data.goodGlobeCurve)); } catch {}
-    }
+    const n = applyPortfolioImport(data);
     if (typeof flashStatus === 'function') {
-      flashStatus(`Imported ${data.counts?.portfolio ?? '?'} positions + ${data.counts?.transactions ?? '?'} transactions from TRAPP2-PORT`, 'success');
+      flashStatus(`Imported ${n} position(s)${isWrapped && data.counts?.transactions != null ? ` + ${data.counts.transactions} transactions` : ''} from TRAPP2-PORT`, 'success');
     }
+    try { if (typeof renderPortfolioTab === 'function' && state.tab === 'portfolio') renderPortfolioTab(); } catch {}
     return data;
   } catch (e) {
     console.warn('[portfolio] import failed:', e.message);
@@ -40134,7 +40169,7 @@ async function supabaseUpsertTrade(bet) {
   if (!supabaseConfigured() || !bet) return false;
   try {
     _ensureTradeId(bet);
-    const r = await fetch(`${getSupabaseUrl()}/rest/v1/${SUPABASE_TABLE}`, {
+    const r = await fetch(`${getSupabaseUrl()}/rest/v1/${SUPABASE_TABLE}?on_conflict=id`, {
       method: 'POST',
       headers: _supabaseHeaders({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
       body: JSON.stringify(_supabaseRow(bet)),
@@ -40200,7 +40235,7 @@ async function supabaseSyncAllTrades() {
     let sent = 0;
     for (let i = 0; i < rows.length; i += 100) {
       const chunk = rows.slice(i, i + 100);
-      const r = await fetch(`${getSupabaseUrl()}/rest/v1/${SUPABASE_TABLE}`, {
+      const r = await fetch(`${getSupabaseUrl()}/rest/v1/${SUPABASE_TABLE}?on_conflict=id`, {
         method: 'POST',
         headers: _supabaseHeaders({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
         body: JSON.stringify(chunk),
@@ -40315,7 +40350,7 @@ function _portSupabaseRow(rec) {
 async function portSupabaseUpsert(rec) {
   if (!portSupabaseConfigured()) return false;
   try {
-    const r = await fetch(`${getPortSupabaseUrl()}/rest/v1/${PORT_SUPABASE_TABLE}`, {
+    const r = await fetch(`${getPortSupabaseUrl()}/rest/v1/${PORT_SUPABASE_TABLE}?on_conflict=id`, {
       method: 'POST',
       headers: _portSupabaseHeaders({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
       body: JSON.stringify([_portSupabaseRow(rec)]),
@@ -40372,7 +40407,7 @@ async function portSupabaseSyncAll() {
     let sent = 0;
     for (let i = 0; i < rows.length; i += 100) {
       const chunk = rows.slice(i, i + 100);
-      const r = await fetch(`${getPortSupabaseUrl()}/rest/v1/${PORT_SUPABASE_TABLE}`, {
+      const r = await fetch(`${getPortSupabaseUrl()}/rest/v1/${PORT_SUPABASE_TABLE}?on_conflict=id`, {
         method: 'POST',
         headers: _portSupabaseHeaders({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
         body: JSON.stringify(chunk),
@@ -40458,6 +40493,93 @@ const ANALYTICS_SUPABASE_ANON_STORAGE = 'valuatio.analyticsSupabase.anon';
 
 function getAnalyticsSupabaseUrl() { return (localStorage.getItem(ANALYTICS_SUPABASE_URL_STORAGE) || '').replace(/\/+$/, ''); }
 function getAnalyticsSupabaseAnon() { return localStorage.getItem(ANALYTICS_SUPABASE_ANON_STORAGE) || ''; }
+
+// ============================================================
+//   INTERCHANGEABLE SUPABASE PROJECTS
+//   Each data type (bot / portfolio / analytics) has its OWN url+key config and
+//   its OWN table, so any of them can point at ANY Supabase project — including
+//   the SAME project (different tables never collide). This supports the free
+//   tier's 2-project cap: e.g. portfolio tables can live in the analytics
+//   project, bot in its own; or any other split. If you later upgrade, just
+//   paste a dedicated url+key into that slot and it moves — no code change.
+//
+//   _SUPABASE_SLOTS lets the UI show which slots share a project and copy one
+//   slot's url+key into another with a click.
+// ============================================================
+const _SUPABASE_SLOTS = {
+  bot:       { label: 'Bot', table: 'bot_trades', getUrl: () => getSupabaseUrl(), getAnon: () => getSupabaseAnon(), set: (u, a) => setSupabaseConfig(u, a) },
+  port:      { label: 'Portfolio', table: 'portfolio_positions', getUrl: () => getPortSupabaseUrl(), getAnon: () => getPortSupabaseAnon(), set: (u, a) => setPortSupabaseConfig(u, a) },
+  analytics: { label: 'Analytics', table: 'research_grades', getUrl: () => getAnalyticsSupabaseUrl(), getAnon: () => getAnalyticsSupabaseAnon(), set: (u, a) => setAnalyticsSupabaseConfig(u, a) },
+};
+
+// Which other slots already point at a given project URL (for the "shared with"
+// hint). Compares by project URL (the host that identifies the Supabase project).
+function _supabaseSharedWith(slotKey) {
+  const me = _SUPABASE_SLOTS[slotKey]; if (!me) return [];
+  const myUrl = (me.getUrl() || '').toLowerCase();
+  if (!myUrl) return [];
+  const others = [];
+  for (const [k, s] of Object.entries(_SUPABASE_SLOTS)) {
+    if (k === slotKey) continue;
+    if ((s.getUrl() || '').toLowerCase() === myUrl) others.push(s.label);
+  }
+  return others;
+}
+
+// Copy another slot's url+key into a target slot's INPUT FIELDS (so the user can
+// review then Save). Returns true if the source had a URL to copy.
+function supabaseCopyConfigToInputs(fromKey, toUrlInputId, toAnonInputId) {
+  const from = _SUPABASE_SLOTS[fromKey]; if (!from) return false;
+  const url = from.getUrl(), anon = from.getAnon();
+  if (!url) { if (typeof flashStatus === 'function') flashStatus(`${from.label} Supabase isn't configured yet — nothing to copy`, ''); return false; }
+  const u = document.getElementById(toUrlInputId), a = document.getElementById(toAnonInputId);
+  if (u) u.value = url;
+  if (a) a.value = anon;
+  if (typeof flashStatus === 'function') flashStatus(`Filled from the ${from.label} project — click Save to use the same project`, 'success');
+  return true;
+}
+if (typeof window !== 'undefined') {
+  window.supabaseCopyConfigToInputs = supabaseCopyConfigToInputs;
+  window._supabaseSharedWith = _supabaseSharedWith;
+}
+
+// Inject "use same project as X" buttons + a "shared with" hint under each
+// Supabase slot's save button. Idempotent. Lets the user reuse one project for
+// multiple data types (the free-tier 2-project workaround) in one click.
+function _injectSupabaseShareControls() {
+  const slots = [
+    { key: 'bot',       saveBtn: 'supabase-save-btn',           urlInput: 'supabase-url-input',           anonInput: 'supabase-anon-input' },
+    { key: 'port',      saveBtn: 'port-supabase-save-btn',      urlInput: 'port-supabase-url-input',      anonInput: 'port-supabase-anon-input' },
+    { key: 'analytics', saveBtn: 'analytics-supabase-save-btn', urlInput: 'analytics-supabase-url-input', anonInput: 'analytics-supabase-anon-input' },
+  ];
+  for (const slot of slots) {
+    const saveBtn = document.getElementById(slot.saveBtn);
+    if (!saveBtn) continue;
+    const host = saveBtn.parentElement; if (!host) continue;
+    // Refresh or create the share row for this slot.
+    let row = document.getElementById(`supabase-share-${slot.key}`);
+    if (!row) {
+      row = document.createElement('div');
+      row.id = `supabase-share-${slot.key}`;
+      row.style.cssText = 'margin-top:6px;font-family:var(--mono);font-size:9px;color:var(--ink-faint);display:flex;flex-wrap:wrap;gap:6px;align-items:center';
+      host.parentElement.insertBefore(row, host.nextSibling);
+    }
+    const others = ['bot', 'port', 'analytics'].filter(k => k !== slot.key);
+    const shared = (typeof _supabaseSharedWith === 'function') ? _supabaseSharedWith(slot.key) : [];
+    const btns = others.map(k => {
+      const label = _SUPABASE_SLOTS[k]?.label || k;
+      const configured = !!(_SUPABASE_SLOTS[k]?.getUrl());
+      return `<button class="btn btn-ghost supabase-share-btn" data-from="${k}" data-tourl="${slot.urlInput}" data-toanon="${slot.anonInput}" style="font-size:9px;padding:1px 7px"${configured ? '' : ' disabled title="not configured yet"'}>use same project as ${label}</button>`;
+    }).join('');
+    row.innerHTML = `${shared.length ? `<span style="color:var(--pos)">● shares a project with ${shared.join(' + ')}</span>` : ''}${btns}`;
+    row.querySelectorAll('.supabase-share-btn').forEach(b => {
+      b.addEventListener('click', () => {
+        if (typeof supabaseCopyConfigToInputs === 'function') supabaseCopyConfigToInputs(b.dataset.from, b.dataset.tourl, b.dataset.toanon);
+      });
+    });
+  }
+}
+if (typeof window !== 'undefined') window._injectSupabaseShareControls = _injectSupabaseShareControls;
 function setAnalyticsSupabaseConfig(url, anon) {
   if (url) localStorage.setItem(ANALYTICS_SUPABASE_URL_STORAGE, url.trim().replace(/\/+$/, '')); else localStorage.removeItem(ANALYTICS_SUPABASE_URL_STORAGE);
   if (anon) localStorage.setItem(ANALYTICS_SUPABASE_ANON_STORAGE, anon.trim()); else localStorage.removeItem(ANALYTICS_SUPABASE_ANON_STORAGE);
@@ -43412,6 +43534,14 @@ function renderBetsTab() {
       if (typeof portSupabaseLoad === 'function' && typeof portSupabaseConfigured === 'function' && portSupabaseConfigured()) {
         setTimeout(() => portSupabaseLoad().then((res) => {
           if (res && res.added && typeof renderPortfolioTab === 'function') renderPortfolioTab();
+        }).catch(() => {}), 800);
+      } else if (typeof importPortfolioData === 'function' && typeof loadPortfolio === 'function' && loadPortfolio().length === 0) {
+        // No Supabase configured AND the local portfolio is empty → pull the
+        // portfolio_data.json from the TRAPP2-PORT repo automatically. This is
+        // what surfaces a repo-maintained portfolio on a fresh load with no
+        // manual import. Only runs when there's nothing local to avoid clobber.
+        setTimeout(() => importPortfolioData().then((res) => {
+          if (res && typeof renderPortfolioTab === 'function') renderPortfolioTab();
         }).catch(() => {}), 800);
       }
     }
@@ -46605,6 +46735,41 @@ async function handleHomeImportFile(file, logEl) {
         });
         return;
       }
+      // Portfolio data (TRAPP2-PORT) — accepts BOTH the wrapped snapshot
+      // ({schema:'valuatio-portfolio…', portfolio:[…]}) AND a bare array of
+      // positions ([{ticker,position,qty,…}], the raw loadPortfolio format the
+      // repo file uses). This is what makes the PORT repo file importable here.
+      {
+        const isWrappedPort = parsed && typeof parsed === 'object' && !Array.isArray(parsed) && (String(parsed.schema || '').indexOf('valuatio-portfolio') === 0 || Array.isArray(parsed.portfolio));
+        const isBarePortArray = Array.isArray(parsed) && parsed.length > 0 && parsed.every(x => x && typeof x === 'object' && 'ticker' in x && ('position' in x || 'qty' in x || 'costBasis' in x));
+        if (isWrappedPort || isBarePortArray) {
+          const n = (typeof applyPortfolioImport === 'function') ? applyPortfolioImport(parsed) : 0;
+          append(`Imported <strong>${n}</strong> portfolio position(s) from <strong>${escapeHtml(file.name)}</strong>`, 'ok');
+          try { if (typeof renderPortfolioTab === 'function' && state.tab === 'portfolio') renderPortfolioTab(); } catch {}
+          addNotification({ title: `Portfolio imported — ${n} positions`, detail: `From ${file.name}. Open the Portfolio tab to see them.`, category: 'note', source: 'system' });
+          return;
+        }
+      }
+      // Bot training data (TRAPP2-BOT).
+      if (parsed && (String(parsed.schema || '').indexOf('valuatio-bot') === 0 || (parsed.bankroll != null && parsed.learnedWeights))) {
+        if (typeof applyBotTrainingData === 'function') {
+          applyBotTrainingData(parsed);
+          append(`Imported bot training data from <strong>${escapeHtml(file.name)}</strong>`, 'ok');
+          try { if (typeof renderBetsTab === 'function' && state.tab === 'bets') renderBetsTab(); } catch {}
+          return;
+        }
+      }
+      // XTRAPP data (lexicon / posts / edits / grades).
+      if (parsed && (String(parsed._schema || '').indexOf('xtrapp') === 0 || parsed.lexicon || parsed.editLog)) {
+        try {
+          if (parsed.lexicon && typeof saveLexicon === 'function') saveLexicon(parsed.lexicon);
+          if (parsed.editLog && typeof saveEditLog === 'function') saveEditLog(parsed.editLog);
+          if (parsed.humanGrades && typeof saveHumanGrades === 'function') saveHumanGrades(parsed.humanGrades);
+          if (parsed.articleFixes && typeof saveArticleFixes === 'function') saveArticleFixes({ ...(typeof loadArticleFixes === 'function' ? loadArticleFixes() : {}), ...parsed.articleFixes });
+          append(`Imported XTRAPP data from <strong>${escapeHtml(file.name)}</strong>`, 'ok');
+          return;
+        } catch (e) { append(`XTRAPP import error: ${escapeHtml(e.message)}`, 'warn'); }
+      }
       // Leadership profile JSON (export from leadership manager)
       if (parsed.name && (parsed.slug || parsed.qid)) {
         if (typeof saveLeadershipPerson === 'function') {
@@ -47148,8 +47313,28 @@ document.addEventListener('DOMContentLoaded', () => {
     catch (e) { console.warn('[portfolio] import failed', e); }
     if (btn) { btn.textContent = '⤒ Import from Repo'; btn.disabled = false; }
     // Refresh portfolio-dependent views if open.
+    try { if (typeof renderPortfolioTab === 'function') renderPortfolioTab(); } catch {}
     try { if (typeof renderStockBook === 'function') renderStockBook(); } catch {}
     try { if (typeof renderGoodGlobeIndex === 'function') renderGoodGlobeIndex(); } catch {}
+  });
+  // Import a portfolio_data.json FILE from the device (no GitHub needed).
+  document.getElementById('home-port-import-file-btn')?.addEventListener('click', () => {
+    document.getElementById('home-port-import-file-input')?.click();
+  });
+  document.getElementById('home-port-import-file-input')?.addEventListener('change', async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const n = (typeof applyPortfolioImport === 'function') ? applyPortfolioImport(parsed) : 0;
+      if (typeof flashStatus === 'function') flashStatus(`Imported ${n} portfolio position(s) from ${file.name}`, 'success');
+      try { if (typeof renderPortfolioTab === 'function') renderPortfolioTab(); } catch {}
+      try { if (typeof renderStockBook === 'function') renderStockBook(); } catch {}
+    } catch (err) {
+      if (typeof flashStatus === 'function') flashStatus(`Couldn't read ${file.name} — ${err.message}`, 'error');
+    }
+    e.target.value = '';   // allow re-importing the same file
   });
   document.getElementById('home-port-commit-btn')?.addEventListener('click', () => {
     window.open(PORT_DATA_REPO_EDIT, '_blank', 'noopener');
