@@ -7267,6 +7267,7 @@
   <button class="val-subtab active" data-subtab="overview">Overview</button>
   <button class="val-subtab" data-subtab="financials">Financials</button>
   <button class="val-subtab" data-subtab="ta">Technical Analysis</button>
+  <button class="val-subtab" data-subtab="options">Options</button>
   <button class="val-subtab" data-subtab="company">Company</button>
   <button class="val-subtab" data-subtab="activity">Activity</button>
 </div>
@@ -7568,6 +7569,11 @@
        nested INSIDE the TA subpanel, so hiding TA (which happens whenever you
        open Company) hid Company with it. The weeks-long blank-Company-tab bug
        was this one div. -->
+
+  <!-- OPTIONS SUB-PANEL (live chains + Greeks; populated by renderOptionsTab) -->
+  <div class="val-subpanel" data-subpanel="options" style="display:none">
+    <div id="options-body" style="padding:0 4px"></div>
+  </div>
 
   <!-- COMPANY INFORMATION SUB-PANEL -->
   <div class="val-subpanel" data-subpanel="company" style="display:none">
@@ -8529,6 +8535,9 @@
       <div class="modal-help">The analytics layer (research grades, composite grades, regime, probability features, bot triggers, formulas) is computed by the <strong>pipeline</strong> and pushed to Supabase by <code>push_analytics_to_supabase.py</code> — so this slot is <strong>read-only</strong> from the app. When set, research grades + regime load from Supabase (indexed, fast, cross-device) and fall back to the TRAPP2-ANALYTICS repo JSON if empty. This can live in the <strong>same project as the bot</strong> (just different tables) or its own project. Run <code>analytics_schema.sql</code> once, add <code>SUPABASE_URL</code> + <code>SUPABASE_SERVICE_KEY</code> as workflow secrets, then paste the URL + anon (read) key here.</div>
     </div>
 
+    <!-- Repository Backup & Sync — Update + Export for all four repos (populated by renderRepoSyncPanel) -->
+    <div id="repo-sync-mount"></div>
+
     <div class="modal-section">
       <div class="modal-label">FRED API Key (macro data — recommended)</div>
       <input type="text" class="modal-input" id="fred-key-input" placeholder="Paste FRED key here">
@@ -8852,6 +8861,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260615z9"></script>
+<script src="app.js?v=20260615z14"></script>
 </body>
 </html>

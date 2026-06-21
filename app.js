@@ -4924,6 +4924,54 @@ function parseHumanNumber(s) {
   return m[2] ? base * mult[m[2].toUpperCase()] : base;
 }
 
+// ============================================================
+//   EXPENSE RATIO (ETF / fund annual fee) + HOLDING-COST FORMULA
+//   Some ETFs/funds charge an annual expense ratio. We fetch it, normalize it to
+//   a DECIMAL (0.0095 = 0.95%/yr), surface it, fold it into a holding/trading
+//   cost estimate, and dock the grade for high fees (a high expense ratio makes
+//   an otherwise-fine fund less attractive — the fee is a guaranteed drag).
+// ============================================================
+// Normalize whatever the data carries into a decimal fraction per year.
+// yfinance returns expense ratios as DECIMALS (SPY 0.000945, ARKK 0.0075,
+// 0.0095 = 0.95%). Some sheets store PERCENTS (0.95, 9.45). We disambiguate:
+//   • v ≤ 0.05  → already a decimal fraction (covers 0.000945 … 5%)
+//   • 0.05 < v ≤ 20 → a percent (0.95%, 9.45%, 2.5%) → ÷100
+//   • otherwise → bad data
+// Final sanity cap: 0 < ratio ≤ 0.20 (20%/yr).
+function normalizeExpenseRatio(raw) {
+  if (raw == null || raw === '') return null;
+  let v = (typeof raw === 'number') ? raw : parseFloat(String(raw).replace(/[%,\s]/g, ''));
+  if (!isFinite(v) || v <= 0) return null;
+  if (v > 20) return null;
+  if (v > 0.05) v = v / 100;      // values above 5% can't be decimals → percent
+  if (v > 0.20 || v <= 0) return null;
+  return v;
+}
+
+// Pull the expense ratio for a stockbook row (any of the field spellings),
+// normalized to a decimal. Returns null if none / not a fund.
+function rowExpenseRatio(row) {
+  if (!row) return null;
+  const raw = row.expenseRatio ?? row['expense ratio'] ?? row.expenseratio ?? row.netExpenseRatio ?? null;
+  return normalizeExpenseRatio(raw);
+}
+
+// Estimate the expense-ratio COST of holding a position. Annual fee = value ×
+// ratio; for a known horizon (days) we prorate. Returns {annual, prorated, pct}.
+function expenseCost(row, positionValue, holdingDays) {
+  const ratio = rowExpenseRatio(row);
+  if (ratio == null || !positionValue || positionValue <= 0) return null;
+  const annual = positionValue * ratio;
+  const days = (holdingDays && holdingDays > 0) ? holdingDays : 365;
+  const prorated = annual * (days / 365);
+  return { ratio, annual, prorated, days, pct: ratio * 100 };
+}
+if (typeof window !== 'undefined') {
+  window.normalizeExpenseRatio = normalizeExpenseRatio;
+  window.rowExpenseRatio = rowExpenseRatio;
+  window.expenseCost = expenseCost;
+}
+
 // Which input keys represent large dollar amounts that should use M/B/T notation
 const LARGE_INPUTS = new Set([
   'sharesOutstanding', 'marketCap', 'fcf', 'revenue', 'totalDebt', 'cash', 'ebitda'
@@ -6832,6 +6880,14 @@ document.getElementById('save-btn').addEventListener('click', saveCurrent);
 // ---------- DATA SOURCES MODAL ----------
 function openSourcesModal() {
   document.getElementById('sources-modal').style.display = 'flex';
+  // Mount the Repository Backup & Sync panel (Update + Export for all four repos).
+  try {
+    const mount = document.getElementById('repo-sync-mount');
+    if (mount && typeof renderRepoSyncPanel === 'function') {
+      mount.innerHTML = renderRepoSyncPanel();
+      if (typeof wireRepoSyncPanel === 'function') wireRepoSyncPanel(mount);
+    }
+  } catch (e) { console.warn('[repo-sync] mount failed', e.message); }
   document.getElementById('av-key-input').value = getApiKey();
   document.getElementById('finnhub-key-input').value = getFinnhubKey();
   document.getElementById('fmp-key-input').value = getFmpKey();
@@ -9005,6 +9061,161 @@ function setMacroBaseOverride(url) {
 // intentionally do NOT fall back to the equity history base or "any configured
 // repo" — that would risk pulling macro from an equities repo (or some unrelated
 // future repo), which is exactly the wrong data.
+// ============================================================
+//   OPTIONS CHAINS (live premium, strike, DTE, Greeks)
+//   Reads data/options/<TICKER>.json from the equity repo (TRAPP2), produced by
+//   fetch_options.py. Expired contracts are already dropped by the pipeline; the
+//   frontend filters again by DTE as a belt-and-suspenders. Bot-traded contracts
+//   live in bot data, so they persist past expiry independently.
+// ============================================================
+const _optionsCache = {};            // ticker -> { data, t }
+const OPTIONS_TTL_MS = 30 * 60 * 1000;
+let _optionsManifest = null;
+
+// Options live with the equity history (TRAPP2). Reuse the history-manifest base
+// when present, else fall back to the default raw base for the equity repo.
+function resolveOptionsBase() {
+  const mb = (typeof state !== 'undefined' && state._historyManifest && state._historyManifest.baseUrl) ? state._historyManifest.baseUrl : null;
+  if (mb) return mb.replace(/\/history\/?$/, '/').replace(/\/+$/, '/') + 'options/';
+  return 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2/main/data/options/';
+}
+
+async function loadOptionsManifest() {
+  if (_optionsManifest) return _optionsManifest;
+  try {
+    const r = await fetch(resolveOptionsBase() + 'manifest.json', { cache: 'no-store' });
+    if (r.ok) { _optionsManifest = await r.json(); }
+  } catch {}
+  return _optionsManifest;
+}
+
+async function loadOptionsForTicker(ticker, force) {
+  const tk = (ticker || '').toUpperCase();
+  if (!tk) return null;
+  const cached = _optionsCache[tk];
+  if (!force && cached && Date.now() - cached.t < OPTIONS_TTL_MS) return cached.data;
+  try {
+    const r = await fetch(resolveOptionsBase() + encodeURIComponent(tk) + '.json', { cache: 'no-store' });
+    if (!r.ok) { _optionsCache[tk] = { data: null, t: Date.now() }; return null; }
+    const data = await r.json();
+    // Belt-and-suspenders: drop any expiry that has gone past DTE 0 since the
+    // file was written (e.g. file is a day stale and a Friday passed).
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    if (data && Array.isArray(data.expiries)) {
+      data.expiries = data.expiries.map(e => {
+        const exp = new Date(e.expiry + 'T16:00:00');
+        e.dteNow = Math.ceil((exp - today) / 86400000);
+        return e;
+      }).filter(e => e.dteNow >= 0);
+    }
+    _optionsCache[tk] = { data, t: Date.now() };
+    return data;
+  } catch (e) { console.warn('[options] load failed', tk, e.message); return null; }
+}
+
+// State for the options panel (which expiry / call|put / sort).
+const OPTIONS_STATE = { expiryIdx: 0, side: 'both', sort: 'strike' };
+
+function _optFmt(v, dp = 2) { return (v == null || !isFinite(v)) ? '—' : (+v).toFixed(dp); }
+function _optGreekColor(v) { return v == null ? 'var(--ink-faint)' : (v >= 0 ? 'var(--pos)' : 'var(--neg)'); }
+
+async function renderOptionsTab(ticker) {
+  const body = document.getElementById('options-body');
+  if (!body) return;
+  const tk = (ticker || '').toUpperCase();
+  body.innerHTML = `<div style="padding:24px;text-align:center;color:var(--ink-faint);font-family:var(--mono);font-size:11px">Loading options for ${escapeHtml(tk)}…</div>`;
+  const data = await loadOptionsForTicker(tk);
+  if (!data || !data.expiries || !data.expiries.length) {
+    const man = await loadOptionsManifest();
+    const has = man && Array.isArray(man.tickers) && man.tickers.includes(tk);
+    body.innerHTML = `<div class="company-card" style="margin:0">
+      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-dim);line-height:1.6;padding:8px">
+        ${has ? `No <strong>live</strong> options for ${escapeHtml(tk)} right now (all near-term contracts may have expired — they refresh on the next pipeline run).`
+              : `${escapeHtml(tk)} isn't in the options universe yet. Options are pulled for a curated list of liquid names; add ${escapeHtml(tk)} to <code>data/options_universe.txt</code> in TRAPP2 to include it.`}
+        <div style="margin-top:8px;color:var(--ink-faint);font-size:10px">Options data is produced by the TRAPP2 <code>options.yml</code> pipeline (yfinance chains + Black-Scholes Greeks).</div>
+      </div></div>`;
+    return;
+  }
+  if (OPTIONS_STATE.expiryIdx >= data.expiries.length) OPTIONS_STATE.expiryIdx = 0;
+  const exp = data.expiries[OPTIONS_STATE.expiryIdx];
+  const spot = data.spot;
+  const ageMin = data.asOf ? Math.round((Date.now() - new Date(data.asOf).getTime()) / 60000) : null;
+  const freshness = ageMin == null ? '' : ageMin < 60 ? `LIVE · ${ageMin}m ago` : ageMin < 1440 ? `${Math.round(ageMin/60)}h ago` : `${Math.round(ageMin/1440)}d ago — stale`;
+  const freshColor = ageMin == null ? 'var(--ink-faint)' : ageMin < 240 ? 'var(--pos)' : ageMin < 1440 ? 'var(--data-amber)' : 'var(--neg)';
+
+  // Expiry selector pills.
+  const expiryPills = data.expiries.map((e, i) => `<button class="opt-expiry-pill" data-idx="${i}" style="font-family:var(--mono);font-size:10px;padding:4px 9px;border-radius:3px;border:1px solid ${i === OPTIONS_STATE.expiryIdx ? 'var(--amber)' : 'var(--rule)'};background:${i === OPTIONS_STATE.expiryIdx ? 'var(--amber)' : 'transparent'};color:${i === OPTIONS_STATE.expiryIdx ? '#1a1a1a' : 'var(--ink-dim)'};cursor:pointer;white-space:nowrap">${e.expiry.slice(5)}${e.isFriday ? '' : '*'} · ${e.dteNow ?? e.dte}d</button>`).join('');
+
+  // Build the rows. Calls + puts shown side by side around the strike (classic
+  // options board) when side='both'; else just one side.
+  const sideBtns = ['both', 'calls', 'puts'].map(sd => `<button class="opt-side-btn" data-side="${sd}" style="font-family:var(--mono);font-size:10px;padding:3px 10px;border-radius:3px;border:1px solid ${OPTIONS_STATE.side === sd ? 'var(--amber)' : 'var(--rule)'};background:${OPTIONS_STATE.side === sd ? 'var(--amber)' : 'transparent'};color:${OPTIONS_STATE.side === sd ? '#1a1a1a' : 'var(--ink-dim)'};cursor:pointer;text-transform:capitalize">${sd}</button>`).join('');
+
+  const renderSideTable = (rows, type) => {
+    if (!rows || !rows.length) return `<div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);padding:12px">No ${type} near the money.</div>`;
+    const head = `<tr style="font-size:9px;color:var(--ink-faint)">
+      <th style="text-align:right">Strike</th><th style="text-align:right">Prem</th><th style="text-align:right">IV</th>
+      <th style="text-align:right" title="Delta — $ move per $1 of underlying">Δ</th>
+      <th style="text-align:right" title="Gamma — delta change per $1">Γ</th>
+      <th style="text-align:right" title="Theta — $ decay per day">Θ</th>
+      <th style="text-align:right" title="Vega — $ per 1% IV">V</th>
+      <th style="text-align:right" title="Open interest">OI</th></tr>`;
+    const body = rows.map(o => {
+      const atm = Math.abs(o.strike - spot) / spot < 0.02;
+      const itmBg = o.inTheMoney ? 'background:rgba(120,160,120,0.07)' : '';
+      return `<tr style="${itmBg};${atm ? 'outline:1px solid var(--amber)' : ''}">
+        <td style="text-align:right;font-family:var(--mono);font-weight:700;font-size:11px">${_optFmt(o.strike)}</td>
+        <td style="text-align:right;font-family:var(--mono);font-size:11px">$${_optFmt(o.mid || o.last)}</td>
+        <td style="text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-dim)">${o.iv ? (o.iv*100).toFixed(0)+'%' : '—'}</td>
+        <td style="text-align:right;font-family:var(--mono);font-size:10px;color:${_optGreekColor(o.delta)}">${_optFmt(o.delta)}</td>
+        <td style="text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-dim)">${_optFmt(o.gamma, 3)}</td>
+        <td style="text-align:right;font-family:var(--mono);font-size:10px;color:${_optGreekColor(o.theta)}">${_optFmt(o.theta, 3)}</td>
+        <td style="text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-dim)">${_optFmt(o.vega, 3)}</td>
+        <td style="text-align:right;font-family:var(--mono);font-size:9px;color:var(--ink-faint)">${o.openInterest.toLocaleString()}</td>
+      </tr>`;
+    }).join('');
+    return `<table class="sb-table" style="width:100%"><thead>${head}</thead><tbody>${body}</tbody></table>`;
+  };
+
+  let boardHtml;
+  if (OPTIONS_STATE.side === 'calls') boardHtml = `<div style="font-family:var(--mono);font-size:10px;color:var(--pos);margin-bottom:4px">CALLS</div>${renderSideTable(exp.calls, 'calls')}`;
+  else if (OPTIONS_STATE.side === 'puts') boardHtml = `<div style="font-family:var(--mono);font-size:10px;color:var(--neg);margin-bottom:4px">PUTS</div>${renderSideTable(exp.puts, 'puts')}`;
+  else boardHtml = `<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+      <div><div style="font-family:var(--mono);font-size:10px;color:var(--pos);margin-bottom:4px">CALLS</div>${renderSideTable(exp.calls, 'calls')}</div>
+      <div><div style="font-family:var(--mono);font-size:10px;color:var(--neg);margin-bottom:4px">PUTS</div>${renderSideTable(exp.puts, 'puts')}</div>
+    </div>`;
+
+  body.innerHTML = `
+    <div class="company-card" style="margin:0 0 12px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">
+        <div>
+          <span style="font-family:var(--mono);font-size:18px;font-weight:700">${escapeHtml(tk)} options</span>
+          <span style="font-family:var(--mono);font-size:12px;color:var(--ink-dim);margin-left:8px">spot $${_optFmt(spot)}</span>
+        </div>
+        <span style="font-family:var(--mono);font-size:10px;color:${freshColor}">${freshness}</span>
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;overflow-x:auto">${expiryPills}</div>
+      <div style="display:flex;gap:6px;margin-top:8px;align-items:center;flex-wrap:wrap">
+        ${sideBtns}
+        <span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-left:auto">${exp.expiry}${exp.isFriday ? ' (Fri)' : ' *non-Friday'} · ${exp.dteNow ?? exp.dte} days · r ${(data.riskFreeRate*100).toFixed(1)}%</span>
+      </div>
+    </div>
+    <div class="company-card" style="margin:0">
+      <div style="overflow-x:auto;-webkit-overflow-scrolling:touch">${boardHtml}</div>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:8px;line-height:1.5">
+        Premium = bid/ask mid (or last). Greeks = Black-Scholes from each contract's IV. ATM strike outlined; ITM shaded. Expired contracts drop automatically. * = non-Friday expiry.
+      </div>
+    </div>`;
+
+  // Wire selectors.
+  body.querySelectorAll('.opt-expiry-pill').forEach(b => b.addEventListener('click', () => { OPTIONS_STATE.expiryIdx = +b.dataset.idx; renderOptionsTab(tk); }));
+  body.querySelectorAll('.opt-side-btn').forEach(b => b.addEventListener('click', () => { OPTIONS_STATE.side = b.dataset.side; renderOptionsTab(tk); }));
+}
+if (typeof window !== 'undefined') {
+  window.loadOptionsForTicker = loadOptionsForTicker;
+  window.renderOptionsTab = renderOptionsTab;
+  window.resolveOptionsBase = resolveOptionsBase;
+}
+
 function resolveMacroBase() {
   // 1. Explicit override wins.
   const ov = getMacroBaseOverride();
@@ -12369,8 +12580,8 @@ async function fnDES(ticker) {
             }
           }
           return `
-            <div><div class="l">Sector</div><div class="v">${merged.sector || '—'}</div></div>
-            <div><div class="l">Industry</div><div class="v">${merged.industry || '—'}</div></div>
+            <div><div class="l">Sector</div><div class="v">${merged.sector || '—'}${(typeof editedMarker === 'function' && merged.ticker) ? editedMarker(merged.ticker, 'sector') : ''}</div></div>
+            <div><div class="l">Industry</div><div class="v">${merged.industry || '—'}${(typeof editedMarker === 'function' && merged.ticker) ? editedMarker(merged.ticker, 'industry') + editedMarker(merged.ticker, 'function') : ''}</div></div>
             <div><div class="l">Last Price</div><div class="v">${merged.price != null ? fmt$(merged.price) : '—'}</div></div>
             <div><div class="l">Market Cap</div><div class="v">${merged.marketCap != null ? formatHumanNumber(merged.marketCap) : '—'}</div></div>
             ${merged.fmpMarketCap && merged.fmpMarketCap !== merged.marketCap ?
@@ -12393,6 +12604,23 @@ async function fnDES(ticker) {
           const pct = dy < 0.001 ? dy * 100 : dy;
           return pct.toFixed(2) + '%';
         })()}</div></div>
+            ${(() => {
+              // Expense ratio (ETF/fund annual fee). Show it + its $ cost on the
+              // current position if one is held. High fee is flagged amber/red.
+              const er = (typeof rowExpenseRatio === 'function') ? rowExpenseRatio(merged) : null;
+              if (er == null) return '';
+              const col = er > 0.0075 ? 'var(--neg)' : er > 0.004 ? 'var(--data-amber)' : 'var(--ink)';
+              let costNote = '';
+              try {
+                const pos = (typeof loadPortfolio === 'function' ? loadPortfolio() : []).find(e => e.ticker === merged.ticker && (e.qty > 0));
+                const px = merged.price ?? merged.lastPrice;
+                if (pos && px) {
+                  const val = pos.qty * px;
+                  costNote = ` <span style="color:var(--ink-faint);font-size:9px">≈ ${fmt$(val * er)}/yr on your ${fmt$(val)}</span>`;
+                }
+              } catch {}
+              return `<div><div class="l">Expense Ratio</div><div class="v" style="color:${col}" title="Annual fund fee — a guaranteed drag on returns, charged whether the fund goes up or down. Factored into the grade and the holding/trading cost.">${(er*100).toFixed(2)}%/yr${costNote}</div></div>`;
+            })()}
             ${merged.isEtf === true || merged.isEtf === 'TRUE' ? `<div><div class="l">Type</div><div class="v" style="color:var(--amber)">ETF</div></div>` : ''}
             ${merged.isFund === true || merged.isFund === 'TRUE' ? `<div><div class="l">Type</div><div class="v" style="color:var(--amber)">Fund</div></div>` : ''}`;
         })()}
@@ -15753,6 +15981,42 @@ document.addEventListener('click', e => {
   }
 });
 
+// Edit-marker clicks → small "manage edit" popover (remove edit / pull fresh).
+document.addEventListener('click', e => {
+  const marker = e.target.closest('.edit-marker');
+  if (!marker) {
+    // Close any open manage popover when clicking elsewhere.
+    if (!e.target.closest('#edit-manage-pop')) document.getElementById('edit-manage-pop')?.remove();
+    return;
+  }
+  e.stopPropagation();
+  document.getElementById('edit-manage-pop')?.remove();
+  const tk = marker.dataset.ticker, field = marker.dataset.field;
+  const rec = (typeof getFieldEdit === 'function') ? getFieldEdit(tk, field) : null;
+  if (!rec) return;
+  const when = rec.editedAt ? new Date(rec.editedAt).toLocaleString() : '';
+  const permTxt = rec.permanent ? 'Permanent edit' : (rec.expiresAt ? `Expires ${new Date(rec.expiresAt).toLocaleDateString()}` : 'Time-bounded');
+  const pop = document.createElement('div');
+  pop.id = 'edit-manage-pop';
+  const r = marker.getBoundingClientRect();
+  pop.style.cssText = `position:fixed;left:${Math.min(r.left, window.innerWidth - 240)}px;top:${r.bottom + 4}px;z-index:10000;background:var(--bg-panel,#16181d);border:1px solid var(--rule);border-radius:6px;padding:10px;width:230px;box-shadow:0 4px 18px rgba(0,0,0,0.5)`;
+  pop.innerHTML = `
+    <div style="font-family:var(--mono);font-size:10px;color:var(--ink);font-weight:700;margin-bottom:2px">${escapeHtml(field)} · edited</div>
+    <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);line-height:1.5;margin-bottom:8px">${when}<br>${permTxt}${rec.oldValue ? `<br>was: ${escapeHtml(String(rec.oldValue))}` : ''}</div>
+    <button class="btn btn-ghost" id="edit-pull-fresh" style="font-size:10px;width:100%;margin-bottom:5px" title="Remove this edit and pull the latest pipeline value">↻ Remove edit · pull fresh</button>`;
+  document.body.appendChild(pop);
+  pop.querySelector('#edit-pull-fresh').addEventListener('click', () => {
+    if (typeof removeFieldEdit === 'function') removeFieldEdit(tk, field);
+    pop.remove();
+    if (typeof flashStatus === 'function') flashStatus(`${tk} ${field}: edit removed — fresh data will resume`, 'success');
+    // Re-render whatever view is showing.
+    try {
+      if (typeof onCompanyTabActive === 'function' && state.valSubtab === 'company') onCompanyTabActive();
+      if (typeof renderResearchTab === 'function') renderResearchTab();
+    } catch {}
+  });
+});
+
 // ============================================================
 //   PROBABILITY TAB — binary thesis odds, blended from priors
 // ============================================================
@@ -17507,6 +17771,9 @@ document.querySelectorAll('.val-subtab').forEach(btn => {
     if (subtab === 'company') {
       // Render the Company subpanel — pulls from state.stock + canonical stockbook row
       if (typeof onCompanyTabActive === 'function') onCompanyTabActive();
+    }
+    if (subtab === 'options') {
+      if (typeof renderOptionsTab === 'function' && state.stock?.ticker) renderOptionsTab(state.stock.ticker);
     }
     if (subtab === 'activity') {
       if (typeof onActivityTabActive === 'function') onActivityTabActive();
@@ -20436,6 +20703,160 @@ function setOverride(ticker, field, value, opts = {}) {
   saveOverrides(all);
 }
 
+// ============================================================
+//   UNIFIED EDIT TRACKING + XTRAPP SYNC
+//   Every manual edit (grade, classification, sector, function, leadership,
+//   news fix) is recorded with a TIMESTAMP and a PERMANENCE class, routed to the
+//   review queue, and queued for XTRAPP — which is the universal overwrite/
+//   refresh store. On the next XTRAPP refresh these edits re-sync across devices.
+//
+//   Permanence per the data type:
+//     • grade        → EXPIRES (~3 months or next earnings) then fresh grades resume
+//     • classification/function/sector/subSector → PERMANENT (but show "edited")
+//     • leadership/ceo → PERMANENT, editable + removable (pull fresh)
+//     • news/function → PERMANENT
+//   All edits show a small "edited" marker in the UI; expiring ones show when
+//   they lapse.
+// ============================================================
+const EDIT_LOG_KEY = 'valuatio.editLog.v1';
+const XTRAPP_EDITS_QUEUE_KEY = 'valuatio.xtrapp.edits.queue.v1';
+// Grade validity: 3 months (or until next earnings, whichever the caller passes).
+const GRADE_TTL_MS = 92 * 24 * 60 * 60 * 1000;       // ~3 months
+const PERMANENT_EDIT_FIELDS = new Set(['classification', 'function', 'sector', 'subSector', 'subsector', 'industry', 'leadership', 'ceo', 'news', 'thesis']);
+
+function loadEditLog() { try { return JSON.parse(localStorage.getItem(EDIT_LOG_KEY) || '{}'); } catch { return {}; } }
+function saveEditLog(l) { try { localStorage.setItem(EDIT_LOG_KEY, JSON.stringify(l)); } catch (e) { console.warn('[editlog] save failed', e.message); } }
+
+// Is a field permanent (never auto-reverts) vs time-bounded?
+function isPermanentEditField(field) { return PERMANENT_EDIT_FIELDS.has(field); }
+
+// Record an edit: timestamp it, classify permanence, mark the field as edited,
+// route to review + the XTRAPP queue. `opts.expiresAt` overrides the default
+// (e.g. pass the next-earnings date for a grade). Returns the edit record.
+function recordFieldEdit(ticker, field, value, opts = {}) {
+  const tk = (ticker || '').toUpperCase();
+  if (!tk || !field) return null;
+  const now = Date.now();
+  const permanent = opts.permanent != null ? opts.permanent : isPermanentEditField(field);
+  let expiresAt = null;
+  if (!permanent) {
+    if (opts.expiresAt != null) expiresAt = opts.expiresAt;
+    else if (field === 'grade') expiresAt = now + (opts.ttlMs || GRADE_TTL_MS);
+    else if (typeof isVariableField === 'function' && isVariableField(field)) expiresAt = now + (opts.ttlMs || VARIABLE_OVERRIDE_DEFAULT_MS);
+  }
+  const rec = {
+    ticker: tk, field,
+    value: value != null ? value : null,
+    oldValue: opts.oldValue != null ? opts.oldValue : null,
+    permanent,
+    editedAt: new Date(now).toISOString(),
+    expiresAt: expiresAt != null ? new Date(expiresAt).toISOString() : null,
+    source: opts.source || 'manual',
+    note: opts.note || '',
+  };
+  // 1. Edit log (keyed ticker→field, so the UI can show "edited" markers fast).
+  const log = loadEditLog();
+  if (!log[tk]) log[tk] = {};
+  log[tk][field] = rec;
+  saveEditLog(log);
+  // 2. XTRAPP queue (universal overwrite store; carries timestamps).
+  try {
+    const q = JSON.parse(localStorage.getItem(XTRAPP_EDITS_QUEUE_KEY) || '{}');
+    q[`${tk}:${field}`] = rec;
+    localStorage.setItem(XTRAPP_EDITS_QUEUE_KEY, JSON.stringify(q));
+  } catch {}
+  // 3. Review queue (human-in-the-loop) — fieldEdit type, deduped per ticker+field.
+  try {
+    if (typeof loadReviewQueue === 'function' && typeof saveReviewQueue === 'function') {
+      const rq = loadReviewQueue();
+      const dedupKey = `${tk}:${field}`;
+      const filtered = rq.filter(x => !(x.type === 'fieldEdit' && x.dedupKey === dedupKey));
+      filtered.unshift({
+        id: `rev-${now}`, type: 'fieldEdit', dedupKey,
+        ticker: tk, field, value: rec.value, oldValue: rec.oldValue,
+        permanent, expiresAt: rec.expiresAt, editedAt: rec.editedAt,
+        queuedAt: rec.editedAt, source: rec.source,
+      });
+      saveReviewQueue(filtered.slice(0, 500));
+    }
+  } catch {}
+  return rec;
+}
+
+// Get the edit record for a field (null if none, or if a non-permanent edit has
+// lapsed — in which case it's auto-cleaned so fresh data resumes).
+function getFieldEdit(ticker, field) {
+  const tk = (ticker || '').toUpperCase();
+  const log = loadEditLog();
+  const rec = log[tk] && log[tk][field];
+  if (!rec) return null;
+  if (!rec.permanent && rec.expiresAt && Date.now() > new Date(rec.expiresAt).getTime()) {
+    // Lapsed — remove so the UI stops showing it and fresh data takes over.
+    delete log[tk][field];
+    if (!Object.keys(log[tk]).length) delete log[tk];
+    saveEditLog(log);
+    return null;
+  }
+  return rec;
+}
+
+// Remove an edit (the "remove edit / pull fresh" action). Clears the log entry,
+// the matching override, and queues the removal for XTRAPP so it propagates.
+function removeFieldEdit(ticker, field) {
+  const tk = (ticker || '').toUpperCase();
+  const log = loadEditLog();
+  if (log[tk]) { delete log[tk][field]; if (!Object.keys(log[tk]).length) delete log[tk]; saveEditLog(log); }
+  // Clear any matching override so the pipeline's fresh value resumes.
+  try { if (typeof setOverride === 'function') setOverride(tk, field, null); } catch {}
+  // Queue a tombstone for XTRAPP so other devices also drop the edit.
+  try {
+    const q = JSON.parse(localStorage.getItem(XTRAPP_EDITS_QUEUE_KEY) || '{}');
+    q[`${tk}:${field}`] = { ticker: tk, field, removed: true, editedAt: new Date().toISOString() };
+    localStorage.setItem(XTRAPP_EDITS_QUEUE_KEY, JSON.stringify(q));
+  } catch {}
+  return true;
+}
+
+// A small, semi-professional "edited" marker for a field. Green check = a
+// permanent confirmed edit; amber note = a time-bounded one (shows when it
+// lapses). Returns an HTML string (empty if not edited).
+function editedMarker(ticker, field, opts = {}) {
+  const rec = getFieldEdit(ticker, field);
+  if (!rec) return '';
+  const when = rec.editedAt ? new Date(rec.editedAt).toLocaleDateString() : '';
+  if (rec.permanent) {
+    return `<span class="edit-marker" title="Edited ${when} · permanent (click to manage)" data-ticker="${escapeHtml(ticker)}" data-field="${escapeHtml(field)}" style="color:var(--pos);font-size:11px;cursor:pointer;margin-left:4px">✓</span>`;
+  }
+  const exp = rec.expiresAt ? new Date(rec.expiresAt) : null;
+  const daysLeft = exp ? Math.max(0, Math.ceil((exp - Date.now()) / 86400000)) : null;
+  return `<span class="edit-marker" title="Edited ${when}${daysLeft != null ? ` · expires in ${daysLeft}d, then fresh data resumes` : ''} (click to manage)" data-ticker="${escapeHtml(ticker)}" data-field="${escapeHtml(field)}" style="color:var(--data-amber);font-size:10px;cursor:pointer;margin-left:4px">📝</span>`;
+}
+
+// Export the edits queue (with timestamps) for committing to XTRAPP.
+function exportXtrappEdits() {
+  let edits = {};
+  try { edits = JSON.parse(localStorage.getItem(XTRAPP_EDITS_QUEUE_KEY) || '{}'); } catch {}
+  const payload = { schema: 'valuatio-xtrapp-edits/v1', generatedAt: new Date().toISOString(), edits, editLog: loadEditLog() };
+  try {
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = 'xtrapp_edits.json';
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    if (typeof flashStatus === 'function') flashStatus(`Exported ${Object.keys(edits).length} edits for XTRAPP`, 'success');
+  } catch (e) { console.warn('[xtrapp-edits] export failed', e.message); }
+  return payload;
+}
+
+if (typeof window !== 'undefined') {
+  window.recordFieldEdit = recordFieldEdit;
+  window.getFieldEdit = getFieldEdit;
+  window.removeFieldEdit = removeFieldEdit;
+  window.editedMarker = editedMarker;
+  window.exportXtrappEdits = exportXtrappEdits;
+  window.isPermanentEditField = isPermanentEditField;
+}
+
+
 function getOverride(ticker, field) {
   const all = loadOverrides();
   const entry = all[ticker]?.[field];
@@ -21033,6 +21454,37 @@ function normalizeRowFields(row) {
       if (typeof row.dividendYield === 'number' && row.dividendYield > 40) row.dividendYield = null;
       row._divYieldNormalized = true;
     }
+  }
+  // Normalize the expense ratio once → decimal fraction (0.0095 = 0.95%/yr).
+  if (!row._expenseRatioNormalized) {
+    if (typeof normalizeExpenseRatio === 'function') {
+      const er = normalizeExpenseRatio(row.expenseRatio ?? row['expense ratio'] ?? row.expenseratio);
+      if (er != null) row.expenseRatio = er;
+    }
+    row._expenseRatioNormalized = true;
+  }
+  // Scale-sanity for big-dollar financials. If a data source delivered revenue /
+  // net income / EBITDA / FCF in ABBREVIATED units (e.g. "0.17" meaning $0.17B =
+  // 170,000,000) it would read as a tiny raw dollar amount. Detect the mismatch:
+  // when a company's market cap is sizable (≥$1B) but a financial reads
+  // implausibly small (0 < |v| < 1e5), it's almost certainly in millions or
+  // billions — scale it up to match the market cap's order of magnitude. Done
+  // once per row, conservative so legitimate small values are left alone.
+  if (!row._financialsScaleChecked) {
+    const mc = _num(row.marketCap);
+    if (mc != null && mc >= 1e9) {
+      for (const f of ['revenue', 'netIncome', 'ebitda', 'freeCashFlow', 'totalAssets', 'totalDebt', 'totalEquity', 'cash']) {
+        const v = _num(row[f]);
+        if (v != null && v !== 0 && Math.abs(v) < 1e5) {
+          // Pick the multiplier that lands the value within 3 orders of magnitude
+          // of market cap. Most likely billions (×1e9) for values < ~1000, else
+          // millions (×1e6).
+          const mult = Math.abs(v) < 1000 ? 1e9 : 1e6;
+          row[f] = v * mult;
+        }
+      }
+    }
+    row._financialsScaleChecked = true;
   }
   return row;
 }
@@ -29390,7 +29842,7 @@ async function renderCompanyOverview() {
       ` : '';
       leadershipPreviewSection = `
         <div class="company-card">
-          <h4>Leadership <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· top tracked individuals · click Leadership subtab for full career profiles</span> <button class="btn btn-ghost" style="font-size:9px;padding:1px 7px;float:right" onclick="openLeadershipEditor('${escapeHtml(s.ticker)}')">✎ edit</button></h4>
+          <h4>Leadership <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· top tracked individuals · click Leadership subtab for full career profiles</span>${(typeof editedMarker === 'function') ? editedMarker(s.ticker, 'leadership') : ''} <button class="btn btn-ghost" style="font-size:9px;padding:1px 7px;float:right" onclick="openLeadershipEditor('${escapeHtml(s.ticker)}')">✎ edit</button></h4>
           ${renderList('Executives', execs)}
           ${renderList('Board Members', board)}
           ${renderList('Founders', founders)}
@@ -30768,6 +31220,8 @@ function setArticleFix(article, verdict, tickers, opts = {}) {
     fixSummary: opts.summary || null,       // corrected description/summary
     sentiment: opts.sentiment || null,      // bullish | bearish | neutral
     impact: opts.impact || null,            // high | medium | low
+    stats: opts.stats || null,              // human-entered statistics/figures string
+    editedAt: opts.editedAt || new Date().toISOString(),  // when this fix was made
   };
   saveArticleFixes(fixes);
 }
@@ -30792,6 +31246,8 @@ function applyArticleFix(article) {
   if (fix.fixSummary) { article.summary = fix.fixSummary; article.expandedSummary = fix.fixSummary; article._humanEdited = true; }
   if (fix.sentiment) { article.sentiment = fix.sentiment; article._humanEdited = true; }
   if (fix.impact) { article.impact = fix.impact; article._humanEdited = true; }
+  if (fix.stats) { article._statsOverride = fix.stats; article._humanEdited = true; }
+  if (fix.editedAt) { article._editedAt = fix.editedAt; }
   return true;
 }
 
@@ -31018,6 +31474,11 @@ function openLeadershipEditor(tic) {
           options: [{ label: 'Approve', action: 'approveLeadershipEdit' }, { label: 'Revert', action: 'revertLeadershipEdit' }],
         });
       }
+      // Record as a PERMANENT edit (timestamped) → review + XTRAPP, and so the
+      // Company tab shows the "edited" marker with a remove/pull-fresh option.
+      if (typeof recordFieldEdit === 'function') {
+        recordFieldEdit(tic, 'leadership', newName, { source: 'leadership-edit', oldValue: oldName, permanent: true, note: newRole || '' });
+      }
       if (typeof flashStatus === 'function') flashStatus(`Updated ${newName} — sent to Review`, 'success');
       if (typeof renderReviewHub === 'function') { try { renderReviewHub(); } catch {} }
       rerender();
@@ -31126,6 +31587,8 @@ function openArticleEditor(key) {
       <input id="ae-main" style="${inputCss};text-transform:uppercase;width:140px" value="${escapeHtml(main)}">
       <label style="${lbl}">Additional tickers involved (comma-separated)</label>
       <input id="ae-extra" style="${inputCss};text-transform:uppercase" value="${escapeHtml(extra)}" placeholder="e.g. MSFT, NVDA">
+      <label style="${lbl}">Statistics / key figures mentioned</label>
+      <input id="ae-stats" style="${inputCss}" value="${escapeHtml(fix.stats || '')}" placeholder="e.g. revenue +18% YoY · $2.4B buyback · EPS $1.92">
       <label style="${lbl}">Description / summary</label>
       <textarea id="ae-summary" style="${inputCss};min-height:90px;resize:vertical">${escapeHtml(article.summary || article.expandedSummary || '')}</textarea>
       <label style="${lbl}">Sentiment</label>
@@ -31171,11 +31634,14 @@ function openArticleEditor(key) {
     const tickers = [mainT, ...extras];
     const headline = (wrap.querySelector('#ae-headline').value || '').trim();
     const summary = (wrap.querySelector('#ae-summary').value || '').trim();
+    const stats = (wrap.querySelector('#ae-stats')?.value || '').trim();
     setArticleFix(article, 'fixed', tickers, {
       headline: headline && headline !== (article.headline || '') ? headline : (getArticleFix(article)?.fixHeadline || null) || (headline || null),
       summary: summary || null,
       sentiment: chosenSent,
       impact: chosenImp,
+      stats: stats || null,
+      editedAt: new Date().toISOString(),
     });
     applyArticleFix(article);
     // Log this fix into the Review hub for APPROVAL rather than silently clearing
@@ -31994,6 +32460,11 @@ function renderActivityTab(forceSocial = false) {
 }
 
 // NEWS mode: reuse the per-ticker news already fetched for the company view.
+// This view shows a RICHER per-article card than the global feed, but deliberately
+// OMITS price / market cap / P/E (those live on the valuation page). Per article:
+// title, summary, mentions (other tickers), stats (figures from the text),
+// bullish/bearish, company financial status, % change since the article came out,
+// edited date/time (if edited), and Read / Hide / Report / Read-full / fix actions.
 function renderActivityNews(body, ticker) {
   let items = (state.news?.items || []).filter(a => a.ticker === ticker && !a._suppressed);
   items.sort((a, b) => (b.datetime || 0) - (a.datetime || 0));
@@ -32001,7 +32472,6 @@ function renderActivityNews(body, ticker) {
     body.innerHTML = `<div class="empty-state" style="padding:32px;text-align:center;color:var(--ink-dim);font-family:var(--mono);font-size:11px">
       No news loaded for ${ticker} yet.${getFinnhubKey() ? ' Try refreshing — news loads from Finnhub per ticker.' : ' Add a Finnhub key in Data Sources to pull company news.'}
     </div>`;
-    // Try to fetch this ticker's news on demand.
     if (getFinnhubKey() && typeof fetchFinnhubNews === 'function') {
       fetchFinnhubNews(ticker, 14).then(arr => {
         if (arr && arr.length) {
@@ -32013,19 +32483,99 @@ function renderActivityNews(body, ticker) {
     }
     return;
   }
+  const sbRow = (typeof getStockbookRow === 'function') ? getStockbookRow(ticker) : (state.stockbook?.rows || []).find(r => r.ticker === ticker);
+  const health = (sbRow && typeof computeCompanyHealth === 'function') ? computeCompanyHealth(sbRow) : null;
+  const livePrice = sbRow ? (sbRow.price ?? sbRow.lastPrice ?? null) : null;
+
   const rows = items.slice(0, 40).map(a => {
+    const articleId = escapeHtml(articleKey(a));
+    const fix = (typeof getArticleFix === 'function') ? (getArticleFix(a) || {}) : {};
+    const ts = a.datetime ? new Date(a.datetime * (a.datetime < 1e12 ? 1000 : 1)) : null;
     const when = a.datetime ? timeAgo(a.datetime) : '';
-    const sentBadge = a.sentiment
-      ? `<span style="font-family:var(--mono);font-size:8px;color:${a.sentiment==='bullish'?'var(--pos)':a.sentiment==='bearish'?'var(--neg)':'var(--ink-faint)'}">${a.sentiment==='bullish'?'▲':a.sentiment==='bearish'?'▼':'·'} ${a.sentiment}</span>`
+    const pubLabel = ts ? ts.toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' }) : '';
+
+    // Sentiment (bullish/bearish) — human-set wins, else lexicon.
+    const label = fix.sentiment || a.sentiment || 'neutral';
+    const sCol = label === 'bullish' ? 'var(--pos)' : label === 'bearish' ? 'var(--neg)' : 'var(--ink-faint)';
+    const sArrow = label === 'bullish' ? '▲' : label === 'bearish' ? '▼' : '·';
+    const sentBadge = `<span style="font-family:var(--mono);font-size:9px;color:${sCol};border:1px solid ${sCol};border-radius:3px;padding:1px 6px;font-weight:700">${sArrow} ${label.toUpperCase()}</span>`;
+
+    // Company financial status (NOT article tone). No price/PE/mktcap.
+    const healthBadge = (health && health.composite != null)
+      ? `<span style="font-family:var(--mono);font-size:9px;color:${health.grade.color};border:1px solid ${health.grade.color};border-radius:3px;padding:1px 6px;font-weight:700" title="Company financial health (fundamentals, not article tone)">${health.grade.icon} ${health.grade.label} ${health.composite.toFixed(0)}</span>`
       : '';
-    return `<a href="${escapeHtml(a.url||'#')}" target="_blank" rel="noopener" style="display:block;padding:12px 0;border-bottom:1px solid var(--rule);text-decoration:none">
-      <div style="display:flex;justify-content:space-between;gap:12px;align-items:baseline">
-        <span style="color:var(--ink);font-size:13px;line-height:1.4;flex:1">${escapeHtml(a.headline||'')}</span>
-        ${sentBadge}
+
+    // Mentions + stats, from manual override if present, else extracted from text.
+    const ent = (typeof extractEntities === 'function') ? extractEntities((a.headline || '') + ' ' + (a.summary || a.expandedSummary || '')) : { tickers: [], dollarAmounts: [], percentages: [] };
+    const mentionList = (fix.tickers || a.tickers || ent.tickers || []).filter(t => t && t !== a.ticker).slice(0, 6);
+    const mentionsHtml = mentionList.length
+      ? `<div style="display:flex;flex-wrap:wrap;gap:5px;align-items:center;margin-top:7px"><span style="font-family:var(--mono);font-size:8px;color:var(--ink-faint);text-transform:uppercase">Mentions</span>${mentionList.map(t => `<span onclick="executeCommand('${escapeHtml(t)}')" style="cursor:pointer;font-family:var(--mono);font-size:9px;color:var(--amber);background:rgba(212,162,76,0.1);border:1px solid var(--rule);border-radius:2px;padding:1px 6px;font-weight:700">${escapeHtml(t)}</span>`).join('')}</div>`
+      : '';
+    // Stats = figures pulled from the article (manual override wins). Dollar
+    // amounts + percentages with context.
+    const statBits = [];
+    if (fix.stats || a._statsOverride) { statBits.push(`<span style="font-family:var(--mono);font-size:9px;color:var(--ink-dim)">${escapeHtml(fix.stats || a._statsOverride)}</span>`); }
+    else {
+      (ent.dollarAmounts || []).slice(0, 3).forEach(d => statBits.push(`<span style="font-family:var(--mono);font-size:9px;color:var(--ink-dim)">${escapeHtml(d.raw)}</span>`));
+      (ent.percentages || []).slice(0, 3).forEach(p => statBits.push(`<span style="font-family:var(--mono);font-size:9px;color:${p.value >= 0 ? 'var(--pos)' : 'var(--neg)'}">${escapeHtml(p.raw)}${p.context ? ` <span style="color:var(--ink-faint)">${escapeHtml(p.context)}</span>` : ''}</span>`));
+    }
+    const statsHtml = statBits.length
+      ? `<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:6px"><span style="font-family:var(--mono);font-size:8px;color:var(--ink-faint);text-transform:uppercase">Stats</span>${statBits.join('')}</div>`
+      : '';
+
+    // % change since the article came out (the ONLY price-derived figure allowed
+    // here — it's about the article, not the company snapshot). Uses the same
+    // reference-price logic as the main feed: prior close before a fresh article,
+    // else the close on the publish date.
+    let sinceHtml = '';
+    if (livePrice != null && a.datetime) {
+      const isRecent = (Date.now() / 1000 - (a.datetime < 1e12 ? a.datetime : a.datetime / 1000)) < 86400;
+      let refPrice = null;
+      try {
+        if (isRecent && typeof _getPriorCloseBefore === 'function') refPrice = _getPriorCloseBefore(ticker, a.datetime);
+        else if (typeof _getPriceOnDate === 'function') refPrice = _getPriceOnDate(ticker, a.datetime);
+      } catch {}
+      if (refPrice != null && refPrice > 0) {
+        const chg = (livePrice - refPrice) / refPrice * 100;
+        const col = chg >= 0 ? 'var(--pos)' : 'var(--neg)';
+        sinceHtml = `<span style="font-family:var(--mono);font-size:9px;color:${col};font-weight:700" title="Price change from when the article published (${pubLabel}) to now">${chg >= 0 ? '+' : ''}${chg.toFixed(1)}% since article</span>`;
+      }
+    }
+
+    // Edited date/time (only if edited).
+    const editedStamp = fix.editedAt || a._editedAt;
+    const editedHtml = (a._humanEdited || editedStamp)
+      ? `<span style="font-family:var(--mono);font-size:8px;color:var(--amber)" title="Human-edited via Review/XTRAPP">✎ edited${editedStamp ? ' ' + new Date(editedStamp).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' }) : ''}</span>`
+      : '';
+
+    // Read / Hide state toggles.
+    const st = (typeof getArticleState === 'function') ? getArticleState(a) : null;
+    const readBtn = (st?.status === 'read')
+      ? `<button class="news-item-cta" onclick="event.stopPropagation();markArticleStateAndRender('${articleId}','__clear')" style="background:transparent;cursor:pointer;color:var(--ink-faint)">↶ Unread</button>`
+      : `<button class="news-item-cta" onclick="event.stopPropagation();markArticleStateAndRender('${articleId}','read')" style="background:transparent;cursor:pointer">✓ Read</button>`;
+    const hideBtn = (st?.status === 'dismissed')
+      ? `<button class="news-item-cta" onclick="event.stopPropagation();markArticleStateAndRender('${articleId}','__clear')" style="background:transparent;cursor:pointer;color:var(--ink-faint)">↶ Unhide</button>`
+      : `<button class="news-item-cta" onclick="event.stopPropagation();markArticleStateAndRender('${articleId}','dismissed')" style="background:transparent;cursor:pointer">✕ Hide</button>`;
+
+    const summaryTxt = a.expandedSummary || a.summary || '';
+    return `<article class="news-item" data-article-key="${articleId}" style="padding:14px 0;border-bottom:1px solid var(--rule)">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
+        ${sentBadge}${healthBadge}${sinceHtml}
+        <span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint)">${escapeHtml(a.source || '')} · ${when}${ts ? ' · ' + pubLabel : ''}</span>
+        ${editedHtml}
+        <button class="btn btn-ghost" style="font-size:9px;padding:1px 6px;margin-left:auto" onclick="event.stopPropagation();openArticleEditor('${articleId}')" title="Edit tickers/mentions, stats, headline, summary, sentiment">✎ fix</button>
       </div>
-      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:4px">${escapeHtml(a.source||'')} · ${when}</div>
-      ${a.summary ? `<div style="color:var(--ink-dim);font-size:11px;line-height:1.5;margin-top:6px">${escapeHtml(a.summary.slice(0,200))}${a.summary.length>200?'…':''}</div>` : ''}
-    </a>`;
+      <h3 style="margin:0 0 4px;font-size:14px;line-height:1.4"><a href="${escapeHtml(a.url || '#')}" target="_blank" rel="noopener" onclick="markArticleStateAndRender('${articleId}','read')" style="color:var(--ink);text-decoration:none">${escapeHtml(a.headline || '')}</a></h3>
+      ${summaryTxt ? `<div style="color:var(--ink-dim);font-size:12px;line-height:1.55">${escapeHtml(summaryTxt.slice(0, 320))}${summaryTxt.length > 320 ? '…' : ''}</div>` : ''}
+      ${mentionsHtml}
+      ${statsHtml}
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:9px">
+        <a class="news-item-cta" href="${escapeHtml(a.url || '#')}" target="_blank" rel="noopener" onclick="markArticleStateAndRender('${articleId}','read')">Read full →</a>
+        ${readBtn}
+        ${hideBtn}
+        <button class="news-item-cta" onclick="event.stopPropagation();reportAndRetryArticle('${articleId}')" style="background:transparent;cursor:pointer;color:var(--neg)" title="Report as wrong/irrelevant and retry from another source">⚠ Report</button>
+      </div>
+    </article>`;
   }).join('');
   body.innerHTML = `<div style="max-width:760px">${rows}</div>`;
 }
@@ -36242,8 +36792,15 @@ const RESEARCH_METRICS = [
   // --- Financial strength ---
   { key: 'debtEquity', label: 'Debt / Equity',           cat: 'Balance Sheet', higher: false, fmt: v => v.toFixed(2), get: r => { const d=_num(r.totalDebt), e=_num(r.totalEquity); return (d!=null&&e&&e>0)? d/e : null; } },
   { key: 'cashRatio',  label: 'Cash / Market Cap',       cat: 'Balance Sheet', higher: true,  fmt: v => (v*100).toFixed(1)+'%', get: r => { const c=_num(r.cash), m=_num(r.marketCap); return (c!=null&&m&&m>0)? c/m : null; } },
+  { key: 'currentRatio', label: 'Current Ratio',         cat: 'Balance Sheet', higher: true,  fmt: v => v.toFixed(2), get: r => { const v=_num(r.currentRatio); return (v!=null&&v>0)?v:null; } },
+  { key: 'quickRatio', label: 'Quick Ratio',             cat: 'Balance Sheet', higher: true,  fmt: v => v.toFixed(2), get: r => { const v=_num(r.quickRatio); return (v!=null&&v>0)?v:null; } },
   // --- Income ---
   { key: 'divYield',   label: 'Dividend Yield',          cat: 'Income',        higher: true,  fmt: v => (v*100).toFixed(2)+'%', get: r => _researchDivYield(r) },
+  { key: 'payoutRatio', label: 'Payout Ratio',           cat: 'Income',        higher: false, fmt: v => (v*100).toFixed(0)+'%', get: r => { let v=_num(r.payoutRatio); if(v==null||v<=0)return null; if(v>2)v=v/100; return (v>0&&v<=2)?v:null; } },
+  // --- Cost (drag on returns; lower is better) ---
+  { key: 'expenseRatio', label: 'Expense Ratio (fund fee)', cat: 'Cost',      higher: false, fmt: v => (v*100).toFixed(2)+'%/yr', get: r => (typeof rowExpenseRatio === 'function') ? rowExpenseRatio(r) : null },
+  // --- Growth-adjusted valuation ---
+  { key: 'peg',        label: 'PEG Ratio',               cat: 'Valuation',     higher: false, fmt: v => v.toFixed(2), get: r => { const v=_num(r.pegRatio); return (v!=null&&v>0&&v<10)?v:null; } },
   // --- Scale (absolute size — informational ranking) ---
   { key: 'revenue',    label: 'Revenue',                 cat: 'Scale',         higher: true,  fmt: v => _fmtBig(v), get: r => _num(r.revenue) },
   { key: 'netIncome',  label: 'Net Income',              cat: 'Scale',         higher: true,  fmt: v => _fmtBig(v), get: r => _num(r.netIncome) },
@@ -36264,11 +36821,12 @@ const RESEARCH_METRICS = [
 // of the grade regardless of how many metrics it contains, and Scale is excluded
 // from the grade entirely (still shown as context). Weights sum to 1.0.
 const RESEARCH_CATEGORY_WEIGHTS = {
-  'Profitability': 0.30,   // quality of the business (margins, returns on capital)
-  'Growth':        0.22,   // are revenue/earnings expanding — the thing growth stocks live on
-  'Valuation':     0.22,   // is it cheap relative to peers (P/E, EV/EBITDA…)
+  'Profitability': 0.28,   // quality of the business (margins, returns on capital)
+  'Growth':        0.20,   // are revenue/earnings expanding — the thing growth stocks live on
+  'Valuation':     0.20,   // is it cheap relative to peers (P/E, EV/EBITDA…)
   'Balance Sheet': 0.16,   // solvency / leverage / liquidity
   'Income':        0.10,   // dividend yield for payers
+  'Cost':          0.06,   // fund expense ratio — a guaranteed annual drag (mostly hits ETFs/funds)
   // 'Scale' intentionally absent — size is context, not a grade input.
 };
 const RESEARCH_GRADED_CATEGORIES = new Set(Object.keys(RESEARCH_CATEGORY_WEIGHTS));
@@ -36341,6 +36899,18 @@ function setHumanGrade(ticker, { grade, status, note }) {
     updatedAt: new Date().toISOString(),
   };
   saveHumanGrades(all);
+  // Grades are time-bounded — good for ~3 months or until next earnings (whichever
+  // the caller passes via opts). Record the edit (timestamped, EXPIRING) → review
+  // + XTRAPP, so stale grades lapse and fresh ones resume.
+  try {
+    if (typeof recordFieldEdit === 'function' && grade != null) {
+      recordFieldEdit(tk, 'grade', grade, {
+        source: 'human-grade', oldValue: prev.grade || null, permanent: false,
+        expiresAt: arguments[1] && arguments[1].expiresAt != null ? arguments[1].expiresAt : null,
+        note: note != null ? note : (prev.note || ''),
+      });
+    }
+  } catch {}
   // Queue for XTRAPP so a retrain can fold human grades back into the model.
   try { if (typeof queueHumanGradeForXtrapp === 'function') queueHumanGradeForXtrapp(all[tk]); } catch {}
   return all[tk];
@@ -36462,12 +37032,18 @@ function _num(v) {
 }
 function _fmtBig(v) {
   if (v == null) return '—';
-  if (typeof fmt$ === 'function') return fmt$(v);
+  // Abbreviated display (e.g. "$170.0M") but with the FULL number in a hover
+  // tooltip so "0.17B" is always verifiable as "$170,000,000" — no ambiguity
+  // about whether a value is in millions/billions.
   const a = Math.abs(v);
-  if (a >= 1e12) return '$' + (v/1e12).toFixed(2) + 'T';
-  if (a >= 1e9)  return '$' + (v/1e9).toFixed(2) + 'B';
-  if (a >= 1e6)  return '$' + (v/1e6).toFixed(1) + 'M';
-  return '$' + v.toFixed(0);
+  let disp;
+  if (a >= 1e12) disp = '$' + (v / 1e12).toFixed(2) + 'T';
+  else if (a >= 1e9) disp = '$' + (v / 1e9).toFixed(2) + 'B';
+  else if (a >= 1e6) disp = '$' + (v / 1e6).toFixed(1) + 'M';
+  else if (a >= 1e3) disp = '$' + Math.round(a).toLocaleString();
+  else disp = '$' + v.toFixed(0);
+  const full = (typeof exactValue === 'function') ? exactValue(v, true) : ('$' + v.toLocaleString());
+  return `<span title="${full}" style="cursor:help">${disp}</span>`;
 }
 
 // Return on Tangible Common Equity = net income / (common equity − goodwill −
@@ -37345,7 +37921,7 @@ function renderResearchGrades(data) {
     <tr class="research-row" data-ticker="${t.ticker}" style="cursor:pointer">
       <td style="text-align:center;width:28px" onclick="event.stopPropagation()"><input type="checkbox" class="research-select" data-ticker="${escapeHtml(t.ticker)}" ${RESEARCH_SELECTED.has(t.ticker)?'checked':''} style="cursor:pointer"></td>
       <td style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);text-align:right">${i+1}</td>
-      <td style="font-family:var(--mono);font-weight:700">${escapeHtml(t.ticker)}</td>
+      <td style="font-family:var(--mono);font-weight:700">${escapeHtml(t.ticker)}${(typeof editedMarker === 'function') ? editedMarker(t.ticker, 'function') : ''}</td>
       <td style="font-size:11px;color:var(--ink-dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(t.name)}</td>
       <td style="text-align:center"><span style="font-family:var(--mono);font-size:15px;font-weight:700;color:${researchGradeColor(t.grade)}">${t.grade}</span></td>
       <td style="text-align:center">${verifyCell}</td>
@@ -37466,7 +38042,11 @@ function _renderResearchBulkBar() {
     for (const tk of sel) {
       // Write the same override store the editor + valuation use, so the change
       // is durable and shows everywhere. 'function' drives classifyAssetRow.
+      const r0 = (state.stockbook?.rows || []).find(x => x.ticker === tk);
+      const oldFn = r0 ? (r0.function || r0._function || null) : null;
       if (typeof setOverride === 'function') { setOverride(tk, 'function', fn, { source: 'research-bulk' }); n++; }
+      // Record the edit (timestamped, permanent classification) → review + XTRAPP.
+      if (typeof recordFieldEdit === 'function') recordFieldEdit(tk, 'function', fn, { source: 'research-bulk', oldValue: oldFn, permanent: true });
       const r = (state.stockbook?.rows || []).find(x => x.ticker === tk);
       if (r) { delete r._preOverride; if (typeof applyOverridesToRow === 'function') applyOverridesToRow(r); if (typeof normalizeRowFields === 'function') normalizeRowFields(r); }
     }
@@ -38348,6 +38928,18 @@ function renderReviewHub() {
         <button class="btn btn-ghost" onclick="setGitHubToken()" title="Fine-grained token, XTRAPP repo only">⚙ Token</button>
         <button class="btn btn-ghost" onclick="fetchXtrappData().then(()=>renderReviewHub())">Reload from XTRAPP</button>
       </div>
+      ${(() => {
+        // Summary of pending edits (timestamped) heading into XTRAPP.
+        let edits = {}; try { edits = JSON.parse(localStorage.getItem(XTRAPP_EDITS_QUEUE_KEY) || '{}'); } catch {}
+        const keys = Object.keys(edits);
+        if (!keys.length) return '';
+        const grades = keys.filter(k => k.endsWith(':grade')).length;
+        const perm = keys.filter(k => { const e = edits[k]; return e && e.permanent; }).length;
+        return `<div style="margin-top:10px;font-family:var(--mono);font-size:10px;color:var(--ink-dim);line-height:1.6">
+          <strong style="color:var(--ink)">${keys.length} edit(s) queued for XTRAPP</strong> — ${perm} permanent (classification / sector / leadership), ${grades} grade(s) (expire ~3mo / next earnings). All carry timestamps; on refresh they re-sync and expired ones drop so fresh data resumes.
+          <button class="btn btn-ghost" onclick="exportXtrappEdits()" style="font-size:9px;margin-left:6px;padding:2px 8px">⤓ Export edits JSON</button>
+        </div>`;
+      })()}
     </div>`;
 }
 
@@ -38656,6 +39248,13 @@ function _buildXtrappPayload() {
     botWeights: (typeof loadBotWeights === 'function') ? loadBotWeights() : {},
     // Open review items so the human-in-the-loop queue follows you too.
     reviewQueue: (typeof loadReviewQueue === 'function') ? loadReviewQueue() : [],
+    // Unified edit log + edits queue (timestamped manual edits: grades [3-mo TTL],
+    // reclassifications, leadership, sector/function — all permanent except grades).
+    // XTRAPP is the universal overwrite store; on refresh these re-sync and stale
+    // (expired) edits drop so fresh pipeline data resumes.
+    editLog: (typeof loadEditLog === 'function') ? loadEditLog() : {},
+    editsQueue: (() => { try { return JSON.parse(localStorage.getItem(XTRAPP_EDITS_QUEUE_KEY) || '{}'); } catch { return {}; } })(),
+    humanGrades: (typeof loadHumanGrades === 'function') ? loadHumanGrades() : {},
     // News corpus — the pulled articles themselves (last 500, lean fields), so
     // the article database lives in the repo, not just this browser. Fixed
     // fields ride along; on import, articleFixes still override everything.
@@ -38817,7 +39416,7 @@ async function pushXtrappToGitHub() {
     window.open(XTRAPP_FILE_EDIT, '_blank', 'noopener');
   }
 }
-if (typeof window !== 'undefined') { window.pushXtrappToGitHub = pushXtrappToGitHub; window.setGitHubToken = setGitHubToken; }
+if (typeof window !== 'undefined') { window.pushXtrappToGitHub = pushXtrappToGitHub; window.setGitHubToken = setGitHubToken; window.exportXtrappData = exportXtrappData; window.fetchXtrappData = fetchXtrappData; }
 
 // ---- AUTO-PUSH ----
 // With a token stored, "closing out loses data" stops being possible: every
@@ -38976,6 +39575,44 @@ async function fetchXtrappData() {
         for (const item of j.reviewQueue) if (!ids.has(item.id)) localQ.push(item);
         saveReviewQueue(localQ);
       } catch (e) { console.warn('[xtrapp] review-queue merge failed:', e.message); }
+    }
+    // Unified edit log — apply timestamped edits from the repo. Newer editedAt
+    // wins; non-permanent edits past their expiry are dropped (fresh data resumes).
+    if (j.editLog && typeof loadEditLog === 'function' && typeof saveEditLog === 'function') {
+      try {
+        const local = loadEditLog();
+        const now = Date.now();
+        for (const tk of Object.keys(j.editLog)) {
+          for (const field of Object.keys(j.editLog[tk] || {})) {
+            const inc = j.editLog[tk][field];
+            if (!inc) continue;
+            // Skip expired non-permanent edits.
+            if (!inc.permanent && inc.expiresAt && now > new Date(inc.expiresAt).getTime()) continue;
+            const cur = local[tk] && local[tk][field];
+            if (!cur || new Date(inc.editedAt || 0) >= new Date(cur.editedAt || 0)) {
+              if (!local[tk]) local[tk] = {};
+              local[tk][field] = inc;
+              // Mirror permanent edits into the override store so they take effect.
+              if (inc.value != null && typeof setOverride === 'function' && ['function', 'sector', 'subSector', 'industry', 'ceo'].includes(field)) {
+                try { setOverride(tk, field, inc.value, { source: 'xtrapp-edit', verified: true }); } catch {}
+              }
+            }
+          }
+        }
+        saveEditLog(local);
+      } catch (e) { console.warn('[xtrapp] edit-log merge failed:', e.message); }
+    }
+    // Human grades (3-month TTL) — newer wins, expired dropped.
+    if (j.humanGrades && typeof loadHumanGrades === 'function' && typeof saveHumanGrades === 'function') {
+      try {
+        const local = loadHumanGrades();
+        for (const tk of Object.keys(j.humanGrades)) {
+          const inc = j.humanGrades[tk];
+          const cur = local[tk];
+          if (!cur || new Date(inc.updatedAt || 0) >= new Date(cur.updatedAt || 0)) local[tk] = inc;
+        }
+        saveHumanGrades(local);
+      } catch (e) { console.warn('[xtrapp] human-grades merge failed:', e.message); }
     }
     const fixCount = j.articleFixes ? Object.keys(j.articleFixes).length : 0;
     console.log(`[xtrapp] loaded lexicon (${j.lexicon?Object.keys(j.lexicon.bull||{}).length:0} bull phrases) + ${(j.posts||[]).length} posts + ${fixCount} news fixes`);
@@ -39896,6 +40533,144 @@ if (typeof window !== 'undefined') {
   window.analyticsSupabaseLoadRegime = analyticsSupabaseLoadRegime;
   window.analyticsSupabaseLoadKV = analyticsSupabaseLoadKV;
 }
+
+
+// ============================================================
+//   UNIFIED REPOSITORY BACKUP & SYNC
+//   One place to UPDATE (pull from the hardwired repo/Supabase → merge into the
+//   app) and EXPORT (download a repo-correct JSON) for all four data repos:
+//   XTRAPP, TRAPP2-BOT, TRAPP2-PORT, TRAPP2-ANALYTICS. Every export writes the
+//   EXACT filename + shape the repo stores and the app reads back, so the round
+//   trip (app → export → commit → raw URL → app) is lossless.
+// ============================================================
+const REPO_SYNC_DEFS = {
+  xtrapp: {
+    name: 'XTRAPP', file: 'xtrapp_data.json',
+    raw: (typeof XTRAPP_BASE !== 'undefined' ? XTRAPP_BASE : 'https://raw.githubusercontent.com/GoodGlobeLLC/XTRAPP/main/data/') + 'xtrapp_data.json',
+    edit: 'https://github.com/GoodGlobeLLC/XTRAPP/edit/main/data/xtrapp_data.json',
+    desc: 'lexicon · posts · news fixes · edits (timestamped) · human grades · review queue',
+    export: () => (typeof exportXtrappData === 'function') ? exportXtrappData() : null,
+    update: () => (typeof fetchXtrappData === 'function') ? fetchXtrappData() : Promise.resolve(null),
+    push: () => (typeof pushXtrappToGitHub === 'function') ? pushXtrappToGitHub() : null,
+  },
+  bot: {
+    name: 'TRAPP2-BOT', file: 'bot_training_data.json',
+    raw: (typeof BOT_DATA_REPO_URL !== 'undefined' ? BOT_DATA_REPO_URL : 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-BOT/main/data/bot_training_data.json'),
+    edit: (typeof BOT_DATA_REPO_EDIT !== 'undefined' ? BOT_DATA_REPO_EDIT : 'https://github.com/GoodGlobeLLC/TRAPP2-BOT/edit/main/data/bot_training_data.json'),
+    desc: 'every paper trade · why · what worked · learned signal weights · bankroll',
+    export: () => (typeof exportBotTrainingData === 'function') ? exportBotTrainingData() : null,
+    update: () => (typeof importBotTrainingData === 'function') ? importBotTrainingData() : Promise.resolve(null),
+  },
+  port: {
+    name: 'TRAPP2-PORT', file: 'portfolio_data.json',
+    raw: (typeof PORT_DATA_REPO_RAW !== 'undefined' ? PORT_DATA_REPO_RAW : 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-PORT/main/data/portfolio_data.json'),
+    edit: (typeof PORT_DATA_REPO_EDIT !== 'undefined' ? PORT_DATA_REPO_EDIT : 'https://github.com/GoodGlobeLLC/TRAPP2-PORT/edit/main/data/portfolio_data.json'),
+    desc: 'positions · watchlist · tracking · transactions · cash · GoodGlobe index · conviction',
+    export: () => (typeof exportPortfolioData === 'function') ? exportPortfolioData() : null,
+    update: () => (typeof importPortfolioData === 'function') ? importPortfolioData() : Promise.resolve(null),
+  },
+  analytics: {
+    name: 'TRAPP2-ANALYTICS', file: 'research_grades.json',
+    raw: (typeof ANALYTICS_BASE !== 'undefined' ? ANALYTICS_BASE : 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-ANALYTICS/main/data/') + 'research_grades.json',
+    edit: 'https://github.com/GoodGlobeLLC/TRAPP2-ANALYTICS/edit/main/data/research_grades.json',
+    desc: 'research grades · composite grades · regime · probability (pipeline-authored — app reads it)',
+    readOnly: true,
+    export: () => exportAnalyticsSnapshot(),
+    update: () => { _backendResearchFetched = false; return (typeof loadBackendResearch === 'function') ? loadBackendResearch() : Promise.resolve(null); },
+  },
+};
+
+// Analytics is authored by the PIPELINE, not the browser — so "export" here
+// dumps whatever grades the app currently holds back into the SAME shape the
+// repo stores ({byTicker, generatedAt}), useful for a manual backup/seed. The
+// canonical writer remains push_analytics_to_supabase.py.
+function exportAnalyticsSnapshot() {
+  const data = (typeof _backendResearch !== 'undefined' && _backendResearch && _backendResearch.byTicker) ? _backendResearch : null;
+  if (!data) { if (typeof flashStatus === 'function') flashStatus('No analytics grades loaded yet — open Research first, then export', ''); return null; }
+  const payload = { byTicker: data.byTicker, generatedAt: data.generatedAt || new Date().toISOString(), _exportedBy: 'valuatio-app', _note: 'Snapshot of grades the app holds; canonical author is the analytics pipeline.' };
+  try {
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = 'research_grades.json';
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    if (typeof flashStatus === 'function') flashStatus(`Exported ${Object.keys(data.byTicker).length} research grades (research_grades.json)`, 'success');
+  } catch (e) { console.warn('[analytics-export] failed', e.message); }
+  return payload;
+}
+
+// UPDATE a single repo (pull → merge). Reports via flashStatus.
+async function repoUpdate(key) {
+  const def = REPO_SYNC_DEFS[key];
+  if (!def) return;
+  if (typeof flashStatus === 'function') flashStatus(`Updating ${def.name} from repo…`, '');
+  try {
+    await def.update();
+    if (typeof flashStatus === 'function') flashStatus(`${def.name} updated from ${def.file}`, 'success');
+    // Refresh whatever view might show the new data.
+    try {
+      if (key === 'bot' && typeof renderBetsTab === 'function') renderBetsTab();
+      if (key === 'port' && typeof renderPortfolioTab === 'function') renderPortfolioTab();
+      if (key === 'analytics' && typeof renderResearchTab === 'function') renderResearchTab();
+    } catch {}
+  } catch (e) { if (typeof flashStatus === 'function') flashStatus(`${def.name} update failed — ${e.message}`, 'error'); }
+}
+// EXPORT a single repo (download repo-correct JSON).
+function repoExport(key) {
+  const def = REPO_SYNC_DEFS[key];
+  if (!def) return;
+  def.export();
+}
+// Update ALL four repos in sequence.
+async function repoUpdateAll() {
+  for (const key of Object.keys(REPO_SYNC_DEFS)) { await repoUpdate(key); }
+  if (typeof flashStatus === 'function') flashStatus('All repositories updated from their hardwired URLs', 'success');
+}
+if (typeof window !== 'undefined') {
+  window.repoUpdate = repoUpdate;
+  window.repoExport = repoExport;
+  window.repoUpdateAll = repoUpdateAll;
+  window.exportAnalyticsSnapshot = exportAnalyticsSnapshot;
+  window.REPO_SYNC_DEFS = REPO_SYNC_DEFS;
+}
+
+// Build the Repository Backup & Sync panel HTML (mounted in Data Sources).
+function renderRepoSyncPanel() {
+  const card = (key) => {
+    const d = REPO_SYNC_DEFS[key];
+    return `<div style="border:1px solid var(--rule);border-radius:6px;padding:11px;margin-bottom:8px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:6px">
+        <span style="font-family:var(--mono);font-size:12px;font-weight:700;color:var(--ink)">${d.name}${d.readOnly ? ' <span style="font-size:8px;color:var(--ink-faint);font-weight:400">read-only · pipeline-authored</span>' : ''}</span>
+        <span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint)">${d.file}</span>
+      </div>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin:4px 0 8px;line-height:1.4">${d.desc}</div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn btn-ghost repo-update-btn" data-repo="${key}" style="font-size:10px" title="Pull ${d.file} from the hardwired URL and merge into the app">↻ Update</button>
+        <button class="btn btn-ghost repo-export-btn" data-repo="${key}" style="font-size:10px" title="Download ${d.file} in the exact format the repo stores + the app reads back">⤓ Export</button>
+        ${d.push ? `<button class="btn btn-ghost repo-push-btn" data-repo="${key}" style="font-size:10px" title="Commit directly (token) or via clipboard + GitHub editor">⇧ Push</button>` : `<a class="btn btn-ghost" href="${d.edit}" target="_blank" rel="noopener" style="font-size:10px;text-decoration:none" title="Open the GitHub editor to paste the exported file">↗ Commit</a>`}
+      </div>
+    </div>`;
+  };
+  return `<div class="modal-section" style="border-top:1px solid var(--rule);padding-top:14px">
+    <div class="modal-label">Repository Backup &amp; Sync — all four data repos</div>
+    <div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap">
+      <button class="btn" id="repo-update-all-btn" style="font-size:10px;background:var(--pos)" title="Pull and merge all four repos from their hardwired URLs">↻ Update All</button>
+    </div>
+    ${card('xtrapp')}${card('bot')}${card('port')}${card('analytics')}
+    <div class="modal-help">Each <strong>Update</strong> pulls that repo's file from its hardwired raw URL and merges it into the app; each <strong>Export</strong> downloads the file in the exact format the repo stores and the app reads back — so the round trip (app → export → commit → raw URL → app) is lossless. XTRAPP and the bot/portfolio are authored by the app; Analytics is authored by the pipeline (its Export is a backup snapshot of the grades the app currently holds).</div>
+  </div>`;
+}
+if (typeof window !== 'undefined') window.renderRepoSyncPanel = renderRepoSyncPanel;
+
+// Wire the repo-sync buttons (delegated, called after the panel mounts).
+function wireRepoSyncPanel(root) {
+  const scope = root || document;
+  scope.querySelectorAll('.repo-update-btn').forEach(b => b.addEventListener('click', () => repoUpdate(b.dataset.repo)));
+  scope.querySelectorAll('.repo-export-btn').forEach(b => b.addEventListener('click', () => repoExport(b.dataset.repo)));
+  scope.querySelectorAll('.repo-push-btn').forEach(b => b.addEventListener('click', () => { const d = REPO_SYNC_DEFS[b.dataset.repo]; if (d && d.push) d.push(); }));
+  const allBtn = scope.querySelector('#repo-update-all-btn');
+  if (allBtn) allBtn.addEventListener('click', repoUpdateAll);
+}
+if (typeof window !== 'undefined') window.wireRepoSyncPanel = wireRepoSyncPanel;
 
 
 // Render the bot's learnings as a readable panel (the human/bot view of the
@@ -41117,6 +41892,20 @@ async function botScoreTicker(ticker) {
     }
   } catch {}
 
+  // 12. Expense ratio drag (ETFs/funds): a high annual fee is a guaranteed cost
+  //     that makes an instrument less attractive to hold or trade. Convert the
+  //     fee into a small negative lean — modest at typical ETF fees, more at the
+  //     expensive end. 0.20%/yr ≈ negligible; 0.75%/yr starts to bite; >1% is a
+  //     real drag the bot should weigh against a position.
+  try {
+    const er = (typeof rowExpenseRatio === 'function') ? rowExpenseRatio(row) : null;
+    if (er != null && er > 0.001) {
+      // Map fee → penalty: 0 at ~0.10%/yr, scaling to ~-0.5 at 1.5%/yr.
+      const penalty = -Math.min(0.5, Math.max(0, (er - 0.001) / 0.015 * 0.5));
+      if (penalty < -0.02) add('expenseRatio', penalty, 0.05, `Fund fee ${(er * 100).toFixed(2)}%/yr — guaranteed drag`);
+    }
+  } catch {}
+
   if (weightSum === 0) return null;
   let conviction = score / weightSum;  // -1..+1
 
@@ -41236,6 +42025,42 @@ async function botScoreTicker(ticker) {
       }
     }
   }
+  // If the bot chose an option AND we have real chain data cached for this name,
+  // attach the actual contract it would trade — a near-the-money strike at a
+  // sensible DTE — with its real premium + Greeks. This makes the trade record
+  // far richer (real cost, delta, theta, IV) and lets sizing use the true
+  // premium instead of a synthetic estimate. Falls back to synthetic if no chain.
+  let optionContract = null;
+  if (instrument === 'option' && typeof _optionsCache === 'object' && _optionsCache[t.toUpperCase()] && _optionsCache[t.toUpperCase()].data) {
+    try {
+      const od = _optionsCache[t.toUpperCase()].data;
+      // Prefer ~30-45 DTE (enough time for the thesis, not too much decay).
+      const exps = (od.expiries || []).filter(e => (e.dteNow ?? e.dte) >= 7);
+      const exp = exps.sort((a, b) => Math.abs((a.dteNow ?? a.dte) - 35) - Math.abs((b.dteNow ?? b.dte) - 35))[0] || exps[0];
+      if (exp) {
+        const list = optionType === 'put' ? exp.puts : exp.calls;
+        const spot = od.spot;
+        // Slightly OTM (delta ~0.40-0.55) is the bot's default — leverage with
+        // a real chance of finishing ITM. Pick the contract whose |delta| is
+        // closest to 0.50, falling back to nearest-strike-to-spot.
+        let pick = null, best = Infinity;
+        for (const o of (list || [])) {
+          const score = (o.delta != null) ? Math.abs(Math.abs(o.delta) - 0.5) : Math.abs(o.strike - spot) / spot;
+          if (score < best) { best = score; pick = o; }
+        }
+        if (pick) {
+          optionContract = {
+            expiry: exp.expiry, dte: exp.dteNow ?? exp.dte, strike: pick.strike,
+            premium: pick.mid || pick.last, iv: pick.iv,
+            delta: pick.delta, gamma: pick.gamma, theta: pick.theta, vega: pick.vega,
+            breakeven: pick.breakeven, openInterest: pick.openInterest,
+            contractType: optionType, underlyingSpot: spot,
+          };
+          decisionPath.push(`option:real ${optionType} $${pick.strike} exp ${exp.expiry} (${exp.dteNow ?? exp.dte}d) prem $${(pick.mid||pick.last).toFixed(2)} Δ${pick.delta != null ? pick.delta.toFixed(2) : '?'} IV ${pick.iv ? (pick.iv*100).toFixed(0)+'%' : '?'}`);
+        }
+      }
+    } catch (e) { /* fall back to synthetic option */ }
+  }
   if (instrument === 'shares') decisionPath.push('instrument:shares');
 
   // Build topDrivers from the signal components — the signals that most pushed
@@ -41270,6 +42095,7 @@ async function botScoreTicker(ticker) {
     hedge,
     instrument,            // 'shares' | 'option' | 'leveraged_etf'
     optionType,            // 'call' | 'put' | null
+    optionContract,        // real chain contract {strike, expiry, dte, premium, Greeks} | null
     leveragedEtf,          // { etf, multiplier, price } | null
     volRegime: volRegime != null ? +volRegime.toFixed(2) : null,
     rationale,
@@ -41343,6 +42169,21 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
   // Resume checkpoint: same-day partial scan picks up where it stopped.
   let startIdx = 0;
   let scored = [];
+  // Warm the options cache for the optionable names in this scan so botScoreTicker
+  // can attach REAL contracts (premium + Greeks) when it reaches for an option.
+  // Only the tickers that actually have chains (per the manifest) are fetched, and
+  // each is cached with a TTL, so this is cheap and bounded.
+  try {
+    if (typeof loadOptionsManifest === 'function' && typeof loadOptionsForTicker === 'function') {
+      const man = await loadOptionsManifest();
+      if (man && Array.isArray(man.tickers) && man.tickers.length) {
+        const have = new Set(man.tickers);
+        const toWarm = candidates.filter(r => have.has((r.ticker || '').toUpperCase())).slice(0, 40);
+        await Promise.all(toWarm.map(r => loadOptionsForTicker(r.ticker).catch(() => {})));
+        if (toWarm.length) console.log(`[bot] warmed options for ${toWarm.length} optionable candidates`);
+      }
+    }
+  } catch {}
   try {
     const ckpt = await idbGet('botScanCheckpoint');
     if (ckpt && ckpt.date === today && Array.isArray(ckpt.scored) && ckpt.index > 0) {
