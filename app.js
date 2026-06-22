@@ -40560,6 +40560,15 @@ async function _portSupabaseExistingIds() {
 // always re-upsert (marks move); the rest upsert if new.
 async function portSupabaseSyncAll() {
   if (!portSupabaseConfigured()) { if (typeof flashStatus === 'function') flashStatus('Portfolio Supabase not configured — add the TRAPP2-PORT URL + anon key in Data Sources', 'error'); return 0; }
+  // Make sure live prices are available so the enriched market value / P&L
+  // columns populate (the #1 reason holdings synced with blank pnl/marketValue
+  // was syncing before the Stock Book / quotes had loaded).
+  try {
+    if ((typeof state === 'undefined' || !state.stockbook || !state.stockbook.rows || !state.stockbook.rows.length) && typeof loadStockBook === 'function') {
+      await loadStockBook();
+    }
+    if (typeof refreshPortfolioQuotes === 'function') { try { await refreshPortfolioQuotes(); } catch {} }
+  } catch {}
   const snap = (typeof buildPortfolioData === 'function') ? buildPortfolioData() : null;
   if (!snap) { if (typeof flashStatus === 'function') flashStatus('No portfolio data to sync', ''); return 0; }
   const records = [];
@@ -40866,6 +40875,7 @@ function _analyticsWriteHeaders(extra) {
   const anon = getAnalyticsSupabaseAnon();
   return { 'apikey': anon, 'Authorization': `Bearer ${anon}`, 'Content-Type': 'application/json', ...(extra || {}) };
 }
+let _analyticsLastPushError = null;   // 'forbidden' | 'http-NNN' | 'network' | 'no-regime' | null
 
 // Push the research grades the app currently holds → research_grades table.
 async function analyticsSupabasePushGrades() {
@@ -40888,24 +40898,32 @@ async function analyticsSupabasePushGrades() {
         body: JSON.stringify(chunk),
       });
       if (r.ok) sent += chunk.length;
-      else { console.warn('[analytics-supabase] grades push failed', r.status, await r.text().catch(() => '')); break; }
+      else { const t = await r.text().catch(() => ''); console.warn('[analytics-supabase] grades push failed', r.status, t); _analyticsLastPushError = (r.status === 401 || r.status === 403) ? 'forbidden' : `http-${r.status}`; break; }
     }
-  } catch (e) { console.warn('[analytics-supabase] grades push error', e.message); }
+  } catch (e) { console.warn('[analytics-supabase] grades push error', e.message); _analyticsLastPushError = 'network'; }
   return sent;
 }
 
 // Push the current + historical regime snapshots → regime_snapshots table.
 async function analyticsSupabasePushRegime() {
   if (!analyticsSupabaseConfigured()) return 0;
+  // Make sure regime is loaded — it's the #1 reason this pushed nothing.
+  if ((typeof state === 'undefined' || !state.marketRegime) && typeof loadRegimeCanonical === 'function') {
+    try { await loadRegimeCanonical(); } catch {}
+  }
   const rows = [];
   const now = new Date().toISOString();
   try {
-    if (state && state.marketRegime) rows.push({ id: 'current', snapshot: state.marketRegime, updated_at: now });
-    // Regime history if the app has it cached.
+    if (state && state.marketRegime) rows.push({ id: (state.marketRegime.date || 'current'), snapshot: state.marketRegime, updated_at: now });
+    // Always also write a stable 'current' row so the app's loader (which reads
+    // id='current') finds it regardless of the dated id above.
+    if (state && state.marketRegime && (state.marketRegime.date && state.marketRegime.date !== 'current')) {
+      rows.push({ id: 'current', snapshot: state.marketRegime, updated_at: now });
+    }
     const hist = (typeof state !== 'undefined' && Array.isArray(state.marketRegimeHistory)) ? state.marketRegimeHistory : null;
     if (hist) for (const h of hist) { if (h && h.date) rows.push({ id: h.date, snapshot: h, updated_at: now }); }
   } catch {}
-  if (!rows.length) return 0;
+  if (!rows.length) { _analyticsLastPushError = 'no-regime'; return 0; }
   let sent = 0;
   try {
     for (let i = 0; i < rows.length; i += 200) {
@@ -40916,22 +40934,29 @@ async function analyticsSupabasePushRegime() {
         body: JSON.stringify(chunk),
       });
       if (r.ok) sent += chunk.length;
-      else { console.warn('[analytics-supabase] regime push failed', r.status, await r.text().catch(() => '')); break; }
+      else { const t = await r.text().catch(() => ''); console.warn('[analytics-supabase] regime push failed', r.status, t); _analyticsLastPushError = (r.status === 401 || r.status === 403) ? 'forbidden' : `http-${r.status}`; break; }
     }
-  } catch (e) { console.warn('[analytics-supabase] regime push error', e.message); }
+  } catch (e) { console.warn('[analytics-supabase] regime push error', e.message); _analyticsLastPushError = 'network'; }
   return sent;
 }
 
 // Push everything the app holds for analytics. Returns a small summary.
 async function analyticsSupabasePushAll() {
   if (!analyticsSupabaseConfigured()) { if (typeof flashStatus === 'function') flashStatus('Analytics Supabase not configured', ''); return { grades: 0, regime: 0 }; }
+  _analyticsLastPushError = null;
   const grades = await analyticsSupabasePushGrades();
   const regime = await analyticsSupabasePushRegime();
   if (typeof flashStatus === 'function') {
-    if (grades === 0 && regime === 0) flashStatus('Nothing to push yet — open Research once so grades load, then sync. (If you get 401/403, run analytics_anon_write.sql.)', 'warn');
-    else flashStatus(`Pushed ${grades} research grades + ${regime} regime snapshot(s) to Supabase`, 'success');
+    if (_analyticsLastPushError === 'forbidden') {
+      flashStatus('Analytics push blocked (401/403) — run analytics_anon_write.sql in your analytics project so the anon key can write, then retry.', 'error');
+    } else if (grades === 0 && regime === 0) {
+      if (_analyticsLastPushError === 'no-regime') flashStatus('Regime not loaded and no grades to push. Open Research + let regime load, then sync.', 'warn');
+      else flashStatus('Nothing to push yet — open Research once so grades load, then sync.', 'warn');
+    } else {
+      flashStatus(`Pushed ${grades} research grades + ${regime} regime snapshot(s) to Supabase`, 'success');
+    }
   }
-  return { grades, regime };
+  return { grades, regime, error: _analyticsLastPushError };
 }
 
 if (typeof window !== 'undefined') {
@@ -43681,6 +43706,21 @@ function botMarkToMarket() {
     const realizedNow = bot.bets.filter(b => b.status === 'closed').reduce((s, b) => s + (b.pnl || 0), 0);
     const bookValue = +(BOT_STARTING_BANKROLL + realizedNow + openPnlNow).toFixed(2);
     if (!Array.isArray(bot.equityCurve)) bot.equityCurve = [];
+    // Seed a starting anchor so the curve always has ≥2 points and the chart
+    // renders on day one (instead of "builds as the bot runs daily"). The anchor
+    // is the $100k basis dated to the bot's start (or the first trade's entry, or
+    // yesterday as a fallback) — distinct from today's live point.
+    if (bot.equityCurve.length === 0) {
+      let anchorDate = (bot.startedAt || '').slice(0, 10);
+      if (!anchorDate) {
+        const firstBet = (bot.bets || []).filter(b => b.entryDate).sort((a, b) => String(a.entryDate).localeCompare(String(b.entryDate)))[0];
+        anchorDate = firstBet ? firstBet.entryDate : null;
+      }
+      if (!anchorDate || anchorDate === today) {
+        anchorDate = new Date(Date.now() - 86400000).toISOString().slice(0, 10);  // yesterday
+      }
+      bot.equityCurve.push({ date: anchorDate, value: BOT_STARTING_BANKROLL, _seed: true });
+    }
     const last = bot.equityCurve[bot.equityCurve.length - 1];
     if (last && last.date === today) {
       // Update today's point in place (price moved during the day).
