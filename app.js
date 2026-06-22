@@ -7014,6 +7014,20 @@ document.getElementById('analytics-supabase-save-btn')?.addEventListener('click'
   try { _backendResearchFetched = false; if (typeof loadBackendResearch === 'function') loadBackendResearch().catch(() => {}); } catch {}
   if (typeof flashStatus === 'function') flashStatus(ok ? 'Analytics Supabase connected — grades + regime will load from here' : 'Analytics Supabase config cleared', 'success');
 });
+// Push the grades + regime the app holds to the analytics Supabase (app-side,
+// anon key). Makes the analytics tables populate without waiting on the pipeline.
+document.getElementById('analytics-supabase-sync-btn')?.addEventListener('click', async () => {
+  const btn = document.getElementById('analytics-supabase-sync-btn');
+  if (btn) { btn.textContent = 'Syncing…'; btn.disabled = true; }
+  try {
+    // Make sure grades are loaded first so there's something to push.
+    if ((!_backendResearch || !_backendResearch.byTicker) && typeof loadBackendResearch === 'function') {
+      try { await loadBackendResearch(); } catch {}
+    }
+    if (typeof analyticsSupabasePushAll === 'function') await analyticsSupabasePushAll();
+  } catch (e) { if (typeof flashStatus === 'function') flashStatus('Analytics sync error — see console', 'error'); }
+  if (btn) { btn.textContent = 'Sync Analytics Now ↗'; btn.disabled = false; }
+});
 
 document.getElementById('github-quick-add-btn')?.addEventListener('click', () => {
   const user = document.getElementById('github-quick-user').value.trim();
@@ -9093,6 +9107,69 @@ async function loadOptionsManifest() {
   return _optionsManifest;
 }
 
+// Extract a tradeable SIGNAL from a cached options chain. Options carry forward-
+// looking information the price history can't: implied volatility (expected move),
+// put/call IV skew (crash fear vs upside chase), and the IV term structure (event
+// risk timing). Returns a small signed signal the bot folds into its score, plus
+// raw fields the app can show. Null when no chain is cached.
+//   ivSignal:  negative when IV is richly elevated (mean-reversion / sell-vol lean,
+//              and long options are expensive), mildly positive when IV is calm.
+//   skew:      put IV minus call IV at comparable deltas (>0 = downside fear).
+function extractOptionsSignal(ticker) {
+  try {
+    const tk = (ticker || '').toUpperCase();
+    const c = (typeof _optionsCache === 'object') ? _optionsCache[tk] : null;
+    const od = c && c.data;
+    if (!od || !Array.isArray(od.expiries) || !od.expiries.length) return null;
+    const spot = od.spot;
+    if (!spot) return null;
+    // Use the nearest monthly-ish expiry (20-60 DTE) for the headline read; fall
+    // back to whatever's nearest.
+    const exps = od.expiries.slice().sort((a, b) => (a.dteNow ?? a.dte) - (b.dteNow ?? b.dte));
+    const ref = exps.find(e => (e.dteNow ?? e.dte) >= 20 && (e.dteNow ?? e.dte) <= 60) || exps[0];
+    if (!ref) return null;
+    const atmOf = (list) => {
+      if (!Array.isArray(list) || !list.length) return null;
+      return list.slice().sort((a, b) => Math.abs(a.strike - spot) - Math.abs(b.strike - spot))[0];
+    };
+    const atmCall = atmOf(ref.calls), atmPut = atmOf(ref.puts);
+    const atmIV = [(atmCall && atmCall.iv), (atmPut && atmPut.iv)].filter(v => v != null && isFinite(v));
+    const iv = atmIV.length ? atmIV.reduce((a, b) => a + b, 0) / atmIV.length : null;
+    if (iv == null) return null;
+    // Put/call IV skew at ATM (downside fear premium).
+    const skew = (atmPut && atmPut.iv != null && atmCall && atmCall.iv != null) ? (atmPut.iv - atmCall.iv) : null;
+    // IV term structure: near IV vs a longer expiry. Backwardation (near > far)
+    // flags concentrated near-term event risk.
+    let termSlope = null;
+    const far = exps.find(e => (e.dteNow ?? e.dte) >= 100);
+    if (far) {
+      const farAtm = atmOf(far.calls);
+      if (farAtm && farAtm.iv != null && isFinite(farAtm.iv)) termSlope = iv - farAtm.iv;  // >0 = backwardation
+    }
+    // Map IV level to a signed signal. Anchor: ~28% IV is "normal" for a liquid
+    // single name. Elevated IV (>45%) leans mean-reversion / vol-sell and makes
+    // long premium expensive → negative; calm IV (<22%) → mild positive.
+    let ivSignal = 0;
+    if (iv > 0.45) ivSignal = -Math.min(1, (iv - 0.45) / 0.45);
+    else if (iv < 0.22) ivSignal = Math.min(0.5, (0.22 - iv) / 0.22);
+    // Heavy downside skew is a caution flag (the market is paying up for crash
+    // protection) — nudge negative.
+    if (skew != null && skew >= 0.05) ivSignal -= Math.min(0.3, (skew - 0.05) / 0.15 * 0.3 + 0.05);
+    // Backwardation (near-term event risk priced in) — mild caution.
+    if (termSlope != null && termSlope > 0.05) ivSignal -= Math.min(0.2, (termSlope - 0.05) / 0.15);
+    return {
+      iv: +iv.toFixed(4),
+      atmIV: +iv.toFixed(4),
+      skew: skew != null ? +skew.toFixed(4) : null,
+      termSlope: termSlope != null ? +termSlope.toFixed(4) : null,
+      ivSignal: Math.max(-1, Math.min(1, +ivSignal.toFixed(3))),
+      refExpiry: ref.expiry,
+      refDte: ref.dteNow ?? ref.dte,
+    };
+  } catch { return null; }
+}
+if (typeof window !== 'undefined') window.extractOptionsSignal = extractOptionsSignal;
+
 async function loadOptionsForTicker(ticker, force) {
   const tk = (ticker || '').toUpperCase();
   if (!tk) return null;
@@ -9147,8 +9224,27 @@ async function renderOptionsTab(ticker) {
   const freshness = ageMin == null ? '' : ageMin < 60 ? `LIVE · ${ageMin}m ago` : ageMin < 1440 ? `${Math.round(ageMin/60)}h ago` : `${Math.round(ageMin/1440)}d ago — stale`;
   const freshColor = ageMin == null ? 'var(--ink-faint)' : ageMin < 240 ? 'var(--pos)' : ageMin < 1440 ? 'var(--data-amber)' : 'var(--neg)';
 
-  // Expiry selector pills.
-  const expiryPills = data.expiries.map((e, i) => `<button class="opt-expiry-pill" data-idx="${i}" style="font-family:var(--mono);font-size:10px;padding:4px 9px;border-radius:3px;border:1px solid ${i === OPTIONS_STATE.expiryIdx ? 'var(--amber)' : 'var(--rule)'};background:${i === OPTIONS_STATE.expiryIdx ? 'var(--amber)' : 'transparent'};color:${i === OPTIONS_STATE.expiryIdx ? '#1a1a1a' : 'var(--ink-dim)'};cursor:pointer;white-space:nowrap">${e.expiry.slice(5)}${e.isFriday ? '' : '*'} · ${e.dteNow ?? e.dte}d</button>`).join('');
+  // Expiry selector pills — labeled by term bucket so weeklies, monthlies, and
+  // LEAPS are visually distinct. Bucket comes from the pipeline; if absent
+  // (older data), derive it from DTE so the UI still labels correctly.
+  const _bucketOf = (e) => {
+    if (e.bucket) return e.bucket;
+    const d = e.dteNow ?? e.dte;
+    return d <= 45 ? 'near' : d <= 120 ? 'monthly' : 'leap';
+  };
+  const _bucketTag = { near: 'W', monthly: 'M', leap: 'LEAP' };
+  const _bucketColor = { near: 'var(--ink-dim)', monthly: '#7faaca', leap: '#c08ae0' };
+  const expiryPills = data.expiries.map((e, i) => {
+    const bk = _bucketOf(e);
+    const sel = i === OPTIONS_STATE.expiryIdx;
+    const tagColor = sel ? '#1a1a1a' : _bucketColor[bk];
+    return `<button class="opt-expiry-pill" data-idx="${i}" title="${e.expiry}${e.isLeap ? ' · LEAP' : ''}${e.isFriday ? ' · standard Friday expiry' : ' · non-Friday'}" style="font-family:var(--mono);font-size:10px;padding:4px 9px;border-radius:3px;border:1px solid ${sel ? 'var(--amber)' : 'var(--rule)'};background:${sel ? 'var(--amber)' : 'transparent'};color:${sel ? '#1a1a1a' : 'var(--ink-dim)'};cursor:pointer;white-space:nowrap">${e.expiry.slice(5)}${e.isFriday ? '' : '*'} · ${e.dteNow ?? e.dte}d <span style="color:${tagColor};font-weight:700;font-size:8px">${_bucketTag[bk]}</span></button>`;
+  }).join('');
+  // Term-structure legend (only when more than one bucket is present).
+  const _bucketsPresent = new Set(data.expiries.map(_bucketOf));
+  const expiryLegend = _bucketsPresent.size > 1
+    ? `<div style="font-family:var(--mono);font-size:8px;color:var(--ink-faint);margin-top:4px">term: <span style="color:var(--ink-dim);font-weight:700">W</span> weekly · <span style="color:#7faaca;font-weight:700">M</span> monthly · <span style="color:#c08ae0;font-weight:700">LEAP</span> long-dated (6mo+)</div>`
+    : '';
 
   // Build the rows. Calls + puts shown side by side around the strike (classic
   // options board) when side='both'; else just one side.
@@ -9188,6 +9284,24 @@ async function renderOptionsTab(ticker) {
       <div><div style="font-family:var(--mono);font-size:10px;color:var(--neg);margin-bottom:4px">PUTS</div>${renderSideTable(exp.puts, 'puts')}</div>
     </div>`;
 
+  // Options-implied read — the same signal the bot/engine folds in, surfaced for
+  // the analyst. Shows ATM IV, put/call skew, term structure, and the lean.
+  let ivReadHtml = '';
+  try {
+    const _sig = (typeof extractOptionsSignal === 'function') ? extractOptionsSignal(tk) : null;
+    if (_sig) {
+      const lean = _sig.ivSignal;
+      const leanLabel = Math.abs(lean) < 0.06 ? 'neutral' : lean < 0 ? 'caution / mean-revert (vol rich)' : 'calm (vol cheap)';
+      const leanColor = Math.abs(lean) < 0.06 ? 'var(--ink-dim)' : lean < 0 ? 'var(--neg)' : 'var(--pos)';
+      const skewTxt = _sig.skew == null ? '—' : `${_sig.skew >= 0 ? '+' : ''}${(_sig.skew * 100).toFixed(0)}pp${_sig.skew > 0.04 ? ' (downside fear)' : _sig.skew < -0.04 ? ' (upside chase)' : ''}`;
+      const termTxt = _sig.termSlope == null ? '—' : `${_sig.termSlope >= 0 ? '+' : ''}${(_sig.termSlope * 100).toFixed(0)}pp${_sig.termSlope > 0.03 ? ' (near-term event risk)' : ''}`;
+      ivReadHtml = `<div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);margin-top:8px;padding-top:8px;border-top:1px solid var(--rule);line-height:1.7">
+        <span style="color:var(--ink-faint)">engine read</span> · ATM IV <strong style="color:var(--ink)">${(_sig.iv * 100).toFixed(0)}%</strong> · put/call skew ${skewTxt} · term ${termTxt} · lean <strong style="color:${leanColor}">${leanLabel}</strong>
+        <span style="color:var(--ink-faint)"> (${_sig.refDte}d ref)</span>
+      </div>`;
+    }
+  } catch {}
+
   body.innerHTML = `
     <div class="company-card" style="margin:0 0 12px">
       <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">
@@ -9198,10 +9312,12 @@ async function renderOptionsTab(ticker) {
         <span style="font-family:var(--mono);font-size:10px;color:${freshColor}">${freshness}</span>
       </div>
       <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;overflow-x:auto">${expiryPills}</div>
+      ${expiryLegend}
       <div style="display:flex;gap:6px;margin-top:8px;align-items:center;flex-wrap:wrap">
         ${sideBtns}
         <span style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-left:auto">${exp.expiry}${exp.isFriday ? ' (Fri)' : ' *non-Friday'} · ${exp.dteNow ?? exp.dte} days · r ${(data.riskFreeRate*100).toFixed(1)}%</span>
       </div>
+      ${ivReadHtml}
     </div>
     <div class="company-card" style="margin:0">
       <div style="overflow-x:auto;-webkit-overflow-scrolling:touch">${boardHtml}</div>
@@ -36222,6 +36338,8 @@ const _syncAllTasks = [
       // Re-pull research grades (Supabase-first, repo fallback) + regime.
       try { _backendResearchFetched = false; if (typeof loadBackendResearch === 'function') await loadBackendResearch(); } catch {}
       try { if (typeof analyticsSupabaseLoadRegime === 'function' && typeof analyticsSupabaseConfigured === 'function' && analyticsSupabaseConfigured()) await analyticsSupabaseLoadRegime(); } catch {}
+      // PUSH grades + regime so the analytics tables populate (app-side, anon key).
+      try { if (typeof analyticsSupabasePushAll === 'function' && typeof analyticsSupabaseConfigured === 'function' && analyticsSupabaseConfigured()) await analyticsSupabasePushAll(); } catch {}
     } },
 ];
 
@@ -40215,17 +40333,13 @@ async function supabaseSyncAllTrades() {
     for (const b of bets) { const had = b.id; _ensureTradeId(b); if (b.id !== had) mutated = true; }
     if (mutated) saveBotState(bot);
 
-    // 2. dedup — pull existing ids + their current payload hash, skip unchanged.
-    const existing = await _supabaseExistingIds();
-
-    // 3. build rows; only those NOT already in the DB (new) or always re-upsert
-    //    open positions (their P&L/cash moves). Closed+already-present = skip.
-    const rows = [];
-    for (const b of bets) {
-      const row = _supabaseRow(b);
-      const isOpen = (b.status || (b.exitDate ? 'closed' : 'open')) === 'open';
-      if (!existing.has(row.id) || isOpen) rows.push(row);   // new, or open (mutable)
-    }
+    // 3. Build rows. Re-upsert EVERY trade: upsert is idempotent, and a trade
+    //    that was synced while OPEN and later CLOSED locally must be re-pushed so
+    //    Supabase reflects the closure (status/exitDate/pnl/won). The old logic
+    //    skipped "already-present + closed" rows, which is exactly why trades
+    //    closed to rebalance cash never updated and bot_trades_closed stayed
+    //    empty. Re-pushing all trades is cheap (chunked) and always correct.
+    const rows = bets.map(b => _supabaseRow(b));
     if (!rows.length) {
       if (typeof flashStatus === 'function') flashStatus(`Supabase already up to date (${bets.length} trades, nothing new)`, 'success');
       return 0;
@@ -40340,9 +40454,78 @@ function _ensurePortId(rec) {
 // {id, trade(jsonb), updated_at} → here {id, position(jsonb), updated_at}). The
 // generated columns in the SQL schema extract ticker/side/size/conviction/pnl
 // from the jsonb automatically.
+// Enrich a portfolio position record with COMPUTED analytics before syncing, so
+// the portfolio_positions generated columns (name, sector, marketValue, pnl,
+// pnlPct, conviction, confidence, reliability, weight) and the portfolio_performance
+// view actually populate. Without this the app synced only the raw record
+// (ticker/position/qty/costBasis/role) and every computed column came back null.
+// Pure read of live stockbook data + the reasoning chain; never mutates `rec`.
+function _enrichPortfolioPosition(rec, ctx) {
+  try {
+    if (!rec || typeof rec !== 'object') return rec;
+    if (rec._kind === 'snapshot') return rec;          // the snapshot record passes through
+    const out = { ...rec };
+    const tk = (rec.ticker || '').toUpperCase();
+    if (!tk) return out;
+    const sbRows = (ctx && ctx.sbRows) || (typeof state !== 'undefined' && state.stockbook ? state.stockbook.rows : []) || [];
+    const sb = sbRows.find(r => (r.ticker || '').toUpperCase() === tk) || null;
+    const ACTIVE = (typeof ACTIVE_POSITIONS !== 'undefined') ? ACTIVE_POSITIONS : ['Long', 'Short', 'Buy to open', 'Sell to open'];
+
+    // Name + sector from live stockbook data.
+    if (sb) {
+      if (sb.name) out.name = sb.name;
+      if (sb.sector) out.sector = sb.sector;
+      if (sb.assetClass || sb.asset_class) out.assetClass = sb.assetClass || sb.asset_class;
+    }
+    // Live price + P/L (mirrors the portfolio view's computePL).
+    const livePrice = sb ? (sb.price ?? sb.fmpPrice ?? null) : null;
+    const qty = +rec.qty || 0;
+    const costBasis = +rec.costBasis || 0;
+    const fees = parseFloat(rec.fees) || 0;
+    const isActive = ACTIVE.includes(rec.position);
+    const mult = (typeof positionMultiplier === 'function') ? positionMultiplier(rec) : 1;
+    const dir = rec.position === 'Short' ? -1 : 1;
+    if (livePrice != null && isFinite(livePrice)) {
+      out.livePrice = +livePrice.toFixed(4);
+      if (costBasis > 0) {
+        out.pnlPct = +(dir * (livePrice - costBasis) / costBasis * 100).toFixed(2);   // percent
+        out.returnPct = out.pnlPct;
+      }
+      if (isActive && qty > 0) {
+        out.marketValue = +(qty * livePrice * mult).toFixed(2);
+        if (costBasis > 0) out.pnl = +(dir * (livePrice - costBasis) * qty * mult - fees).toFixed(2);
+      }
+    } else if (isActive && qty > 0 && costBasis > 0) {
+      // No live price — fall back to cost basis so market value isn't blank.
+      out.marketValue = +(qty * costBasis * mult).toFixed(2);
+    }
+    // Conviction / confidence / reliability from the reasoning chain + grade.
+    try {
+      if (sb && typeof financialReasoningChain === 'function') {
+        const chain = financialReasoningChain(sb);
+        if (chain) {
+          if (chain.conviction != null) out.conviction = +Number(chain.conviction).toFixed(1);  // 0-100
+          if (chain.confidence != null) out.confidence = +Number(chain.confidence).toFixed(1);
+        }
+      }
+      // Reliability = research-grade percentile if present (how trustworthy the
+      // signal is for this name), else derived from data coverage.
+      if (sb) {
+        const gScore = sb.backendGradeScore ?? sb.gradeScore ?? null;
+        if (gScore != null && isFinite(gScore)) out.reliability = +Number(gScore).toFixed(0);
+        else if (sb.coverage != null) out.reliability = +(Number(sb.coverage) * 100).toFixed(0);
+      }
+    } catch {}
+    return out;
+  } catch { return rec; }
+}
+if (typeof window !== 'undefined') window._enrichPortfolioPosition = _enrichPortfolioPosition;
+
 function _portSupabaseRow(rec) {
   _ensurePortId(rec);
-  return { id: rec.id, position: rec, updated_at: new Date().toISOString() };
+  // Sync the ENRICHED record so computed columns + the performance view populate.
+  const enriched = (typeof _enrichPortfolioPosition === 'function') ? _enrichPortfolioPosition(rec) : rec;
+  return { id: rec.id, position: enriched, updated_at: new Date().toISOString() };
 }
 
 // Upsert a SINGLE portfolio record immediately (called on add/edit so a change
@@ -40547,6 +40730,27 @@ if (typeof window !== 'undefined') {
 // Supabase slot's save button. Idempotent. Lets the user reuse one project for
 // multiple data types (the free-tier 2-project workaround) in one click.
 function _injectSupabaseShareControls() {
+  // Ensure the analytics slot has a "Sync Analytics Now" button (the base HTML
+  // may not include it). Inject next to the analytics Save button, once.
+  try {
+    const anSave = document.getElementById('analytics-supabase-save-btn');
+    if (anSave && !document.getElementById('analytics-supabase-sync-btn')) {
+      const sync = document.createElement('button');
+      sync.id = 'analytics-supabase-sync-btn';
+      sync.className = 'btn btn-ghost';
+      sync.textContent = 'Sync Analytics Now ↗';
+      sync.title = 'Push the research grades + regime the app holds to the analytics Supabase (run analytics_anon_write.sql once first so the anon key can write).';
+      anSave.parentElement && anSave.parentElement.insertBefore(sync, anSave.nextSibling);
+      sync.addEventListener('click', async () => {
+        sync.textContent = 'Syncing…'; sync.disabled = true;
+        try {
+          if ((typeof _backendResearch === 'undefined' || !_backendResearch || !_backendResearch.byTicker) && typeof loadBackendResearch === 'function') { try { await loadBackendResearch(); } catch {} }
+          if (typeof analyticsSupabasePushAll === 'function') await analyticsSupabasePushAll();
+        } catch { if (typeof flashStatus === 'function') flashStatus('Analytics sync error — see console', 'error'); }
+        sync.textContent = 'Sync Analytics Now ↗'; sync.disabled = false;
+      });
+    }
+  } catch {}
   const slots = [
     { key: 'bot',       saveBtn: 'supabase-save-btn',           urlInput: 'supabase-url-input',           anonInput: 'supabase-anon-input' },
     { key: 'port',      saveBtn: 'port-supabase-save-btn',      urlInput: 'port-supabase-url-input',      anonInput: 'port-supabase-anon-input' },
@@ -40647,6 +40851,89 @@ async function analyticsSupabaseLoadKV(category) {
   } catch (e) { console.warn('[analytics-supabase] kv error', e.message); return null; }
 }
 
+// ============================================================
+//   ANALYTICS PUSH (app-side, anon key)
+//   The canonical author of analytics is the pipeline (push_analytics_to_supabase.py
+//   with the SERVICE key). But on the free tier that means deploying a workflow +
+//   secrets before any data appears. To make the analytics tables populate
+//   immediately — and to keep them fresh from whatever device is open — the app
+//   can ALSO push the research grades + regime it already holds (loaded from the
+//   repo JSON) using the same ANON key it uses for the portfolio. This requires
+//   anon INSERT/UPDATE policies on research_grades + regime_snapshots (see the
+//   analytics_anon_write.sql in the SUPABASE-ANALYTICS-SYNC package). Pipeline and
+//   app both upsert on the same PK, so they coexist — last writer wins per row.
+function _analyticsWriteHeaders(extra) {
+  const anon = getAnalyticsSupabaseAnon();
+  return { 'apikey': anon, 'Authorization': `Bearer ${anon}`, 'Content-Type': 'application/json', ...(extra || {}) };
+}
+
+// Push the research grades the app currently holds → research_grades table.
+async function analyticsSupabasePushGrades() {
+  if (!analyticsSupabaseConfigured()) return 0;
+  // Prefer the freshest grades the app has: the backend research object, else the
+  // merged research the research tab built.
+  let byTicker = null;
+  if (_backendResearch && _backendResearch.byTicker) byTicker = _backendResearch.byTicker;
+  if (!byTicker) { try { const r = (typeof loadBackendResearch === 'function') ? await loadBackendResearch() : null; if (r && r.byTicker) byTicker = r.byTicker; } catch {} }
+  if (!byTicker || !Object.keys(byTicker).length) return 0;
+  const now = new Date().toISOString();
+  const rows = Object.entries(byTicker).map(([ticker, grades]) => ({ ticker: ticker.toUpperCase(), grades, updated_at: now }));
+  let sent = 0;
+  try {
+    for (let i = 0; i < rows.length; i += 200) {
+      const chunk = rows.slice(i, i + 200);
+      const r = await fetch(`${getAnalyticsSupabaseUrl()}/rest/v1/research_grades?on_conflict=ticker`, {
+        method: 'POST',
+        headers: _analyticsWriteHeaders({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+        body: JSON.stringify(chunk),
+      });
+      if (r.ok) sent += chunk.length;
+      else { console.warn('[analytics-supabase] grades push failed', r.status, await r.text().catch(() => '')); break; }
+    }
+  } catch (e) { console.warn('[analytics-supabase] grades push error', e.message); }
+  return sent;
+}
+
+// Push the current + historical regime snapshots → regime_snapshots table.
+async function analyticsSupabasePushRegime() {
+  if (!analyticsSupabaseConfigured()) return 0;
+  const rows = [];
+  const now = new Date().toISOString();
+  try {
+    if (state && state.marketRegime) rows.push({ id: 'current', snapshot: state.marketRegime, updated_at: now });
+    // Regime history if the app has it cached.
+    const hist = (typeof state !== 'undefined' && Array.isArray(state.marketRegimeHistory)) ? state.marketRegimeHistory : null;
+    if (hist) for (const h of hist) { if (h && h.date) rows.push({ id: h.date, snapshot: h, updated_at: now }); }
+  } catch {}
+  if (!rows.length) return 0;
+  let sent = 0;
+  try {
+    for (let i = 0; i < rows.length; i += 200) {
+      const chunk = rows.slice(i, i + 200);
+      const r = await fetch(`${getAnalyticsSupabaseUrl()}/rest/v1/regime_snapshots?on_conflict=id`, {
+        method: 'POST',
+        headers: _analyticsWriteHeaders({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+        body: JSON.stringify(chunk),
+      });
+      if (r.ok) sent += chunk.length;
+      else { console.warn('[analytics-supabase] regime push failed', r.status, await r.text().catch(() => '')); break; }
+    }
+  } catch (e) { console.warn('[analytics-supabase] regime push error', e.message); }
+  return sent;
+}
+
+// Push everything the app holds for analytics. Returns a small summary.
+async function analyticsSupabasePushAll() {
+  if (!analyticsSupabaseConfigured()) { if (typeof flashStatus === 'function') flashStatus('Analytics Supabase not configured', ''); return { grades: 0, regime: 0 }; }
+  const grades = await analyticsSupabasePushGrades();
+  const regime = await analyticsSupabasePushRegime();
+  if (typeof flashStatus === 'function') {
+    if (grades === 0 && regime === 0) flashStatus('Nothing to push yet — open Research once so grades load, then sync. (If you get 401/403, run analytics_anon_write.sql.)', 'warn');
+    else flashStatus(`Pushed ${grades} research grades + ${regime} regime snapshot(s) to Supabase`, 'success');
+  }
+  return { grades, regime };
+}
+
 if (typeof window !== 'undefined') {
   window.getAnalyticsSupabaseUrl = getAnalyticsSupabaseUrl;
   window.analyticsSupabaseConfigured = analyticsSupabaseConfigured;
@@ -40654,6 +40941,9 @@ if (typeof window !== 'undefined') {
   window.analyticsSupabaseLoadGrades = analyticsSupabaseLoadGrades;
   window.analyticsSupabaseLoadRegime = analyticsSupabaseLoadRegime;
   window.analyticsSupabaseLoadKV = analyticsSupabaseLoadKV;
+  window.analyticsSupabasePushGrades = analyticsSupabasePushGrades;
+  window.analyticsSupabasePushRegime = analyticsSupabasePushRegime;
+  window.analyticsSupabasePushAll = analyticsSupabasePushAll;
 }
 
 
@@ -40957,7 +41247,109 @@ function showBotReceipt(betId) {
 if (typeof window !== 'undefined') window.showBotReceipt = showBotReceipt;
 
 const BOT_STARTING_BANKROLL = 100000;
-const BETS_STATE = { perfWindow: 'all' };   // equity-curve window: week|month|year|all
+const BETS_STATE = { perfWindow: 'all', selectedPosition: null };   // equity-curve window + selected open position (ticker|direction|instrument key)
+// Ledger sort: which column + direction. Default = date descending (latest first).
+// Columns: date|ticker|direction|size|entry|last|return|pnl|cash|status.
+const LEDGER_SORT = { col: 'date', dir: 'desc' };
+
+// ============================================================
+//   INTERACTIVE OPEN-POSITION CHART
+//   When a position is selected (clicking its row in Open Positions), the chart
+//   area swaps from the equity curve to that ticker's PRICE history, with the
+//   entry, target, and stop drawn in — plus a "View all positions" button to go
+//   back and a "Value ↗" button to open the ticker in the Valuation tab.
+// ============================================================
+function _betsHistorySeries(ticker) {
+  try {
+    const hist = (typeof getHistoryForTicker === 'function') ? getHistoryForTicker(ticker) : null;
+    if (!hist || !Array.isArray(hist) || hist.length < 2) return null;
+    // Normalize to [{date, close}], sorted ascending, last ~1y for readability.
+    const series = hist.map(h => ({
+      date: h.date || h.t || h[0],
+      close: Number(h.close ?? h.c ?? h.price ?? h[1]),
+    })).filter(p => p.date && isFinite(p.close)).sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    return series.length >= 2 ? series.slice(-252) : null;   // ~1 trading year
+  } catch { return null; }
+}
+
+// Build the individual position chart card (price history + entry/target/stop).
+function renderPositionChart(pos) {
+  if (!pos) return '';
+  const series = _betsHistorySeries(pos.ticker);
+  const avgEntry = pos.shares > 0 ? pos.entryCost / pos.shares : (pos.lastPrice || 0);
+  const last = pos.lastPrice;
+  const W = 600, H = 180;
+
+  // Header (shared between has-data / no-data states).
+  const dirLabel = pos.direction === 'long' ? '▲ LONG' : '▼ SHORT';
+  const dirColor = pos.direction === 'long' ? 'var(--pos)' : 'var(--neg)';
+  const pnlPct = (avgEntry > 0 && last != null) ? ((last - avgEntry) / avgEntry * 100) * (pos.direction === 'long' ? 1 : -1) : null;
+  const pnlCol = pnlPct == null ? 'var(--ink-dim)' : pnlPct >= 0 ? 'var(--pos)' : 'var(--neg)';
+  const header = `
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px;margin-bottom:10px">
+      <div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Position · Price Performance</div>
+        <div style="font-family:var(--mono);font-size:15px;font-weight:700;margin-top:2px">${escapeHtml(pos.ticker)}
+          <span style="font-size:11px;color:${dirColor};font-weight:700;margin-left:6px">${dirLabel}</span>
+          ${pnlPct != null ? `<span style="font-size:11px;color:${pnlCol};margin-left:6px">${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%</span>` : ''}
+        </div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);margin-top:3px">
+          entry $${avgEntry.toFixed(2)}${last != null ? ` · last $${last.toFixed(2)}` : ''}${pos.targetPrice != null ? ` · target $${pos.targetPrice.toFixed(2)}` : ''}${pos.stopPrice != null ? ` · stop $${pos.stopPrice.toFixed(2)}` : ''}
+        </div>
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn btn-ghost" id="bets-value-btn" data-ticker="${escapeHtml(pos.ticker)}" style="font-size:10px" title="Open ${escapeHtml(pos.ticker)} in the Valuation tab for a deeper dive">Value ↗</button>
+        <button class="btn btn-ghost" id="bets-viewall-btn" style="font-size:10px" title="Back to the all-positions equity curve">← View all positions</button>
+      </div>
+    </div>`;
+
+  if (!series) {
+    return `<div class="company-card" style="margin:0 0 18px">${header}
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);padding:14px 0;text-align:center">
+        No price history cached for ${escapeHtml(pos.ticker)} yet. Open it in Valuation once (Value ↗) to pull its history, then come back.
+      </div></div>`;
+  }
+
+  // Scale includes price range + entry/target/stop so the reference lines fit.
+  const closes = series.map(p => p.close);
+  const refs = [avgEntry, pos.targetPrice, pos.stopPrice, last].filter(v => v != null && isFinite(v));
+  const minV = Math.min(...closes, ...refs), maxV = Math.max(...closes, ...refs);
+  const pad = (maxV - minV) * 0.08 || 1;
+  const lo = minV - pad, hi = maxV + pad;
+  const x = (i) => (i / (series.length - 1)) * W;
+  const y = (v) => H - ((v - lo) / (hi - lo)) * H;
+  const linePath = series.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(p.close).toFixed(1)}`).join(' ');
+  const up = series[series.length - 1].close >= series[0].close;
+  const lineColor = up ? 'var(--pos)' : 'var(--neg)';
+  const areaPath = linePath + ` L${W},${H} L0,${H} Z`;
+
+  const refLine = (v, color, label, dash) => {
+    if (v == null || !isFinite(v) || v < lo || v > hi) return '';
+    const yy = y(v).toFixed(1);
+    return `<line x1="0" y1="${yy}" x2="${W}" y2="${yy}" stroke="${color}" stroke-width="1" stroke-dasharray="${dash}" opacity="0.8"/>
+      <text x="${W - 4}" y="${(y(v) - 3).toFixed(1)}" text-anchor="end" font-family="monospace" font-size="9" fill="${color}" opacity="0.9">${label} $${v.toFixed(2)}</text>`;
+  };
+
+  return `<div class="company-card" style="margin:0 0 18px">${header}
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:180px;display:block">
+      <defs><linearGradient id="botPosGrad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="${up ? 'rgba(61,220,132,0.22)' : 'rgba(255,92,92,0.22)'}"/>
+        <stop offset="100%" stop-color="${up ? 'rgba(61,220,132,0)' : 'rgba(255,92,92,0)'}"/>
+      </linearGradient></defs>
+      <path d="${areaPath}" fill="url(#botPosGrad)"/>
+      <path d="${linePath}" fill="none" stroke="${lineColor}" stroke-width="2" stroke-linejoin="round"/>
+      ${refLine(avgEntry, 'var(--ink-dim)', 'entry', '2,2')}
+      ${refLine(pos.targetPrice, 'var(--pos)', 'target', '5,3')}
+      ${refLine(pos.stopPrice, 'var(--neg)', 'stop', '5,3')}
+      <circle cx="${x(series.length - 1).toFixed(1)}" cy="${y(series[series.length - 1].close).toFixed(1)}" r="3.5" fill="${lineColor}"/>
+    </svg>
+    <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:4px">
+      <span>${series[0].date}</span>
+      <span>${series.length} sessions</span>
+      <span>${series[series.length - 1].date}</span>
+    </div>
+  </div>`;
+}
 let _betsLiveQuotesPrimed = false;          // fires a one-time live-quote refresh on bets tab open
 let _betsRepoSynced = false;                // fires a one-time TRAPP2-BOT repo import on bets tab open
 let _betsView = 'portfolio';                // 'portfolio' | 'ledger' — the bets-tab sub-view toggle
@@ -41126,11 +41518,11 @@ function botAssessRegime() {
 function _regimeProfile(mode, evidence) {
   const profiles = {
     'risk-on':  { mode, evidence, leverageOK: true,  thresholdMod: 0,     shortBar: 0.10, longBar: 0,
-                  weightMods: { trend: 1.3, momentum: 1.3, meanReversion: 0.7, health: 1.0, fundamentals: 1.0, crossAsset: 1.1, regimeGrade: 1.4, peerGrade: 1.2, momentumGrade: 1.4 } },
+                  weightMods: { trend: 1.3, momentum: 1.3, meanReversion: 0.7, health: 1.0, fundamentals: 1.0, crossAsset: 1.1, regimeGrade: 1.4, peerGrade: 1.2, momentumGrade: 1.4, optionsIV: 0.8 } },
     'risk-off': { mode, evidence, leverageOK: false, thresholdMod: 0.03,  shortBar: 0,    longBar: 0.10,
-                  weightMods: { trend: 0.7, momentum: 0.8, meanReversion: 1.0, health: 1.3, fundamentals: 1.3, fed: 1.2, regimeGrade: 1.5, peerGrade: 1.3, momentumGrade: 0.8 } },
+                  weightMods: { trend: 0.7, momentum: 0.8, meanReversion: 1.0, health: 1.3, fundamentals: 1.3, fed: 1.2, regimeGrade: 1.5, peerGrade: 1.3, momentumGrade: 0.8, optionsIV: 1.4 } },
     'choppy':   { mode, evidence, leverageOK: false, thresholdMod: 0.06,  shortBar: 0.05, longBar: 0.05,
-                  weightMods: { trend: 0.7, momentum: 0.8, meanReversion: 1.3, health: 1.1, fundamentals: 1.1, regimeGrade: 1.2, peerGrade: 1.1, momentumGrade: 1.0 } },
+                  weightMods: { trend: 0.7, momentum: 0.8, meanReversion: 1.3, health: 1.1, fundamentals: 1.1, regimeGrade: 1.2, peerGrade: 1.1, momentumGrade: 1.0, optionsIV: 1.3 } },
   };
   return profiles[mode] || profiles['choppy'];
 }
@@ -42028,6 +42420,20 @@ async function botScoreTicker(ticker) {
     }
   } catch {}
 
+  // 13. Options-implied signal (forward-looking): when a live chain is cached,
+  //     fold in implied volatility + put/call skew. Richly elevated IV leans
+  //     mean-reversion (and warns that long premium is expensive); heavy downside
+  //     skew is a caution flag. Small weight — it informs, doesn't dominate.
+  try {
+    const _optSig = (typeof extractOptionsSignal === 'function') ? extractOptionsSignal(t) : null;
+    if (_optSig && _optSig.ivSignal != null && Math.abs(_optSig.ivSignal) > 0.05) {
+      const _ivPct = (_optSig.iv * 100).toFixed(0);
+      const _skewNote = _optSig.skew != null && _optSig.skew > 0.04 ? `, downside skew ${(_optSig.skew * 100).toFixed(0)}pp` : '';
+      add('optionsIV', _optSig.ivSignal, 0.07, `Options: ATM IV ${_ivPct}%${_skewNote} (${_optSig.refDte}d)`);
+      decisionPath.push(`optionsIV: iv ${_ivPct}% skew ${_optSig.skew != null ? (_optSig.skew*100).toFixed(0)+'pp' : '?'} term ${_optSig.termSlope != null ? (_optSig.termSlope*100).toFixed(0)+'pp' : '?'} → ${_optSig.ivSignal > 0 ? '+' : ''}${_optSig.ivSignal}`);
+    }
+  } catch {}
+
   if (weightSum === 0) return null;
   let conviction = score / weightSum;  // -1..+1
 
@@ -42156,18 +42562,33 @@ async function botScoreTicker(ticker) {
   if (instrument === 'option' && typeof _optionsCache === 'object' && _optionsCache[t.toUpperCase()] && _optionsCache[t.toUpperCase()].data) {
     try {
       const od = _optionsCache[t.toUpperCase()].data;
-      // Prefer ~30-45 DTE (enough time for the thesis, not too much decay).
+      // Match the expiry to the trade's HORIZON. The bot now has the full term
+      // structure (weeklies → monthlies → LEAPS), so a fast momentum trade buys
+      // short-dated, while a high-conviction value/macro thesis buys a monthly or
+      // LEAP that gives the thesis room to play out without theta bleeding it dry.
+      // Rule of thumb: target expiry ≈ 2.5× the expected hold, so most of the
+      // option's life remains when the bot expects to exit.
+      const _style = (typeof _classifyTradeStyle === 'function') ? _classifyTradeStyle({ instrument, optionType, direction, leverage, components }) : null;
+      const _holdDays = (typeof confidenceHorizonDays === 'function')
+        ? confidenceHorizonDays(Math.abs(conviction), { style: _style, regimeMode: (typeof regimeMode !== 'undefined' ? regimeMode : null) })
+        : 21;
+      const _targetDte = Math.max(10, Math.round(_holdDays * 2.5));   // desired days-to-expiry
+      decisionPath.push(`option:horizon hold~${_holdDays}d → target ~${_targetDte}d expiry`);
+      // Candidates: at least 7 DTE so we're not buying same-week decay.
       const exps = (od.expiries || []).filter(e => (e.dteNow ?? e.dte) >= 7);
-      const exp = exps.sort((a, b) => Math.abs((a.dteNow ?? a.dte) - 35) - Math.abs((b.dteNow ?? b.dte) - 35))[0] || exps[0];
+      // Pick the expiry whose DTE is closest to the horizon-derived target.
+      const exp = exps.sort((a, b) => Math.abs((a.dteNow ?? a.dte) - _targetDte) - Math.abs((b.dteNow ?? b.dte) - _targetDte))[0] || exps[0];
       if (exp) {
         const list = optionType === 'put' ? exp.puts : exp.calls;
         const spot = od.spot;
-        // Slightly OTM (delta ~0.40-0.55) is the bot's default — leverage with
-        // a real chance of finishing ITM. Pick the contract whose |delta| is
-        // closest to 0.50, falling back to nearest-strike-to-spot.
+        const _isLeapPick = (exp.dteNow ?? exp.dte) >= 180;
+        // Delta target by horizon: short-dated trades want ~0.50 (leverage with a
+        // real ITM chance); LEAPS lean deeper ITM (~0.65-0.70) so they behave more
+        // like stock with less theta/IV-crush risk over the long hold.
+        const _deltaTarget = _isLeapPick ? 0.67 : 0.50;
         let pick = null, best = Infinity;
         for (const o of (list || [])) {
-          const score = (o.delta != null) ? Math.abs(Math.abs(o.delta) - 0.5) : Math.abs(o.strike - spot) / spot;
+          const score = (o.delta != null) ? Math.abs(Math.abs(o.delta) - _deltaTarget) : Math.abs(o.strike - spot) / spot;
           if (score < best) { best = score; pick = o; }
         }
         if (pick) {
@@ -42177,8 +42598,10 @@ async function botScoreTicker(ticker) {
             delta: pick.delta, gamma: pick.gamma, theta: pick.theta, vega: pick.vega,
             breakeven: pick.breakeven, openInterest: pick.openInterest,
             contractType: optionType, underlyingSpot: spot,
+            bucket: exp.bucket || (_isLeapPick ? 'leap' : (exp.dteNow ?? exp.dte) <= 45 ? 'near' : 'monthly'),
+            isLeap: _isLeapPick, targetDte: _targetDte, holdDays: _holdDays,
           };
-          decisionPath.push(`option:real ${optionType} $${pick.strike} exp ${exp.expiry} (${exp.dteNow ?? exp.dte}d) prem $${(pick.mid||pick.last).toFixed(2)} Δ${pick.delta != null ? pick.delta.toFixed(2) : '?'} IV ${pick.iv ? (pick.iv*100).toFixed(0)+'%' : '?'}`);
+          decisionPath.push(`option:real ${optionType} $${pick.strike} exp ${exp.expiry} (${exp.dteNow ?? exp.dte}d${_isLeapPick ? ' · LEAP' : ''}) prem $${(pick.mid||pick.last).toFixed(2)} Δ${pick.delta != null ? pick.delta.toFixed(2) : '?'} IV ${pick.iv ? (pick.iv*100).toFixed(0)+'%' : '?'}`);
         }
       }
     } catch (e) { /* fall back to synthetic option */ }
@@ -42718,11 +43141,11 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
       _b.cashAfter = +(bot.bankroll - _committedNow).toFixed(2);
       _b.decisionReceipt = {
         placedAt: new Date().toISOString(),
-        action: `${p.direction.toUpperCase()} ${p.instrument === 'option' ? p.optionType?.toUpperCase() + ' option' : p.instrument === 'leveraged_etf' ? (p.leveragedEtf?.etf + ' (leveraged ETF)') : 'shares'}`,
+        action: `${p.direction.toUpperCase()} ${p.instrument === 'option' ? (p.optionContract ? `$${p.optionContract.strike} ${p.optionType?.toUpperCase()} exp ${p.optionContract.expiry} (${p.optionContract.dte}d${p.optionContract.isLeap ? ' · LEAP' : p.optionContract.bucket === 'monthly' ? ' · monthly' : ' · weekly'})${p.optionContract.delta != null ? ` Δ${Math.abs(p.optionContract.delta).toFixed(2)}` : ''}${p.optionContract.iv ? ` IV ${(p.optionContract.iv*100).toFixed(0)}%` : ''}` : p.optionType?.toUpperCase() + ' option') : p.instrument === 'leveraged_etf' ? (p.leveragedEtf?.etf + ' (leveraged ETF)') : 'shares'}`,
         regime: (typeof _botRegime !== 'undefined' && _botRegime) ? `${_botRegime.mode} — ${_botRegime.evidence}` : null,
         conviction: +p.conviction.toFixed(2),
         confidence: +(p.confidence * 100).toFixed(0),
-        sizing: `$${notional.toFixed(0)} (${(frac * 100).toFixed(1)}% of deployable)${p.leverage > 1 ? `, ${p.leverage}× → $${dollars.toFixed(0)} exposure` : ''}`,
+        sizing: `$${notional.toFixed(0)} (${(frac * 100).toFixed(1)}% of deployable)${p.leverage > 1 ? `, ${p.leverage}× → $${dollars.toFixed(0)} exposure` : ''}${p.optionContract ? ` · premium $${(p.optionContract.premium||0).toFixed(2)}/sh × ${(contracts||1)*100} = $${((p.optionContract.premium||0)*(contracts||1)*100).toFixed(0)}` : ''}`,
         cashAfter: _b.cashAfter,
         style: _b.tradeStyle,
         horizon: `${_b.horizonType} (~${_b.horizonDays} trading days)`,
@@ -43009,6 +43432,13 @@ function botRebalanceToPositiveCash(targetCashFraction = 0.10) {
   saveBotState(bot);
   console.log(`[bot] rebalanced to cash target — trimmed positions, realized ${totalRealized >= 0 ? '+' : ''}$${totalRealized.toFixed(0)}, bankroll now $${bot.bankroll.toFixed(0)}`);
   if (typeof flashStatus === 'function') flashStatus(`Rebalanced to positive cash (trimmed, realized ${totalRealized >= 0 ? '+' : ''}$${totalRealized.toFixed(0)})`, 'success');
+  // Push the trimmed/closed trades to Supabase so bot_trades (and the closed/
+  // signal-performance views) reflect the closures. Without this, rebalancing
+  // closed positions locally but Supabase still showed them open → the
+  // bot_trades_closed view stayed empty.
+  if (typeof supabaseConfigured === 'function' && supabaseConfigured() && typeof supabaseSyncAllTrades === 'function') {
+    supabaseSyncAllTrades().catch(() => {});
+  }
   return bot;
 }
 if (typeof window !== 'undefined') {
@@ -43506,6 +43936,18 @@ if (typeof window !== 'undefined') window.botWindowedPerformance = botWindowedPe
 function renderBetsTab() {
   const body = document.getElementById('bets-body');
   if (!body) return;
+  // Make sure every bet has a stable id BEFORE we render — the receipt rows key
+  // off data-bet-id, and a bet with no id makes "tap for receipt" a no-op. IDs
+  // were previously only assigned during Supabase sync, so locally-created bets
+  // (no Supabase configured) could lack one. Backfill + persist once here.
+  try {
+    if (typeof loadBotState === 'function' && typeof _ensureTradeId === 'function') {
+      const _bs = loadBotState();
+      let _mut = false;
+      for (const b of (_bs.bets || [])) { const had = b.id; _ensureTradeId(b); if (b.id !== had) _mut = true; }
+      if (_mut && typeof saveBotState === 'function') saveBotState(_bs);
+    }
+  } catch {}
   // On first render of a session, kick off a live-quote refresh in the
   // background so open positions show fresh marks rather than stale nightly
   // prices. Guarded so it fires once, not on every re-render.
@@ -43609,11 +44051,41 @@ function renderBetsTab() {
       })()}
     </div>`;
 
+  // ---- OPEN POSITIONS aggregation (computed here so the chart can offer the
+  //      per-position view; the table that uses it renders further down). ----
+  const openBets = (perf.bets || []).filter(b => b.status === 'open');
+  // Aggregate by ticker+direction so multiple adds to the same name roll up into
+  // one line showing TOTAL shares (the gradual-accumulation view).
+  const posMap = new Map();
+  for (const b of openBets) {
+    const key = `${b.ticker}|${b.direction}|${b.instrument || 'shares'}`;
+    const cur = posMap.get(key) || { ticker: b.ticker, direction: b.direction, instrument: b.instrument || 'shares', leveragedEtf: b.leveragedEtf, shares: 0, notional: 0, dollars: 0, pnl: 0, lots: 0, lastPrice: null, entryCost: 0, targetPrice: null, stopPrice: null, firstEntryDate: null };
+    cur.shares += (b.shares || 0);
+    cur.notional += (b.notional || 0);
+    cur.dollars += (b.dollars || 0);
+    cur.pnl += (b.pnl || 0);
+    cur.entryCost += (b.entryPrice || 0) * (b.shares || 0);
+    cur.lots += 1;
+    if (b.lastPrice != null && isFinite(b.lastPrice)) cur.lastPrice = Number(b.lastPrice);
+    if (b.targetPrice != null && isFinite(b.targetPrice)) cur.targetPrice = Number(b.targetPrice);
+    if (b.stopPrice != null && isFinite(b.stopPrice)) cur.stopPrice = Number(b.stopPrice);
+    if (b.entryDate && (!cur.firstEntryDate || b.entryDate < cur.firstEntryDate)) cur.firstEntryDate = b.entryDate;
+    posMap.set(key, cur);
+  }
+  const positions = Array.from(posMap.values()).sort((a, b) => b.notional - a.notional);
+  const totalSharesAll = positions.reduce((s, p) => s + p.shares, 0);
+
   // ---- Equity curve chart + time-window performance ----
+  // If an open position is selected, show ITS price chart (with entry/target/
+  // stop) instead of the all-positions equity curve.
   const wp = (typeof botWindowedPerformance === 'function') ? botWindowedPerformance() : null;
   const activeWin = BETS_STATE.perfWindow || 'all';
   let chartHtml = '';
-  if (wp && wp.curve.length >= 2) {
+  const _selPosKey = BETS_STATE.selectedPosition;
+  const _selPos = _selPosKey ? positions.find(p => `${p.ticker}|${p.direction}|${p.instrument || 'shares'}` === _selPosKey) : null;
+  if (_selPos) {
+    chartHtml = renderPositionChart(_selPos);
+  } else if (wp && wp.curve.length >= 2) {
     // Slice the curve to the active window.
     const winDays = { week: 7, month: 30, year: 365, all: null }[activeWin];
     let pts = wp.curve;
@@ -43684,25 +44156,7 @@ function renderBetsTab() {
   let balanceHtml = '';
   try { balanceHtml = renderBotEnvironmentBalance(); } catch {}
 
-  // ---- OPEN POSITIONS table: total shares held per ticker + current value. ----
-  const openBets = (perf.bets || []).filter(b => b.status === 'open');
-  // Aggregate by ticker+direction so multiple adds to the same name roll up into
-  // one line showing TOTAL shares (the gradual-accumulation view).
-  const posMap = new Map();
-  for (const b of openBets) {
-    const key = `${b.ticker}|${b.direction}|${b.instrument || 'shares'}`;
-    const cur = posMap.get(key) || { ticker: b.ticker, direction: b.direction, instrument: b.instrument || 'shares', leveragedEtf: b.leveragedEtf, shares: 0, notional: 0, dollars: 0, pnl: 0, lots: 0, lastPrice: null, entryCost: 0 };
-    cur.shares += (b.shares || 0);
-    cur.notional += (b.notional || 0);
-    cur.dollars += (b.dollars || 0);
-    cur.pnl += (b.pnl || 0);
-    cur.entryCost += (b.entryPrice || 0) * (b.shares || 0);
-    cur.lots += 1;
-    if (b.lastPrice != null && isFinite(b.lastPrice)) cur.lastPrice = Number(b.lastPrice);
-    posMap.set(key, cur);
-  }
-  const positions = Array.from(posMap.values()).sort((a, b) => b.notional - a.notional);
-  const totalSharesAll = positions.reduce((s, p) => s + p.shares, 0);
+  // ---- OPEN POSITIONS table (positions already aggregated above for the chart). ----
   const positionsHtml = positions.length ? `
     <div class="company-card">
       <h4>Open Positions <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· ${positions.length} ${positions.length === 1 ? 'name' : 'names'} · total ${totalSharesAll.toLocaleString(undefined,{maximumFractionDigits:2})} shares · gradual adds roll up here</span></h4>
@@ -43711,9 +44165,11 @@ function renderBetsTab() {
           <thead><tr><th>Ticker</th><th>Direction</th><th>Total Shares</th><th>Avg Entry</th><th>Last</th><th>Cost Basis</th><th>Unrealized</th><th>Lots</th></tr></thead>
           <tbody>${positions.map(p => {
             const avgEntry = p.shares > 0 ? p.entryCost / p.shares : 0;
+            const _pkey = `${p.ticker}|${p.direction}|${p.instrument || 'shares'}`;
+            const _isSel = BETS_STATE.selectedPosition === _pkey;
             return `
-            <tr>
-              <td style="font-family:var(--mono);font-weight:700"><span class="bot-ticker-link" data-ticker="${p.ticker}" style="cursor:pointer;color:var(--amber);text-decoration:underline;text-decoration-style:dotted" title="Open ${p.ticker} in Valuation">${p.ticker}</span></td>
+            <tr class="bot-position-row" data-poskey="${escapeHtml(_pkey)}" style="cursor:pointer;${_isSel ? 'background:rgba(212,162,76,0.12);outline:1px solid var(--amber)' : ''}" title="Click to chart ${p.ticker}'s price performance with entry/target/stop">
+              <td style="font-family:var(--mono);font-weight:700">${_isSel ? '<span style="color:var(--amber)">▸ </span>' : ''}<span class="bot-ticker-link" data-ticker="${p.ticker}" style="cursor:pointer;color:var(--amber);text-decoration:underline;text-decoration-style:dotted" title="Open ${p.ticker} in Valuation">${p.ticker}</span></td>
               <td style="font-family:var(--mono);font-size:11px">${dirBadge(p.direction)}${p.instrument === 'leveraged_etf' && p.leveragedEtf ? ` <span style="color:#4ec9a8;font-weight:700">${p.leveragedEtf}</span>` : ''}</td>
               <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--ink)">${p.shares.toLocaleString(undefined,{maximumFractionDigits:2})}</td>
               <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">$${avgEntry.toFixed(2)}</td>
@@ -43799,8 +44255,36 @@ function renderBetsTab() {
       </div>
     </div>`;
 
-  // ---- Full bet ledger — every transaction, click a row for the receipt ----
-  const ledgerRows = perf.bets.slice().reverse().map(b => `
+  // ---- Full bet ledger — every transaction, click a row for the receipt,
+  //      click a COLUMN HEADER to sort (A-Z / Z-A or latest/earliest), default
+  //      latest-to-oldest. Mirrors the Stock Book's sortable columns. ----
+  const _ledgerCols = [
+    { key: 'date',      label: 'Date',       type: 'date',   get: b => b.entryDate || '' },
+    { key: 'ticker',    label: 'Ticker',     type: 'text',   get: b => b.ticker || '' },
+    { key: 'direction', label: 'Direction',  type: 'text',   get: b => b.direction || '' },
+    { key: 'size',      label: 'Size',       type: 'num',    get: b => (b.dollars ?? b.notional ?? 0) },
+    { key: 'entry',     label: 'Entry',      type: 'num',    get: b => (b.entryPrice != null ? Number(b.entryPrice) : null) },
+    { key: 'last',      label: 'Last',       type: 'num',    get: b => (b.lastPrice != null && isFinite(b.lastPrice) ? Number(b.lastPrice) : null) },
+    { key: 'return',    label: 'Return',     type: 'num',    get: b => (b.returnPct != null ? Number(b.returnPct) : null) },
+    { key: 'pnl',       label: 'P/L',        type: 'num',    get: b => (b.pnl != null ? Number(b.pnl) : null) },
+    { key: 'cash',      label: 'Cash After', type: 'num',    get: b => (b.cashAfter != null ? Number(b.cashAfter) : null) },
+    { key: 'status',    label: 'Status',     type: 'text',   get: b => b.status || '' },
+  ];
+  const _lsCol = _ledgerCols.find(c => c.key === LEDGER_SORT.col) || _ledgerCols[0];
+  const _lsDir = LEDGER_SORT.dir === 'asc' ? 1 : -1;
+  // Stable sort: nulls always sink to the bottom regardless of direction.
+  const _sortedBets = perf.bets.slice().sort((a, b) => {
+    const va = _lsCol.get(a), vb = _lsCol.get(b);
+    const na = (va == null || va === ''), nb = (vb == null || vb === '');
+    if (na && nb) return 0;
+    if (na) return 1;
+    if (nb) return -1;
+    let cmp;
+    if (_lsCol.type === 'num') cmp = va - vb;
+    else cmp = String(va).localeCompare(String(vb));
+    return cmp * _lsDir;
+  });
+  const ledgerRows = _sortedBets.map(b => `
     <tr class="bot-receipt-row" data-bet-id="${b.id || ''}" style="cursor:pointer" title="Tap for the bot's full decision receipt">
       <td style="font-family:var(--mono);font-size:11px">${b.entryDate}</td>
       <td style="font-family:var(--mono);font-weight:700"><span class="bot-ticker-link" data-ticker="${b.ticker}" style="cursor:pointer;color:var(--amber);text-decoration:underline;text-decoration-style:dotted" title="Open ${b.ticker} in Valuation">${b.ticker}</span></td>
@@ -43815,12 +44299,21 @@ function renderBetsTab() {
     </tr>
   `).join('');
 
+  // Clickable sortable headers with an arrow on the active column. Clicking the
+  // active column flips direction; clicking a new column sorts it (date/numeric
+  // default to descending = newest/highest first, text defaults to A-Z).
+  const ledgerHead = _ledgerCols.map(c => {
+    const active = c.key === LEDGER_SORT.col;
+    const arrow = active ? (LEDGER_SORT.dir === 'asc' ? ' ▲' : ' ▼') : '';
+    return `<th class="ledger-sort-th" data-lcol="${c.key}" data-ltype="${c.type}" style="cursor:pointer;user-select:none;white-space:nowrap${active ? ';color:var(--amber)' : ''}" title="Sort by ${c.label}">${c.label}${arrow}</th>`;
+  }).join('');
+
   const ledger = perf.bets.length ? `
     <div class="company-card">
-      <h4>${filter ? filter + ' — ' : ''}Transaction Ledger <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· every transaction permanent · ${perf.bets.length} total · tap any row for the receipt</span></h4>
+      <h4>${filter ? filter + ' — ' : ''}Transaction Ledger <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· every transaction permanent · ${perf.bets.length} total · tap a row for the receipt · tap a column to sort</span></h4>
       <div style="overflow-x:auto">
         <table class="sb-table" style="width:100%;min-width:720px">
-          <thead><tr><th>Date</th><th>Ticker</th><th>Direction</th><th>Size</th><th>Entry</th><th>Last</th><th>Return</th><th>P/L</th><th>Cash After</th><th>Status</th></tr></thead>
+          <thead><tr>${ledgerHead}</tr></thead>
           <tbody>${ledgerRows}</tbody>
         </table>
       </div>
@@ -43879,6 +44372,22 @@ function renderBetsTab() {
   body.querySelectorAll('.bets-view-btn').forEach(btn => {
     btn.addEventListener('click', () => { _betsView = btn.dataset.view; renderBetsTab(); });
   });
+  // Wire ledger column-header sorting (like the Stock Book). Click the active
+  // column to flip direction; click a new column to sort it (numeric/date →
+  // descending first = newest/highest; text → A-Z first).
+  body.querySelectorAll('.ledger-sort-th').forEach(th => {
+    th.addEventListener('click', () => {
+      const col = th.dataset.lcol, type = th.dataset.ltype;
+      if (LEDGER_SORT.col === col) {
+        LEDGER_SORT.dir = LEDGER_SORT.dir === 'asc' ? 'desc' : 'asc';
+      } else {
+        LEDGER_SORT.col = col;
+        LEDGER_SORT.dir = (type === 'text') ? 'asc' : 'desc';
+      }
+      renderBetsTab();
+    });
+  });
+
   // Wire receipt-row taps (ledger view).
   body.querySelectorAll('.bot-receipt-row').forEach(row => {
     row.addEventListener('click', (e) => {
@@ -43886,6 +44395,33 @@ function renderBetsTab() {
       const id = row.dataset.betId;
       if (id && typeof showBotReceipt === 'function') showBotReceipt(id);
     });
+  });
+
+  // Wire open-position row clicks → select the position & swap the chart to its
+  // price performance (entry/target/stop). Clicking the selected row deselects.
+  body.querySelectorAll('.bot-position-row').forEach(row => {
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('.bot-ticker-link')) return;   // ticker link opens valuation
+      const key = row.dataset.poskey;
+      BETS_STATE.selectedPosition = (BETS_STATE.selectedPosition === key) ? null : key;
+      renderBetsTab();
+    });
+  });
+  // "← View all positions" — clear selection, back to the equity curve.
+  body.querySelector('#bets-viewall-btn')?.addEventListener('click', () => {
+    BETS_STATE.selectedPosition = null;
+    renderBetsTab();
+  });
+  // "Value ↗" — open the selected ticker in the Valuation tab for a deep dive.
+  body.querySelector('#bets-value-btn')?.addEventListener('click', (e) => {
+    const tk = e.currentTarget.dataset.ticker;
+    if (tk && typeof executeCommand === 'function') executeCommand(tk);
+    else if (tk) {
+      const inp = document.getElementById('ticker');
+      if (inp) inp.value = tk;
+      if (typeof switchTab === 'function') switchTab('valuation');
+      setTimeout(() => document.getElementById('fetch-btn')?.click(), 100);
+    }
   });
 
   // Wire the equity-curve window selector.
