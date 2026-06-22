@@ -8518,10 +8518,10 @@
       <input type="text" class="modal-input" id="port-supabase-anon-input" placeholder="anon public key for that project" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         <button class="btn" id="port-supabase-save-btn">Save Portfolio Config</button>
-        <button class="btn btn-ghost" id="port-supabase-sync-btn" title="Push every portfolio position, watchlist item, transaction + GoodGlobe index to the portfolio Supabase now">Sync Portfolio Now ↗</button>
+        <button class="btn btn-ghost" id="port-supabase-sync-btn" title="Mirror the current portfolio to Supabase (upserts current positions, deletes stale rows). The repo keeps full history.">Sync Portfolio Now ↗</button>
         <span id="port-supabase-status" style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);align-self:center"></span>
       </div>
-      <div class="modal-help">Holds your portfolio in the <code>portfolio_positions</code> table — synced ENRICHED with ALL the schema fields (shares, avg_cost, weight, market value, P/L, conviction, confidence, thesis, reliability, open_date, plus txn_action/shares/price/date for the ledger). Loads live prices first. The GoodGlobe Index now mirrors the WHOLE portfolio (watching + tracking too). Run <code>portfolio_positions_schema.sql</code> once in whichever project hosts it.</div>
+      <div class="modal-help">Supabase MIRRORS your current portfolio in <code>portfolio_positions</code> (enriched: shares, avg_cost, weight, market value, P/L, conviction, confidence, thesis, reliability, open_date, plus txn_*). Deleting a position locally deletes it here too. Buying spends cash + logs a buy; deleting a held position returns its value to cash + logs a sell — so net worth only moves with price. The GoodGlobe Index mirrors the WHOLE portfolio. Run <code>portfolio_positions_schema.sql</code> + <code>portfolio_views_fix.sql</code> once.</div>
     </div>
 
     <div class="modal-section" style="border-top:1px solid var(--rule);padding-top:14px">
@@ -8533,7 +8533,7 @@
         <button class="btn btn-ghost" id="analytics-supabase-sync-btn" title="Push research grades + the full regime timeline + probability/regime KV to Supabase (run analytics_anon_write.sql once first so the anon key can write)">Sync Analytics Now ↗</button>
         <span id="analytics-supabase-status" style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);align-self:center"></span>
       </div>
-      <div class="modal-help">Pushes research grades, the FULL regime timeline (from TRAPP2-1 history, not just current), and analytics_kv rows (probability theses + regime drivers). Run <code>analytics_anon_write.sql</code> ONCE to allow anon writes, then "Sync Analytics Now". A 401/403 means that SQL hasn't run. Shares cleanly with portfolio/bot.</div>
+      <div class="modal-help">Pushes research grades, the FULL regime timeline, and analytics_kv (probability theses auto-push on save + regime drivers). Run <code>analytics_anon_write.sql</code> ONCE to allow anon writes. A 401/403 means that SQL hasn't run. Shares cleanly with portfolio/bot (different table names).</div>
     </div>
 
     <!-- Repository Backup & Sync — Update + Export for all four repos (populated by renderRepoSyncPanel) -->
@@ -8864,6 +8864,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260615z23"></script>
+<script src="app.js?v=20260615z28"></script>
 </body>
 </html>

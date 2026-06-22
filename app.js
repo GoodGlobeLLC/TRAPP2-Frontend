@@ -74,6 +74,36 @@ const _ENV_PREFIX = APP_ENV === 'production' ? '' : `__${APP_ENV}__`;
 })();
 
 // Badge so you always know which build you're in.
+// Make native date-picker controls visible in dark mode. The WebKit calendar
+// indicator + the date text default to near-black, which is invisible on the dark
+// background. Injected here (not in the main CSS) so it applies app-wide without
+// touching the stylesheet.
+document.addEventListener('DOMContentLoaded', () => {
+  try {
+    if (document.getElementById('valuatio-datepicker-css')) return;
+    const st = document.createElement('style');
+    st.id = 'valuatio-datepicker-css';
+    st.textContent = `
+      input[type="date"], input[type="datetime-local"], input[type="month"], input[type="time"] {
+        color: #fff;
+        color-scheme: dark;
+      }
+      input[type="date"]::-webkit-calendar-picker-indicator,
+      input[type="datetime-local"]::-webkit-calendar-picker-indicator,
+      input[type="month"]::-webkit-calendar-picker-indicator,
+      input[type="time"]::-webkit-calendar-picker-indicator {
+        filter: invert(1) brightness(2);
+        opacity: 0.9;
+        cursor: pointer;
+      }
+      input[type="date"]::-webkit-datetime-edit,
+      input[type="datetime-local"]::-webkit-datetime-edit { color: #fff; }
+      input[type="date"]::-webkit-datetime-edit-fields-wrapper { color: #fff; }
+    `;
+    document.head.appendChild(st);
+  } catch {}
+});
+
 document.addEventListener('DOMContentLoaded', () => {
   if (APP_ENV === 'production') return;
   const b = document.createElement('div');
@@ -1246,6 +1276,21 @@ function backfillGoodGlobeIndexFromPortfolio() {
   return n;
 }
 if (typeof window !== 'undefined') window.backfillGoodGlobeIndexFromPortfolio = backfillGoodGlobeIndexFromPortfolio;
+
+// Remove a ticker from the GoodGlobe Index roster (local + Supabase mirror is
+// updated on next sync via the singleton). Idempotent.
+function removeFromGoodGlobeIndex(ticker) {
+  if (!ticker) return false;
+  const tic = String(ticker).trim().toUpperCase();
+  const idx = loadGoodGlobeIndex();
+  if (idx[tic]) {
+    delete idx[tic];
+    saveGoodGlobeIndex(idx);
+    return true;
+  }
+  return false;
+}
+if (typeof window !== 'undefined') window.removeFromGoodGlobeIndex = removeFromGoodGlobeIndex;
 
 // Get all entries as an array sorted by lastFlaggedAt desc (most recent first)
 function getGoodGlobeIndexEntries() {
@@ -8184,6 +8229,22 @@ const SECTOR_HOLDINGS = {
   GLD:  [], // commodity ETF
 };
 
+// Approximate top-holding WEIGHTS (% of fund) for the SPDR sector ETFs. These are
+// representative recent weights — ETF compositions drift, so treat as a guide,
+// not a live feed. Used to show each constituent's weight in the drill-down and
+// as a reliable fallback so the stock list always populates. Ordered high→low.
+const SECTOR_HOLDINGS_WEIGHTED = {
+  XLK:  [['NVDA',16.2],['AAPL',14.1],['MSFT',13.8],['AVGO',5.1],['ORCL',3.6],['CRM',2.7],['AMD',2.4],['CSCO',2.3],['ADBE',2.0],['ACN',1.9],['IBM',1.8],['INTU',1.7]],
+  XLY:  [['AMZN',22.6],['TSLA',16.4],['HD',7.2],['MCD',4.4],['BKNG',3.5],['LOW',3.4],['NKE',2.6],['TJX',2.6],['SBUX',2.1],['CMG',1.9],['ABNB',1.6],['F',1.3]],
+  XLI:  [['GE',4.6],['CAT',3.9],['RTX',3.6],['HON',3.3],['UNP',3.0],['BA',2.9],['LMT',2.5],['DE',2.4],['UPS',2.3],['ETN',2.3],['NOC',1.9],['WM',1.8]],
+  XLF:  [['JPM',10.4],['BRK.B',7.0],['V',6.0],['MA',5.1],['BAC',4.3],['WFC',3.6],['GS',3.0],['MS',2.5],['BLK',2.3],['C',2.3],['AXP',2.3],['SPGI',2.2]],
+  XLE:  [['XOM',23.5],['CVX',17.4],['COP',7.6],['WMB',5.1],['EOG',4.0],['SLB',3.8],['KMI',3.6],['OKE',3.4],['PSX',3.1],['MPC',2.9],['OXY',2.6],['VLO',2.5]],
+  XLP:  [['COST',12.8],['WMT',10.6],['PG',9.9],['KO',8.3],['PEP',5.0],['PM',5.7],['MO',4.4],['MDLZ',3.5],['CL',2.9],['TGT',2.1],['KMB',2.0],['GIS',1.8]],
+  XLV:  [['LLY',11.4],['UNH',7.8],['JNJ',6.9],['ABBV',6.1],['MRK',4.5],['TMO',3.8],['ABT',3.7],['ISRG',3.4],['DHR',2.6],['PFE',2.6],['AMGN',2.5],['BMY',2.1]],
+  XLU:  [['NEE',13.5],['SO',8.1],['DUK',7.1],['CEG',6.4],['AEP',4.7],['D',4.2],['SRE',4.1],['EXC',3.5],['XEL',3.4],['PCG',3.3],['ED',2.6],['PEG',2.6]],
+  XLRE: [['PLD',9.8],['AMT',8.7],['EQIX',7.3],['WELL',7.1],['SPG',4.6],['O',4.5],['PSA',4.2],['CCI',4.0],['DLR',4.0],['CBRE',3.4],['EXR',3.0],['VICI',2.9]],
+};
+
 // ---------- UNIFIED SECTOR RESOLUTION ----------
 // Maps any sector name (Finnhub, Yahoo, AV, sheet) to a sector ETF.
 // Returns null if no match.
@@ -9433,11 +9494,16 @@ async function verifyMacroAgainstFred() {
     return { ok: false, reason: 'no-backend', message: 'No backend macro snapshot found to verify (the GitHub data/macro/ files are missing). Set your GitHub Data base URL in Data Sources.' };
   }
   const hasKey = !!getFredKey();
+  // IMPORTANT: compare each backend series against the SAME FRED series the
+  // pipeline actually fetched. The backend stores nominal GDP (FRED 'GDP'), not
+  // real GDP ('GDPC1') — comparing GDP↔GDPC1 produced a spurious ~25% "mismatch"
+  // (that gap is the GDP deflator, not a data error). CPI/10Y/FedFunds already
+  // line up by series id.
   const series = [
-    { id: FRED_SERIES.gdp, label: 'Real GDP', backend: gh.gdpRaw },
-    { id: FRED_SERIES.cpi, label: 'CPI', backend: gh.cpiRaw },
-    { id: FRED_SERIES.tsy10, label: '10Y Treasury', backend: gh.tsyRaw },
-    { id: FRED_SERIES.fedFunds, label: 'Fed Funds', backend: gh.fedRaw },
+    { id: 'GDP',      label: 'GDP (nominal)', backend: gh.gdpRaw },
+    { id: 'CPIAUCSL', label: 'CPI',           backend: gh.cpiRaw },
+    { id: 'DGS10',    label: '10Y Treasury',  backend: gh.tsyRaw },
+    { id: 'DFF',      label: 'Fed Funds',     backend: gh.fedRaw },
   ];
   const results = [];
   for (const s of series) {
@@ -10247,10 +10313,21 @@ function populateSectorStocksList(etfTicker) {
   if (!container) return;
 
   const sbRows = state.stockbook?.rows || [];
-  // 1. LIVE: every stockbook ticker whose sector maps to this ETF.
+  const weighted = SECTOR_HOLDINGS_WEIGHTED[etfTicker] || null;   // [[ticker, weight%], ...]
+  const weightOf = (tic) => {
+    if (!weighted) return null;
+    const hit = weighted.find(w => w[0] === tic);
+    return hit ? hit[1] : null;
+  };
+
+  // Build the constituent list. Prefer the WEIGHTED holdings (so weights show and
+  // the list always populates), then union with any extra same-sector names from
+  // the Stock Book so the user's own universe is represented too.
   let tickers = [];
+  if (weighted) tickers = weighted.map(w => w[0]);
+  // Add stockbook names mapped to this ETF's sector that aren't already listed.
   try {
-    tickers = sbRows
+    const sbMatched = sbRows
       .filter(r => {
         const sec = r.sector || r.rawRow?.sector || r.rawRow?.Sector;
         if (!sec) return false;
@@ -10259,38 +10336,48 @@ function populateSectorStocksList(etfTicker) {
       })
       .map(r => r.ticker)
       .filter(Boolean);
+    for (const t of sbMatched) if (!tickers.includes(t)) tickers.push(t);
   } catch {}
-
-  // 2. FALLBACK: curated top holdings if the stockbook had none for this sector.
-  if (tickers.length === 0) {
-    tickers = (SECTOR_HOLDINGS[etfTicker] || []).slice();
-  }
+  // Final fallback: the bare curated list.
+  if (tickers.length === 0) tickers = (SECTOR_HOLDINGS[etfTicker] || []).slice();
 
   if (tickers.length === 0) {
-    container.innerHTML = '<span style="color:var(--ink-faint);font-style:italic">No constituent stocks for this ETF in your Stock Book. Add tickers in this sector, or refresh the Stock Book.</span>';
+    container.innerHTML = '<span style="color:var(--ink-faint);font-style:italic">No constituent stocks for this ETF (bond/commodity fund, or none in your Stock Book).</span>';
     return;
   }
 
-  // Sort by today's move (biggest gainers first) when we have it.
   const chgOf = (tic) => {
     const sb = sbRows.find(r => r.ticker === tic);
     return sb?.rawRow ? parsePct(sb.rawRow['changepct']) : null;
   };
-  tickers.sort((a, b) => (chgOf(b) ?? -Infinity) - (chgOf(a) ?? -Infinity));
+  // Sort by ETF weight (largest holding first) when we have weights; else by move.
+  if (weighted) {
+    tickers.sort((a, b) => (weightOf(b) ?? -1) - (weightOf(a) ?? -1));
+  } else {
+    tickers.sort((a, b) => (chgOf(b) ?? -Infinity) - (chgOf(a) ?? -Infinity));
+  }
 
-  container.innerHTML = tickers.map(tic => {
+  // Sum of known weights (top holdings) for a header note.
+  const knownWeightSum = weighted ? weighted.reduce((s, w) => s + w[1], 0) : null;
+  const header = weighted
+    ? `<div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-bottom:6px">Top ${weighted.length} holdings ≈ ${knownWeightSum.toFixed(0)}% of fund · weights are representative (ETF composition drifts) · click a ticker to value it</div>`
+    : '';
+
+  container.innerHTML = header + tickers.map(tic => {
     const sb = sbRows.find(r => r.ticker === tic);
     const name = sb?.name || tic;
     const price = sb?.price;
     const chg = chgOf(tic);
+    const wt = weightOf(tic);
     const chgColor = chg == null ? 'var(--ink-faint)' : chg > 0 ? 'var(--pos)' : 'var(--neg)';
     const chgText = chg == null ? '' : (chg >= 0 ? '+' : '') + (chg * 100).toFixed(2) + '%';
     return `
-      <button class="sector-stock-pill" data-sector-stock="${tic}" title="Click to run valuation"
+      <button class="sector-stock-pill" data-sector-stock="${tic}" title="${escapeHtml(name)}${wt != null ? ` · ${wt}% of ${etfTicker}` : ''} · click to run valuation"
         style="display:inline-flex;align-items:center;gap:6px;background:var(--bg);border:1px solid var(--rule);padding:6px 10px;margin:3px;font-family:var(--mono);font-size:10px;color:var(--ink);cursor:pointer;border-radius:3px"
         onmouseover="this.style.borderColor='var(--amber)'" onmouseout="this.style.borderColor='var(--rule)'">
+        ${wt != null ? `<span style="color:var(--data-amber);font-weight:700;min-width:34px;text-align:right">${wt.toFixed(1)}%</span>` : ''}
         <strong style="color:var(--amber)">${tic}</strong>
-        <span style="color:var(--ink-dim);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(name)}</span>
+        <span style="color:var(--ink-dim);max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(name)}</span>
         ${price != null ? `<span style="color:var(--ink-dim)">${fmt$(price)}</span>` : ''}
         ${chgText ? `<span style="color:${chgColor}">${chgText}</span>` : ''}
       </button>
@@ -10301,7 +10388,7 @@ function populateSectorStocksList(etfTicker) {
   container.querySelectorAll('.sector-stock-pill').forEach(btn => {
     btn.addEventListener('click', () => {
       const tic = btn.dataset.sectorStock;
-      switchTab('valuation');
+      if (typeof switchTab === 'function') switchTab('valuation');
       const input = document.getElementById('ticker');
       if (input) input.value = tic;
       if (typeof loadValuation === 'function') loadValuation();
@@ -16268,6 +16355,14 @@ function thesisElapsedDays(thesis) {
 }
 function saveTheses(arr) {
   localStorage.setItem(PROB_STORAGE, JSON.stringify(arr));
+  // Mirror probability theses to the analytics_kv table immediately (if analytics
+  // Supabase is configured), so adding a thesis lands in Supabase without a
+  // manual sync. Fire-and-forget; needs anon-write policies (analytics_anon_write.sql).
+  try {
+    if (typeof analyticsSupabaseConfigured === 'function' && analyticsSupabaseConfigured() && typeof analyticsSupabasePushKV === 'function') {
+      analyticsSupabasePushKV().catch(() => {});
+    }
+  } catch {}
 }
 
 // ---------- MATH ----------
@@ -24044,6 +24139,43 @@ function addToPortfolio(entry) {
   arr.push(newEntry);
   savePortfolio(arr);
   _portUpsertSafe(newEntry);
+
+  // CASH ACCOUNTING: buying an active position is a CASH→ASSET swap — cash falls
+  // by the cost, the asset appears at the same value, so net worth is unchanged
+  // until prices move. Record the cash movement + a buy transaction so the chart
+  // and totals stay correct (this is what stops the "+$30K jump when I add a
+  // position" problem). Skipped for passive (Watching/Tracking/Avoid) and when
+  // the caller opts out (e.g. importing/restoring, which shouldn't move cash).
+  if (!isPassive && !entry._noCash && ACTIVE_POSITIONS.includes(entry.position)) {
+    const qty = +entry.qty || 0;
+    const costBasis = +entry.costBasis || 0;
+    const fees = parseFloat(entry.fees) || 0;
+    const mult = (typeof positionMultiplier === 'function') ? positionMultiplier(entry) : 1;
+    if (qty > 0 && costBasis > 0) {
+      const cost = +(qty * costBasis * mult + fees).toFixed(2);
+      try {
+        const cash = (typeof getCashPosition === 'function') ? (getCashPosition() || 0) : 0;
+        if (entry.position === 'Short') {
+          // Short SALE credits proceeds to cash.
+          if (typeof setCashPosition === 'function') setCashPosition(+(cash + (qty * costBasis * mult - fees)).toFixed(2));
+        } else {
+          // Long/Trading BUY spends cash.
+          if (typeof setCashPosition === 'function') setCashPosition(+(cash - cost).toFixed(2));
+        }
+      } catch {}
+      // Log the entry transaction (dated to the position's entry date) so the
+      // ledger + chart reconstruct the cash flow at the right time.
+      try {
+        if (typeof appendTransaction === 'function') appendTransaction({
+          type: entry.position === 'Short' ? 'short' : 'buy',
+          ticker: entry.ticker, qty, price: costBasis, fee: fees,
+          cost: entry.position === 'Short' ? undefined : cost,
+          proceeds: entry.position === 'Short' ? +(qty * costBasis * mult - fees).toFixed(2) : undefined,
+          entryId: id, entryDate: (newEntry.addedAt || '').slice(0, 10), reason: 'position-added',
+        });
+      } catch {}
+    }
+  }
   return id;
 }
 // Best-effort immediate upsert of a single portfolio entry to the portfolio
@@ -24055,10 +24187,52 @@ function _portUpsertSafe(entry) {
     }
   } catch {}
 }
-function removeFromPortfolio(idOrTicker) {
-  // Accept either an id (preferred) or a ticker (legacy)
-  const arr = loadPortfolio().filter(e => e.id !== idOrTicker && e.ticker !== idOrTicker);
+function removeFromPortfolio(idOrTicker, opts = {}) {
+  // Accept either an id (preferred) or a ticker (legacy).
+  const all = loadPortfolio();
+  const removed = all.filter(e => e.id === idOrTicker || e.ticker === idOrTicker);
+  const arr = all.filter(e => e.id !== idOrTicker && e.ticker !== idOrTicker);
   savePortfolio(arr);
+
+  for (const entry of removed) {
+    const isActive = ACTIVE_POSITIONS.includes(entry.position);
+    const qty = +entry.qty || 0;
+    const costBasis = +entry.costBasis || 0;
+    // 1. AUTO-RETURN CASH: if a held (trading/long/short) position is deleted,
+    //    return its current market value (or cost basis) to cash so the user
+    //    doesn't have to top up cash manually. Skipped for watch/track/avoid
+    //    (no money was deployed) and when caller opts out (e.g. a sell already
+    //    booked the proceeds).
+    if (isActive && qty > 0 && !opts.noCashReturn) {
+      let px = costBasis;
+      try {
+        const sb = (state.stockbook?.rows || []).find(r => (r.ticker || '').toUpperCase() === (entry.ticker || '').toUpperCase());
+        if (sb && isFinite(sb.price)) px = sb.price;
+      } catch {}
+      const mult = (typeof positionMultiplier === 'function') ? positionMultiplier(entry) : 1;
+      const proceeds = +(qty * px * mult).toFixed(2);
+      if (proceeds > 0) {
+        try {
+          const cash = (typeof getCashPosition === 'function') ? (getCashPosition() || 0) : 0;
+          if (typeof setCashPosition === 'function') setCashPosition(+(cash + proceeds).toFixed(2));
+        } catch {}
+        // 2. RECORD A TRANSACTION so the removal is in the ledger (and ships).
+        try {
+          if (typeof appendTransaction === 'function') appendTransaction({
+            type: 'sell', ticker: entry.ticker, qty, price: px, fee: 0,
+            proceeds, entryId: entry.id, reason: opts.reason || 'position-removed',
+          });
+        } catch {}
+        if (typeof flashStatus === 'function') flashStatus(`Removed ${entry.ticker} — $${proceeds.toLocaleString(undefined,{maximumFractionDigits:0})} returned to cash`, 'success');
+      }
+    }
+    // 3. Remove from the GoodGlobe Index roster (unless a transaction history
+    //    should keep it — but per the mirror model, deleting removes it).
+    try { if (typeof removeFromGoodGlobeIndex === 'function') removeFromGoodGlobeIndex(entry.ticker); } catch {}
+    // 4. Delete the row from the portfolio Supabase mirror immediately.
+    try { if (typeof portSupabaseDelete === 'function' && entry.id) portSupabaseDelete(entry.id); } catch {}
+  }
+  return removed.length;
 }
 function findPortfolioEntry(id) {
   return loadPortfolio().find(e => e.id === id) || null;
@@ -24867,6 +25041,36 @@ function _renderPortfolioChartImpl(enriched, range) {
     else if (tx.type === 'buy-to-close') delta = -((tx.cost) || (tx.qty * tx.price * 100 + fee));
     if (delta !== 0) cashEvents.push({ date: dateIso, cashDelta: delta });
   }
+
+  // CRITICAL: a position added DIRECTLY (not through a logged buy/short tx) has
+  // no cash event, so its market value would inflate the chart with no
+  // offsetting cash outflow — exactly the "+$30K jump when I add SNK" bug.
+  // Buying is a CASH→ASSET swap: at entry, cash falls by cost and the position's
+  // MTM rises by the same amount, so NAV is UNCHANGED until prices move. We
+  // synthesize that entry cash event for every active position whose entry isn't
+  // already represented by a transaction on/near its entry date.
+  const _txKeyset = new Set(txLedger
+    .filter(t => t.entryDate && t.ticker && (t.type === 'buy' || t.type === 'short' || t.type === 'buy-to-open' || t.type === 'sell-to-open'))
+    .map(t => `${(t.ticker || '').toUpperCase()}|${(t.entryDate || '').slice(0,10)}`));
+  for (const p of positionContributions) {
+    if (p.isHistorical) continue;                       // sold positions handled via ledger
+    if (!ACTIVE_POSITIONS.includes(p.position)) continue;
+    const entryIso = (p.windowed[0]?.date) || null;
+    if (!entryIso) continue;
+    const key = `${(p.ticker || '').toUpperCase()}|${entryIso}`;
+    if (_txKeyset.has(key)) continue;                   // a real tx already covers this entry
+    const mult = p.multiplier || 1;
+    const cost = (p.cost != null ? p.cost : 0) * p.qty * mult + (p.fees || 0);
+    if (!cost) continue;
+    if (p.position === 'Short') {
+      // Short entry CREDITS cash (broker pays you the sale proceeds); the
+      // negative MTM liability already cancels it, so NAV is flat at entry.
+      cashEvents.push({ date: entryIso, cashDelta: +(p.cost * p.qty * mult - (p.fees || 0)) });
+    } else {
+      // Long/Trading entry SPENDS cash equal to the position's cost.
+      cashEvents.push({ date: entryIso, cashDelta: -cost });
+    }
+  }
   cashEvents.sort((a, b) => a.date.localeCompare(b.date));
 
   // Cumulative cash at any date. Reconciled to current Cash Position so the
@@ -25291,6 +25495,11 @@ function wirePortfolioRowEvents() {
 //     (3) Export toolbar — copy-to-clipboard, download .txt (all OR manual-only)
 // ============================================================
 function renderGoodGlobeIndexView(content, summary, subTabs) {
+  // Make sure every current portfolio position (held, watched, OR tracked) is in
+  // the index roster before we render — the index should always mirror the
+  // portfolio. This is why the roster looked empty after a refresh: nothing
+  // re-populated it from the loaded portfolio.
+  try { if (typeof backfillGoodGlobeIndexFromPortfolio === 'function') backfillGoodGlobeIndexFromPortfolio(); } catch {}
   const entries = (typeof getGoodGlobeIndexEntries === 'function') ? getGoodGlobeIndexEntries() : [];
   // Per-member live return % since each was added (equal-weight index members).
   // Built once here so each row can show its contribution to the index.
@@ -25573,6 +25782,10 @@ function renderGoodGlobeIndexView(content, summary, subTabs) {
       const idx = loadGoodGlobeIndex();
       delete idx[tic];
       saveGoodGlobeIndex(idx);
+      // Refresh the GoodGlobe index singleton in the Supabase mirror.
+      try { if (typeof portSupabaseConfigured === 'function' && portSupabaseConfigured() && typeof portSupabaseUpsert === 'function') {
+        portSupabaseUpsert({ id: '__goodglobe_index__', _kind: 'index', value: loadGoodGlobeIndex() });
+      } } catch {}
       renderStockBookPortfolio(content);
     });
   });
@@ -30449,6 +30662,18 @@ async function renderCompany13fHolders(ticker) {
   holders.sort((a, b) => (b.value || 0) - (a.value || 0));
   const changeColor = (typeof _13fChangeColor === 'function') ? _13fChangeColor : () => 'var(--ink-dim)';
   const changeLabel = (typeof _13fChangeLabel === 'function') ? _13fChangeLabel : (c) => c;
+  // Format a 13F period (quarter-end date) into a readable "as of" label.
+  const _fmtPeriod = (p) => {
+    if (!p) return '—';
+    const d = new Date(p + (p.length === 10 ? 'T00:00:00Z' : ''));
+    if (isNaN(d)) return p;
+    const q = Math.floor(d.getUTCMonth() / 3) + 1;
+    return `Q${q} ${d.getUTCFullYear()}`;
+  };
+  // The newest period present across holders — surfaced in the header so the
+  // whole table's "as of" date is obvious at a glance.
+  const _periods = holders.map(h => h.period).filter(Boolean).sort();
+  const _latestPeriod = _periods.length ? _periods[_periods.length - 1] : null;
   const rows = holders.map(h => {
     const isOpt = h.option === 'PUT' || h.option === 'CALL';
     return `<tr>
@@ -30456,19 +30681,20 @@ async function renderCompany13fHolders(ticker) {
       <td style="font-family:var(--mono);font-size:11px;text-align:right">$${(h.value / 1e6).toFixed(1)}M</td>
       <td style="font-family:var(--mono);font-size:11px;text-align:right">${(h.shares || 0).toLocaleString()}</td>
       <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${changeColor(h.change)}">${changeLabel(h.change)}</td>
+      <td style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);white-space:nowrap" title="13F reporting period (quarter-end the filing covers)${h.period ? ' · ' + h.period : ''}">${_fmtPeriod(h.period)}</td>
       <td style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${isOpt ? h.option + ' (mkt value)' : 'equity'}</td>
     </tr>`;
   }).join('');
   host.innerHTML = `
     <div class="company-card">
-      <h4>Institutional Holders (13F) <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· tracked institutions · latest quarter · Q/Q changes</span></h4>
+      <h4>Institutional Holders (13F) <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· tracked institutions${_latestPeriod ? ' · as of ' + _fmtPeriod(_latestPeriod) + ' (' + _latestPeriod + ')' : ''} · Q/Q changes</span></h4>
       <div style="overflow-x:auto">
-        <table class="sb-table" style="width:100%;min-width:520px">
-          <thead><tr><th>Institution</th><th style="text-align:right">Market Value</th><th style="text-align:right">Shares</th><th>Q/Q Change</th><th>Type</th></tr></thead>
+        <table class="sb-table" style="width:100%;min-width:580px">
+          <thead><tr><th>Institution</th><th style="text-align:right">Market Value</th><th style="text-align:right">Shares</th><th>Q/Q Change</th><th>Reported</th><th>Type</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
       </div>
-      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:8px">Among ${holders.length} tracked institution(s). Press F2 → THF for full institutional portfolios.</div>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:8px">Among ${holders.length} tracked institution(s). "Reported" = the 13F period each filing covers (quarter-end); filings post ~45 days after. Press F2 → THF for full institutional portfolios.</div>
     </div>`;
 }
 
@@ -40597,6 +40823,21 @@ async function portSupabaseUpsert(rec) {
   } catch (e) { console.warn('[port-supabase] upsert error', e.message); return false; }
 }
 
+// Delete a SINGLE portfolio record from Supabase immediately (called when a
+// position/watch/track is removed locally, so the mirror stays in sync).
+async function portSupabaseDelete(id) {
+  if (!portSupabaseConfigured() || !id) return false;
+  try {
+    const r = await fetch(`${getPortSupabaseUrl()}/rest/v1/${PORT_SUPABASE_TABLE}?id=eq.${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: _portSupabaseHeaders({ 'Prefer': 'return=minimal' }),
+    });
+    if (!r.ok) { console.warn('[port-supabase] delete failed', r.status); return false; }
+    return true;
+  } catch (e) { console.warn('[port-supabase] delete error', e.message); return false; }
+}
+if (typeof window !== 'undefined') window.portSupabaseDelete = portSupabaseDelete;
+
 // Existing ids in the portfolio table (for dedup on bulk sync).
 async function _portSupabaseExistingIds() {
   const ids = new Set();
@@ -40635,8 +40876,15 @@ async function portSupabaseSyncAll() {
     if (!rec.ticker && e.ticker) rec.ticker = e.ticker;
     records.push(rec);
   }
-  // Transactions ledger (immutable history).
-  for (const t of (snap.transactions || [])) records.push(Object.assign({ _kind: 'transaction' }, t));
+  // Transactions ledger (immutable history). Give each a stable txn:-prefixed id
+  // so the reconcile step can recognize + preserve transaction rows.
+  for (const t of (snap.transactions || [])) {
+    const rec = Object.assign({ _kind: 'transaction' }, t);
+    if (!rec.id || !String(rec.id).startsWith('txn:')) {
+      rec.id = `txn:${t.id || (t.ticker || 'TX') + '-' + (t.ts || t.date || Math.random().toString(36).slice(2, 8))}`;
+    }
+    records.push(rec);
+  }
   // Singletons: cash, GoodGlobe index + curve, and a full snapshot for restore.
   if (snap.cashPosition != null) records.push({ id: '__cash__', _kind: 'cash', value: snap.cashPosition });
   if (snap.goodGlobeIndex != null) records.push({ id: '__goodglobe_index__', _kind: 'index', value: snap.goodGlobeIndex });
@@ -40659,6 +40907,7 @@ async function portSupabaseSyncAll() {
   try {
     const existing = await _portSupabaseExistingIds();
     const rows = [];
+    const localIds = new Set();    // every id that SHOULD exist in Supabase now
     for (const rec of records) {
       // Enrich entries/transactions with the weight context; singletons pass through.
       let row;
@@ -40669,11 +40918,41 @@ async function portSupabaseSyncAll() {
       } else {
         row = _portSupabaseRow(rec);
       }
-      const isOpenHolding = rec._kind === 'entry' && !rec.exitDate && !rec.closed;
-      const mutable = ['cash', 'index', 'indexCurve', 'snapshot'].includes(rec._kind);
-      if (!existing.has(row.id) || isOpenHolding || mutable) rows.push(row);
+      localIds.add(row.id);
+      // Always re-upsert entries (marks/enrichment change) + mutable singletons;
+      // transactions are immutable so only push if new.
+      const isTxn = rec._kind === 'transaction';
+      if (!isTxn || !existing.has(row.id)) rows.push(row);
     }
-    if (!rows.length) { if (typeof flashStatus === 'function') flashStatus('Portfolio Supabase already up to date', 'success'); return 0; }
+    // RECONCILE: delete Supabase rows that no longer exist locally. Supabase
+    // mirrors CURRENT local state — when a position/watch/track is removed
+    // locally, it must disappear from the table too. EXCEPTION: keep transaction
+    // rows (immutable history) and the snapshot singleton. The GitHub repo keeps
+    // the full history; Supabase is just the live mirror.
+    const toDelete = [];
+    for (const id of existing) {
+      if (localIds.has(id)) continue;                      // still present locally
+      if (typeof id === 'string' && id.startsWith('txn:')) continue;  // keep tx history
+      if (id === '__portfolio_snapshot__') continue;
+      toDelete.push(id);
+    }
+    let deleted = 0;
+    if (toDelete.length) {
+      try {
+        // Delete in chunks via the `id=in.(...)` filter.
+        for (let i = 0; i < toDelete.length; i += 50) {
+          const chunk = toDelete.slice(i, i + 50);
+          const inList = chunk.map(id => `"${String(id).replace(/"/g, '')}"`).join(',');
+          const r = await fetch(`${getPortSupabaseUrl()}/rest/v1/${PORT_SUPABASE_TABLE}?id=in.(${encodeURIComponent(inList)})`, {
+            method: 'DELETE',
+            headers: _portSupabaseHeaders({ 'Prefer': 'return=minimal' }),
+          });
+          if (r.ok) deleted += chunk.length;
+          else console.warn('[port-supabase] reconcile delete failed', r.status, await r.text().catch(() => ''));
+        }
+      } catch (e) { console.warn('[port-supabase] reconcile error', e.message); }
+    }
+    if (!rows.length && !deleted) { if (typeof flashStatus === 'function') flashStatus('Portfolio Supabase already up to date', 'success'); return 0; }
     let sent = 0;
     for (let i = 0; i < rows.length; i += 100) {
       const chunk = rows.slice(i, i + 100);
@@ -40685,7 +40964,7 @@ async function portSupabaseSyncAll() {
       if (!r.ok && r.status !== 409) { console.warn('[port-supabase] bulk chunk failed', r.status); if (typeof flashStatus === 'function') flashStatus(`Portfolio sync failed at row ${i} (HTTP ${r.status})`, 'error'); break; }
       sent += chunk.length;
     }
-    if (typeof flashStatus === 'function') flashStatus(`Synced ${sent} portfolio record${sent !== 1 ? 's' : ''} to TRAPP2-PORT Supabase`, 'success');
+    if (typeof flashStatus === 'function') flashStatus(`Synced ${sent} portfolio record${sent !== 1 ? 's' : ''}${deleted ? `, removed ${deleted} stale` : ''} → Supabase mirror`, 'success');
     return sent;
   } catch (e) { console.warn('[port-supabase] bulk error', e.message); if (typeof flashStatus === 'function') flashStatus('Portfolio Supabase sync error — see console', 'error'); return 0; }
 }
@@ -42831,6 +43110,17 @@ async function botDailyRun(force = false) {
     if (typeof flashStatus === 'function') flashStatus('Bot: Stock Book not loaded yet — open the Stock Book tab first', 'error');
     return bot;
   }
+  // PRICE-READINESS GUARD: don't scan until a meaningful share of rows actually
+  // have live prices. Running with stale/zero prices makes the bot enter at bad
+  // marks and then immediately rebalance — the churn the user saw. Require ≥50%
+  // of rows priced (unless forced).
+  const priced = rows.filter(r => isFinite(r.price) && r.price > 0).length;
+  const pricedFrac = rows.length ? priced / rows.length : 0;
+  if (!force && pricedFrac < 0.5) {
+    console.warn(`[bot] only ${priced}/${rows.length} rows priced (${(pricedFrac*100).toFixed(0)}%) — deferring scan until prices load`);
+    if (typeof flashStatus === 'function') flashStatus(`Bot: waiting for prices to load (${priced}/${rows.length} ready) — try again in a moment`, 'info');
+    return bot;
+  }
   try {
   return await _botDailyRunInner(bot, today, rows, force);
   } catch (e) {
@@ -44061,9 +44351,69 @@ if (typeof window !== 'undefined') window.botConfidenceFactor = botConfidenceFac
 // for the period return resets at the window start (and, per the request, the
 // "current trades" basis effectively resets when positions close and book value
 // is realized) — while all-time always anchors to $100k.
+// Reconstruct a DAILY equity curve from the trade history so the chart is rich
+// even when the bot has only run a few times (the stored curve only gets one
+// point per day the app is opened). For every calendar day from the first trade
+// to today, the book value = starting bankroll + realized P&L from trades closed
+// on/before that day + marked P&L of trades open on that day (using their last
+// known pnl as a proxy, scaled toward 0 at entry so early days aren't flat).
+// Returns [{date, value}] ascending. Merges UNDER the stored curve (real recorded
+// points win) so genuine intraday marks aren't lost.
+function botReconstructEquityCurve(bot) {
+  try {
+    const bets = (bot && Array.isArray(bot.bets)) ? bot.bets : [];
+    if (!bets.length) return [];
+    // Earliest entry date.
+    let minDate = null;
+    for (const b of bets) {
+      if (b.entryDate && (!minDate || b.entryDate < minDate)) minDate = b.entryDate;
+    }
+    if (!minDate) return [];
+    const start = new Date(minDate + 'T00:00:00Z');
+    const today = new Date();
+    const dayMs = 86400000;
+    const out = [];
+    // Cap at ~370 daily points (1y+) for performance.
+    const totalDays = Math.min(370, Math.round((today - start) / dayMs) + 1);
+    for (let d = 0; d < totalDays; d++) {
+      const cur = new Date(start.getTime() + d * dayMs);
+      const ds = cur.toISOString().slice(0, 10);
+      let realized = 0, openMark = 0;
+      for (const b of bets) {
+        if (!b.entryDate || b.entryDate > ds) continue;             // not entered yet
+        const closed = b.status === 'closed' && b.exitDate && b.exitDate <= ds;
+        if (closed) {
+          realized += (b.pnl || 0);
+        } else if (b.status === 'open' || (b.exitDate && b.exitDate > ds)) {
+          // Open on this day. Ramp the mark from 0 at entry to its current pnl
+          // over the holding period so the curve isn't a flat step.
+          const entT = new Date(b.entryDate + 'T00:00:00Z').getTime();
+          const span = Math.max(1, (today.getTime() - entT) / dayMs);
+          const elapsed = Math.max(0, Math.min(span, (cur.getTime() - entT) / dayMs));
+          openMark += (b.pnl || 0) * (elapsed / span);
+        }
+      }
+      out.push({ date: ds, value: +(BOT_STARTING_BANKROLL + realized + openMark).toFixed(2) });
+    }
+    return out;
+  } catch { return []; }
+}
+
 function botWindowedPerformance() {
   const bot = botMarkToMarket();
-  const curve = Array.isArray(bot.equityCurve) ? bot.equityCurve.slice() : [];
+  let curve = Array.isArray(bot.equityCurve) ? bot.equityCurve.slice() : [];
+  // Enrich the stored curve with a daily reconstruction from trade history so
+  // the chart and all time windows have enough points to be meaningful. The
+  // stored points (real recorded marks) take precedence on any shared date.
+  try {
+    const recon = botReconstructEquityCurve(bot);
+    if (recon.length) {
+      const byDate = new Map();
+      for (const p of recon) byDate.set(p.date, p);       // reconstructed base
+      for (const p of curve) byDate.set(p.date, p);        // real points override
+      curve = Array.from(byDate.values()).sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    }
+  } catch {}
   const now = curve.length ? curve[curve.length - 1].value : BOT_STARTING_BANKROLL;
   const today = new Date();
   const windows = {
@@ -44074,11 +44424,15 @@ function botWindowedPerformance() {
   };
   const valueAtOrBefore = (cutoffMs) => {
     // The curve point on/just before the cutoff is the window's starting value.
+    // If the cutoff predates all history (e.g. a 1Y window on a 40-day-old bot),
+    // fall back to the EARLIEST point so the window still shows a return vs the
+    // start, rather than a blank "—".
     let start = null;
     for (const p of curve) {
       const t = new Date(p.date + 'T00:00:00Z').getTime();
       if (t <= cutoffMs) start = p; else break;
     }
+    if (!start && curve.length) start = curve[0];   // window older than all history → since-inception
     return start ? start.value : null;
   };
   const out = {};
@@ -44276,13 +44630,13 @@ function renderBetsTab() {
     }
     const vals = pts.map(p => p.value);
     const minV = Math.min(...vals), maxV = Math.max(...vals);
-    const pad = (maxV - minV) * 0.08 || 1000;
+    const pad = (maxV - minV) * 0.10 || 1000;
     const lo = minV - pad, hi = maxV + pad;
-    const W = 600, H = 160;
+    const W = 600, H = 170, PADL = 0;
     const x = (i) => pts.length > 1 ? (i / (pts.length - 1)) * W : 0;
     const y = (v) => H - ((v - lo) / (hi - lo)) * H;
     const linePath = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(p.value).toFixed(1)}`).join(' ');
-    const basisY = y(BOT_STARTING_BANKROLL);   // the $100k reference line
+    const basisY = y(BOT_STARTING_BANKROLL);
     const showBasis = BOT_STARTING_BANKROLL >= lo && BOT_STARTING_BANKROLL <= hi;
     const first = pts[0].value, lastV = pts[pts.length - 1].value;
     const up = lastV >= first;
@@ -44291,6 +44645,23 @@ function renderBetsTab() {
     const winData = wp.windows[activeWin];
     const winPct = winData?.returnPct;
     const winColor = winPct == null ? 'var(--ink-dim)' : winPct >= 0 ? 'var(--pos)' : 'var(--neg)';
+    // Horizontal gridlines with $ labels (like the Valuation chart) — 4 evenly
+    // spaced levels across the value range.
+    const _fmtK = (v) => Math.abs(v) >= 1000 ? '$' + (v / 1000).toFixed(1) + 'k' : '$' + v.toFixed(0);
+    const gridN = 4;
+    let gridHtml = '';
+    for (let g = 0; g <= gridN; g++) {
+      const gv = lo + (hi - lo) * (g / gridN);
+      const gy = y(gv).toFixed(1);
+      gridHtml += `<line x1="0" y1="${gy}" x2="${W}" y2="${gy}" stroke="var(--rule)" stroke-width="0.5" opacity="0.35"/>
+        <text x="2" y="${(parseFloat(gy) - 2).toFixed(1)}" font-family="monospace" font-size="8" fill="var(--ink-faint)" opacity="0.6">${_fmtK(gv)}</text>`;
+    }
+    // Peak + trough markers (highest/lowest equity in the window).
+    const maxI = vals.indexOf(maxV), minI = vals.indexOf(minV);
+    const peakMark = (maxV !== minV && pts.length > 3)
+      ? `<circle cx="${x(maxI).toFixed(1)}" cy="${y(maxV).toFixed(1)}" r="2.5" fill="var(--pos)" opacity="0.7"/>
+         <circle cx="${x(minI).toFixed(1)}" cy="${y(minV).toFixed(1)}" r="2.5" fill="var(--neg)" opacity="0.7"/>` : '';
+    const pointCount = pts.length;
     chartHtml = `
     <div class="company-card" style="margin:0 0 18px">
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px">
@@ -44300,28 +44671,33 @@ function renderBetsTab() {
             ${activeWin === 'all' ? 'All-time vs $100,000 basis' : activeWin + ' window'} ·
             <span style="color:${winColor};font-weight:700">${winPct == null ? '—' : (winPct >= 0 ? '+' : '') + winPct + '%'}</span>
             ${winData?.dollars != null ? `<span style="color:${winColor}"> (${winData.dollars >= 0 ? '+' : ''}$${Math.abs(winData.dollars).toLocaleString(undefined,{maximumFractionDigits:0})})</span>` : ''}
+            <span style="color:var(--ink-faint)"> · ${pointCount} pts</span>
           </div>
         </div>
         <div class="seg-control" style="font-size:10px">
           ${['week','month','year','all'].map(w => `<button class="seg-btn ${activeWin===w?'active':''}" data-perfwin="${w}" style="font-size:10px;text-transform:capitalize">${w==='all'?'All':w==='week'?'1W':w==='month'?'1M':'1Y'}</button>`).join('')}
         </div>
       </div>
-      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:160px;display:block">
+      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:170px;display:block">
         <defs>
           <linearGradient id="botEqGrad" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stop-color="${up ? 'rgba(61,220,132,0.28)' : 'rgba(255,92,92,0.28)'}"/>
+            <stop offset="0%" stop-color="${up ? 'rgba(61,220,132,0.30)' : 'rgba(255,92,92,0.30)'}"/>
+            <stop offset="55%" stop-color="${up ? 'rgba(61,220,132,0.08)' : 'rgba(255,92,92,0.08)'}"/>
             <stop offset="100%" stop-color="${up ? 'rgba(61,220,132,0)' : 'rgba(255,92,92,0)'}"/>
           </linearGradient>
         </defs>
-        ${showBasis ? `<line x1="0" y1="${basisY.toFixed(1)}" x2="${W}" y2="${basisY.toFixed(1)}" stroke="var(--ink-faint)" stroke-width="1" stroke-dasharray="4,4" opacity="0.5"/>
-        <text x="4" y="${(basisY - 4).toFixed(1)}" font-family="monospace" font-size="9" fill="var(--ink-faint)" opacity="0.7">$100k basis</text>` : ''}
+        ${gridHtml}
+        ${showBasis ? `<line x1="0" y1="${basisY.toFixed(1)}" x2="${W}" y2="${basisY.toFixed(1)}" stroke="var(--amber)" stroke-width="1" stroke-dasharray="4,4" opacity="0.55"/>
+        <text x="${W - 4}" y="${(basisY - 4).toFixed(1)}" text-anchor="end" font-family="monospace" font-size="9" fill="var(--amber)" opacity="0.85">$100k basis</text>` : ''}
         <path d="${areaPath}" fill="url(#botEqGrad)"/>
-        <path d="${linePath}" fill="none" stroke="${lineColor}" stroke-width="2" stroke-linejoin="round"/>
+        <path d="${linePath}" fill="none" stroke="${lineColor}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+        ${peakMark}
         <circle cx="${x(pts.length-1).toFixed(1)}" cy="${y(lastV).toFixed(1)}" r="3.5" fill="${lineColor}"/>
+        <circle cx="${x(pts.length-1).toFixed(1)}" cy="${y(lastV).toFixed(1)}" r="6" fill="none" stroke="${lineColor}" stroke-width="1" opacity="0.4"/>
       </svg>
       <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:4px">
         <span>${pts[0].date}</span>
-        <span>$${lastV.toLocaleString(undefined,{maximumFractionDigits:0})}</span>
+        <span style="color:${lineColor};font-weight:700">$${lastV.toLocaleString(undefined,{maximumFractionDigits:0})}</span>
         <span>${pts[pts.length-1].date}</span>
       </div>
     </div>`;
