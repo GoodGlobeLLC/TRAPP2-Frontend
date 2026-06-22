@@ -33187,7 +33187,23 @@ function validateAndFixTicker(article) {
 
   const assignedScore = scores[article.ticker] || 0;
   const maxScore = Math.max(...Object.values(scores), 0);
-  const trusted = article._fetchedByTicker === true;
+  // An article is "trusted" only if it came from a ticker's own feed AND the
+  // pipeline judged the tag confident (symbol/name/related-ticker match). The
+  // pipeline now blanks non-confident tags, so a blank ticker is an explicit
+  // "needs review" signal and must never be treated as trusted.
+  const hasTicker = !!(article.ticker && String(article.ticker).trim());
+  const pipelineConfident = article._tickerConfident !== false;  // undefined = legacy = assume ok
+  const trusted = hasTicker && article._fetchedByTicker === true && pipelineConfident;
+
+  // Blank ticker (pipeline couldn't confidently attribute it) → straight to
+  // review with the fetch-origin offered as a suggestion, never auto-applied.
+  if (!hasTicker) {
+    article._proposedTicker = null;
+    article._suggestedTicker = article._suggestedTicker || article._reassignedFrom || null;
+    article._needsTickerReview = true;
+    if (typeof queueArticleForReview === 'function') queueArticleForReview(article);
+    return article;
+  }
 
   // ---- CONFIDENCE GATE ----
   // The output is one of: keep (trusted/matched), confident retag, or
@@ -39573,11 +39589,57 @@ function reviewThesisDelete(id) {
 function reviewGenericOption(id, optIdx) {
   const item = loadReviewQueue().find(x => x.id === id);
   const opt = item?.options?.[optIdx];
+  // Actions that open an editor (or otherwise need the item to STAY in the queue
+  // until the user confirms) must NOT dequeue here. The "Fix ticker…" flow opens
+  // the article editor; the item should remain visible so that after fixing, the
+  // user clicks OK/Confirm to finalize — at which point it leaves review and
+  // reappears in the News feed with the fixes applied.
+  const KEEP_IN_QUEUE = new Set(['newsReportFix']);
   if (opt && typeof window[opt.action] === 'function') {
     try { window[opt.action](item); } catch (e) { console.warn('[review] option action failed', e); }
   }
+  if (opt && KEEP_IN_QUEUE.has(opt.action)) {
+    // Leave the item in the queue; just re-render so any state (e.g. the editor)
+    // shows. The editor's Save handler refreshes the feed; OK/Confirm dequeues.
+    renderReviewHub();
+    return;
+  }
   _dequeue(id);
   renderReviewHub();
+}
+
+// News-report review actions (from the News tab "report" flow → genericCard).
+if (typeof window !== 'undefined') {
+  // Keep the article's current ticker — acknowledge + leave it in the feed.
+  window.newsReportKeep = function (item) {
+    try { if (typeof updateNewsStatus === 'function') updateNewsStatus(`Kept ${item?.ticker || 'ticker'} — article confirmed`); } catch {}
+    try { if (typeof renderNewsFeed === 'function') renderNewsFeed(); } catch {}
+  };
+  // Fix ticker — open the SAME full article editor used in the News tab. The
+  // item stays in the review queue (reviewGenericOption keeps it) so after the
+  // user saves the fix they can click OK/Confirm to finalize; the editor's Save
+  // refreshes the News feed with the durable fix applied.
+  window.newsReportFix = function (item) {
+    const key = item?.articleKey || item?.key || item?.url;
+    if (key && typeof openArticleEditor === 'function') {
+      openArticleEditor(key);
+    } else if (typeof flashStatus === 'function') {
+      flashStatus('Could not open the article editor (no article key)', 'error');
+    }
+  };
+  // Remove the article entirely — mark it bad so it's hidden from the feed.
+  window.newsReportRemove = function (item) {
+    try {
+      const key = item?.articleKey || item?.key || item?.url;
+      if (key && typeof loadArticleFixes === 'function' && typeof saveArticleFixes === 'function') {
+        const fixes = loadArticleFixes() || {};
+        fixes[key] = Object.assign({}, fixes[key], { verdict: 'bad' });
+        saveArticleFixes(fixes);
+      }
+      if (typeof renderNewsFeed === 'function') renderNewsFeed();
+      if (typeof updateNewsStatus === 'function') updateNewsStatus('Article removed from the feed');
+    } catch (e) { console.warn('[news] remove failed', e.message); }
+  };
 }
 
 // ---- Action handlers for the news/leadership review items ----
