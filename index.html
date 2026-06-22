@@ -8521,19 +8521,19 @@
         <button class="btn btn-ghost" id="port-supabase-sync-btn" title="Push every portfolio position, watchlist item, transaction + GoodGlobe index to the portfolio Supabase now">Sync Portfolio Now ↗</button>
         <span id="port-supabase-status" style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);align-self:center"></span>
       </div>
-      <div class="modal-help">Holds your portfolio in the <code>portfolio_positions</code> table — now synced ENRICHED (name, market value, P/L, conviction, confidence, reliability), so the generated columns + the portfolio_performance view populate. It loads live prices first so holdings carry P/L. It can live in <strong>its own Supabase project OR share one with the bot or analytics</strong>. Run <code>portfolio_positions_schema.sql</code> once in whichever project hosts it.</div>
+      <div class="modal-help">Holds your portfolio in the <code>portfolio_positions</code> table — synced ENRICHED with ALL the schema fields (shares, avg_cost, weight, market value, P/L, conviction, confidence, thesis, reliability, open_date, plus txn_action/shares/price/date for the ledger). Loads live prices first. The GoodGlobe Index now mirrors the WHOLE portfolio (watching + tracking too). Run <code>portfolio_positions_schema.sql</code> once in whichever project hosts it.</div>
     </div>
 
     <div class="modal-section" style="border-top:1px solid var(--rule);padding-top:14px">
-      <div class="modal-label">Analytics Supabase (TRAPP2-ANALYTICS — research grades, regime)</div>
+      <div class="modal-label">Analytics Supabase (TRAPP2-ANALYTICS — research grades, regime, KV)</div>
       <input type="text" class="modal-input" id="analytics-supabase-url-input" placeholder="Analytics project URL — its own project, or shared with bot/portfolio" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
       <input type="text" class="modal-input" id="analytics-supabase-anon-input" placeholder="anon public key" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         <button class="btn" id="analytics-supabase-save-btn">Save Analytics Config</button>
-        <button class="btn btn-ghost" id="analytics-supabase-sync-btn" title="Push the research grades + regime the app holds to Supabase (run analytics_anon_write.sql once first so the anon key can write)">Sync Analytics Now ↗</button>
+        <button class="btn btn-ghost" id="analytics-supabase-sync-btn" title="Push research grades + the full regime timeline + probability/regime KV to Supabase (run analytics_anon_write.sql once first so the anon key can write)">Sync Analytics Now ↗</button>
         <span id="analytics-supabase-status" style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);align-self:center"></span>
       </div>
-      <div class="modal-help">Research grades + regime in <code>research_grades</code> / <code>regime_snapshots</code>. The app can <strong>push these directly</strong> (anon key) — run <code>analytics_anon_write.sql</code> ONCE to allow anon writes, then "Sync Analytics Now" (it loads regime + grades first, then pushes). If you see a 401/403 error, the anon-write SQL hasn't run. The pipeline (service key) still works if deployed; both upsert on the same key. Shares cleanly with portfolio/bot.</div>
+      <div class="modal-help">Pushes research grades, the FULL regime timeline (from TRAPP2-1 history, not just current), and analytics_kv rows (probability theses + regime drivers). Run <code>analytics_anon_write.sql</code> ONCE to allow anon writes, then "Sync Analytics Now". A 401/403 means that SQL hasn't run. Shares cleanly with portfolio/bot.</div>
     </div>
 
     <!-- Repository Backup & Sync — Update + Export for all four repos (populated by renderRepoSyncPanel) -->
@@ -8864,6 +8864,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260615z22"></script>
+<script src="app.js?v=20260615z23"></script>
 </body>
 </html>

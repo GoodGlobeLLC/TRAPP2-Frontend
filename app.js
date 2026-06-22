@@ -1221,6 +1221,32 @@ function recordInGoodGlobeIndex(ticker, flag, opts = {}) {
   saveGoodGlobeIndex(idx);
 }
 
+// Backfill the GoodGlobe Index roster from the ENTIRE portfolio — every position
+// regardless of role (Long, Short, Watching, Tracking, Trading, Avoid, Sold).
+// The index should mirror everything the user tracks; previously a ticker only
+// entered the index when explicitly flagged, so a portfolio imported from the
+// repo showed an empty index. Idempotent (recordInGoodGlobeIndex dedupes).
+// Returns the number of tickers ensured in the index.
+function backfillGoodGlobeIndexFromPortfolio() {
+  let n = 0;
+  try {
+    const portfolio = (typeof loadPortfolio === 'function') ? loadPortfolio() : [];
+    for (const e of portfolio) {
+      if (!e || !e.ticker) continue;
+      // The position role IS the flag (Watching/Tracking/Long/Short/...).
+      const flag = e.position || 'Tracking';
+      recordInGoodGlobeIndex(e.ticker, flag, {
+        entryPrice: (e.costBasis != null && isFinite(e.costBasis)) ? +e.costBasis : undefined,
+        source: 'portfolio',
+        notes: Array.isArray(e.notes) && e.notes.length ? (e.notes[0].text || null) : null,
+      });
+      n++;
+    }
+  } catch (err) { console.warn('[goodglobe] backfill failed', err.message); }
+  return n;
+}
+if (typeof window !== 'undefined') window.backfillGoodGlobeIndexFromPortfolio = backfillGoodGlobeIndexFromPortfolio;
+
 // Get all entries as an array sorted by lastFlaggedAt desc (most recent first)
 function getGoodGlobeIndexEntries() {
   const idx = loadGoodGlobeIndex();
@@ -23866,6 +23892,9 @@ function applyPortfolioImport(parsed) {
   }
   if (Array.isArray(positions)) {
     if (typeof savePortfolio === 'function') savePortfolio(positions);
+    // Make sure every imported position appears in the GoodGlobe Index roster
+    // (watching + tracking included), so the index mirrors the whole portfolio.
+    try { if (typeof backfillGoodGlobeIndexFromPortfolio === 'function') backfillGoodGlobeIndexFromPortfolio(); } catch {}
   }
   // If it's a full snapshot, also restore transactions / cash / GoodGlobe.
   if (snapshot) {
@@ -40464,20 +40493,43 @@ function _enrichPortfolioPosition(rec, ctx) {
   try {
     if (!rec || typeof rec !== 'object') return rec;
     if (rec._kind === 'snapshot') return rec;          // the snapshot record passes through
+
+    // Transactions: map the app's tx fields → the schema's txn_* column paths
+    // (the table reads action/shares/price/date; the app stores type/qty/price/ts).
+    if (rec._kind === 'transaction') {
+      const to = { ...rec };
+      if (rec.type != null && to.action == null) to.action = rec.type;        // 'buy'|'sell'
+      if (rec.qty != null && to.shares == null) to.shares = rec.qty;
+      if ((rec.ts || rec.date) && to.date == null) to.date = (rec.ts || rec.date);
+      return to;
+    }
+
     const out = { ...rec };
     const tk = (rec.ticker || '').toUpperCase();
     if (!tk) return out;
+
+    // ---- Field-name bridges so the generated columns populate ----
+    // schema reads 'shares' (app stores 'qty'), 'avgCost' (app stores 'costBasis'),
+    // 'openDate' (app stores 'addedAt'). Add the schema's names without losing the
+    // originals.
+    if (rec.qty != null && out.shares == null) out.shares = +rec.qty;
+    if (rec.costBasis != null && out.avgCost == null) out.avgCost = +rec.costBasis;
+    if (rec.addedAt && out.openDate == null) out.openDate = rec.addedAt;
+    // Thesis from the first note, if any.
+    if (out.thesis == null) {
+      const note = Array.isArray(rec.notes) && rec.notes.length ? (rec.notes[0].text || rec.notes[0]) : null;
+      if (note) out.thesis = String(note);
+    }
+
     const sbRows = (ctx && ctx.sbRows) || (typeof state !== 'undefined' && state.stockbook ? state.stockbook.rows : []) || [];
     const sb = sbRows.find(r => (r.ticker || '').toUpperCase() === tk) || null;
     const ACTIVE = (typeof ACTIVE_POSITIONS !== 'undefined') ? ACTIVE_POSITIONS : ['Long', 'Short', 'Buy to open', 'Sell to open'];
 
-    // Name + sector from live stockbook data.
     if (sb) {
       if (sb.name) out.name = sb.name;
       if (sb.sector) out.sector = sb.sector;
       if (sb.assetClass || sb.asset_class) out.assetClass = sb.assetClass || sb.asset_class;
     }
-    // Live price + P/L (mirrors the portfolio view's computePL).
     const livePrice = sb ? (sb.price ?? sb.fmpPrice ?? null) : null;
     const qty = +rec.qty || 0;
     const costBasis = +rec.costBasis || 0;
@@ -40488,7 +40540,7 @@ function _enrichPortfolioPosition(rec, ctx) {
     if (livePrice != null && isFinite(livePrice)) {
       out.livePrice = +livePrice.toFixed(4);
       if (costBasis > 0) {
-        out.pnlPct = +(dir * (livePrice - costBasis) / costBasis * 100).toFixed(2);   // percent
+        out.pnlPct = +(dir * (livePrice - costBasis) / costBasis * 100).toFixed(2);
         out.returnPct = out.pnlPct;
       }
       if (isActive && qty > 0) {
@@ -40496,20 +40548,22 @@ function _enrichPortfolioPosition(rec, ctx) {
         if (costBasis > 0) out.pnl = +(dir * (livePrice - costBasis) * qty * mult - fees).toFixed(2);
       }
     } else if (isActive && qty > 0 && costBasis > 0) {
-      // No live price — fall back to cost basis so market value isn't blank.
       out.marketValue = +(qty * costBasis * mult).toFixed(2);
+    }
+    // Weight = this position's share of total active market value (filled in by
+    // the caller when it knows the book total; default from ctx if provided).
+    if (out.weight == null && ctx && ctx.totalActiveMV && out.marketValue != null && ctx.totalActiveMV > 0) {
+      out.weight = +(out.marketValue / ctx.totalActiveMV * 100).toFixed(2);
     }
     // Conviction / confidence / reliability from the reasoning chain + grade.
     try {
       if (sb && typeof financialReasoningChain === 'function') {
         const chain = financialReasoningChain(sb);
         if (chain) {
-          if (chain.conviction != null) out.conviction = +Number(chain.conviction).toFixed(1);  // 0-100
+          if (chain.conviction != null) out.conviction = +Number(chain.conviction).toFixed(1);
           if (chain.confidence != null) out.confidence = +Number(chain.confidence).toFixed(1);
         }
       }
-      // Reliability = research-grade percentile if present (how trustworthy the
-      // signal is for this name), else derived from data coverage.
       if (sb) {
         const gScore = sb.backendGradeScore ?? sb.gradeScore ?? null;
         if (gScore != null && isFinite(gScore)) out.reliability = +Number(gScore).toFixed(0);
@@ -40569,6 +40623,9 @@ async function portSupabaseSyncAll() {
     }
     if (typeof refreshPortfolioQuotes === 'function') { try { await refreshPortfolioQuotes(); } catch {} }
   } catch {}
+  // Ensure the GoodGlobe Index mirrors the whole portfolio before we build the
+  // snapshot (so its roster — watching + tracking included — syncs too).
+  try { if (typeof backfillGoodGlobeIndexFromPortfolio === 'function') backfillGoodGlobeIndexFromPortfolio(); } catch {}
   const snap = (typeof buildPortfolioData === 'function') ? buildPortfolioData() : null;
   if (!snap) { if (typeof flashStatus === 'function') flashStatus('No portfolio data to sync', ''); return 0; }
   const records = [];
@@ -40586,11 +40643,32 @@ async function portSupabaseSyncAll() {
   if (snap.goodGlobeCurve != null) records.push({ id: '__goodglobe_curve__', _kind: 'indexCurve', value: snap.goodGlobeCurve });
   records.push({ id: '__portfolio_snapshot__', _kind: 'snapshot', counts: snap.counts, generatedAt: snap.generatedAt, schema: snap.schema });
   if (!records.length) { if (typeof flashStatus === 'function') flashStatus('Portfolio is empty — nothing to sync', ''); return 0; }
+  // Pre-compute total ACTIVE market value across holdings so each position's
+  // weight_pct can be filled (it's that position's share of the active book).
+  const _sbRows = (typeof state !== 'undefined' && state.stockbook ? state.stockbook.rows : []) || [];
+  const ACTIVE = (typeof ACTIVE_POSITIONS !== 'undefined') ? ACTIVE_POSITIONS : ['Long', 'Short', 'Buy to open', 'Sell to open'];
+  let _totalActiveMV = 0;
+  for (const rec of records) {
+    if (rec._kind !== 'entry' || !ACTIVE.includes(rec.position)) continue;
+    const sb = _sbRows.find(r => (r.ticker || '').toUpperCase() === (rec.ticker || '').toUpperCase());
+    const px = sb ? (sb.price ?? sb.fmpPrice ?? rec.costBasis) : rec.costBasis;
+    const mult = (typeof positionMultiplier === 'function') ? positionMultiplier(rec) : 1;
+    if (px && rec.qty) _totalActiveMV += Math.abs((+rec.qty) * (+px) * mult);
+  }
+  const _enrichCtx = { sbRows: _sbRows, totalActiveMV: _totalActiveMV };
   try {
     const existing = await _portSupabaseExistingIds();
     const rows = [];
     for (const rec of records) {
-      const row = _portSupabaseRow(rec);
+      // Enrich entries/transactions with the weight context; singletons pass through.
+      let row;
+      if (rec._kind === 'entry' || rec._kind === 'transaction') {
+        _ensurePortId(rec);
+        const enriched = (typeof _enrichPortfolioPosition === 'function') ? _enrichPortfolioPosition(rec, _enrichCtx) : rec;
+        row = { id: rec.id, position: enriched, updated_at: new Date().toISOString() };
+      } else {
+        row = _portSupabaseRow(rec);
+      }
       const isOpenHolding = rec._kind === 'entry' && !rec.exitDate && !rec.closed;
       const mutable = ['cash', 'index', 'indexCurve', 'snapshot'].includes(rec._kind);
       if (!existing.has(row.id) || isOpenHolding || mutable) rows.push(row);
@@ -40920,14 +40998,32 @@ async function analyticsSupabasePushRegime() {
     if (state && state.marketRegime && (state.marketRegime.date && state.marketRegime.date !== 'current')) {
       rows.push({ id: 'current', snapshot: state.marketRegime, updated_at: now });
     }
-    const hist = (typeof state !== 'undefined' && Array.isArray(state.marketRegimeHistory)) ? state.marketRegimeHistory : null;
-    if (hist) for (const h of hist) { if (h && h.date) rows.push({ id: h.date, snapshot: h, updated_at: now }); }
+    // Pull the full regime TIMELINE from TRAPP2-1 and push every snapshot so the
+    // regime_snapshots table has history (not just the current row). Each dated
+    // row keys on its date.
+    try {
+      const base = (typeof resolveMacroBase === 'function' && resolveMacroBase()) ? resolveMacroBase() : CANONICAL_REGIME_BASE;
+      const hr = await fetch(`${base}regime_history.json`, { cache: 'no-store' });
+      if (hr.ok) {
+        const hist = await hr.json();
+        if (Array.isArray(hist)) {
+          for (const h of hist) { if (h && h.date) rows.push({ id: h.date, snapshot: h, updated_at: now }); }
+        }
+      }
+    } catch {}
+    // Any in-memory history too.
+    const memHist = (typeof state !== 'undefined' && Array.isArray(state.marketRegimeHistory)) ? state.marketRegimeHistory : null;
+    if (memHist) for (const h of memHist) { if (h && h.date) rows.push({ id: h.date, snapshot: h, updated_at: now }); }
   } catch {}
-  if (!rows.length) { _analyticsLastPushError = 'no-regime'; return 0; }
+  // De-dupe by id (current + dated rows may overlap).
+  const _seen = new Set();
+  const _rows = [];
+  for (const r of rows) { if (!_seen.has(r.id)) { _seen.add(r.id); _rows.push(r); } }
+  if (!_rows.length) { _analyticsLastPushError = 'no-regime'; return 0; }
   let sent = 0;
   try {
-    for (let i = 0; i < rows.length; i += 200) {
-      const chunk = rows.slice(i, i + 200);
+    for (let i = 0; i < _rows.length; i += 200) {
+      const chunk = _rows.slice(i, i + 200);
       const r = await fetch(`${getAnalyticsSupabaseUrl()}/rest/v1/regime_snapshots?on_conflict=id`, {
         method: 'POST',
         headers: _analyticsWriteHeaders({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
@@ -40942,21 +41038,64 @@ async function analyticsSupabasePushRegime() {
 
 // Push everything the app holds for analytics. Returns a small summary.
 async function analyticsSupabasePushAll() {
-  if (!analyticsSupabaseConfigured()) { if (typeof flashStatus === 'function') flashStatus('Analytics Supabase not configured', ''); return { grades: 0, regime: 0 }; }
+  if (!analyticsSupabaseConfigured()) { if (typeof flashStatus === 'function') flashStatus('Analytics Supabase not configured', ''); return { grades: 0, regime: 0, kv: 0 }; }
   _analyticsLastPushError = null;
   const grades = await analyticsSupabasePushGrades();
   const regime = await analyticsSupabasePushRegime();
+  const kv = await analyticsSupabasePushKV();
   if (typeof flashStatus === 'function') {
     if (_analyticsLastPushError === 'forbidden') {
       flashStatus('Analytics push blocked (401/403) — run analytics_anon_write.sql in your analytics project so the anon key can write, then retry.', 'error');
-    } else if (grades === 0 && regime === 0) {
+    } else if (grades === 0 && regime === 0 && kv === 0) {
       if (_analyticsLastPushError === 'no-regime') flashStatus('Regime not loaded and no grades to push. Open Research + let regime load, then sync.', 'warn');
       else flashStatus('Nothing to push yet — open Research once so grades load, then sync.', 'warn');
     } else {
-      flashStatus(`Pushed ${grades} research grades + ${regime} regime snapshot(s) to Supabase`, 'success');
+      flashStatus(`Pushed ${grades} grades + ${regime} regime + ${kv} analytics rows to Supabase`, 'success');
     }
   }
-  return { grades, regime, error: _analyticsLastPushError };
+  return { grades, regime, kv, error: _analyticsLastPushError };
+}
+
+// Push key-value analytics the app holds → analytics_kv table. Currently:
+//   • probability:<TICKER>  — each probability thesis the user has set
+//   • regime:drivers        — the current regime's signal drivers
+//   • regime:probabilities  — the current regime's probability vector
+// keyed so the table's `category` (text before ':') groups them.
+async function analyticsSupabasePushKV() {
+  if (!analyticsSupabaseConfigured()) return 0;
+  const now = new Date().toISOString();
+  const rows = [];
+  try {
+    // Probability theses.
+    const theses = (typeof loadTheses === 'function') ? loadTheses() : null;
+    if (theses && typeof theses === 'object') {
+      const list = Array.isArray(theses) ? theses : Object.values(theses);
+      for (const th of list) {
+        if (th && th.ticker) rows.push({ key: `probability:${String(th.ticker).toUpperCase()}`, value: th, updated_at: now });
+      }
+    }
+    // Regime drivers + probabilities (handy for a dashboard).
+    if (typeof state !== 'undefined' && state.marketRegime) {
+      if (state.marketRegime.drivers) rows.push({ key: 'regime:drivers', value: state.marketRegime.drivers, updated_at: now });
+      if (state.marketRegime.probabilities) rows.push({ key: 'regime:probabilities', value: state.marketRegime.probabilities, updated_at: now });
+      if (state.marketRegime.scores) rows.push({ key: 'regime:scores', value: state.marketRegime.scores, updated_at: now });
+    }
+  } catch {}
+  if (!rows.length) return 0;
+  let sent = 0;
+  try {
+    for (let i = 0; i < rows.length; i += 200) {
+      const chunk = rows.slice(i, i + 200);
+      const r = await fetch(`${getAnalyticsSupabaseUrl()}/rest/v1/analytics_kv?on_conflict=key`, {
+        method: 'POST',
+        headers: _analyticsWriteHeaders({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+        body: JSON.stringify(chunk),
+      });
+      if (r.ok) sent += chunk.length;
+      else { const t = await r.text().catch(() => ''); console.warn('[analytics-supabase] kv push failed', r.status, t); _analyticsLastPushError = (r.status === 401 || r.status === 403) ? 'forbidden' : `http-${r.status}`; break; }
+    }
+  } catch (e) { console.warn('[analytics-supabase] kv push error', e.message); _analyticsLastPushError = 'network'; }
+  return sent;
 }
 
 if (typeof window !== 'undefined') {
@@ -40969,6 +41108,7 @@ if (typeof window !== 'undefined') {
   window.analyticsSupabasePushGrades = analyticsSupabasePushGrades;
   window.analyticsSupabasePushRegime = analyticsSupabasePushRegime;
   window.analyticsSupabasePushAll = analyticsSupabasePushAll;
+  window.analyticsSupabasePushKV = analyticsSupabasePushKV;
 }
 
 
