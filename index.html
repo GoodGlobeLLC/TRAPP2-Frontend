@@ -7798,6 +7798,10 @@
   <div class="prob-toolbar">
     <button class="btn" id="prob-new-btn">+ New Thesis</button>
     <button class="btn btn-ghost" id="prob-recalc-btn">Recalculate All</button>
+    <button class="btn btn-ghost" id="prob-export-btn" title="Download probability_data.json to commit to TRAPP2-PORT (keeps your theses for future reference)">⤓ Export Theses</button>
+    <button class="btn btn-ghost" id="prob-import-repo-btn" title="Pull probability_data.json from TRAPP2-PORT and merge your theses back in (no duplicates)">⤒ Load from Repo</button>
+    <button class="btn btn-ghost" id="prob-sync-supabase-btn" title="Push every thesis to Supabase analytics_kv now (needs analytics_anon_write.sql + Analytics config)">↗ Sync to Supabase</button>
+    <button class="btn btn-ghost" id="prob-commit-btn" title="Open the TRAPP2-PORT editor to paste/commit probability_data.json">Open Repo to Commit ↗</button>
     <button class="btn btn-ghost" id="prob-clear-btn">Clear All</button>
     <div class="status" id="prob-status">—</div>
   </div>
@@ -8525,7 +8529,7 @@
     </div>
 
     <div class="modal-section" style="border-top:1px solid var(--rule);padding-top:14px">
-      <div class="modal-label">Analytics Supabase (TRAPP2-ANALYTICS — research grades, regime, KV)</div>
+      <div class="modal-label">Analytics Supabase (TRAPP2-ANALYTICS — research grades, regime, KV, theses)</div>
       <input type="text" class="modal-input" id="analytics-supabase-url-input" placeholder="Analytics project URL — its own project, or shared with bot/portfolio" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
       <input type="text" class="modal-input" id="analytics-supabase-anon-input" placeholder="anon public key" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
       <div style="display:flex;gap:6px;flex-wrap:wrap">
@@ -8864,6 +8868,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260615z29"></script>
+<script src="app.js?v=20260615z32"></script>
 </body>
 </html>

@@ -1224,28 +1224,49 @@ function recordInGoodGlobeIndex(ticker, flag, opts = {}) {
     } catch {}
   }
 
+  // Entry DATE — honor an explicit date (e.g. a position's addedAt, possibly
+  // backdated) so the member's performance tracks from when it was actually
+  // placed, not from when it happened to land in the index. Falls back to now.
+  let entryDate = opts.entryDate || now;
+  // Normalize to ISO if a bare date or ms timestamp came in.
+  try {
+    if (typeof entryDate === 'number') entryDate = new Date(entryDate).toISOString();
+    else if (typeof entryDate === 'string' && entryDate && !entryDate.includes('T')) entryDate = new Date(entryDate + 'T00:00:00Z').toISOString();
+  } catch { entryDate = now; }
+
   if (!existing) {
     idx[tic] = {
       ticker: tic,
       assetType,
-      firstFlaggedAt: now,
+      firstFlaggedAt: entryDate,
       lastFlaggedAt: now,
       flags: [flag],
       source: opts.source || 'modal',
       notes: opts.notes || null,
       // Index-tracking fields:
       entryPrice: entryPrice != null && isFinite(entryPrice) ? +entryPrice : null,
-      entryDate: now,
+      entryDate: entryDate,
     };
   } else {
     existing.lastFlaggedAt = now;
     if (!existing.flags.includes(flag)) existing.flags.push(flag);
     if (opts.notes && !existing.notes) existing.notes = opts.notes;
     if (opts.assetType && !existing.assetType) existing.assetType = opts.assetType;
-    // Backfill entry price/date if this ticker was added before we tracked them.
+    // Backfill entry price/date if this ticker was added before we tracked them,
+    // or correct a "now"-dated entry when a real (earlier) entry date arrives.
     if (existing.entryPrice == null && entryPrice != null && isFinite(entryPrice)) {
       existing.entryPrice = +entryPrice;
-      if (!existing.entryDate) existing.entryDate = existing.firstFlaggedAt || now;
+    }
+    if (opts.entryDate) {
+      // An explicit (often earlier/backdated) entry date should win over a
+      // previously auto-stamped "now", so performance measures from real entry.
+      const incoming = entryDate;
+      if (!existing.entryDate || incoming < existing.entryDate) {
+        existing.entryDate = incoming;
+        existing.firstFlaggedAt = incoming;
+      }
+    } else if (!existing.entryDate) {
+      existing.entryDate = entryDate;
     }
   }
   saveGoodGlobeIndex(idx);
@@ -1265,8 +1286,18 @@ function backfillGoodGlobeIndexFromPortfolio() {
       if (!e || !e.ticker) continue;
       // The position role IS the flag (Watching/Tracking/Long/Short/...).
       const flag = e.position || 'Tracking';
+      // Best entry price: explicit costBasis, else the price captured in the
+      // first note (priceAtNote), else a stored livePrice. Best entry DATE: the
+      // position's addedAt (which may be backdated, e.g. AAPL to 2025-12-30) so
+      // the index member's performance tracks from its real entry.
+      let entryPrice;
+      if (e.costBasis != null && isFinite(e.costBasis)) entryPrice = +e.costBasis;
+      else if (Array.isArray(e.notes) && e.notes[0] && isFinite(e.notes[0].priceAtNote)) entryPrice = +e.notes[0].priceAtNote;
+      else if (e.livePrice != null && isFinite(e.livePrice)) entryPrice = +e.livePrice;
       recordInGoodGlobeIndex(e.ticker, flag, {
-        entryPrice: (e.costBasis != null && isFinite(e.costBasis)) ? +e.costBasis : undefined,
+        entryPrice,
+        entryDate: e.addedAt || undefined,
+        assetType: e.assetClass || undefined,
         source: 'portfolio',
         notes: Array.isArray(e.notes) && e.notes.length ? (e.notes[0].text || null) : null,
       });
@@ -17865,6 +17896,31 @@ document.getElementById('prob-clear-btn').addEventListener('click', () => {
   saveTheses([]);
   renderProbabilityTab();
 });
+// Durable persistence wiring (export to repo file / import from repo / open repo).
+document.getElementById('prob-export-btn')?.addEventListener('click', () => {
+  if (typeof exportProbabilityData === 'function') exportProbabilityData();
+});
+document.getElementById('prob-import-repo-btn')?.addEventListener('click', async () => {
+  const btn = document.getElementById('prob-import-repo-btn');
+  const orig = btn ? btn.textContent : '';
+  if (btn) { btn.textContent = 'Loading…'; btn.disabled = true; }
+  try { if (typeof importProbabilityData === 'function') await importProbabilityData(); }
+  finally { if (btn) { btn.textContent = orig; btn.disabled = false; } }
+});
+document.getElementById('prob-commit-btn')?.addEventListener('click', () => {
+  if (typeof PROB_DATA_REPO_EDIT !== 'undefined') window.open(PROB_DATA_REPO_EDIT, '_blank', 'noopener');
+});
+document.getElementById('prob-sync-supabase-btn')?.addEventListener('click', async () => {
+  if (typeof analyticsSupabasePushKV !== 'function') return;
+  const btn = document.getElementById('prob-sync-supabase-btn');
+  const orig = btn ? btn.textContent : '';
+  if (btn) { btn.textContent = 'Syncing…'; btn.disabled = true; }
+  try {
+    const n = await analyticsSupabasePushKV();
+    if (typeof flashStatus === 'function') flashStatus(`Pushed ${n} probability row(s) to Supabase analytics_kv`, n ? 'success' : '');
+  } catch { if (typeof flashStatus === 'function') flashStatus('Supabase push failed — run analytics_anon_write.sql + set Analytics config', 'error'); }
+  finally { if (btn) { btn.textContent = orig; btn.disabled = false; } }
+});
 
 // --- Import-call-to-thesis wiring (Probability tab) ---
 let _probImportPending = null;
@@ -23784,6 +23840,120 @@ const PORT_DATA_REPO = 'https://github.com/GoodGlobeLLC/TRAPP2-PORT';
 const PORT_DATA_REPO_RAW = 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-PORT/main/data/portfolio_data.json';
 const PORT_DATA_REPO_EDIT = 'https://github.com/GoodGlobeLLC/TRAPP2-PORT/edit/main/data/portfolio_data.json';
 
+// ============================================================
+//   PROBABILITY THESES — durable persistence (PORT repo + Supabase)
+//
+//   Theses are kept in localStorage (loadTheses/saveTheses) for the live device,
+//   but to survive across devices/clears and be referenceable later they're also
+//   (a) exportable to a dedicated probability_data.json in TRAPP2-PORT, (b)
+//   importable back from that file, and (c) mirrored to Supabase analytics_kv on
+//   every save. This file is intentionally SEPARATE from portfolio_data.json so
+//   the two concerns don't collide.
+// ============================================================
+const PROB_DATA_REPO_RAW = 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-PORT/main/data/probability_data.json';
+const PROB_DATA_REPO_EDIT = 'https://github.com/GoodGlobeLLC/TRAPP2-PORT/edit/main/data/probability_data.json';
+
+// Build the durable theses snapshot for the repo. Carries the FULL thesis
+// objects (ticker, probability, weights, components, target date, created date,
+// notes) plus a computed current probability so the file is human-readable and
+// self-contained for future reference.
+function buildProbabilityData() {
+  let theses = [];
+  try { theses = (typeof loadTheses === 'function') ? loadTheses() : []; } catch {}
+  const enriched = theses.map(t => {
+    // Use the stored probability. (computeThesisProbability is async + needs live
+    // price data, so we don't call it here — the snapshot reflects the last
+    // computed/stored value, which is what's shown in the UI.)
+    const currentProb = t.prob;
+    return {
+      id: t.id || `${t.ticker || t.primaryTicker || 'TH'}-${t.createdAt || Date.now()}`,
+      ticker: t.ticker || t.primaryTicker || null,
+      probability: currentProb != null ? +(+currentProb).toFixed(4) : null,
+      initialProbability: t.prob != null ? +(+t.prob).toFixed(4) : null,
+      weights: t.weights || null,
+      components: t.components || null,
+      direction: t.direction || null,
+      strike: t.strike != null ? t.strike : null,
+      targetDate: t.targetDate || null,
+      createdAt: t.createdAt || null,
+      initialDays: t.initialDays != null ? t.initialDays : (t.days != null ? t.days : null),
+      sourceText: t.sourceText || null,
+      notes: t.notes || null,
+      _raw: t,                  // keep the untouched object so re-import is lossless
+    };
+  });
+  return {
+    schema: 'valuatio-probability/v1',
+    generatedAt: new Date().toISOString(),
+    count: enriched.length,
+    theses: enriched,
+  };
+}
+if (typeof window !== 'undefined') window.buildProbabilityData = buildProbabilityData;
+
+// Download probability_data.json for committing to TRAPP2-PORT.
+function exportProbabilityData() {
+  const data = buildProbabilityData();
+  const json = JSON.stringify(data, null, 2);
+  try {
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'probability_data.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    if (typeof flashStatus === 'function') flashStatus(`Exported ${data.count} thesis record(s) → probability_data.json`, 'success');
+  } catch (e) {
+    if (typeof flashStatus === 'function') flashStatus('Export failed — see console', 'error');
+    console.warn('[probability] export failed', e.message);
+  }
+  return data;
+}
+if (typeof window !== 'undefined') window.exportProbabilityData = exportProbabilityData;
+
+// Apply an imported probability snapshot (merge by id, never drop local theses).
+function applyProbabilityImport(parsed) {
+  if (!parsed) return 0;
+  let incoming = null;
+  if (Array.isArray(parsed)) incoming = parsed;
+  else if (Array.isArray(parsed.theses)) incoming = parsed.theses;
+  if (!Array.isArray(incoming)) return 0;
+  // Unwrap the lossless _raw object when present; else use the record itself.
+  const incomingTheses = incoming.map(r => r && r._raw ? r._raw : r).filter(Boolean);
+  const local = (typeof loadTheses === 'function') ? loadTheses() : [];
+  const keyOf = (t) => t.id || `${(t.ticker || t.primaryTicker || '').toUpperCase()}|${t.createdAt || ''}`;
+  const byKey = new Map();
+  for (const t of local) byKey.set(keyOf(t), t);
+  for (const t of incomingTheses) byKey.set(keyOf(t), t);   // incoming wins on conflict
+  const merged = Array.from(byKey.values());
+  if (typeof saveTheses === 'function') saveTheses(merged);
+  return merged.length;
+}
+if (typeof window !== 'undefined') window.applyProbabilityImport = applyProbabilityImport;
+
+// Import theses from the TRAPP2-PORT probability_data.json (durable source).
+async function importProbabilityData(repoUrl) {
+  const url = repoUrl || PROB_DATA_REPO_RAW;
+  try {
+    const r = await fetch(url, { cache: 'no-store' });
+    if (!r.ok) {
+      if (typeof flashStatus === 'function') flashStatus(`Theses import failed (HTTP ${r.status}) — is probability_data.json committed?`, 'error');
+      return null;
+    }
+    const data = await r.json();
+    const n = applyProbabilityImport(data);
+    if (typeof flashStatus === 'function') flashStatus(`Imported ${n} thesis record(s) from TRAPP2-PORT`, 'success');
+    try { if (typeof renderProbabilityTab === 'function') renderProbabilityTab(); } catch {}
+    return data;
+  } catch (e) {
+    if (typeof flashStatus === 'function') flashStatus('Theses import failed — see console', 'error');
+    console.warn('[probability] import failed', e.message);
+    return null;
+  }
+}
+if (typeof window !== 'undefined') window.importProbabilityData = importProbabilityData;
+
 // Build the full portfolio snapshot for the repo.
 function buildPortfolioData() {
   let portfolio = [], transactions = [], cash = 0, ggIndex = null, ggCurve = null;
@@ -23975,7 +24145,7 @@ function exportPortfolioData() {
 //   • wrapped snapshot         {schema, portfolio:[…], transactions, cash, …}
 // Returns the number of positions restored. Shared by the repo import + the
 // home-drawer file import so both read the same shapes.
-function applyPortfolioImport(parsed) {
+function applyPortfolioImport(parsed, opts = {}) {
   if (!parsed) return 0;
   let positions = null, snapshot = null;
   if (Array.isArray(parsed)) {
@@ -23986,10 +24156,20 @@ function applyPortfolioImport(parsed) {
     else if (Array.isArray(parsed.positions)) positions = parsed.positions;
   }
   if (Array.isArray(positions)) {
+    // MERGE (not replace) by id so loading from one source doesn't wipe positions
+    // that only exist in the other (XTRAPP dump vs portfolio_data.json). Repo
+    // version wins on conflict (it's the freshest committed copy). Dedupe also by
+    // ticker+position for legacy rows that lack a stable id.
+    const merge = opts.replace ? false : true;
+    if (merge && typeof loadPortfolio === 'function') {
+      const local = loadPortfolio() || [];
+      const byId = new Map();
+      const keyOf = (e) => e.id || `${(e.ticker||'').toUpperCase()}|${e.position||''}`;
+      for (const e of local) byId.set(keyOf(e), e);
+      for (const e of positions) byId.set(keyOf(e), e);   // incoming overwrites
+      positions = Array.from(byId.values());
+    }
     if (typeof savePortfolio === 'function') savePortfolio(positions);
-    // Make sure every imported position appears in the GoodGlobe Index roster
-    // (watching + tracking included), so the index mirrors the whole portfolio.
-    try { if (typeof backfillGoodGlobeIndexFromPortfolio === 'function') backfillGoodGlobeIndexFromPortfolio(); } catch {}
   }
   // If it's a full snapshot, also restore transactions / cash / GoodGlobe.
   if (snapshot) {
@@ -24002,9 +24182,30 @@ function applyPortfolioImport(parsed) {
       if (typeof saveTransactions === 'function') saveTransactions(merged);
     }
     if (typeof snapshot.cashPosition === 'number' && typeof setCashPosition === 'function') setCashPosition(snapshot.cashPosition);
-    if (snapshot.goodGlobeIndex && typeof saveGoodGlobeIndex === 'function') saveGoodGlobeIndex(snapshot.goodGlobeIndex);
+    // MERGE the GoodGlobe index (don't overwrite) — the repo copy may have fewer
+    // members than the live portfolio (the user's file had only SNK+TSM while the
+    // portfolio has 5 names). Merge keeps existing members and adds the repo's.
+    if (snapshot.goodGlobeIndex && typeof loadGoodGlobeIndex === 'function' && typeof saveGoodGlobeIndex === 'function') {
+      const idx = loadGoodGlobeIndex() || {};
+      for (const [tic, rec] of Object.entries(snapshot.goodGlobeIndex)) {
+        if (!idx[tic]) idx[tic] = rec;
+        else {
+          // Keep the EARLIER entry date (real entry), union flags.
+          const cur = idx[tic];
+          if (rec.entryDate && (!cur.entryDate || rec.entryDate < cur.entryDate)) { cur.entryDate = rec.entryDate; cur.firstFlaggedAt = rec.entryDate; }
+          if (cur.entryPrice == null && rec.entryPrice != null) cur.entryPrice = rec.entryPrice;
+          if (Array.isArray(rec.flags)) for (const f of rec.flags) if (!cur.flags?.includes(f)) (cur.flags = cur.flags || []).push(f);
+          if (Array.isArray(rec.trades) && !cur.trades) cur.trades = rec.trades;
+        }
+      }
+      saveGoodGlobeIndex(idx);
+    }
     if (snapshot.goodGlobeCurve) { try { localStorage.setItem(GOODGLOBE_INDEX_CURVE_KEY, JSON.stringify(snapshot.goodGlobeCurve)); } catch {} }
   }
+  // Finally, ensure EVERY current position is in the GoodGlobe index dated from
+  // its real entry (fills GLD/NVDA/AAPL that the repo index was missing). Runs
+  // after the merges so it sees the full merged portfolio. Idempotent + dedupes.
+  try { if (typeof backfillGoodGlobeIndexFromPortfolio === 'function') backfillGoodGlobeIndexFromPortfolio(); } catch {}
   return Array.isArray(positions) ? positions.length : 0;
 }
 if (typeof window !== 'undefined') window.applyPortfolioImport = applyPortfolioImport;
@@ -24531,6 +24732,7 @@ function renderStockBookPortfolio(content) {
   const toolbar = `
     <div class="portfolio-toolbar">
       <button class="btn portfolio-add-pill" id="portfolio-add-btn" title="Add equity, option, future, FX/crypto, or bulk-import"><span class="add-pill-icon">+</span> ADD</button>
+      <button class="btn btn-ghost" id="portfolio-load-repo" title="Pull the latest portfolio_data.json from the TRAPP2-PORT repo and merge it in (no duplicates). Restores positions + transactions + GoodGlobe index on any device.">⤓ Load from Repo</button>
       <button class="btn btn-ghost" id="portfolio-import-watch" title="Add positions from sheet status">Import from Sheet Status</button>
       <button class="btn btn-ghost" id="portfolio-export" title="Download as JSON">Export</button>
     </div>
@@ -25378,6 +25580,23 @@ function showPCTooltip(idx) {
 function wirePortfolioToolbar() {
   document.getElementById('portfolio-add-btn')?.addEventListener('click', () => {
     openAddPositionModal();
+  });
+  document.getElementById('portfolio-load-repo')?.addEventListener('click', async () => {
+    const btn = document.getElementById('portfolio-load-repo');
+    const orig = btn ? btn.textContent : '';
+    if (btn) { btn.textContent = 'Loading…'; btn.disabled = true; }
+    try {
+      if (typeof importPortfolioData === 'function') await importPortfolioData();
+      // Make sure every loaded position is in the GoodGlobe index, dated from its
+      // real entry — then refresh the view.
+      if (typeof backfillGoodGlobeIndexFromPortfolio === 'function') backfillGoodGlobeIndexFromPortfolio();
+      if (typeof renderStockBook === 'function') renderStockBook();
+      else if (typeof renderPortfolioTab === 'function') renderPortfolioTab();
+    } catch (e) {
+      if (typeof flashStatus === 'function') flashStatus('Load from repo failed — see console', 'error');
+    } finally {
+      if (btn) { btn.textContent = orig; btn.disabled = false; }
+    }
   });
   document.getElementById('portfolio-import-watch')?.addEventListener('click', () => {
     const sbRows = state.stockbook?.rows || [];
@@ -34670,8 +34889,30 @@ async function fetchGitHubYieldCurve() {
     }
   }
   if (!any) return null;
-  const arr = Object.values(byDate).filter(row => Object.keys(row).length > 1).sort((a, b) => a.date.localeCompare(b.date));
-  return arr.length > 0 ? arr : null;
+  // Build rows, then FORWARD-FILL each tenor across dates so a row missing one
+  // tenor (different series have slightly different last-observation dates, and
+  // DGS2MO doesn't exist at all) inherits the most recent prior value instead of
+  // leaving a hole. This is why the 1yr column (and others) could read blank on
+  // the latest date — its last observation lagged another tenor's by a day.
+  const arr = Object.values(byDate).sort((a, b) => a.date.localeCompare(b.date));
+  const allTenors = tenors;
+  const lastSeen = {};
+  for (const row of arr) {
+    for (const t of allTenors) {
+      if (row[t] != null && isFinite(row[t])) lastSeen[t] = row[t];
+      else if (lastSeen[t] != null) row[t] = lastSeen[t];   // carry forward
+    }
+  }
+  const out = arr.filter(row => Object.keys(row).length > 1);
+  // DGS2MO doesn't exist at FRED, leaving a 2mo hole between 1mo and 3mo.
+  // Linearly interpolate it (≈⅓ of the way from 1mo to 3mo) so the curve is
+  // visually continuous. Marked implicitly — it's a cosmetic bridge, not a quote.
+  for (const row of out) {
+    if (row['2mo'] == null && row['1mo'] != null && row['3mo'] != null) {
+      row['2mo'] = +(row['1mo'] + (row['3mo'] - row['1mo']) * 0.5).toFixed(2);
+    }
+  }
+  return out.length > 0 ? out : null;
 }
 
 async function fetchFredYieldCurve() {
@@ -34747,56 +34988,81 @@ async function fetchStooqYieldCurve() {
 }
 
 async function fetchTreasuryYieldCurve() {
-  // SOURCE 1 (most reliable): the backend's GitHub-stored tenor series. No CORS,
-  // no proxies. May be a partial curve (subset of tenors) — we still take it and
-  // try to enrich it from a live source below.
+  // SOURCE PRIORITY (revised): the backend's GitHub-stored tenor series is the
+  // MOST reliable source — raw.githubusercontent.com, no CORS, no proxies — and
+  // it carries the FULL tenor set (1mo…30yr incl. the 1yr/DGS1 that Stooq lacks).
+  // We take it as the BASE, then enrich/overlay a live source on top when one is
+  // reachable. Previously GitHub was a last resort, so whenever the flaky live
+  // sources returned a partial curve (e.g. Stooq's 4 tenors), the 1yr and other
+  // columns were simply absent. GitHub-first fixes that.
   let ghCurve = null;
   try { ghCurve = await fetchGitHubYieldCurve(); } catch {}
 
-  const endpoint = 'https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v2/accounting/od/daily_treasury_yield_curve_rates';
-  const params = new URLSearchParams({
-    sort: '-record_date',
-    'page[size]': '90',
-  });
-  const j = await fetchJsonWithProxies(`${endpoint}?${params}`);
-  if (j?.data && Array.isArray(j.data)) {
-    return j.data.map(row => ({
-      date: row.record_date,
-      '1mo':  parseFloat(row.bc_1month) || null,
-      '2mo':  parseFloat(row.bc_2month) || null,
-      '3mo':  parseFloat(row.bc_3month) || null,
-      '6mo':  parseFloat(row.bc_6month) || null,
-      '1yr':  parseFloat(row.bc_1year)  || null,
-      '2yr':  parseFloat(row.bc_2year)  || null,
-      '3yr':  parseFloat(row.bc_3year)  || null,
-      '5yr':  parseFloat(row.bc_5year)  || null,
-      '7yr':  parseFloat(row.bc_7year)  || null,
-      '10yr': parseFloat(row.bc_10year) || null,
-      '20yr': parseFloat(row.bc_20year) || null,
-      '30yr': parseFloat(row.bc_30year) || null,
-    })).reverse();
+  // Helper: overlay live rows onto the GitHub base by date, filling any tenor
+  // the base is missing and refreshing values where live has them.
+  const mergeCurves = (base, live) => {
+    if (!base || !base.length) return live;
+    if (!live || !live.length) return base;
+    const byDate = {};
+    for (const row of base) byDate[row.date] = Object.assign({}, row);
+    for (const row of live) {
+      if (!byDate[row.date]) byDate[row.date] = { date: row.date };
+      for (const k of Object.keys(row)) {
+        if (k === 'date') continue;
+        if (row[k] != null && isFinite(row[k])) byDate[row.date][k] = row[k];
+      }
+    }
+    return Object.values(byDate).sort((a, b) => a.date.localeCompare(b.date));
+  };
+
+  // Try the live Treasury endpoint (richest when reachable).
+  let liveCurve = null;
+  try {
+    const endpoint = 'https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v2/accounting/od/daily_treasury_yield_curve_rates';
+    const params = new URLSearchParams({ sort: '-record_date', 'page[size]': '90' });
+    const j = await fetchJsonWithProxies(`${endpoint}?${params}`);
+    if (j?.data && Array.isArray(j.data)) {
+      liveCurve = j.data.map(row => ({
+        date: row.record_date,
+        '1mo':  parseFloat(row.bc_1month) || null,
+        '2mo':  parseFloat(row.bc_2month) || null,
+        '3mo':  parseFloat(row.bc_3month) || null,
+        '6mo':  parseFloat(row.bc_6month) || null,
+        '1yr':  parseFloat(row.bc_1year)  || null,
+        '2yr':  parseFloat(row.bc_2year)  || null,
+        '3yr':  parseFloat(row.bc_3year)  || null,
+        '5yr':  parseFloat(row.bc_5year)  || null,
+        '7yr':  parseFloat(row.bc_7year)  || null,
+        '10yr': parseFloat(row.bc_10year) || null,
+        '20yr': parseFloat(row.bc_20year) || null,
+        '30yr': parseFloat(row.bc_30year) || null,
+      })).reverse();
+    }
+  } catch {}
+
+  // FRED next (live via proxies) if Treasury didn't return.
+  if (!liveCurve) {
+    try {
+      const fred = await fetchFredYieldCurve();
+      if (fred && fred.length > 0) liveCurve = fred;
+    } catch {}
+  }
+  // Stooq last (only 3mo/5yr/10yr/30yr — never the 1yr).
+  if (!liveCurve) {
+    try {
+      const stooq = await fetchStooqYieldCurve();
+      if (stooq && stooq.length > 0) liveCurve = stooq;
+    } catch {}
   }
 
-  // Treasury blocked — fall back to FRED (live, via proxies)
-  console.log('Treasury yield curve unreachable, falling back to FRED…');
-  const fred = await fetchFredYieldCurve();
-  if (fred && fred.length > 0) return fred;
-
-  // FRED also blocked — last resort: Stooq (4 tenors only)
-  console.log('FRED unreachable, falling back to Stooq…');
-  const stooq = await fetchStooqYieldCurve();
-  if (stooq && stooq.length > 0) {
-    console.log(`✓ Stooq returned ${stooq.length} days of yields (3M / 5Y / 10Y / 30Y only)`);
-    return stooq;
+  // Prefer GitHub base merged with whatever live data we got. If GitHub was
+  // unreachable, fall back to the live curve alone; if everything failed, null.
+  if (ghCurve && ghCurve.length) {
+    const merged = mergeCurves(ghCurve, liveCurve);
+    console.log(`✓ Yield curve: GitHub base (${ghCurve.length}d, full tenors)${liveCurve ? ` + live overlay (${liveCurve.length}d)` : ' (no live overlay)'}`);
+    return merged;
   }
-
-  // Every live source failed — use the GitHub partial curve if we got one. It's
-  // better to show a real (if partial) curve from the backend than nothing.
-  if (ghCurve && ghCurve.length > 0) {
-    console.log(`✓ Using GitHub-stored yield curve (${ghCurve.length} days, backend tenors only)`);
-    return ghCurve;
-  }
-
+  if (liveCurve && liveCurve.length) return liveCurve;
   return null;
 }
 
@@ -35246,8 +35512,9 @@ async function renderBondEtfTable() {
 
   // Helper: priceChange% over N calendar days, from any available history source
   const histReturn = (ticker, days) => {
-    // Prefer unified accessor (sheet → cache → in-memory GitHub manifest history)
-    const h = getHistoryForTicker(ticker) || sheetHistory?.[ticker];
+    // Prefer unified accessor (sheet → cache → in-memory GitHub manifest history),
+    // then the direct TRAPP2-1 bond history we may have fetched below.
+    const h = getHistoryForTicker(ticker) || sheetHistory?.[ticker] || state._bondHistDirect?.[ticker];
     if (!h || h.length < 2) return null;
     const last = h[h.length - 1];
     if (!last?.price) return null;
@@ -35274,10 +35541,38 @@ async function renderBondEtfTable() {
       if (state.bonds?.loaded) renderBondEtfTable();
     }).catch(() => {});
   }
+  // DIRECT FALLBACK: bond ETF history lives in TRAPP2-1 (data/history/<T>.json,
+  // ~20yr of bars), which the equity history manifest may not cover — that's why
+  // the per-asset return columns (esp. 1Y/3Y) could be blank for every bond ETF.
+  // Pull them straight from TRAPP2-1 into the in-memory history cache.
+  if (missing.length > 0) {
+    const BOND_HIST_BASE = 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-1/main/data/history/';
+    state._bondHistDirect = state._bondHistDirect || {};
+    const stillMissing = missing.filter(t => !state._bondHistDirect[t] && !getHistoryForTicker(t));
+    if (stillMissing.length && !state._bondHistFetching) {
+      state._bondHistFetching = true;
+      Promise.all(stillMissing.map(async (t) => {
+        try {
+          const r = await fetch(BOND_HIST_BASE + t + '.json');
+          if (!r.ok) return;
+          const j = await r.json();
+          const bars = Array.isArray(j) ? j : (j.history || j.bars || j.observations);
+          if (Array.isArray(bars) && bars.length) {
+            state._bondHistDirect[t] = bars
+              .map(b => ({ date: String(b.date || b.d).slice(0, 10), price: Number(b.price ?? b.close ?? b.c ?? b.value) }))
+              .filter(b => b.date && isFinite(b.price));
+          }
+        } catch {}
+      })).then(() => {
+        state._bondHistFetching = false;
+        if (state.bonds?.loaded) renderBondEtfTable();
+      }).catch(() => { state._bondHistFetching = false; });
+    }
+  }
 
   const rows = BOND_ETFS.map(etf => {
     const sbRow = getStockbookRow(etf.ticker);
-    const hist = getHistoryForTicker(etf.ticker) || sheetHistory?.[etf.ticker];
+    const hist = getHistoryForTicker(etf.ticker) || sheetHistory?.[etf.ticker] || state._bondHistDirect?.[etf.ticker];
     let price = null, r1d = null, r1m = null, r3m = null, r1y = null, r3y = null;
 
     if (sbRow?.price != null) price = sbRow.price;
@@ -35290,7 +35585,7 @@ async function renderBondEtfTable() {
     r1y = histReturn(etf.ticker, 365);
     r3y = histReturn(etf.ticker, 365 * 3);  // 3-year return — useful for duration risk analysis
 
-    return { ...etf, price, r1d, r1m, r3m, r1y, r3y, inSheet: !!sbRow || (hist?.length > 0) };
+    return { ...etf, price, r1d, r1m, r3m, r1y, r3y, inSheet: !!sbRow || (hist?.length > 0) || !!state._bondHistDirect?.[etf.ticker] };
   });
 
   // Group by category
@@ -41407,12 +41702,15 @@ async function analyticsSupabasePushKV() {
   const now = new Date().toISOString();
   const rows = [];
   try {
-    // Probability theses.
+    // Probability theses. Persist EVERY thesis (key probability:<TICKER>) so
+    // they're durable + referenceable. Tolerate both `ticker` and the parser's
+    // `primaryTicker` field.
     const theses = (typeof loadTheses === 'function') ? loadTheses() : null;
     if (theses && typeof theses === 'object') {
       const list = Array.isArray(theses) ? theses : Object.values(theses);
       for (const th of list) {
-        if (th && th.ticker) rows.push({ key: `probability:${String(th.ticker).toUpperCase()}`, value: th, updated_at: now });
+        const tic = th && (th.ticker || th.primaryTicker);
+        if (tic) rows.push({ key: `probability:${String(tic).toUpperCase()}`, value: th, updated_at: now });
       }
     }
     // Regime drivers + probabilities (handy for a dashboard).
