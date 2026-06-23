@@ -3327,8 +3327,8 @@ document.addEventListener('DOMContentLoaded', () => {
   const _betsRetrainHandler = () => {
     if (typeof botRetrain !== 'function') return;
     const bot = (typeof loadBotState === 'function') ? loadBotState() : { bets: [] };
-    const settledCount = (bot.bets || []).filter(b => b.status === 'closed' && b.components && isFinite(b.pnl)).length;
-    const untrainedCount = (bot.bets || []).filter(b => b.status === 'closed' && b.components && isFinite(b.pnl) && !b._trained).length;
+    const settledCount = (bot.bets || []).filter(b => b.status === "closed" && b.components && (isFinite(b.realizedPL) || isFinite(b.pnl))).length;
+    const untrainedCount = (bot.bets || []).filter(b => b.status === "closed" && b.components && (isFinite(b.realizedPL) || isFinite(b.pnl)) && !b._trained).length;
     if (settledCount === 0) {
       if (typeof flashStatus === 'function') flashStatus("Nothing to retrain yet \u2014 the bot learns from CLOSED trades, and none have closed so far. Open positions don't teach until they settle.", '');
       return;
@@ -7116,6 +7116,26 @@ document.getElementById('analytics-supabase-save-btn')?.addEventListener('click'
   try { _backendResearchFetched = false; if (typeof loadBackendResearch === 'function') loadBackendResearch().catch(() => {}); } catch {}
   if (typeof flashStatus === 'function') flashStatus(ok ? 'Analytics Supabase connected — grades + regime will load from here' : 'Analytics Supabase config cleared', 'success');
 });
+// GitHub one-tap save wiring.
+document.getElementById('github-connect-btn')?.addEventListener('click', () => {
+  if (typeof setGitHubToken === 'function') setGitHubToken();
+  const st = document.getElementById('github-status');
+  if (st) st.textContent = (typeof hasGitHubToken === 'function' && hasGitHubToken()) ? '● token set' : '';
+});
+document.getElementById('github-save-all-btn')?.addEventListener('click', async () => {
+  const btn = document.getElementById('github-save-all-btn');
+  const orig = btn ? btn.textContent : '';
+  if (btn) { btn.textContent = 'Saving…'; btn.disabled = true; }
+  try { if (typeof saveAllToReposAndSupabase === 'function') await saveAllToReposAndSupabase(); }
+  finally { if (btn) { btn.textContent = orig; btn.disabled = false; } }
+});
+// Reflect token state on open (guarded — runs after definitions exist).
+(function () {
+  try {
+    const st = document.getElementById('github-status');
+    if (st && typeof hasGitHubToken === 'function' && hasGitHubToken()) st.textContent = '● token set';
+  } catch {}
+})();
 // Push the grades + regime the app holds to the analytics Supabase (app-side,
 // anon key). Makes the analytics tables populate without waiting on the pipeline.
 document.getElementById('analytics-supabase-sync-btn')?.addEventListener('click', async () => {
@@ -24733,6 +24753,7 @@ function renderStockBookPortfolio(content) {
     <div class="portfolio-toolbar">
       <button class="btn portfolio-add-pill" id="portfolio-add-btn" title="Add equity, option, future, FX/crypto, or bulk-import"><span class="add-pill-icon">+</span> ADD</button>
       <button class="btn btn-ghost" id="portfolio-load-repo" title="Pull the latest portfolio_data.json from the TRAPP2-PORT repo and merge it in (no duplicates). Restores positions + transactions + GoodGlobe index on any device.">⤓ Load from Repo</button>
+      <button class="btn btn-ghost" id="portfolio-save-repo" title="Save the portfolio straight to TRAPP2-PORT on GitHub (needs a GitHub token via Connect GitHub — otherwise copies JSON + opens the editor). No manual download needed.">↑ Save to Repo</button>
       <button class="btn btn-ghost" id="portfolio-import-watch" title="Add positions from sheet status">Import from Sheet Status</button>
       <button class="btn btn-ghost" id="portfolio-export" title="Download as JSON">Export</button>
     </div>
@@ -25623,6 +25644,18 @@ function wirePortfolioToolbar() {
     });
     flashStatus(`Imported ${added} positions from sheet status`, 'success');
     renderStockBook();
+  });
+  document.getElementById('portfolio-save-repo')?.addEventListener('click', async () => {
+    const btn = document.getElementById('portfolio-save-repo');
+    const orig = btn ? btn.textContent : '';
+    if (btn) { btn.textContent = 'Saving…'; btn.disabled = true; }
+    try {
+      if (typeof commitFileToRepo === 'function' && typeof buildPortfolioData === 'function') {
+        await commitFileToRepo('TRAPP2-PORT', 'data/portfolio_data.json', buildPortfolioData(), 'portfolio: app save');
+      }
+      // Also mirror to Supabase if configured.
+      try { if (typeof portSupabaseSyncAll === 'function' && typeof portSupabaseConfigured === 'function' && portSupabaseConfigured()) await portSupabaseSyncAll(); } catch {}
+    } finally { if (btn) { btn.textContent = orig; btn.disabled = false; } }
   });
   document.getElementById('portfolio-export')?.addEventListener('click', () => {
     // Use the FULL snapshot (positions + transactions + cash + GoodGlobe index),
@@ -32269,6 +32302,19 @@ function openArticleEditor(key) {
       editedAt: new Date().toISOString(),
     });
     applyArticleFix(article);
+    // LEARN FROM THE SELECTION: when the user tags this article bullish or
+    // bearish, retrain the lexicon on its headline + summary so the model picks
+    // up the words/phrases that characterize that direction. This is the
+    // "selecting more bullish articles teaches more bullish words" loop.
+    try {
+      if (chosenSent && (chosenSent === 'bullish' || chosenSent === 'bearish') && typeof retrainLexicon === 'function') {
+        const trainText = [headline || article.headline || '', summary || article.summary || ''].join('. ').trim();
+        if (trainText.length > 3) {
+          const learned = retrainLexicon(trainText, chosenSent);
+          if (learned && typeof flashStatus === 'function') flashStatus(`Lexicon learned ${learned} ${chosenSent} cue(s) from this article`, 'success');
+        }
+      }
+    } catch {}
     // Log this fix into the Review hub for APPROVAL rather than silently clearing
     // it. The fix applies immediately (stats update live), but it now shows up in
     // Review as a pending human-applied change the user can confirm or revert —
@@ -39130,24 +39176,46 @@ function extractLexPhrases(text) {
   return [...grams];
 }
 
-function retrainLexicon(text, direction) {
+function retrainLexicon(text, direction, opts = {}) {
   if (direction !== 'bullish' && direction !== 'bearish') return 0;  // neutral doesn't train
   const lex = loadLexicon();
   const bucket = direction === 'bullish' ? lex.bull : lex.bear;
   const opp = direction === 'bullish' ? lex.bear : lex.bull;
   const phrases = extractLexPhrases(text);
+  // For longer text (news articles), reinforcing EVERY n-gram adds noise. Favor
+  // phrases that already lean this way or are sentiment-bearing; give brand-new
+  // phrases a smaller initial bump so a single article can't crown junk as a
+  // strong cue. The weight cap still prevents runaway growth.
+  const bump = opts.bump != null ? opts.bump : (phrases.length > 25 ? 0.5 : 1);
   let learned = 0;
   for (const p of phrases) {
-    // Reinforce in the chosen direction (cap weight so it can't run away).
-    bucket[p] = Math.min(5, (bucket[p] || 0) + 1);
-    // Slightly decay the same phrase in the opposite bucket (it was contradicted).
-    if (opp[p]) { opp[p] = Math.max(0, opp[p] - 0.5); if (opp[p] === 0) delete opp[p]; }
+    const existing = bucket[p] || 0;
+    // New phrases enter at a modest weight; known phrases strengthen up to the cap.
+    const next = existing === 0 ? Math.min(2, bump + 0.5) : Math.min(5, existing + bump);
+    bucket[p] = next;
+    // Contradicted in the opposite bucket → decay it there.
+    if (opp[p]) { opp[p] = Math.max(0, opp[p] - bump); if (opp[p] <= 0) delete opp[p]; }
     learned++;
   }
   lex.meta.trainedCount = (lex.meta.trainedCount || 0) + 1;
+  lex.meta.lastTrainedAt = new Date().toISOString();
   saveLexicon(lex);
   return learned;
 }
+
+// Bulk-learn from several articles at once: pass an array of {text|headline,
+// summary} and a direction. Useful for "teach the model from these N bullish
+// articles" — each article contributes, common cross-article phrases compound.
+function retrainLexiconFromArticles(articles, direction) {
+  if (!Array.isArray(articles) || !articles.length) return 0;
+  let total = 0;
+  for (const a of articles) {
+    const t = [a.headline || a.text || '', a.summary || ''].join('. ').trim();
+    if (t.length > 3) total += retrainLexicon(t, direction, { bump: 0.5 });
+  }
+  return total;
+}
+if (typeof window !== 'undefined') window.retrainLexiconFromArticles = retrainLexiconFromArticles;
 
 // ---- LLM hook (Phase: deep understanding). Returns null unless an API key is
 // configured; the app falls back to the lexicon. Wire your provider here. ----
@@ -39607,18 +39675,26 @@ function renderReviewHub() {
 
   // --- Section 3: lexicon inspector (what the model learned) ---
   const sortW = (obj) => Object.entries(obj).sort((a, b) => b[1] - a[1]);
-  const lexChip = (p, w, dir) => `<span style="display:inline-flex;align-items:center;gap:4px;font-family:var(--mono);font-size:10px;background:var(--bg-elev);border:1px solid var(--rule);border-radius:3px;padding:2px 6px;margin:2px;color:${dir==='bull'?'var(--pos)':'var(--neg)'}">${escapeHtml(p)} ·${w}<span style="cursor:pointer;color:var(--ink-faint)" onclick="lexiconPrune('${dir}','${escapeHtml(p).replace(/'/g,"")}')">✕</span></span>`;
+  const lexChip = (p, w, dir) => `<span style="display:inline-flex;align-items:center;gap:4px;font-family:var(--mono);font-size:10px;background:var(--bg-elev);border:1px solid var(--rule);border-radius:3px;padding:2px 6px;margin:2px;color:${dir==='bull'?'var(--pos)':'var(--neg)'}">${escapeHtml(p)}<span style="display:inline-flex;align-items:center;gap:2px;color:var(--ink-faint)"><span style="cursor:pointer" title="weaken" onclick="lexiconSetWeight('${dir}','${escapeHtml(p).replace(/'/g,"")}',-0.5)">−</span>${w}<span style="cursor:pointer" title="strengthen" onclick="lexiconSetWeight('${dir}','${escapeHtml(p).replace(/'/g,"")}',0.5)">+</span></span><span style="cursor:pointer;color:var(--neg);margin-left:2px" title="remove" onclick="lexiconPrune('${dir}','${escapeHtml(p).replace(/'/g,"")}')">✕</span></span>`;
+  const addForm = (dir) => `
+    <div style="display:flex;gap:4px;align-items:center;margin-top:8px;flex-wrap:wrap">
+      <input id="lex-add-phrase-${dir}" placeholder="add ${dir==='bull'?'bullish':'bearish'} word/phrase" style="flex:1;min-width:140px;background:var(--bg);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:10px;padding:4px 8px;border-radius:3px" onkeydown="if(event.key==='Enter')lexiconAddFromInputs('${dir}')">
+      <input id="lex-add-weight-${dir}" type="number" min="0.5" max="5" step="0.5" value="2" title="weight 0.5–5" style="width:52px;background:var(--bg);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:10px;padding:4px 6px;border-radius:3px">
+      <button class="btn btn-ghost" style="font-size:10px;padding:4px 10px" onclick="lexiconAddFromInputs('${dir}')">+ Add</button>
+    </div>`;
   const lexSection = `
     <div style="margin-bottom:20px">
       <div class="regime-section-title">LEXICON · what the model learned <span style="color:var(--ink-faint);font-weight:400">(${lex.meta.trainedCount||0} trainings)</span></div>
-      <div class="gt-section-sub">Editable. Click ✕ to prune a phrase the model shouldn't trust. Bigger weight = stronger signal.</div>
+      <div class="gt-section-sub">Editable. Add your own phrases, nudge weights with − / +, or ✕ to remove. The model also learns automatically when you confirm a post's direction or tag a news article bullish/bearish. Bigger weight = stronger signal.</div>
       <div class="company-card" style="margin:0 0 10px">
         <h4 style="color:var(--pos)">Bullish phrases (${Object.keys(lex.bull).length})</h4>
-        <div>${sortW(lex.bull).slice(0,60).map(([p,w])=>lexChip(p,w,'bull')).join('')}</div>
+        <div>${sortW(lex.bull).slice(0,80).map(([p,w])=>lexChip(p,w,'bull')).join('')}</div>
+        ${addForm('bull')}
       </div>
       <div class="company-card" style="margin:0">
         <h4 style="color:var(--neg)">Bearish phrases (${Object.keys(lex.bear).length})</h4>
-        <div>${sortW(lex.bear).slice(0,60).map(([p,w])=>lexChip(p,w,'bear')).join('')}</div>
+        <div>${sortW(lex.bear).slice(0,80).map(([p,w])=>lexChip(p,w,'bear')).join('')}</div>
+        ${addForm('bear')}
       </div>
     </div>`;
 
@@ -39838,6 +39914,47 @@ function lexiconPrune(dir, phrase) {
   saveLexicon(lex);
   renderReviewHub();
 }
+
+// Manually ADD or update a phrase in a direction bucket. If the same phrase
+// exists in the opposite bucket, remove it there (a phrase shouldn't be both).
+function lexiconAdd(dir, phrase, weight) {
+  const p = String(phrase || '').toLowerCase().trim().replace(/\s+/g, ' ');
+  if (!p) return false;
+  if (dir !== 'bull' && dir !== 'bear') return false;
+  const lex = loadLexicon();
+  const bucket = dir === 'bull' ? lex.bull : lex.bear;
+  const opp = dir === 'bull' ? lex.bear : lex.bull;
+  let w = parseFloat(weight);
+  if (!isFinite(w)) w = 2;
+  bucket[p] = Math.max(0.5, Math.min(5, w));   // clamp to sane range
+  if (opp[p]) delete opp[p];                    // can't be bull AND bear
+  saveLexicon(lex);
+  if (typeof flashStatus === 'function') flashStatus(`Added "${p}" → ${dir === 'bull' ? 'bullish' : 'bearish'} (weight ${bucket[p]})`, 'success');
+  renderReviewHub();
+  return true;
+}
+if (typeof window !== 'undefined') window.lexiconAdd = lexiconAdd;
+
+// Nudge a phrase's weight up/down from the inspector (delta usually ±0.5).
+function lexiconSetWeight(dir, phrase, delta) {
+  const lex = loadLexicon();
+  const bucket = dir === 'bull' ? lex.bull : lex.bear;
+  if (bucket[phrase] == null) return;
+  bucket[phrase] = Math.max(0.5, Math.min(5, bucket[phrase] + (parseFloat(delta) || 0)));
+  saveLexicon(lex);
+  renderReviewHub();
+}
+if (typeof window !== 'undefined') window.lexiconSetWeight = lexiconSetWeight;
+
+// Wire the add-phrase form (called from the inspector's inputs).
+function lexiconAddFromInputs(dir) {
+  const phraseEl = document.getElementById(`lex-add-phrase-${dir}`);
+  const weightEl = document.getElementById(`lex-add-weight-${dir}`);
+  if (!phraseEl) return;
+  const ok = lexiconAdd(dir, phraseEl.value, weightEl ? weightEl.value : 2);
+  if (ok && phraseEl) phraseEl.value = '';
+}
+if (typeof window !== 'undefined') window.lexiconAddFromInputs = lexiconAddFromInputs;
 
 // --- Thesis review handlers: corrections write back to the live thesis ---
 function _findThesisForReview(id) {
@@ -40132,18 +40249,120 @@ const XTRAPP_BASE = 'https://raw.githubusercontent.com/GoodGlobeLLC/XTRAPP/main/
 const GH_TOKEN_KEY = 'valuatio.github.token';
 const XTRAPP_FILE_API = 'https://api.github.com/repos/GoodGlobeLLC/XTRAPP/contents/data/xtrapp_data.json';
 const XTRAPP_FILE_EDIT = 'https://github.com/GoodGlobeLLC/XTRAPP/edit/main/data/xtrapp_data.json';
+
+// ============================================================
+//   GENERIC GITHUB COMMIT — one fine-grained token, all repos
+//
+//   Lets the app write a file STRAIGHT into any of the data repos via the GitHub
+//   Contents API — no manual download → open editor → paste → commit. One
+//   fine-grained token scoped to the GoodGlobeLLC repos with Contents:Read&write
+//   covers PORT / BOT / ANALYTICS / XTRAPP. Falls back to clipboard + web editor
+//   if no token is set, so nothing breaks without one.
+// ============================================================
+function getGitHubToken() { return localStorage.getItem(GH_TOKEN_KEY) || ''; }
+function hasGitHubToken() { return !!getGitHubToken(); }
+
+// owner/repo/path → the Contents API + web-edit URLs.
+function _ghUrls(repo, path) {
+  return {
+    api: `https://api.github.com/repos/GoodGlobeLLC/${repo}/contents/${path}`,
+    edit: `https://github.com/GoodGlobeLLC/${repo}/edit/main/${path}`,
+  };
+}
+
+// Commit `obj` (stringified pretty) to GoodGlobeLLC/<repo>/<path>. Returns true on
+// a real push, false if it fell back to clipboard/editor.
+async function commitFileToRepo(repo, path, obj, message) {
+  const json = (typeof obj === 'string') ? obj : JSON.stringify(obj, null, 2);
+  const { api, edit } = _ghUrls(repo, path);
+  const token = getGitHubToken();
+  if (!token) {
+    try { await navigator.clipboard.writeText(json); } catch {}
+    window.open(edit, '_blank', 'noopener');
+    if (typeof flashStatus === 'function') flashStatus(`No GitHub token — JSON copied, ${repo} editor opened. Paste + Commit. (Set a token once via "Connect GitHub" for one-tap saves.)`, 'success');
+    return false;
+  }
+  try {
+    if (typeof flashStatus === 'function') flashStatus(`Saving to ${repo}…`, 'success');
+    const headers = { Authorization: 'Bearer ' + token, Accept: 'application/vnd.github+json' };
+    let sha;
+    const cur = await fetch(api, { headers });
+    if (cur.ok) sha = (await cur.json()).sha;
+    else if (cur.status !== 404) throw new Error('read HTTP ' + cur.status);
+    const b64 = btoa(unescape(encodeURIComponent(json)));
+    const put = await fetch(api, {
+      method: 'PUT', headers,
+      body: JSON.stringify({ message: message || `${repo}: app save ${new Date().toISOString()}`, content: b64, ...(sha ? { sha } : {}) }),
+    });
+    if (!put.ok) { const e = await put.json().catch(() => ({})); throw new Error('HTTP ' + put.status + (e.message ? ' — ' + e.message : '')); }
+    if (typeof flashStatus === 'function') flashStatus(`✓ Saved to ${repo}/${path.split('/').pop()}`, 'success');
+    return true;
+  } catch (e) {
+    console.error('[gh-commit]', repo, e);
+    if (typeof flashStatus === 'function') flashStatus(`Save to ${repo} failed (${e.message}) — copied to clipboard, opening editor`, 'error');
+    try { await navigator.clipboard.writeText(json); } catch {}
+    window.open(edit, '_blank', 'noopener');
+    return false;
+  }
+}
+if (typeof window !== 'undefined') {
+  window.commitFileToRepo = commitFileToRepo;
+  window.getGitHubToken = getGitHubToken;
+  window.hasGitHubToken = hasGitHubToken;
+}
+
+// One-tap "save everything to its repo" — portfolio→PORT, theses→PORT, bot→BOT.
+// Also pushes to Supabase if configured, so a single tap fans out everywhere.
+async function saveAllToReposAndSupabase() {
+  let ok = 0, total = 0;
+  // Portfolio → PORT/portfolio_data.json
+  try {
+    if (typeof buildPortfolioData === 'function') {
+      total++;
+      if (await commitFileToRepo('TRAPP2-PORT', 'data/portfolio_data.json', buildPortfolioData(), 'portfolio: app save')) ok++;
+    }
+  } catch (e) { console.warn(e); }
+  // Theses → PORT/probability_data.json
+  try {
+    if (typeof buildProbabilityData === 'function') {
+      total++;
+      if (await commitFileToRepo('TRAPP2-PORT', 'data/probability_data.json', buildProbabilityData(), 'theses: app save')) ok++;
+    }
+  } catch (e) { console.warn(e); }
+  // Bot → BOT/bot_training_data.json
+  try {
+    if (typeof buildBotTrainingData === 'function') {
+      total++;
+      if (await commitFileToRepo('TRAPP2-BOT', 'data/bot_training_data.json', buildBotTrainingData(), 'bot: app save')) ok++;
+    }
+  } catch (e) { console.warn(e); }
+  // Supabase fan-out (best-effort).
+  try { if (typeof supabaseSyncAllTrades === 'function' && typeof supabaseConfigured === 'function' && supabaseConfigured()) await supabaseSyncAllTrades(); } catch {}
+  try { if (typeof portSupabaseSyncAll === 'function' && typeof portSupabaseConfigured === 'function' && portSupabaseConfigured()) await portSupabaseSyncAll(); } catch {}
+  try { if (typeof analyticsSupabasePushAll === 'function' && typeof analyticsSupabaseConfigured === 'function' && analyticsSupabaseConfigured()) await analyticsSupabasePushAll(); } catch {}
+  if (typeof flashStatus === 'function') {
+    if (hasGitHubToken()) flashStatus(`Saved ${ok}/${total} repo files${ok < total ? ' (some failed — see console)' : ''} + Supabase`, ok === total ? 'success' : 'error');
+  }
+  return ok;
+}
+if (typeof window !== 'undefined') window.saveAllToReposAndSupabase = saveAllToReposAndSupabase;
+
 function setGitHubToken() {
   const cur = localStorage.getItem(GH_TOKEN_KEY);
   const t = prompt(
-    'Paste a FINE-GRAINED GitHub token scoped to ONLY the XTRAPP repo with Contents: Read & write.\n' +
-    '(github.com → Settings → Developer settings → Fine-grained tokens)\n\n' +
+    'Paste a FINE-GRAINED GitHub token with Contents: Read & write, scoped to your\n' +
+    'GoodGlobeLLC data repos (TRAPP2-PORT, TRAPP2-BOT, TRAPP2-ANALYTICS, XTRAPP).\n' +
+    '(github.com → Settings → Developer settings → Fine-grained tokens → select those repos)\n\n' +
+    'With this set, "Save to Repo" buttons write the JSON straight to GitHub —\n' +
+    'no more download + paste. Stored in THIS browser only; never included in any export.\n\n' +
     'Leave empty + OK to REMOVE the stored token.', cur ? '••••stored••••' : '');
   if (t === null) return;
   if (!t.trim()) { localStorage.removeItem(GH_TOKEN_KEY); flashStatus('GitHub token removed', 'success'); return; }
   if (t.includes('•')) return;  // unchanged placeholder
   localStorage.setItem(GH_TOKEN_KEY, t.trim());
-  flashStatus('Token stored (this browser only — never included in XTRAPP exports)', 'success');
+  flashStatus('GitHub token stored (this browser only) — repo saves are now one-tap', 'success');
 }
+if (typeof window !== 'undefined') window.setGitHubToken = setGitHubToken;
 async function pushXtrappToGitHub() {
   const payload = _buildXtrappPayload();
   const json = JSON.stringify(payload, null, 2);
@@ -40433,13 +40652,13 @@ function saveBotWeights(w) {
 function botRetrain() {
   const bot = loadBotState();
   const w = loadBotWeights();
-  const settled = (bot.bets || []).filter(b => b.status === 'closed' && b.components && isFinite(b.pnl));
+  const settled = (bot.bets || []).filter(b => b.status === "closed" && b.components && (isFinite(b.realizedPL) || isFinite(b.pnl)));
   if (!settled.length) { console.log('[bot-retrain] no settled bets with components yet'); return w; }
   const lr = 0.05;  // small steps; weights converge over many settles
   let nudges = 0;
   for (const bet of settled) {
     if (bet._trained) continue;          // each settled bet teaches exactly once
-    const won = bet.pnl > 0;
+    const won = (bet.realizedPL != null ? bet.realizedPL : bet.pnl || 0) > 0;
     // direction sign: long bets reward positive-signed signals on wins;
     // short bets reward negative-signed signals on wins.
     const dirSign = bet.direction === 'short' ? -1 : 1;
@@ -40491,8 +40710,11 @@ function buildBotTrainingData() {
   // Closed trades carry full outcome/learning fields; open trades carry the
   // entry-side fields and are restored as still-open. ----
   const trades = bets.map(b => {
-    const won = (b.pnl || 0) > 0;
-    const ret = b.returnPct != null ? b.returnPct : null;
+    const won = (b.realizedPL != null ? b.realizedPL : (b.pnl || 0)) > 0;
+    const _rpl = (b.realizedPL != null && isFinite(b.realizedPL)) ? b.realizedPL : (b.pnl || 0);
+    const _entryCap = (b.shares != null && b.entryPrice) ? b.shares * b.entryPrice : (b.notional || b.dollars || 0);
+    const ret = (b.returnPct != null && b.returnPct !== 0) ? b.returnPct
+      : (_entryCap > 0 ? +((_rpl / _entryCap) * 100).toFixed(2) : null);
     // The dominant signals behind this trade (largest |contribution|).
     const comps = b.components || {};
     const ranked = Object.entries(comps)
@@ -40548,7 +40770,13 @@ function buildBotTrainingData() {
       stopPrice: b.stopPrice != null ? b.stopPrice : null,
       targetPrice: b.targetPrice != null ? b.targetPrice : null,
       holdDays: (b.entryDate && b.exitDate) ? Math.round((new Date(b.exitDate) - new Date(b.entryDate)) / 86400000) : (b.holdDays != null ? b.holdDays : 0),
-      pnl: b.pnl != null ? b.pnl : 0,
+      // Realized P&L is the deterministic shares-based number frozen at close —
+      // export it explicitly AND mirror it into pnl so any reader (repo, Supabase,
+      // re-import, the bot's own learning) gets the true figure, never a stale 0.
+      realizedPL: (b.realizedPL != null && isFinite(b.realizedPL)) ? b.realizedPL : (b.pnl != null ? b.pnl : 0),
+      pnl: (b.realizedPL != null && isFinite(b.realizedPL)) ? b.realizedPL : (b.pnl != null ? b.pnl : 0),
+      sharesAtExit: b.sharesAtExit != null ? b.sharesAtExit : (b.shares != null ? b.shares : null),
+      fees: b.fees != null ? b.fees : 0,
       returnPct: ret != null ? ret : 0,
       won,
       exitReason: b.exitReason || (b.status === 'open' ? 'open' : 'unknown'),
@@ -40570,12 +40798,16 @@ function buildBotTrainingData() {
   });
 
   // ---- Aggregate learnings (the "how do we attack next time" rollup) ----
-  const wins = closed.filter(b => (b.pnl || 0) > 0);
-  const losses = closed.filter(b => (b.pnl || 0) <= 0);
+  // Prefer the frozen realizedPL on closed bets (the deterministic shares-based
+  // number); fall back to pnl. This is what fixes "0% P&L / no win rate" — the
+  // realized figure is always populated at close now.
+  const _plOf = (b) => (b.realizedPL != null && isFinite(b.realizedPL)) ? b.realizedPL : (b.pnl || 0);
+  const wins = closed.filter(b => _plOf(b) > 0);
+  const losses = closed.filter(b => _plOf(b) <= 0);
   const winRate = closed.length ? +(wins.length / closed.length).toFixed(3) : null;
-  const totalPnl = +closed.reduce((s, b) => s + (b.pnl || 0), 0).toFixed(2);
-  const avgWin = wins.length ? +(wins.reduce((s, b) => s + b.pnl, 0) / wins.length).toFixed(2) : null;
-  const avgLoss = losses.length ? +(losses.reduce((s, b) => s + b.pnl, 0) / losses.length).toFixed(2) : null;
+  const totalPnl = +closed.reduce((s, b) => s + _plOf(b), 0).toFixed(2);
+  const avgWin = wins.length ? +(wins.reduce((s, b) => s + _plOf(b), 0) / wins.length).toFixed(2) : null;
+  const avgLoss = losses.length ? +(losses.reduce((s, b) => s + _plOf(b), 0) / losses.length).toFixed(2) : null;
   const profitFactor = (avgLoss && avgLoss !== 0 && wins.length && losses.length)
     ? +Math.abs((avgWin * wins.length) / (avgLoss * losses.length)).toFixed(2) : null;
 
@@ -40584,7 +40816,7 @@ function buildBotTrainingData() {
   // trust — the data-driven version of what botRetrain nudges.
   const signalPerf = {};
   for (const b of closed) {
-    const won = (b.pnl || 0) > 0;
+    const won = (b.realizedPL != null ? b.realizedPL : (b.pnl || 0)) > 0;
     const dirSign = b.direction === 'short' ? -1 : 1;
     for (const [k, v] of Object.entries(b.components || {})) {
       if (!isFinite(v) || v === 0) continue;
@@ -41334,17 +41566,30 @@ function mergePortfolioRecords(records) {
   let added = 0;
   let portfolio = []; try { portfolio = loadPortfolio(); } catch {}
   let txns = []; try { txns = loadTransactions(); } catch {}
-  const entryKey = (e) => `${(e.ticker || '').toUpperCase()}|${(e.position || '').toLowerCase()}`;
+  // Prefer the STABLE id as the dedup key (falling back to ticker|position only
+  // for legacy rows without one). Keying on ticker|position caused duplicates
+  // when a position's role changed (e.g. Tracking→Watching) — the same holding
+  // appeared twice. id-keying makes startup merges stable across role edits and
+  // across builds, which is what kept "scrambling" the portfolio on reload.
+  const entryKey = (e) => e.id || `${(e.ticker || '').toUpperCase()}|${(e.position || '').toLowerCase()}`;
   const haveEntries = new Set(portfolio.map(entryKey));
+  const haveTickers = new Set(portfolio.map(e => (e.ticker || '').toUpperCase()));
   const haveTxn = new Set(txns.map(t => t.id || `${t.ticker}|${t.date}|${t.shares}|${t.price}`));
   for (const rec of records) {
     if (!rec || !rec._kind) {
-      // Bare entry (older shape) — treat as a portfolio entry.
       if (rec && rec.ticker) { const k = entryKey(rec); if (!haveEntries.has(k)) { portfolio.push(rec); haveEntries.add(k); added++; } }
       continue;
     }
     if (rec._kind === 'entry') {
-      const k = entryKey(rec); if (!haveEntries.has(k)) { const { _kind, id, ...e } = rec; portfolio.push(e); haveEntries.add(k); added++; }
+      const k = entryKey(rec);
+      // Skip if we already have this exact id. Also skip a legacy id-less repo
+      // row whose ticker is already represented locally (avoids a duplicate of a
+      // position the user already has under a real id).
+      const dupByTicker = !rec.id && haveTickers.has((rec.ticker || '').toUpperCase());
+      if (!haveEntries.has(k) && !dupByTicker) {
+        const { _kind, ...e } = rec;
+        portfolio.push(e); haveEntries.add(k); haveTickers.add((rec.ticker || '').toUpperCase()); added++;
+      }
     } else if (rec._kind === 'transaction') {
       const tk = rec.id || `${rec.ticker}|${rec.date}|${rec.shares}|${rec.price}`;
       if (!haveTxn.has(tk)) { const { _kind, ...t } = rec; txns.push(t); haveTxn.add(tk); added++; }
@@ -41352,6 +41597,20 @@ function mergePortfolioRecords(records) {
       try { if (typeof setCashPosition === 'function') setCashPosition(rec.value); } catch {}
     } else if (rec._kind === 'index' && rec.value != null) {
       try { if (typeof saveGoodGlobeIndex === 'function') saveGoodGlobeIndex(rec.value); } catch {}
+    } else if (rec._kind === 'snapshot') {
+      // Snapshot singleton from the server-side sync: restore cash + GoodGlobe
+      // ONLY to fill gaps, never to clobber a non-empty local value.
+      try {
+        if (rec.cashPosition != null && typeof getCashPosition === 'function' && typeof setCashPosition === 'function') {
+          const localCash = getCashPosition();
+          if (localCash == null || localCash === 0) setCashPosition(rec.cashPosition);
+        }
+        if (rec.goodGlobeIndex && typeof loadGoodGlobeIndex === 'function' && typeof saveGoodGlobeIndex === 'function') {
+          const idx = loadGoodGlobeIndex() || {};
+          for (const [t, r] of Object.entries(rec.goodGlobeIndex)) if (!idx[t]) idx[t] = r;
+          saveGoodGlobeIndex(idx);
+        }
+      } catch {}
     }
   }
   try { if (typeof savePortfolio === 'function') savePortfolio(portfolio); } catch {}
@@ -43630,6 +43889,19 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
   // but explore enough to discover regime changes and avoid overfitting to a
   // streak. The mix is different every run — never a fixed quota.
   scored.sort((a, b) => b.confidence - a.confidence);
+  // DEDUP GUARD: never open a NEW position in a ticker the bot already holds
+  // open. Without this, a re-run (or a sync that fired before prices loaded, then
+  // again after) could stack a second AAPL/NVDA position on top of the first —
+  // exactly the "sync added more trades and blew up committed capital" problem.
+  // One open position per ticker; the bot manages the existing one instead.
+  {
+    const heldNow = new Set(bot.bets.filter(b => b.status === 'open').map(b => (b.ticker || '').toUpperCase()));
+    const before = scored.length;
+    for (let i = scored.length - 1; i >= 0; i--) {
+      if (heldNow.has((scored[i].ticker || '').toUpperCase())) scored.splice(i, 1);
+    }
+    if (before !== scored.length) console.log(`[bot] dedup: dropped ${before - scored.length} candidate(s) already held open`);
+  }
   // Record the best available conviction this scan saw (among names NOT already
   // held), so the mark-to-market exit logic can judge opportunity cost: a held
   // winner is only worth rotating out of if something clearly better is waiting.
@@ -44408,6 +44680,49 @@ function botMarkToMarket() {
         const holdDays = Math.round((new Date(today) - new Date(bet.entryDate)) / 86400000);
         bet.holdDays = holdDays;
         bet._taxTreatment = holdDays > BOT_TAX.longTermDays ? 'long-term' : 'short-term';   // internal
+        // ===== FREEZE REALIZED P&L FROM SHARES (deterministic) =====
+        // Compute the realized dollar P&L directly from shares × price move −
+        // fees, NOT from the possibly-stale mark-to-market `pnl`. This is the
+        // number that was wrong: if MTM hadn't run (fresh import, prices not yet
+        // loaded), bet.pnl could be 0 and the trade closed showing $0 / 0%. The
+        // shares-based calc is always correct as long as we have entry/exit price
+        // and size. We also persist it as `realizedPL` AND keep `pnl` in sync so
+        // every downstream reader (ledger, win-rate, export, Supabase) sees it.
+        const _shares = (bet.shares != null && isFinite(bet.shares) && bet.shares > 0)
+          ? bet.shares
+          : ((bet.entryPrice > 0) ? ((bet.notional || bet.dollars || 0) / bet.entryPrice) : 0);
+        const _fees = (bet.fees != null && isFinite(bet.fees)) ? bet.fees : 0;
+        let _realized;
+        if (bet.instrument === 'option' && bet.optionPremium > 0) {
+          // Options: realized = (exit option value − premium) × 100 × contracts.
+          const contracts = bet.optionContracts || 1;
+          const exitVal = (bet.optionValue != null && isFinite(bet.optionValue)) ? bet.optionValue
+            : (bet.optionType === 'put' ? Math.max(0, bet.optionStrike - px) : Math.max(0, px - bet.optionStrike));
+          _realized = (exitVal - bet.optionPremium) * 100 * contracts - _fees;
+          const maxLoss = bet.maxLoss != null ? bet.maxLoss : bet.optionPremium * 100 * contracts;
+          if (_realized < -maxLoss) _realized = -maxLoss;
+        } else if (bet.instrument === 'leveraged_etf') {
+          // Leveraged ETF: hold the ETF long; realized = shares × (exit − entry) − fees.
+          _realized = _shares * (px - bet.entryPrice) - _fees;
+        } else {
+          // Shares (long or short): direction sets the sign.
+          const dir = bet.direction === 'short' ? -1 : 1;
+          _realized = dir * (px - bet.entryPrice) * _shares * (bet.leverage || 1) - _fees;
+          // Subtract any accrued short dividend carry that was tracked.
+          if (bet.direction === 'short' && bet.dividendCarry) _realized -= bet.dividendCarry;
+        }
+        if (!isFinite(_realized)) _realized = (bet.pnl || 0);
+        _realized = +_realized.toFixed(2);
+        bet.realizedPL = _realized;          // the durable, exported truth
+        bet.pnl = _realized;                  // keep MTM field consistent at close
+        bet.won = _realized > 0;              // explicit win flag for win-rate
+        // Return % from the actual capital at risk (entry notional), not exposure.
+        const _entryCapital = (bet.shares != null && bet.entryPrice)
+          ? bet.shares * bet.entryPrice
+          : (bet.notional || bet.dollars || 0);
+        bet.returnPct = _entryCapital > 0 ? +((_realized / _entryCapital) * 100).toFixed(2) : (bet.returnPct || 0);
+        // Record the shares + prices on the bet so the ledger can show the math.
+        bet.sharesAtExit = +(_shares || 0).toFixed(4);
         // Opportunity-cost breadcrumb: capture how strong the name still looked at
         // exit. If we sold a still-strong winner (high momentum) and it wasn't a
         // rotation into something better, that's a flag the bot can learn from
@@ -44417,20 +44732,43 @@ function botMarkToMarket() {
           if (typeof computeMomentumGrade === 'function') {
             const mg = computeMomentumGrade(bet.ticker);
             bet.exitMomentum = mg && mg.score != null ? mg.score : null;
-            bet.soldStillStrong = (bet.direction === 'long' && (bet.pnl || 0) > 0 && bet.exitMomentum != null && bet.exitMomentum > 60 && exitReason === 'horizon');
+            bet.soldStillStrong = (bet.direction === 'long' && _realized > 0 && bet.exitMomentum != null && bet.exitMomentum > 60 && exitReason === 'horizon');
           }
         } catch {}
         if (bet._rolledForMomentum) bet.rolledForMomentum = bet._rolledForMomentum;
-        // Realize the GROSS P&L into the bankroll (the displayed account matches
-        // gross P&L — no surprise tax drag shown). Tax only influences WHICH
-        // trades the bot makes / how long it holds, not the reported balance.
-        bot.bankroll = +(bot.bankroll + (bet.pnl || 0)).toFixed(2);
-        // Cash balance AFTER this sell: freed notional returns to cash, P&L
-        // realized into the bankroll. Recompute against remaining open positions.
+        // Realize the P&L into the bankroll using the SHARES-BASED number.
+        bot.bankroll = +(bot.bankroll + _realized).toFixed(2);
+        // Cash AFTER this sell: the position's freed CAPITAL (entry cost) returns
+        // to cash, plus/minus the realized P&L. Recompute reserve vs remaining
+        // open positions so cash reflects reality.
         {
           const _committedAfter = bot.bets.filter(b => b.status === 'open' && b.id !== bet.id).reduce((s, b) => s + (b.notional || 0), 0);
           bet.cashAfter = +(bot.bankroll - _committedAfter).toFixed(2);
         }
+        // Log a closing transaction into the bot ledger so the realized P&L,
+        // shares, entry/exit, and fees are all in one auditable place (and ride
+        // to the repo + Supabase).
+        try {
+          bot.transactions = bot.transactions || [];
+          bot.transactions.push({
+            id: `bottx-${bet.id || bet.ticker}-${Date.now()}`,
+            ts: new Date().toISOString(),
+            type: 'close',
+            ticker: bet.ticker,
+            direction: bet.direction,
+            instrument: bet.instrument || 'shares',
+            shares: bet.sharesAtExit,
+            entryPrice: bet.entryPrice,
+            exitPrice: px,
+            fees: _fees,
+            realizedPL: _realized,
+            returnPct: bet.returnPct,
+            exitReason,
+            entryDate: bet.entryDate,
+            exitDate: today,
+            betId: bet.id,
+          });
+        } catch {}
         // COMPLETE THE RECEIPT — what happened, what it learned, what it could
         // have done better. This is the close-side of the trade's story, used in
         // the popup and fed into the retrain.
