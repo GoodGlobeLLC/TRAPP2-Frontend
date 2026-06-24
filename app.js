@@ -104,6 +104,19 @@ document.addEventListener('DOMContentLoaded', () => {
   } catch {}
 });
 
+// On load, heal any historical duplicate transactions/positions (e.g. a sell or
+// buy that double-fired, or a doubled import) so the book reflects reality.
+document.addEventListener('DOMContentLoaded', () => {
+  try {
+    const txRemoved = (typeof dedupeTransactions === 'function') ? dedupeTransactions() : 0;
+    const posRemoved = (typeof dedupePortfolioPositions === 'function') ? dedupePortfolioPositions() : 0;
+    if ((txRemoved || posRemoved) && typeof flashStatus === 'function') {
+      flashStatus(`Cleaned ${txRemoved} duplicate transaction(s) + ${posRemoved} duplicate position(s)`, 'success');
+    }
+    if ((txRemoved || posRemoved) && typeof renderStockBook === 'function') { try { renderStockBook(); } catch {} }
+  } catch (e) { console.warn('[dedup] startup cleanup failed', e.message); }
+});
+
 document.addEventListener('DOMContentLoaded', () => {
   if (APP_ENV === 'production') return;
   const b = document.createElement('div');
@@ -1449,22 +1462,55 @@ function goodGlobeIndexPerformance(windowName = 'all') {
     if (pts.length < 2) pts = series.slice(-2);
   }
 
-  // Since-inception equal-weighted return computed directly from entry prices —
-  // the simple "each member's return from when it was added, averaged equally."
-  // This is the honest cross-check / fallback before a daily curve accrues.
+  // Since-inception weighted return computed directly from entry prices. This is
+  // the headline number the user wants: "performance since adding what's in the
+  // index." Each member's return is measured from its own add; the index return
+  // is the WEIGHTED average of those returns.
+  //
+  // Weighting mode (GG_INDEX_WEIGHT_MODE): 'equal' (default — every member
+  // contributes equally, the "average weighted" the user asked to keep for now)
+  // or 'mktcap' (SPY-style — each member weighted by its float-adjusted market
+  // cap, so the index behaves like SPY/XLF if the right tickers are chosen).
   const members = _indexPerformanceMembers();
+  const mode = (typeof getIndexWeightMode === 'function') ? getIndexWeightMode() : 'equal';
   const perMember = [];
   for (const m of members) {
     const cur = _currentPriceFor(m.ticker);
     if (m.entryPrice != null && m.entryPrice > 0 && cur != null) {
-      perMember.push({ ticker: m.ticker, entryPrice: m.entryPrice, current: cur,
+      // Weight: market cap for mktcap mode, else 1 (equal). Market cap pulled
+      // from the stockbook row; falls back to equal weight if unavailable.
+      let weight = 1;
+      if (mode === 'mktcap') {
+        try {
+          const row = (typeof getStockbookRow === 'function') ? getStockbookRow(m.ticker) : null;
+          const mc = row && (row.marketCap ?? row.marketcap);
+          weight = (mc != null && isFinite(mc) && mc > 0) ? +mc : 1;
+        } catch { weight = 1; }
+      }
+      perMember.push({ ticker: m.ticker, entryPrice: m.entryPrice, current: cur, weight,
         returnPct: +(((cur - m.entryPrice) / m.entryPrice) * 100).toFixed(2),
         since: m.entryDate || m.firstFlaggedAt });
     }
   }
+  // Weighted average of member returns.
+  let weightedSinceAdd = null;
+  if (perMember.length) {
+    const totalW = perMember.reduce((s, x) => s + (x.weight || 0), 0) || perMember.length;
+    weightedSinceAdd = +(perMember.reduce((s, x) => s + x.returnPct * (x.weight || 1), 0) / totalW).toFixed(2);
+    // Store each member's % weight for display.
+    for (const x of perMember) x.weightPct = +(((x.weight || 1) / totalW) * 100).toFixed(2);
+  }
+  // Back-compat alias (older callers read equalWeightSinceAdd).
   const equalWeightSinceAdd = perMember.length
     ? +(perMember.reduce((s, x) => s + x.returnPct, 0) / perMember.length).toFixed(2)
     : null;
+
+  // Index money value: a base LEVEL of $20 (like an index/ETF share price) that
+  // moves with the index's since-add return. AAPL alone +10% → $22.00; AAPL +10%
+  // & GME +5% equal-weighted → +7.5% → $21.50.
+  const GG_BASE_VALUE = 20;
+  const headlineReturn = weightedSinceAdd != null ? weightedSinceAdd : 0;
+  const indexValue = +(GG_BASE_VALUE * (1 + headlineReturn / 100)).toFixed(2);
 
   const levelNow = series.length ? series[series.length - 1].level : 100;
   const compoundedAllTime = +((levelNow / 100 - 1) * 100).toFixed(2);
@@ -1479,10 +1525,27 @@ function goodGlobeIndexPerformance(windowName = 'all') {
     levelNow: +levelNow.toFixed(2),
     compoundedAllTime,        // compounded equal-weighted, from the daily curve
     windowReturnPct,          // return over the selected window
-    equalWeightSinceAdd,      // direct entry-price-based equal-weight (cross-check)
-    perMember,                // each member's return since its own add
+    weightedSinceAdd,         // THE headline: weighted return since each member's add
+    equalWeightSinceAdd,      // equal-weight version (always available)
+    weightMode: mode,         // 'equal' | 'mktcap'
+    indexValue,               // $-value, base $20 (acts like an ETF/SPY level)
+    baseValue: GG_BASE_VALUE,
+    perMember,                // each member's return since its own add (+ weightPct)
     memberCount: perMember.length,
   };
+}
+// Index weighting mode — 'equal' (default) or 'mktcap' (SPY-style). Stored so the
+// user can switch later without code changes.
+const GG_INDEX_WEIGHT_KEY = 'valuatio.goodglobe.weightMode';
+function getIndexWeightMode() {
+  try { return localStorage.getItem(GG_INDEX_WEIGHT_KEY) === 'mktcap' ? 'mktcap' : 'equal'; } catch { return 'equal'; }
+}
+function setIndexWeightMode(mode) {
+  try { localStorage.setItem(GG_INDEX_WEIGHT_KEY, mode === 'mktcap' ? 'mktcap' : 'equal'); } catch {}
+}
+if (typeof window !== 'undefined') {
+  window.getIndexWeightMode = getIndexWeightMode;
+  window.setIndexWeightMode = setIndexWeightMode;
 }
 if (typeof window !== 'undefined') {
   window.goodGlobeIndexPerformance = goodGlobeIndexPerformance;
@@ -11140,6 +11203,9 @@ async function loadStockBook(forceRefresh = false) {
   // Persist stable identity/taxonomy fields to long-lived cache for instant cold-start
   updateTaxonomyCache(state.stockbook.rows);
   setStatus(`${state.stockbook.rows.length} tickers loaded`, 'success');
+  // Capture an intraday tick per charted ticker so a refresh becomes a new chart
+  // point (Robinhood-style "today"). No-op outside market hours.
+  try { if (typeof captureIntradaySnapshot === 'function') captureIntradaySnapshot(); } catch {}
   renderStockBook();
   maybeShowTickerTape();
 }
@@ -22584,12 +22650,187 @@ function getHistoryForTicker(ticker) {
     const ext = loadPriceHistCache()[ticker];
     if (ext?.data?.length >= 2) raw = ext.data;
   }
-  if (!raw) return null;
+  if (!raw) {
+    // Even with no stored daily history, we may have intraday ticks captured
+    // today — return those alone so a brand-new position still draws a line.
+    const intraOnly = (typeof _intradayAsHistory === 'function') ? _intradayAsHistory(ticker, null) : null;
+    return intraOnly && intraOnly.length >= 2 ? intraOnly : null;
+  }
   // Return the canonical shape so every consumer (charts, correlations, bot,
   // probability) reads the same .date/.close/.price/.volume regardless of which
   // source filled the cache.
-  return (typeof normalizeHistorySeries === 'function') ? normalizeHistorySeries(raw) : raw;
+  let norm = (typeof normalizeHistorySeries === 'function') ? normalizeHistorySeries(raw) : raw;
+  // Append TODAY's intraday ticks so charts show live movement, Robinhood-style:
+  // the daily series ends at yesterday's close; intraday points extend from there.
+  if (typeof _appendIntradayToHistory === 'function') norm = _appendIntradayToHistory(ticker, norm);
+  return norm;
 }
+
+// ============================================================
+//   INTRADAY TAPE — Robinhood-style "today" on every chart
+//
+//   Daily history (GitHub/sheet) ends at yesterday's close. Each time prices
+//   refresh, we capture a timestamped tick per ticker into a per-trading-day
+//   buffer. Charts then append today's ticks after the last daily close, so the
+//   most recent segment shows live intraday movement that grows point-by-point
+//   through the session. At the 9:30 ET open a new trading day starts and the
+//   prior close becomes "yesterday".
+// ============================================================
+const INTRADAY_KEY = 'valuatio.intraday.v1';
+
+// Current US-Eastern wall-clock parts (handles EST/EDT automatically).
+function _etParts(d = new Date()) {
+  try {
+    const fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    });
+    const parts = {};
+    for (const p of fmt.formatToParts(d)) if (p.type !== 'literal') parts[p.type] = p.value;
+    let hour = parseInt(parts.hour, 10); if (hour === 24) hour = 0;
+    return { y: +parts.year, mo: +parts.month, d: +parts.day, h: hour, mi: +parts.minute,
+             date: `${parts.year}-${parts.month}-${parts.day}`, minutes: hour * 60 + +parts.minute };
+  } catch {
+    const date = d.toISOString().slice(0, 10);
+    return { date, h: d.getUTCHours(), mi: d.getUTCMinutes(), minutes: d.getUTCHours() * 60 + d.getUTCMinutes() };
+  }
+}
+// The trading date "today" belongs to in ET. Before 9:30 ET, the active session
+// hasn't opened — but we still bucket pre-market ticks under today's date; the
+// chart simply treats the last daily close as the baseline until 9:30.
+function etTradingDate(d = new Date()) { return _etParts(d).date; }
+// Is the regular session open right now (9:30–16:00 ET, Mon–Fri)? Weekends/
+// holidays: we can't know holidays without a calendar, so weekends only.
+function isMarketOpenET(d = new Date()) {
+  const p = _etParts(d);
+  const dow = new Date(`${p.date}T12:00:00Z`).getUTCDay();   // 0 Sun … 6 Sat
+  if (dow === 0 || dow === 6) return false;
+  return p.minutes >= 570 && p.minutes < 960;                // 9:30 … 16:00
+}
+
+function _loadIntraday() {
+  try { return JSON.parse(localStorage.getItem(INTRADAY_KEY) || '{}'); } catch { return {}; }
+}
+function _saveIntraday(obj) {
+  try { localStorage.setItem(INTRADAY_KEY, JSON.stringify(obj)); } catch {}
+}
+
+// Record one intraday tick for a ticker at the current price. Called on every
+// price refresh. Stores { t: ms, p: price } under intraday[date][TICKER].
+// Keeps today + the previous trading day only (prunes the rest to stay small),
+// and caps points per ticker per day so a long session can't bloat storage.
+function recordIntradayTick(ticker, price, when = Date.now()) {
+  if (!ticker || price == null || !isFinite(price) || price <= 0) return;
+  const tk = String(ticker).toUpperCase();
+  const date = etTradingDate(new Date(when));
+  const store = _loadIntraday();
+  if (!store[date]) store[date] = {};
+  if (!store[date][tk]) store[date][tk] = [];
+  const arr = store[date][tk];
+  const last = arr[arr.length - 1];
+  // Skip a duplicate if price unchanged AND <60s since the last point (avoids
+  // flat spam); otherwise record — a changed price always adds a point ("a new
+  // spike unless the ticker was flat", as requested).
+  if (last && Math.abs(last.p - price) < 1e-9 && (when - last.t) < 60000) return;
+  arr.push({ t: when, p: +(+price).toFixed(6) });
+  // Cap ~480 points/day/ticker (e.g. every ~1 min for 8h) — trim oldest.
+  if (arr.length > 480) arr.splice(0, arr.length - 480);
+  // Prune to today + the immediately prior date present.
+  const dates = Object.keys(store).sort();
+  while (dates.length > 2) { delete store[dates.shift()]; }
+  _saveIntraday(store);
+}
+if (typeof window !== 'undefined') window.recordIntradayTick = recordIntradayTick;
+
+// Get today's intraday points for a ticker as [{t, p}], oldest first.
+function getIntradayPoints(ticker, date) {
+  const tk = String(ticker || '').toUpperCase();
+  const d = date || etTradingDate();
+  const store = _loadIntraday();
+  return (store[d] && store[d][tk]) ? store[d][tk].slice() : [];
+}
+if (typeof window !== 'undefined') window.getIntradayPoints = getIntradayPoints;
+
+// Convert today's intraday ticks into history-shaped rows (date = today, close =
+// price), so a no-daily-history ticker can still chart from intraday alone.
+function _intradayAsHistory(ticker, _unused) {
+  const pts = getIntradayPoints(ticker);
+  if (!pts.length) return null;
+  const date = etTradingDate();
+  return pts.map(p => ({ date, t: p.t, close: p.p, price: p.p, _intraday: true }));
+}
+
+// Append today's intraday ticks to a normalized daily series. The daily series
+// ends at yesterday's close; we add today's points after it. If the series
+// already contains a row dated today (some sources include a partial day), we
+// drop it first so intraday is the single source of truth for "today".
+function _appendIntradayToHistory(ticker, series) {
+  try {
+    if (!Array.isArray(series) || !series.length) return series;
+    const pts = getIntradayPoints(ticker);
+    if (!pts.length) return series;
+    const today = etTradingDate();
+    // Remove any existing same-day row(s) so we don't double-count today.
+    const base = series.filter(r => String(r.date).slice(0, 10) !== today);
+    const intra = pts.map(p => ({ date: today, t: p.t, close: p.p, price: p.p, _intraday: true }));
+    return base.concat(intra);
+  } catch { return series; }
+}
+if (typeof window !== 'undefined') window._appendIntradayToHistory = _appendIntradayToHistory;
+
+// Snapshot an intraday tick for every ticker the user actually charts —
+// portfolio positions, open bot bets, and the current valuation ticker. Called
+// after each stockbook (re)load so a price refresh becomes a new chart point.
+// Only records when the regular session is open (or pre/post if a fresh quote
+// exists) so overnight reloads don't spam flat points.
+function captureIntradaySnapshot() {
+  try {
+    if (typeof recordIntradayTick !== 'function') return;
+    const rows = (state.stockbook && Array.isArray(state.stockbook.rows)) ? state.stockbook.rows : [];
+    if (!rows.length) return;
+    const priceOf = (tk) => {
+      const r = rows.find(x => (x.ticker || '').toUpperCase() === tk.toUpperCase());
+      return r && r.price != null && isFinite(r.price) ? r.price : null;
+    };
+    const tickers = new Set();
+    try { (loadPortfolio() || []).forEach(p => p.ticker && tickers.add(p.ticker.toUpperCase())); } catch {}
+    try { const bot = loadBotState(); (bot.bets || []).filter(b => b.status === 'open').forEach(b => b.ticker && tickers.add(b.ticker.toUpperCase())); } catch {}
+    try { if (state.valuation && state.valuation.ticker) tickers.add(state.valuation.ticker.toUpperCase()); } catch {}
+    // Only bother during/around market hours; outside, a reload is just yesterday.
+    const open = (typeof isMarketOpenET === 'function') ? isMarketOpenET() : true;
+    if (!open) return;
+    let n = 0;
+    for (const tk of tickers) { const px = priceOf(tk); if (px != null) { recordIntradayTick(tk, px); n++; } }
+    // Snapshot the PORTFOLIO net worth and the BOT book value under synthetic
+    // tickers so their performance charts also grow a live "today" curve.
+    try {
+      const port = loadPortfolio() || [];
+      const ACTIVE = (typeof ACTIVE_POSITIONS !== 'undefined') ? ACTIVE_POSITIONS : ['Long', 'Short', 'Buy to open', 'Sell to open'];
+      let holdings = 0;
+      for (const p of port) {
+        if (!ACTIVE.includes(p.position)) continue;
+        const px = priceOf(p.ticker);
+        const qty = +p.qty || 0;
+        if (px != null && qty) {
+          const dir = (p.position || '').toLowerCase() === 'short' ? -1 : 1;
+          const mult = (typeof positionMultiplier === 'function') ? positionMultiplier(p) : 1;
+          holdings += dir * px * qty * mult;
+        }
+      }
+      const cash = (typeof getCashPosition === 'function') ? getCashPosition() : 0;
+      const nav = holdings + cash;
+      if (isFinite(nav) && nav !== 0) recordIntradayTick('__PORTFOLIO_NAV__', nav);
+    } catch {}
+    try {
+      if (typeof botBookValue === 'function') {
+        const bv = botBookValue();
+        if (bv && bv.totalValue != null && isFinite(bv.totalValue)) recordIntradayTick('__BOT_VALUE__', bv.totalValue);
+      }
+    } catch {}
+    if (n) console.log(`[intraday] captured ${n} tick(s) @ ${new Date().toLocaleTimeString()}`);
+  } catch (e) { console.warn('[intraday] snapshot failed', e.message); }
+}
+if (typeof window !== 'undefined') window.captureIntradaySnapshot = captureIntradaySnapshot;
 
 // Lazy on-demand single-ticker history fetch.
 // Uses the manifest base URL registered when history_manifest.json was loaded.
@@ -23843,8 +24084,44 @@ function loadPortfolio() {
   } catch { return []; }
 }
 function savePortfolio(arr) {
-  try { localStorage.setItem(PORTFOLIO_STORAGE, JSON.stringify(arr)); } catch {}
+  try {
+    // Dedupe by stable id before persisting — guarantees the same position can
+    // never be stored twice (the "4000 shares of SNK" bug came from a duplicate
+    // position landing on import/refresh). Last write wins for a given id.
+    const seen = new Map();
+    for (const e of (Array.isArray(arr) ? arr : [])) {
+      if (!e) continue;
+      const key = e.id || `${(e.ticker || '').toUpperCase()}|${e.position || ''}|${e.addedAt || ''}|${e.qty || ''}`;
+      seen.set(key, e);
+    }
+    localStorage.setItem(PORTFOLIO_STORAGE, JSON.stringify(Array.from(seen.values())));
+  } catch {}
 }
+
+// Heavier cleanup: collapse positions that are clearly the SAME lot duplicated —
+// same ticker + role + entry price + (same-day) entry date + qty — even if they
+// somehow got different ids. Keeps the earliest. Returns count removed.
+function dedupePortfolioPositions() {
+  let arr = [];
+  try { arr = loadPortfolio(); } catch { return 0; }
+  if (arr.length < 2) return 0;
+  const sorted = arr.slice().sort((a, b) => new Date(a.addedAt || 0) - new Date(b.addedAt || 0));
+  const kept = [];
+  for (const p of sorted) {
+    const dupe = kept.find(k =>
+      (k.ticker || '').toUpperCase() === (p.ticker || '').toUpperCase() &&
+      (k.position || '') === (p.position || '') &&
+      Math.abs((+k.costBasis || 0) - (+p.costBasis || 0)) < 1e-6 &&
+      Math.abs((+k.qty || 0) - (+p.qty || 0)) < 1e-6 &&
+      String(k.addedAt || '').slice(0, 10) === String(p.addedAt || '').slice(0, 10)
+    );
+    if (!dupe) kept.push(p);
+  }
+  const removed = arr.length - kept.length;
+  if (removed > 0) { savePortfolio(kept); console.warn(`[portfolio] dedupePortfolioPositions removed ${removed} duplicate position(s)`); }
+  return removed;
+}
+if (typeof window !== 'undefined') window.dedupePortfolioPositions = dedupePortfolioPositions;
 
 // ============================================================
 //   TRAPP2-PORT — portfolio backend repo (export / import).
@@ -24296,7 +24573,28 @@ function saveTransactions(arr) {
 function appendTransaction(tx) {
   // tx shape: { id, ts, type: 'sell'|'buy', ticker, qty, price, fee, proceeds, entryId }
   const arr = loadTransactions();
-  const id = `tx-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const nowMs = Date.now();
+  const tsMs = tx.ts ? new Date(tx.ts).getTime() : nowMs;
+  // DEDUP GUARD: reject a transaction that matches a recent one on type + ticker
+  // + qty + price within a short time window. A double-fired sell/buy (the bug
+  // where one sale recorded twice) produces two near-identical rows milliseconds
+  // apart; this catches them. Deposits/withdrawals are exempt (you can legitimately
+  // add cash twice). Window: 5 seconds — far longer than any double-click/double-
+  // render gap, far shorter than two deliberate identical trades.
+  if (tx.type !== 'deposit' && tx.type !== 'withdrawal') {
+    const DEDUP_MS = 5000;
+    const sameKey = (a) =>
+      a.type === tx.type &&
+      (a.ticker || '').toUpperCase() === (tx.ticker || '').toUpperCase() &&
+      Math.abs((+a.qty || 0) - (+tx.qty || 0)) < 1e-6 &&
+      Math.abs((+a.price || 0) - (+tx.price || 0)) < 1e-6;
+    const dupe = arr.find(a => sameKey(a) && Math.abs((a.ts ? new Date(a.ts).getTime() : 0) - tsMs) < DEDUP_MS);
+    if (dupe) {
+      console.warn(`[txn] duplicate ${tx.type} ${tx.ticker} ${tx.qty}@${tx.price} suppressed (matches ${dupe.id} within ${DEDUP_MS}ms)`);
+      return dupe.id;   // return the existing id; do NOT add a second row
+    }
+  }
+  const id = `tx-${nowMs}-${Math.random().toString(36).slice(2, 7)}`;
   const record = { id, ts: new Date().toISOString(), ...tx };
   arr.push(record);
   saveTransactions(arr);
@@ -24320,6 +24618,84 @@ function getCashPosition() {
     return raw ? parseFloat(raw) : 0;
   } catch { return 0; }
 }
+
+// One-time/cleanup dedup of the transaction ledger: collapses duplicate rows
+// that share type + ticker + qty + price and land within ~2s of each other (a
+// double-fired buy/sell, or a doubled import). Keeps the earliest of each
+// cluster. Returns the number removed. Runs on load so historical duplicates
+// (like the doubled SNK buy/sell) self-heal.
+function dedupeTransactions() {
+  let arr = [];
+  try { arr = loadTransactions(); } catch { return 0; }
+  if (!Array.isArray(arr) || arr.length < 2) return 0;
+  // Sort oldest-first so we keep the first occurrence.
+  const sorted = arr.slice().sort((a, b) => new Date(a.ts || 0) - new Date(b.ts || 0));
+  const kept = [];
+  const DEDUP_MS = 2000;
+  for (const tx of sorted) {
+    if (tx.type === 'deposit' || tx.type === 'withdrawal') { kept.push(tx); continue; }
+    const tsMs = tx.ts ? new Date(tx.ts).getTime() : 0;
+    const isDupe = kept.some(k =>
+      k.type === tx.type &&
+      (k.ticker || '').toUpperCase() === (tx.ticker || '').toUpperCase() &&
+      Math.abs((+k.qty || 0) - (+tx.qty || 0)) < 1e-6 &&
+      Math.abs((+k.price || 0) - (+tx.price || 0)) < 1e-6 &&
+      Math.abs((k.ts ? new Date(k.ts).getTime() : 0) - tsMs) < DEDUP_MS
+    );
+    if (!isDupe) kept.push(tx);
+  }
+  const removed = arr.length - kept.length;
+  if (removed > 0) {
+    saveTransactions(kept);
+    console.warn(`[txn] dedupeTransactions removed ${removed} duplicate row(s)`);
+  }
+  return removed;
+}
+if (typeof window !== 'undefined') window.dedupeTransactions = dedupeTransactions;
+
+// Cumulative realized P/L for a ticker, computed from the TRANSACTION ledger —
+// the running lifetime performance across every closed trade of that name. The
+// user's spec: sell AAPL for +$300 (10%), trade it again next month for another
+// +$300 (10%), and the cell shows the SUM ($600) plus the blended % gain on the
+// capital deployed. We sum realized P/L across all sells and divide by the total
+// cost basis of the sold lots (qty × entry) to get a capital-weighted % return.
+function cumulativeTickerPL(ticker) {
+  const tk = String(ticker || '').toUpperCase();
+  let txns = [];
+  try { txns = loadTransactions(); } catch { return null; }
+  const sells = txns.filter(t => t && (t.ticker || '').toUpperCase() === tk &&
+    (t.type === 'sell' || t.type === 'cover' || t.type === 'sell-to-close' || t.type === 'buy-to-close'));
+  if (!sells.length) return null;
+  let totalPL = 0, totalCost = 0, trades = 0, wins = 0, totalProceeds = 0, totalFees = 0;
+  for (const s of sells) {
+    const pl = (s.realizedPL != null && isFinite(s.realizedPL)) ? s.realizedPL : 0;
+    totalPL += pl;
+    trades++;
+    if (pl > 0) wins++;
+    totalFees += (+s.fee || 0);
+    if (s.proceeds != null && isFinite(s.proceeds)) totalProceeds += s.proceeds;
+    // Cost basis of the sold lot: prefer explicit entryPrice × qty, else derive
+    // from proceeds − P/L (what it cost to acquire what was sold).
+    const qty = +s.qty || 0;
+    const entryPx = (s.entryPrice != null && isFinite(s.entryPrice)) ? s.entryPrice : null;
+    if (entryPx != null && qty) totalCost += entryPx * qty;
+    else if (s.proceeds != null && isFinite(s.proceeds)) totalCost += Math.max(0, s.proceeds - pl);
+  }
+  const pctOfCost = totalCost > 0 ? +((totalPL / totalCost) * 100).toFixed(2) : null;
+  return {
+    ticker: tk,
+    totalPL: +totalPL.toFixed(2),       // cumulative $ realized across all trades
+    pctOfCost,                          // blended % return on capital deployed
+    trades,                            // number of closing trades
+    wins,
+    winRate: trades ? +(wins / trades).toFixed(3) : null,
+    totalCost: +totalCost.toFixed(2),
+    totalProceeds: +totalProceeds.toFixed(2),
+    totalFees: +totalFees.toFixed(2),
+  };
+}
+if (typeof window !== 'undefined') window.cumulativeTickerPL = cumulativeTickerPL;
+
 function setCashPosition(v) {
   try { localStorage.setItem(CASH_POSITION_STORAGE, String(v)); } catch {}
 }
@@ -24327,6 +24703,53 @@ function addToCashPosition(amount) {
   const current = getCashPosition();
   setCashPosition(current + amount);
 }
+
+// Feed the PORTFOLIO external cash (or withdraw with a negative amount), and
+// RECORD it as a deposit/withdrawal transaction so the backend understands the
+// money was added by the user — it's capital, not a realized gain. Cash rises so
+// you can open more/bigger positions.
+function addCashToPortfolio(amount) {
+  const amt = parseFloat(amount);
+  if (!isFinite(amt) || amt === 0) return null;
+  addToCashPosition(amt);
+  try {
+    if (typeof appendTransaction === 'function') {
+      appendTransaction({
+        id: `cash-${Date.now()}`,
+        ts: new Date().toISOString(),
+        type: amt > 0 ? 'deposit' : 'withdrawal',
+        amount: amt,
+        cashAfter: getCashPosition(),
+        note: 'user capital injection',
+      });
+    }
+  } catch {}
+  // Track cumulative external capital for honest return math.
+  try {
+    const k = 'valuatio.portfolio.cashAdded';
+    const cur = parseFloat(localStorage.getItem(k) || '0') || 0;
+    localStorage.setItem(k, String(cur + amt));
+  } catch {}
+  if (typeof flashStatus === 'function') flashStatus(`${amt > 0 ? 'Added' : 'Withdrew'} $${Math.abs(amt).toLocaleString()} ${amt > 0 ? 'to' : 'from'} the portfolio — recorded as a capital ${amt > 0 ? 'deposit' : 'withdrawal'} (not P&L)`, 'success');
+  try { if (typeof renderStockBook === 'function') renderStockBook(); else if (typeof renderPortfolioTab === 'function') renderPortfolioTab(); } catch {}
+  // Mirror to PORT Supabase if configured (backend record; Supabase keeps the position state).
+  try { if (typeof portSupabaseSyncAll === 'function' && typeof portSupabaseConfigured === 'function' && portSupabaseConfigured()) portSupabaseSyncAll(); } catch {}
+  return getCashPosition();
+}
+if (typeof window !== 'undefined') window.addCashToPortfolio = addCashToPortfolio;
+
+function editPortfolioCash() {
+  const cur = (typeof getCashPosition === 'function') ? getCashPosition() : 0;
+  const v = prompt(
+    'Add cash to your portfolio (or use a negative number to withdraw).\n\n' +
+    'Recorded as a capital deposit — raises your buying power, not counted as a gain.\n\n' +
+    `Current cash: $${cur.toLocaleString()}\n\nAmount to add (USD):`, '10000');
+  if (v == null) return;
+  const amt = parseFloat(v.replace(/[,$\s]/g, ''));
+  if (!isFinite(amt) || amt === 0) { if (typeof flashStatus === 'function') flashStatus('No change — enter a non-zero number', ''); return; }
+  addCashToPortfolio(amt);
+}
+if (typeof window !== 'undefined') window.editPortfolioCash = editPortfolioCash;
 
 function addToPortfolio(entry) {
   const arr = loadPortfolio();
@@ -25822,14 +26245,26 @@ function renderGoodGlobeIndexView(content, summary, subTabs) {
     }).join(' ');
     const firstDate = e.firstFlaggedAt ? new Date(e.firstFlaggedAt).toISOString().slice(0, 10) : '—';
     const lastDate  = e.lastFlaggedAt  ? new Date(e.lastFlaggedAt).toISOString().slice(0, 10)  : '—';
-    // Realized P/L cell — populated from the trade journal (shorts + options
-    // handled with correct sign + 100× multiplier inside recordTradeInGoodGlobeIndex)
+    // Realized P/L cell — CUMULATIVE across every closed trade of this ticker,
+    // computed from the transaction ledger ($ gained/lost + blended % on capital
+    // deployed). Falls back to the index trade-journal figure if no transactions.
+    const cumPL = (typeof cumulativeTickerPL === 'function') ? cumulativeTickerPL(e.ticker) : null;
+    const hasTxPL = cumPL && cumPL.trades > 0;
     const hasTradePL = e.realizedPL != null && e.tradeCount > 0;
-    const plColor = !hasTradePL ? 'var(--ink-faint)' : e.realizedPL >= 0 ? 'var(--pos)' : 'var(--neg)';
-    const plCell = hasTradePL
-      ? `<span style="color:${plColor};font-weight:600">${e.realizedPL >= 0 ? '+' : ''}$${Math.abs(e.realizedPL) >= 1000 ? (e.realizedPL/1000).toFixed(1) + 'k' : e.realizedPL.toFixed(2)}</span>`
-        + `<br><span style="font-size:8px;color:var(--ink-faint)">${e.tradeCount} trade${e.tradeCount === 1 ? '' : 's'}${e.winRate != null ? ` · ${Math.round(e.winRate * 100)}% win` : ''}</span>`
-      : '<span style="color:var(--ink-faint)">—</span>';
+    let plCell;
+    if (hasTxPL) {
+      const v = cumPL.totalPL;
+      const plColor = v >= 0 ? 'var(--pos)' : 'var(--neg)';
+      plCell = `<span style="color:${plColor};font-weight:600">${v >= 0 ? '+' : ''}$${Math.abs(v) >= 1000 ? (v/1000).toFixed(1) + 'k' : v.toFixed(2)}</span>`
+        + (cumPL.pctOfCost != null ? ` <span style="color:${plColor};font-size:9px">(${cumPL.pctOfCost >= 0 ? '+' : ''}${cumPL.pctOfCost}%)</span>` : '')
+        + `<br><span style="font-size:8px;color:var(--ink-faint)">${cumPL.trades} trade${cumPL.trades === 1 ? '' : 's'} cumulative${cumPL.winRate != null ? ` · ${Math.round(cumPL.winRate * 100)}% win` : ''}</span>`;
+    } else if (hasTradePL) {
+      const plColor = e.realizedPL >= 0 ? 'var(--pos)' : 'var(--neg)';
+      plCell = `<span style="color:${plColor};font-weight:600">${e.realizedPL >= 0 ? '+' : ''}$${Math.abs(e.realizedPL) >= 1000 ? (e.realizedPL/1000).toFixed(1) + 'k' : e.realizedPL.toFixed(2)}</span>`
+        + `<br><span style="font-size:8px;color:var(--ink-faint)">${e.tradeCount} trade${e.tradeCount === 1 ? '' : 's'}${e.winRate != null ? ` · ${Math.round(e.winRate * 100)}% win` : ''}</span>`;
+    } else {
+      plCell = '<span style="color:var(--ink-faint)">—</span>';
+    }
     // Live "% since added" — this member's contribution to the equal-weighted
     // index, measured from its entry price to the current price.
     const mr = _memberReturns[e.ticker];
@@ -25862,8 +26297,11 @@ function renderGoodGlobeIndexView(content, summary, subTabs) {
         return `<div class="company-card" style="margin:0 0 14px"><div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);padding:6px 0">Index performance tracks once members with an entry price are added. Add tickers via Tracking/Trading and a price is captured at add time; the equal-weighted index builds from there.</div></div>`;
       }
       const win = state.goodglobeView?.perfWindow || 'all';
-      const allTimePct = perf.compoundedAllTime != null && perf.levelSeries.length >= 2 ? perf.compoundedAllTime : perf.equalWeightSinceAdd;
+      // Headline = weighted return since each member was added (the user's spec).
+      const headlinePct = perf.weightedSinceAdd != null ? perf.weightedSinceAdd : (perf.equalWeightSinceAdd ?? 0);
+      const allTimePct = headlinePct;
       const c = allTimePct == null ? 'var(--ink-dim)' : allTimePct >= 0 ? 'var(--pos)' : 'var(--neg)';
+      const weightLabel = perf.weightMode === 'mktcap' ? 'market-cap weighted (SPY-style)' : 'equal-weighted';
       // Mini equity curve of the index level.
       let chart = '';
       const pts = perf.levelSeries;
@@ -25885,8 +26323,8 @@ function renderGoodGlobeIndexView(content, summary, subTabs) {
       return `<div class="company-card" style="margin:0 0 14px;border-left:3px solid ${c}">
         <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
           <div>
-            <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">GoodGlobe Index · equal-weighted · ${perf.memberCount} members</div>
-            <div style="font-family:var(--mono);font-size:26px;font-weight:800;color:${c};margin-top:2px">${allTimePct >= 0 ? '+' : ''}${allTimePct}%<span style="font-size:12px;color:var(--ink-dim);font-weight:400"> all-time · level ${perf.levelNow}</span></div>
+            <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">GoodGlobe Index · ${weightLabel} · ${perf.memberCount} members</div>
+            <div style="font-family:var(--mono);font-size:26px;font-weight:800;color:${c};margin-top:2px">$${perf.indexValue}<span style="font-size:13px;color:${c};font-weight:600"> (${allTimePct >= 0 ? '+' : ''}${allTimePct}%)</span><span style="font-size:11px;color:var(--ink-dim);font-weight:400"> since add · $20 base</span></div>
             ${win !== 'all' && perf.windowReturnPct != null ? `<div style="font-family:var(--mono);font-size:11px;color:${perf.windowReturnPct>=0?'var(--pos)':'var(--neg)'}">${perf.windowReturnPct >= 0 ? '+' : ''}${perf.windowReturnPct}% this ${win}</div>` : ''}
           </div>
           <div class="seg-control" style="font-size:10px">
@@ -25894,7 +26332,7 @@ function renderGoodGlobeIndexView(content, summary, subTabs) {
           </div>
         </div>
         ${chart}
-        <div style="font-family:var(--mono);font-size:8px;color:var(--ink-faint);margin-top:6px;opacity:0.8">Equal-weighted: every member counts the same; new members join at the current level (no retroactive effect) and compound forward. Direct entry-price average: ${perf.equalWeightSinceAdd >= 0 ? '+' : ''}${perf.equalWeightSinceAdd}%.</div>
+        <div style="font-family:var(--mono);font-size:8px;color:var(--ink-faint);margin-top:6px;opacity:0.8">${perf.weightMode === 'mktcap' ? 'Market-cap weighted (SPY-style): bigger companies move the index more, like SPY/XLF.' : 'Equal-weighted: every member counts the same (average of each member\'s return since it was added).'} Measured from each member\'s entry price. <button id="gg-weight-toggle" class="btn btn-ghost" style="font-size:8px;padding:2px 8px;margin-left:6px">Switch to ${perf.weightMode === 'mktcap' ? 'equal weight' : 'SPY-style (market-cap)'}</button></div>
       </div>`;
     })()}
     <div class="gg-toolbar">
@@ -26026,6 +26464,13 @@ function renderGoodGlobeIndexView(content, summary, subTabs) {
         setTimeout(() => document.getElementById('fetch-btn')?.click(), 100);
       }
     });
+  });
+  // GoodGlobe Index weighting toggle (equal ↔ market-cap / SPY-style).
+  document.getElementById('gg-weight-toggle')?.addEventListener('click', () => {
+    const cur = (typeof getIndexWeightMode === 'function') ? getIndexWeightMode() : 'equal';
+    if (typeof setIndexWeightMode === 'function') setIndexWeightMode(cur === 'mktcap' ? 'equal' : 'mktcap');
+    if (typeof flashStatus === 'function') flashStatus(`Index now ${cur === 'mktcap' ? 'equal-weighted' : 'market-cap weighted (SPY-style)'}`, 'success');
+    renderStockBookPortfolio(content);
   });
   document.querySelectorAll('.gg-row-remove').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -26270,15 +26715,29 @@ function renderTransactionsLedger(content, summary, subTabs) {
   if (editCashBtn) {
     editCashBtn.addEventListener('click', () => {
       const current = getCashPosition();
-      const next = prompt('Set cash position to (numeric value):\n\nUse this to:\n  • Initialize starting cash\n  • Reconcile with brokerage statement\n  • Adjust after external deposit/withdrawal\n\nCurrent: $' + current.toFixed(2), current.toFixed(2));
-      if (next == null) return;
-      const v = parseFloat(next);
-      if (!isFinite(v)) {
-        alert('Not a valid number');
+      // Two modes: ADD (logged as a deposit/withdrawal the backend understands)
+      // or SET (silent reconcile to a brokerage statement). Default to ADD since
+      // that's the common "feed the portfolio more cash" case and it's recorded.
+      const choice = prompt(
+        'Cash: $' + current.toFixed(2) + '\n\n' +
+        'Type an AMOUNT TO ADD (e.g. 10000, or -5000 to withdraw) — this is logged\n' +
+        'as a capital deposit the backend tracks (raises buying power, not a gain).\n\n' +
+        'OR type "set 12345" to overwrite the balance for a brokerage reconcile\n' +
+        '(no deposit logged).', '10000');
+      if (choice == null) return;
+      const trimmed = choice.trim();
+      const setMatch = /^set\s+(-?[\d,.]+)/i.exec(trimmed);
+      if (setMatch) {
+        const v = parseFloat(setMatch[1].replace(/[,$\s]/g, ''));
+        if (!isFinite(v)) { alert('Not a valid number'); return; }
+        setCashPosition(v);
+        flashStatus(`Cash reconciled to ${fmt$(v)} (no deposit logged)`, 'success');
+        renderStockBookPortfolio(content);
         return;
       }
-      setCashPosition(v);
-      flashStatus(`Cash position set to ${fmt$(v)}`, 'success');
+      const amt = parseFloat(trimmed.replace(/[,$\s]/g, ''));
+      if (!isFinite(amt) || amt === 0) { alert('Enter an amount to add (e.g. 10000), or "set 12345" to reconcile.'); return; }
+      if (typeof addCashToPortfolio === 'function') addCashToPortfolio(amt);
       renderStockBookPortfolio(content);
     });
   }
@@ -26383,23 +26842,44 @@ function openSellModal(entryId) {
       alert(`Quantity must be between 0 and ${maxQty}`);
       return;
     }
+    // GUARD: never sell more than is actually HELD across all lots of this
+    // ticker (long positions). Selling more than you own would only be valid as
+    // a short, which is a different trade style entered explicitly — not here.
+    try {
+      const heldSameTicker = loadPortfolio()
+        .filter(p => (p.ticker || '').toUpperCase() === (entry.ticker || '').toUpperCase() && ACTIVE_POSITIONS.includes(p.position) && (p.position || '').toLowerCase() !== 'short')
+        .reduce((s, p) => s + (+p.qty || 0), 0);
+      if (qty > heldSameTicker + 0.0001) {
+        alert(`You only hold ${heldSameTicker} shares of ${entry.ticker}. Can't sell ${qty}.\n\n(Selling more than you own would be a short — open that as a separate short position instead.)`);
+        return;
+      }
+    } catch {}
     if (price <= 0) {
       alert('Sell price must be > 0');
       return;
     }
+    // Confirm the fee with the user before executing (the requested fee prompt):
+    // pre-filled with whatever they typed; they accept or correct it, then the
+    // sale fires exactly once.
+    const feeConfirmed = prompt(`Confirm the broker fee you paid on this sale of ${qty} ${entry.ticker} (USD):`, String(fee));
+    if (feeConfirmed === null) return;             // cancelled → no sale
+    const finalFee = parseFloat(feeConfirmed.replace(/[,$\s]/g, ''));
+    const useFee = isFinite(finalFee) ? finalFee : fee;
+    // Guard against a double-fire: disable the button immediately.
+    const confirmBtn = document.getElementById('sell-confirm');
+    if (confirmBtn) { if (confirmBtn.disabled) return; confirmBtn.disabled = true; confirmBtn.textContent = 'Selling…'; }
+    _executeSale(qty, price, useFee);
+  });
+
+  // The actual sale execution, factored out so the fee-confirm step calls it once.
+  function _executeSale(qty, price, fee) {
     const proceeds = qty * price - fee;
     const realizedPL = (price - (entry.costBasis || 0)) * qty - fee;
     const realizedPLPct = entry.costBasis ? ((price - entry.costBasis) / entry.costBasis) * 100 : 0;
     const noteText = (document.getElementById('sell-note')?.value || '').trim();
     const soldAt = new Date().toISOString();
     const todayStr = soldAt.slice(0, 10);
-
-    // Compose the auto-note that gets attached to the position notes history.
-    // Includes the qty, price, date, and the user's free-text rationale (if any).
     const autoNote = `Sold ${qty} @ ${fmt$(price)} on ${todayStr}${noteText ? ` · ${noteText}` : ''}`;
-
-    // 1) Append the auto-note to the position's note history (so it shows on the row's notes view).
-    //    This is true whether the position will be removed or kept (partial sell).
     const existing = findPortfolioEntry(entry.id);
     if (existing) {
       const updatedNotes = [
@@ -26408,8 +26888,6 @@ function openSellModal(entryId) {
       ];
       updatePortfolioEntry(entry.id, { notes: updatedNotes });
     }
-
-    // 2) Log the transaction (full receipt with notes + everything needed to reconstruct later)
     appendTransaction({
       type: 'sell',
       ticker: entry.ticker,
@@ -26424,30 +26902,20 @@ function openSellModal(entryId) {
       entryPrice: entry.costBasis,
       soldDate: soldAt,
       notes: noteText || null,
-      // Snapshot of the position's full note history at sell time so the receipt
-      // survives even if the position is removed.
       positionNotes: existing?.notes || [],
     });
-
-    // 3) Add proceeds to cash position
     addToCashPosition(proceeds);
-
-    // 4) Update or remove the position.
-    // Per user spec: when the whole position is sold, REMOVE from the All page
-    // (the Transactions tab keeps the receipt).
     const remainingQty = maxQty - qty;
     if (remainingQty > 0.0001) {
-      // Partial sell — keep with reduced qty
       updatePortfolioEntry(entry.id, { qty: remainingQty });
     } else {
-      // Full sell — DELETE from portfolio entirely. The transaction record preserves history.
       removeFromPortfolio(entry.id);
     }
-
-    document.getElementById('portfolio-sell-modal').remove();
-    flashStatus(`Sold ${qty} ${entry.ticker} @ ${fmt$(price)} · +${fmt$(proceeds)} to cash`, 'success');
+    const modal = document.getElementById('portfolio-sell-modal');
+    if (modal) modal.remove();
+    flashStatus(`Sold ${qty} ${entry.ticker} @ ${fmt$(price)} · +${fmt$(proceeds)} to cash (fee ${fmt$(fee)})`, 'success');
     renderStockBook();
-  });
+  }
 }
 
 // Edit modal — only allows editing fees and quantity (entry price/date locked once set)
@@ -36568,6 +37036,37 @@ function _scnComputeImpacts(horizonKey) {
   };
 }
 
+// Bound an equity impact (as a decimal, e.g. -0.45 = -45%) to physically
+// realistic limits. A stock can't lose more than 100% of its value, and in
+// practice anything beyond ~-99.9% means bankruptcy/total wipeout. Linear
+// summation of stacked shocks can produce impossible figures (-1.5 = -150%),
+// so we compress the tails with a smooth saturating curve that:
+//   • leaves ordinary moves (roughly ±35%) essentially unchanged,
+//   • bends larger losses so they asymptotically approach -99.9% but never reach
+//     or exceed -100%,
+//   • softens extreme upside too (a sector rarely doubles on one shock).
+// tanh gives the smooth saturation; the scale keeps small/medium values linear.
+function _boundEquityImpact(x) {
+  if (x == null || !isFinite(x)) return x;
+  if (x < 0) {
+    const FLOOR = 0.999;            // max realistic loss = -99.9%
+    const a = Math.abs(x);
+    // Keep ordinary losses faithful: below ~50% we pass through nearly 1:1, and
+    // only beyond that do we smoothly saturate toward -99.9%. Piecewise: linear
+    // region + tanh tail on the excess, so -10% stays -10%, -30% stays -30%, but
+    // -150% bends to roughly -85% and nothing can reach -100%.
+    const KNEE = 0.5;              // below 50% loss: ~linear
+    if (a <= KNEE) return x;
+    const excess = a - KNEE;
+    const room = FLOOR - KNEE;      // remaining room down to the floor
+    const bounded = KNEE + room * Math.tanh(excess / room);
+    return -bounded;
+  }
+  // Upside: soften only the extreme (a single shock rarely > +80% to a sector).
+  if (x > 0.8) return 0.8 + (x - 0.8) * 0.3;
+  return x;
+}
+
 function _scnComputeImpactsForMonths(horizonMonths) {
   const channelImpacts = {};  // channel → {low, mid, high, contributions: [{shock, contribution}]}
 
@@ -36620,7 +37119,16 @@ function _scnComputeImpactsForMonths(horizonMonths) {
       }
     }
     if (drivers.length > 0) {
-      sectorImpacts[sector] = { low: lo, mid, high: hi, drivers };
+      // REALITY BOUND: a stock (or sector) cannot fall more than 100% — equity
+      // value floors at zero. Stacked/severe shocks summed linearly can produce
+      // impossible numbers like −150%, which is what made the downside look
+      // wildly exaggerated. Compress the tails so losses approach but never reach
+      // −100% (we cap at −99.9%, since a full −100% implies bankruptcy/total
+      // wipeout), and soften extreme upside too. _boundEquityImpact leaves
+      // normal-sized moves essentially unchanged and only bends the extremes.
+      sectorImpacts[sector] = {
+        low: _boundEquityImpact(lo), mid: _boundEquityImpact(mid), high: _boundEquityImpact(hi), drivers,
+      };
     }
   }
 
@@ -41330,6 +41838,17 @@ function _enrichPortfolioPosition(rec, ctx) {
     if (rec.qty != null && out.shares == null) out.shares = +rec.qty;
     if (rec.costBasis != null && out.avgCost == null) out.avgCost = +rec.costBasis;
     if (rec.addedAt && out.openDate == null) out.openDate = rec.addedAt;
+    // open_date / exit_date bridges (snake_case for the SQL generated columns).
+    if (rec.addedAt && out.open_date == null) out.open_date = rec.addedAt;
+    // A position carries an exit date only once (partially or fully) sold; pull
+    // it from the most recent sell note if present so Supabase shows when it
+    // closed. Open positions correctly leave this null.
+    if (out.exitDate == null) {
+      const sellNote = Array.isArray(rec.notes) ? rec.notes.filter(n => n && n.soldAction).slice(-1)[0] : null;
+      if (sellNote && sellNote.ts) { out.exitDate = sellNote.ts; out.exit_date = sellNote.ts; }
+    } else if (out.exit_date == null) {
+      out.exit_date = out.exitDate;
+    }
     // Thesis from the first note, if any.
     if (out.thesis == null) {
       const note = Array.isArray(rec.notes) && rec.notes.length ? (rec.notes[0].text || rec.notes[0]) : null;
@@ -41801,6 +42320,80 @@ async function analyticsSupabaseLoadGrades() {
     console.log(`[analytics-supabase] grades loaded: ${Object.keys(byTicker).length} tickers, ${out._ageHours}h old`);
     return out;
   } catch (e) { console.warn('[analytics-supabase] grades error', e.message); return null; }
+}
+
+// ============================================================
+//   TICKER SNAPSHOT — fast server-side screening
+//
+//   Queries the flat `ticker_snapshot` table (one row per ticker: price +
+//   per-category grades + financials + signals, kept fresh by the GitHub
+//   workflow). The win over the in-memory universe is SCREENING: filtering
+//   happens in Postgres and only matching rows come back, instead of scanning
+//   700+ cached rows in JS. GitHub remains the source of truth; this is a
+//   read-optimized projection.
+//
+//   filters: array of PostgREST conditions, e.g.
+//     [['grade','in','("A","B")'], ['pe','gt',0], ['pe','lt',15], ['sector','eq','Technology']]
+//   order:  column to sort by (default grade_score desc)
+//   limit:  max rows
+// ============================================================
+async function screenSnapshot({ filters = [], select = '*', order = 'grade_score.desc', limit = 50 } = {}) {
+  if (!analyticsSupabaseConfigured()) {
+    console.warn('[snapshot] Analytics Supabase not configured — falling back to in-memory screen');
+    return _screenSnapshotInMemory({ filters, limit });
+  }
+  try {
+    const params = new URLSearchParams();
+    params.set('select', select);
+    for (const [col, op, val] of filters) params.append(col, `${op}.${val}`);
+    if (order) params.set('order', order);
+    if (limit) params.set('limit', String(limit));
+    const url = `${getAnalyticsSupabaseUrl()}/rest/v1/ticker_snapshot?${params.toString()}`;
+    const r = await fetch(url, { headers: _analyticsSupabaseHeaders() });
+    if (!r.ok) {
+      console.warn('[snapshot] screen failed', r.status, '— falling back to in-memory');
+      return _screenSnapshotInMemory({ filters, limit });
+    }
+    const rows = await r.json();
+    console.log(`[snapshot] screen returned ${rows.length} rows`);
+    return Array.isArray(rows) ? rows : [];
+  } catch (e) {
+    console.warn('[snapshot] screen error', e.message, '— falling back to in-memory');
+    return _screenSnapshotInMemory({ filters, limit });
+  }
+}
+if (typeof window !== 'undefined') window.screenSnapshot = screenSnapshot;
+
+// In-memory fallback: applies the same screen against the cached stockbook rows
+// when Supabase isn't configured or is unreachable. Supports the common ops
+// (eq, gt, gte, lt, lte, in) so a screen behaves the same either way.
+function _screenSnapshotInMemory({ filters = [], limit = 50 } = {}) {
+  const rows = (state.stockbook && Array.isArray(state.stockbook.rows)) ? state.stockbook.rows : [];
+  const colMap = {
+    grade: r => r._grade || r.grade, grade_score: r => r._gradeScore ?? r.gradeScore,
+    pe: r => r.pe, market_cap: r => r.marketCap ?? r.marketcap, sector: r => r.sector,
+    roe: r => r.returnOnEquity, rev_growth: r => r.revenueGrowth, price: r => r.price,
+    dividend_yield: r => r.dividend_yield, beta: r => r.beta, asset_class: r => r.asset_class,
+  };
+  const parseIn = (v) => String(v).replace(/[()"']/g, '').split(',').map(s => s.trim());
+  let out = rows.filter(r => {
+    for (const [col, op, val] of filters) {
+      const getter = colMap[col];
+      if (!getter) continue;
+      const cv = getter(r);
+      if (cv == null) return false;
+      const nv = parseFloat(val);
+      if (op === 'eq' && String(cv) !== String(val)) return false;
+      else if (op === 'gt' && !(cv > nv)) return false;
+      else if (op === 'gte' && !(cv >= nv)) return false;
+      else if (op === 'lt' && !(cv < nv)) return false;
+      else if (op === 'lte' && !(cv <= nv)) return false;
+      else if (op === 'in' && !parseIn(val).includes(String(cv))) return false;
+    }
+    return true;
+  });
+  out.sort((a, b) => (b._gradeScore ?? b.gradeScore ?? 0) - (a._gradeScore ?? a.gradeScore ?? 0));
+  return out.slice(0, limit);
 }
 
 // Pull the current regime snapshot from Supabase.
@@ -42338,7 +42931,14 @@ function _betsHistorySeries(ticker) {
 // Build the individual position chart card (price history + entry/target/stop).
 function renderPositionChart(pos) {
   if (!pos) return '';
-  const series = _betsHistorySeries(pos.ticker);
+  let series = _betsHistorySeries(pos.ticker);
+  // The position's entry/stop/target are in USD, but a foreign ticker's price
+  // HISTORY is in local currency — so convert the series to USD with the bet's
+  // stored FX rate so the line and the reference lines share one scale.
+  if (series && pos.fxRateToUsd && isFinite(pos.fxRateToUsd) && pos.localCurrency && pos.localCurrency !== 'USD') {
+    const r = pos.fxRateToUsd;
+    series = series.map(p => ({ ...p, close: (p.close != null && isFinite(p.close)) ? p.close * r : p.close }));
+  }
   const avgEntry = pos.shares > 0 ? pos.entryCost / pos.shares : (pos.lastPrice || 0);
   const last = pos.lastPrice;
   const W = 600, H = 180;
@@ -43207,6 +43807,14 @@ async function botScoreTicker(ticker) {
   const t = ticker.toUpperCase();
   const row = (typeof getStockbookRow === 'function') ? getStockbookRow(t) : null;
   if (!row) return null;
+  // CRITICAL: convert the row to USD BEFORE reading any price. For a foreign
+  // listing (e.g. 000660.KS in KRW) the raw price is in local currency; if we
+  // size/stop/target off that, only the entry happened to look right (because
+  // mark-to-market re-converts the live quote) while stop & target stayed in
+  // KRW and never lined up. Normalizing here makes row.price USD so entry,
+  // stop, and target are all the SAME currency and the bet is internally
+  // consistent.
+  if (typeof ensureRowNormalized === 'function') { try { ensureRowNormalized(row); } catch {} }
   // CRITICAL: normalize the row first. The engine's fundamental signals
   // (financialReasoningChain, computeCompanyHealth) read camelCase NUMBERS
   // (marketCap, pe, returnOnEquity). CSV rows arrive as snake_case STRINGS
@@ -43694,6 +44302,8 @@ async function botScoreTicker(ticker) {
     name: row.name || t,
     sector: row.sector || null,
     price: row.price,
+    _localCurrency: row._localCurrency || null,   // set by ensureRowNormalized for foreign listings
+    _fxRate: row._fxRate || null,                 // USD per local unit (for chart conversion)
     conviction,
     confidence,
     confidenceFactor: _scoreConf.factor,   // the bot's earned aggressiveness (track record)
@@ -44169,6 +44779,13 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
       volEstimate: +p._vol.toFixed(3),
       stopPrice,
       targetPrice,
+      // Currency metadata: the bet's prices (entry/stop/target) are in USD. For a
+      // foreign listing we record the local currency + the FX rate used so the
+      // per-position chart can convert its (local-currency) price history to USD
+      // and the entry/stop/target reference lines line up correctly.
+      priceCurrency: 'USD',
+      localCurrency: p._localCurrency || (typeof _tickerLocalCurrency === 'function' ? _tickerLocalCurrency(p.ticker) : null) || null,
+      fxRateToUsd: (p._fxRate != null && isFinite(p._fxRate)) ? p._fxRate : (typeof _fxRateToUSD === 'function' ? (_fxRateToUSD(p._localCurrency || (typeof _tickerLocalCurrency === 'function' ? _tickerLocalCurrency(p.ticker) : null)) || null) : null),
       // For an option expression: record the strike (~at-the-money), an
       // estimated premium (rough: vol × price × sqrt(time), a Black-Scholes-ish
       // ballpark), and an expiry ~ the bet horizon. The position's risk is capped
@@ -44489,15 +45106,50 @@ function botRebalanceToPositiveCash(targetCashFraction = 0.10) {
   const bot = loadBotState();
   const open = bot.bets.filter(b => b.status === 'open');
   if (!open.length) return bot;
-  const committed = open.reduce((s, b) => s + (b.notional || 0), 0);
+  // FIRST, purge accidental DUPLICATE open positions before trimming anything.
+  // If a sync/import (before the dedup guard) stacked a second position in a
+  // ticker, that phantom is what blew committed capital past the bankroll and
+  // drove cash negative — NOT a real loss. Drop the younger duplicate(s) so we
+  // restore cash without selling down the genuine position. This is the
+  // "don't take away from the real value" safeguard: phantom exposure is
+  // removed, real positions are left intact.
+  {
+    const byTicker = {};
+    for (const b of open) { (byTicker[(b.ticker || '').toUpperCase()] ||= []).push(b); }
+    let purged = 0;
+    for (const tic of Object.keys(byTicker)) {
+      const group = byTicker[tic];
+      if (group.length <= 1) continue;
+      // Keep the EARLIEST-entered position (the real one); mark the rest voided.
+      group.sort((a, b) => String(a.entryDate || '').localeCompare(String(b.entryDate || '')) || String(a.id).localeCompare(String(b.id)));
+      for (let i = 1; i < group.length; i++) {
+        const dup = group[i];
+        dup.status = 'voided-duplicate';
+        dup.exitReason = 'duplicate-removed';
+        dup.exitDate = new Date().toISOString().slice(0, 10);
+        dup.realizedPL = 0;            // a phantom never had real P&L
+        dup.pnl = 0;
+        purged++;
+      }
+    }
+    if (purged) {
+      saveBotState(bot);
+      console.log(`[bot] rebalance: purged ${purged} duplicate open position(s) before trimming — real positions untouched`);
+      if (typeof flashStatus === 'function') flashStatus(`Removed ${purged} duplicate position(s) — real value preserved`, 'success');
+    }
+  }
+  // Recompute against the now-clean book.
+  const openClean = bot.bets.filter(b => b.status === 'open');
+  if (!openClean.length) { saveBotState(bot); return bot; }
+  const committed = openClean.reduce((s, b) => s + (b.notional || 0), 0);
   let cash = bot.bankroll - committed;
   const targetCash = bot.bankroll * targetCashFraction;
-  if (cash >= targetCash) return bot;   // already onside
+  if (cash >= targetCash) { saveBotState(bot); return bot; }   // duplicates purge alone fixed cash
 
   // Need to free up (targetCash − cash) of notional. Trim from the biggest
   // positions first (and leveraged ones, which carry more risk per dollar).
   let need = targetCash - cash;
-  const ranked = open.slice().sort((a, b) => {
+  const ranked = openClean.slice().sort((a, b) => {
     const ax = (b.notional || 0) * (b.leverage || 1);
     const bx = (a.notional || 0) * (a.leverage || 1);
     return ax - bx;
@@ -44870,6 +45522,18 @@ function botBookValue() {
   const openPnl = open.reduce((s, b) => s + (b.pnl || 0), 0);
   // Cash = bankroll minus capital tied up in open positions (pre-leverage).
   const cash = +(bot.bankroll - openNotional).toFixed(2);
+  // Fees paid across ALL trades. Use the explicit per-bet fee if present; else
+  // estimate at a typical retail commission+spread of ~5bps of notional per side
+  // (entry always; +exit for already-closed trades). This is a best-effort
+  // figure for the ledger, not an exact accounting.
+  const FEE_BPS = 0.0005;
+  let feesPaid = 0;
+  for (const b of bot.bets) {
+    if (b.fees != null && isFinite(b.fees)) { feesPaid += b.fees; continue; }
+    const notion = b.notional || (b.shares && b.entryPrice ? b.shares * b.entryPrice : 0) || 0;
+    const sides = b.status === 'closed' ? 2 : 1;
+    feesPaid += notion * FEE_BPS * sides;
+  }
   return {
     bankroll: bot.bankroll,
     cash,
@@ -44877,6 +45541,8 @@ function botBookValue() {
     openNotional: +openNotional.toFixed(2),     // capital committed
     openExposure: +openExposure.toFixed(2),     // post-leverage market exposure
     openPnl: +openPnl.toFixed(2),               // unrealized
+    feesPaid: +feesPaid.toFixed(2),             // total fees (explicit + estimated)
+    cashAdded: +(bot.cashAdded || 0).toFixed(2),// external cash injected by the user
     totalValue: +(bot.bankroll + openPnl).toFixed(2),  // mark-to-market book value
     // Open-position return %: unrealized P&L as a % of the capital committed to
     // open positions (your "$35k up 6.84%" read). This is the CURRENT TRADES'
@@ -44887,6 +45553,117 @@ function botBookValue() {
   };
 }
 if (typeof window !== 'undefined') window.botBookValue = botBookValue;
+
+// Feed the bot external cash (or withdraw with a negative amount). This RAISES
+// the bankroll and is RECORDED as a capital injection so the backend/training
+// data understands the money was added by the user — it is NOT trading profit,
+// so it must not inflate the bot's win/return stats. The bot then has more cash
+// available and will size new trades larger automatically.
+function botAddCash(amount) {
+  const amt = parseFloat(amount);
+  if (!isFinite(amt) || amt === 0) return null;
+  const bot = loadBotState();
+  bot.bankroll = +((bot.bankroll || 0) + amt).toFixed(2);
+  bot.cashAdded = +((bot.cashAdded || 0) + amt).toFixed(2);   // cumulative external capital
+  // Record the injection in the bot's transaction ledger (the rich backend
+  // record). type:'deposit' (or 'withdrawal') is explicitly NOT a trade, so
+  // performance math skips it.
+  bot.transactions = bot.transactions || [];
+  bot.transactions.push({
+    id: `botcash-${Date.now()}`,
+    ts: new Date().toISOString(),
+    type: amt > 0 ? 'deposit' : 'withdrawal',
+    amount: amt,
+    bankrollAfter: bot.bankroll,
+    note: 'user capital injection',
+  });
+  // Adjust the starting-capital baseline so all-time RETURN % stays honest:
+  // adding cash shouldn't read as a gain or loss. (Return is measured against
+  // capital deployed, which now includes the injection.)
+  bot.capitalBase = +((bot.capitalBase || BOT_STARTING_BANKROLL) + amt).toFixed(2);
+  saveBotState(bot);
+  if (typeof flashStatus === 'function') flashStatus(`${amt > 0 ? 'Added' : 'Withdrew'} $${Math.abs(amt).toLocaleString()} ${amt > 0 ? 'to' : 'from'} the bot — recorded as capital ${amt > 0 ? 'deposit' : 'withdrawal'} (not P&L)`, 'success');
+  // Mirror to the bot repo + Supabase if wired (the backend needs to know).
+  try { if (typeof supabaseSyncAllTrades === 'function' && typeof supabaseConfigured === 'function' && supabaseConfigured()) supabaseSyncAllTrades(); } catch {}
+  if (typeof renderBetsTab === 'function') renderBetsTab();
+  return bot.bankroll;
+}
+if (typeof window !== 'undefined') window.botAddCash = botAddCash;
+
+// Prompt wrapper for the editable cash card.
+function botEditCash() {
+  const cur = (typeof botBookValue === 'function') ? botBookValue() : null;
+  const msg = `Feed the bot cash (or use a negative number to withdraw).\n\n` +
+    `This is recorded as a capital deposit — it raises available cash and lets the\n` +
+    `bot size new trades larger, but it is NOT counted as trading profit.\n\n` +
+    (cur ? `Current cash: $${cur.cash.toLocaleString()} · book value: $${cur.totalValue.toLocaleString()}\n\n` : '') +
+    `Amount to add (USD):`;
+  const v = prompt(msg, '10000');
+  if (v == null) return;
+  const amt = parseFloat(v.replace(/[,$\s]/g, ''));
+  if (!isFinite(amt) || amt === 0) { if (typeof flashStatus === 'function') flashStatus('No change — enter a non-zero number', ''); return; }
+  botAddCash(amt);
+}
+if (typeof window !== 'undefined') window.botEditCash = botEditCash;
+
+// Wire the equity-curve hover (crosshair + tooltip showing the value, date,
+// % vs $100k basis, and % over the window) for whatever chart is currently in
+// the DOM. Reads geometry from the wrap's data-* attributes so it works for any
+// window selection. Idempotent — safe to call after every render.
+function _wireBotEquityHover() {
+  try {
+    const wrap = document.getElementById('bot-eq-chart-wrap');
+    if (!wrap || wrap._hoverWired) return;
+    const svg = wrap.querySelector('svg');
+    const tip = document.getElementById('bot-eq-tip');
+    const cross = document.getElementById('bot-eq-cross');
+    const dot = document.getElementById('bot-eq-hover-dot');
+    if (!svg || !tip) return;
+    let pts = [];
+    try { pts = JSON.parse(wrap.getAttribute('data-points') || '[]'); } catch {}
+    if (!pts.length) return;
+    const W = +wrap.getAttribute('data-w') || 600;
+    const H = +wrap.getAttribute('data-h') || 170;
+    const lo = +wrap.getAttribute('data-lo');
+    const hi = +wrap.getAttribute('data-hi');
+    const basisRaw = wrap.getAttribute('data-basis');
+    const basis = basisRaw ? +basisRaw : null;
+    const xAt = (i) => pts.length > 1 ? (i / (pts.length - 1)) * W : W / 2;
+    const yAt = (v) => H - ((v - lo) / ((hi - lo) || 1)) * H;
+    const move = (ev) => {
+      const r = svg.getBoundingClientRect();
+      const clientX = ev.touches ? ev.touches[0].clientX : ev.clientX;
+      let fx = (clientX - r.left) / r.width;
+      if (fx < 0) fx = 0; if (fx > 1) fx = 1;
+      let idx = Math.round(fx * (pts.length - 1));
+      if (idx < 0) idx = 0; if (idx >= pts.length) idx = pts.length - 1;
+      const p = pts[idx];
+      const vbX = xAt(idx), vbY = yAt(p.v);
+      if (cross) { cross.setAttribute('x1', vbX); cross.setAttribute('x2', vbX); cross.setAttribute('opacity', '0.5'); }
+      if (dot) { dot.setAttribute('cx', vbX); dot.setAttribute('cy', vbY); dot.setAttribute('opacity', '1'); }
+      const pxX = (vbX / W) * r.width, pxY = (vbY / H) * r.height;
+      const chg = basis != null ? ((p.v - basis) / basis * 100) : null;
+      const prev = pts[0].v;
+      const since = prev ? ((p.v - prev) / prev * 100) : 0;
+      tip.innerHTML = `<div style="color:var(--ink-faint);font-size:9px">${p.d}</div>` +
+        `<div style="font-weight:700;color:var(--ink)">$${p.v.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>` +
+        (chg != null ? `<div style="font-size:9px;color:${chg >= 0 ? 'var(--pos)' : 'var(--neg)'}">${chg >= 0 ? '+' : ''}${chg.toFixed(1)}% vs basis</div>` : '') +
+        `<div style="font-size:9px;color:${since >= 0 ? 'var(--pos)' : 'var(--neg)'}">${since >= 0 ? '+' : ''}${since.toFixed(1)}% window</div>`;
+      // Keep the tip inside the chart horizontally.
+      tip.style.left = Math.max(28, Math.min(r.width - 28, pxX)) + 'px';
+      tip.style.top = Math.max(8, pxY) + 'px';
+      tip.style.opacity = '1';
+    };
+    const leave = () => { tip.style.opacity = '0'; if (cross) cross.setAttribute('opacity', '0'); if (dot) dot.setAttribute('opacity', '0'); };
+    wrap.addEventListener('mousemove', move);
+    wrap.addEventListener('mouseleave', leave);
+    wrap.addEventListener('touchstart', move, { passive: true });
+    wrap.addEventListener('touchmove', move, { passive: true });
+    wrap.addEventListener('touchend', leave);
+    wrap._hoverWired = true;
+  } catch {}
+}
+if (typeof window !== 'undefined') window._wireBotEquityHover = _wireBotEquityHover;
 
 // Prime fresh live quotes for all OPEN bot positions, then re-render the bets
 // tab. Runs browser-side (Stooq/Finnhub), USD-converts, and populates the cache
@@ -44908,7 +45685,14 @@ async function botRefreshLiveQuotes() {
       const slice = tickers.slice(i, i + CONC);
       await Promise.all(slice.map(async (tk) => {
         const row = (typeof getStockbookRow === 'function') ? getStockbookRow(tk) : null;
-        try { await botLiveQuote(tk, row); } catch {}
+        try {
+          const q = await botLiveQuote(tk, row);
+          // Capture an intraday tick from the fresh quote so the bot's per-
+          // position chart grows a live "today" segment on every refresh.
+          if (q && q.price != null && isFinite(q.price) && typeof recordIntradayTick === 'function') {
+            recordIntradayTick(tk, q.price);
+          }
+        } catch {}
       }));
     }
     // Re-render with the fresh marks.
@@ -44929,10 +45713,18 @@ function botPerformance(filterTicker = null) {
 
   const closed = bets.filter(b => b.status === 'closed');
   const open = bets.filter(b => b.status === 'open');
-  const wins = closed.filter(b => (b.pnl || 0) > 0);
-  const losses = closed.filter(b => (b.pnl || 0) < 0);
-  const totalPnl = bets.reduce((s, b) => s + (b.pnl || 0), 0);
-  const realizedPnl = closed.reduce((s, b) => s + (b.pnl || 0), 0);
+  // Closed bets: use the frozen shares-based realizedPL; fall back to pnl.
+  const _plOf = (b) => (b.realizedPL != null && isFinite(b.realizedPL)) ? b.realizedPL : (b.pnl || 0);
+  const wins = closed.filter(b => _plOf(b) > 0);
+  const losses = closed.filter(b => _plOf(b) < 0);
+  // Total P&L = realized (closed) + unrealized (open marks). Deposits/withdrawals
+  // are NOT bets, so they never enter here.
+  const realizedPnl = closed.reduce((s, b) => s + _plOf(b), 0);
+  const openPnl = open.reduce((s, b) => s + (b.pnl || 0), 0);
+  const totalPnl = realizedPnl + openPnl;
+  // Capital base for return %: starting bankroll PLUS any user cash injections,
+  // so feeding the bot cash doesn't masquerade as a gain/loss.
+  const capBase = (bot.capitalBase != null && isFinite(bot.capitalBase) && bot.capitalBase > 0) ? bot.capitalBase : BOT_STARTING_BANKROLL;
 
   // vs SPY benchmark
   let spyReturn = null;
@@ -44945,7 +45737,7 @@ function botPerformance(filterTicker = null) {
     startedAt: bot.startedAt,
     bankroll: bot.bankroll,
     currentValue: +(bot.bankroll + totalPnl).toFixed(2),
-    totalReturnPct: +((totalPnl / BOT_STARTING_BANKROLL) * 100).toFixed(2),
+    totalReturnPct: +((totalPnl / capBase) * 100).toFixed(2),
     totalPnl: +totalPnl.toFixed(2),
     realizedPnl: +realizedPnl.toFixed(2),
     betCount: bets.length,
@@ -45240,17 +46032,22 @@ function renderBetsTab() {
       <div class="company-card" style="margin:0;border-left:3px solid ${pnlColor(perf.totalPnl)}">
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Portfolio Value</div>
         <div style="font-family:var(--mono);font-size:24px;font-weight:700;color:${pnlColor(perf.totalPnl)};margin-top:4px">$${(book ? book.totalValue : perf.currentValue).toLocaleString(undefined,{maximumFractionDigits:0})}</div>
-        <div style="font-family:var(--mono);font-size:9px;color:${pnlColor(perf.totalPnl)};margin-top:2px">${perf.totalReturnPct >= 0 ? '+' : ''}${perf.totalReturnPct}% from $100,000</div>
+        <div style="font-family:var(--mono);font-size:9px;color:${pnlColor(perf.totalPnl)};margin-top:2px">${perf.totalReturnPct >= 0 ? '+' : ''}${perf.totalReturnPct}% from $${(book && book.cashAdded ? (100000 + book.cashAdded) : 100000).toLocaleString(undefined,{maximumFractionDigits:0})}${book && book.cashAdded ? ' (incl. added cash)' : ''}</div>
       </div>
       ${book ? `<div class="company-card" style="margin:0;border-left:3px solid var(--amber)">
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Open Positions</div>
         <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:var(--ink);margin-top:4px">$${book.openNotional.toLocaleString(undefined,{maximumFractionDigits:0})}${book.openReturnPct != null ? ` <span style="font-size:13px;color:${pnlColor(book.openPnl)}">${book.openReturnPct >= 0 ? '+' : ''}${book.openReturnPct}%</span>` : ''}</div>
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">${book.openPositions} open · $${book.openExposure.toLocaleString(undefined,{maximumFractionDigits:0})} exposure (${book.grossLeverage}× gross)</div>
       </div>
-      <div class="company-card" style="margin:0">
-        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Cash</div>
+      <div class="company-card" style="margin:0;cursor:pointer" id="bets-cash-card" title="Click to feed the bot cash (or withdraw). Recorded as a capital deposit, not P&L — gives the bot more to size trades with.">
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Cash <span style="color:var(--amber);text-transform:none;letter-spacing:0">✎ edit</span></div>
         <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:var(--ink);margin-top:4px">$${book.cash.toLocaleString(undefined,{maximumFractionDigits:0})}</div>
-        <div style="font-family:var(--mono);font-size:9px;color:${pnlColor(book.openPnl)};margin-top:2px">${book.openPnl >= 0 ? '+' : ''}$${book.openPnl.toLocaleString(undefined,{maximumFractionDigits:0})} unrealized</div>
+        <div style="font-family:var(--mono);font-size:9px;color:${pnlColor(book.openPnl)};margin-top:2px">${book.openPnl >= 0 ? '+' : ''}$${book.openPnl.toLocaleString(undefined,{maximumFractionDigits:0})} unrealized${book.cashAdded ? ` · $${book.cashAdded.toLocaleString(undefined,{maximumFractionDigits:0})} added` : ''}</div>
+      </div>` : ''}
+      ${book ? `<div class="company-card" style="margin:0">
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Fees Paid</div>
+        <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:var(--ink);margin-top:4px">$${book.feesPaid.toLocaleString(undefined,{maximumFractionDigits:0})}</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">est. commission + spread, all trades</div>
       </div>` : ''}
       <div class="company-card" style="margin:0">
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Total P/L</div>
@@ -45376,6 +46173,7 @@ function renderBetsTab() {
           ${['week','month','year','all'].map(w => `<button class="seg-btn ${activeWin===w?'active':''}" data-perfwin="${w}" style="font-size:10px;text-transform:capitalize">${w==='all'?'All':w==='week'?'1W':w==='month'?'1M':'1Y'}</button>`).join('')}
         </div>
       </div>
+      <div class="bot-chart-wrap" id="bot-eq-chart-wrap" data-points="${escapeHtml(JSON.stringify(pts.map(p => ({ d: p.date, v: +(+p.value).toFixed(2) }))))}" data-lo="${lo}" data-hi="${hi}" data-w="${W}" data-h="${H}" data-basis="${showBasis ? 100000 : ''}" style="position:relative">
       <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:170px;display:block">
         <defs>
           <linearGradient id="botEqGrad" x1="0" y1="0" x2="0" y2="1">
@@ -45392,7 +46190,11 @@ function renderBetsTab() {
         ${peakMark}
         <circle cx="${x(pts.length-1).toFixed(1)}" cy="${y(lastV).toFixed(1)}" r="3.5" fill="${lineColor}"/>
         <circle cx="${x(pts.length-1).toFixed(1)}" cy="${y(lastV).toFixed(1)}" r="6" fill="none" stroke="${lineColor}" stroke-width="1" opacity="0.4"/>
+        <line id="bot-eq-cross" x1="0" y1="0" x2="0" y2="${H}" stroke="var(--ink-dim)" stroke-width="1" stroke-dasharray="3,3" opacity="0" vector-effect="non-scaling-stroke"/>
+        <circle id="bot-eq-hover-dot" cx="0" cy="0" r="4" fill="${lineColor}" stroke="var(--bg)" stroke-width="1.5" opacity="0"/>
       </svg>
+      <div id="bot-eq-tip" style="position:absolute;pointer-events:none;opacity:0;transform:translate(-50%,-110%);background:var(--bg-elev);border:1px solid var(--rule);border-radius:4px;padding:5px 8px;font-family:var(--mono);font-size:10px;white-space:nowrap;z-index:5;box-shadow:0 2px 8px rgba(0,0,0,0.3)"></div>
+      </div>
       <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:4px">
         <span>${pts[0].date}</span>
         <span style="color:${lineColor};font-weight:700">$${lastV.toLocaleString(undefined,{maximumFractionDigits:0})}</span>
@@ -45665,6 +46467,12 @@ function renderBetsTab() {
   body.querySelector('#bets-viewall-btn')?.addEventListener('click', () => {
     BETS_STATE.selectedPosition = null;
     renderBetsTab();
+  });
+  // Equity-curve hover: nearest-point crosshair + tooltip (mouse + touch).
+  if (typeof _wireBotEquityHover === 'function') _wireBotEquityHover();
+  // Editable Cash card — feed the bot capital (recorded as a deposit).
+  body.querySelector('#bets-cash-card')?.addEventListener('click', () => {
+    if (typeof botEditCash === 'function') botEditCash();
   });
   // "Value ↗" — open the selected ticker in the Valuation tab for a deep dive.
   body.querySelector('#bets-value-btn')?.addEventListener('click', (e) => {

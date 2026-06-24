@@ -8516,40 +8516,39 @@
     </div>
 
     <div class="modal-section" style="border-top:1px solid var(--rule);padding-top:14px">
-      <div class="modal-label">Portfolio Supabase (TRAPP2-PORT — your paper-trading backend)</div>
-      <input type="text" class="modal-input" id="port-supabase-url-input" placeholder="Portfolio project URL — can be its OWN project or shared (e.g. the Analytics project)" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
-      <input type="text" class="modal-input" id="port-supabase-anon-input" placeholder="anon public key for that project" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
+      <div class="modal-label">Portfolio Supabase (TRAPP2-PORT)</div>
+      <input type="text" class="modal-input" id="port-supabase-url-input" placeholder="Portfolio project URL — own or shared" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
+      <input type="text" class="modal-input" id="port-supabase-anon-input" placeholder="anon public key" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         <button class="btn" id="port-supabase-save-btn">Save Portfolio Config</button>
-        <button class="btn btn-ghost" id="port-supabase-sync-btn" title="Mirror the current portfolio to Supabase (upserts current positions, deletes stale rows). The repo keeps full history.">Sync Portfolio Now ↗</button>
+        <button class="btn btn-ghost" id="port-supabase-sync-btn" title="Mirror the portfolio to Supabase">Sync Portfolio Now ↗</button>
         <span id="port-supabase-status" style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);align-self:center"></span>
       </div>
-      <div class="modal-help">Supabase MIRRORS your current portfolio in <code>portfolio_positions</code>. Deleting a position locally deletes it here too. The hourly TRAPP2-PORT workflow keeps this fresh even without the app.</div>
+      <div class="modal-help">Mirrors current positions in <code>portfolio_positions</code> (open_date + exit_date carried). The hourly TRAPP2-PORT workflow keeps this fresh even without the app.</div>
     </div>
 
     <div class="modal-section" style="border-top:1px solid var(--rule);padding-top:14px">
-      <div class="modal-label">Analytics Supabase (TRAPP2-ANALYTICS — research grades, regime, KV, theses)</div>
-      <input type="text" class="modal-input" id="analytics-supabase-url-input" placeholder="Analytics project URL — its own project, or shared with bot/portfolio" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
+      <div class="modal-label">Analytics Supabase (TRAPP2-ANALYTICS · also holds ticker_snapshot)</div>
+      <input type="text" class="modal-input" id="analytics-supabase-url-input" placeholder="Analytics project URL" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
       <input type="text" class="modal-input" id="analytics-supabase-anon-input" placeholder="anon public key" style="font-family:var(--mono);font-size:11px;margin-bottom:6px">
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         <button class="btn" id="analytics-supabase-save-btn">Save Analytics Config</button>
-        <button class="btn btn-ghost" id="analytics-supabase-sync-btn" title="Push research grades + the full regime timeline + probability/regime KV to Supabase">Sync Analytics Now ↗</button>
+        <button class="btn btn-ghost" id="analytics-supabase-sync-btn" title="Push research grades + regime + KV to Supabase">Sync Analytics Now ↗</button>
         <span id="analytics-supabase-status" style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);align-self:center"></span>
       </div>
-      <div class="modal-help">The hourly TRAPP2-ANALYTICS workflow does this server-side with the service key — no app or anon policy needed for that path. A 401/403 from the app means <code>analytics_anon_write.sql</code> hasn't run.</div>
+      <div class="modal-help">Also the home of <code>ticker_snapshot</code> — the flat price+grade+financials table the app screens against. The hourly workflow keeps it fresh with the service key.</div>
     </div>
 
     <div class="modal-section" style="border-top:1px solid var(--rule);padding-top:14px">
       <div class="modal-label">GitHub (one-tap saves to your repos)</div>
       <div style="display:flex;gap:6px;flex-wrap:wrap">
-        <button class="btn" id="github-connect-btn" title="Paste a fine-grained GitHub token (Contents:read&write on your GoodGlobeLLC repos). Lets Save to Repo write straight to GitHub — no download/paste.">Connect GitHub ↗</button>
-        <button class="btn btn-ghost" id="github-save-all-btn" title="Save portfolio + theses + bot journal straight to their repos, then push Supabase — one tap">↑ Save Everything to Repos</button>
+        <button class="btn" id="github-connect-btn" title="Paste a fine-grained GitHub token (Contents:read&write)">Connect GitHub ↗</button>
+        <button class="btn btn-ghost" id="github-save-all-btn" title="Save portfolio + theses + bot journal to their repos, then push Supabase">↑ Save Everything to Repos</button>
         <span id="github-status" style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);align-self:center"></span>
       </div>
-      <div class="modal-help">With a token set, the app writes JSON directly to TRAPP2-PORT / TRAPP2-BOT — no manual download + commit. Stored in this browser only, never exported.</div>
+      <div class="modal-help">With a token set, the app writes JSON directly to your repos — no manual download + commit. Stored in this browser only.</div>
     </div>
 
-    <!-- Repository Backup & Sync — Update + Export for all four repos (populated by renderRepoSyncPanel) -->
     <div id="repo-sync-mount"></div>
 
     <div class="modal-section">
@@ -8735,7 +8734,7 @@
           </svg>
           <span>Refresh All Data</span>
         </button>
-        <button class="home-action-btn" id="sync-all-btn" title="Sync prices, all Supabase projects (bot + portfolio + analytics), the bot + portfolio repos, and XTRAPP — all at once, on demand. News is skipped.">
+        <button class="home-action-btn" id="sync-all-btn" title="Sync prices, all Supabase projects, the bot + portfolio repos, and XTRAPP — all at once.">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0">
             <path d="M12 2v4"/><path d="M12 18v4"/><path d="M4.93 4.93l2.83 2.83"/><path d="M16.24 16.24l2.83 2.83"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="M4.93 19.07l2.83-2.83"/><path d="M16.24 7.76l2.83-2.83"/>
           </svg>
@@ -8877,6 +8876,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260615z35"></script>
+<script src="app.js?v=20260615z41"></script>
 </body>
 </html>
