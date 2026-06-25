@@ -1381,11 +1381,24 @@ function _indexPerformanceMembers() {
   const entries = getGoodGlobeIndexEntries();
   return entries.filter(e => {
     const flags = e.flags || [];
-    // Exclude entries that are ONLY 'Avoid' — those aren't index holdings.
+    // Membership rule: a ticker is IN the index only if it's being Tracked,
+    // Traded, held Long, or Short. WATCHING is NOT membership (it's a shortlist),
+    // and an 'Avoid'-only or 'Sold'/removed entry isn't a live member.
+    if (e.removedFromIndex) return false;                 // taken off → frozen, not live
+    const isMember = flags.some(f => ['Tracking', 'Trading', 'Long', 'Short'].includes(f));
+    if (!isMember) return false;
     if (flags.length === 1 && flags[0] === 'Avoid') return false;
     return true;
   });
 }
+
+// Is this index entry a SHORT? Short members track the INVERSE return (the index
+// gains when the shorted name falls).
+function _isShortMember(e) {
+  const flags = e.flags || [];
+  return flags.includes('Short') && !flags.includes('Long');
+}
+function _memberDirection(e) { return _isShortMember(e) ? -1 : 1; }
 
 function _currentPriceFor(tic) {
   try {
@@ -1393,6 +1406,89 @@ function _currentPriceFor(tic) {
     if (row && isFinite(row.price) && row.price > 0) return row.price;
   } catch {}
   return null;
+}
+
+// Every ticker that IS or WAS an index member (Tracking/Trading/Long/Short),
+// including removed ones — needed to reconstruct the full historical curve.
+function _indexAllTimeMembers() {
+  const entries = getGoodGlobeIndexEntries();
+  return entries.filter(e => {
+    const f = e.flags || [];
+    return e.removedFromIndex || f.some(x => ['Tracking', 'Trading', 'Long', 'Short'].includes(x));
+  });
+}
+
+// Reconstruct the index level series from members' ACTUAL price history, so the
+// chart is a full, real performance line the moment you add holdings — instead of
+// the sparse one-point-per-day-the-app-is-open curve. This is the "it just IPO'd"
+// model: the index is born on the earliest member's entry date at base 100, each
+// member joins on its own entry date at the then-current level (no retroactive
+// change), short members contribute the INVERSE daily move, and a removed member
+// stops contributing after its removal date (its gains stay baked into the level).
+// Equal-weighted: each day's index return is the average of that day's active
+// members' daily returns.
+let _ggCurveCache = { key: null, curve: null, at: 0 };
+function _reconstructIndexCurve() {
+  const members = _indexAllTimeMembers();
+  if (!members.length) return null;
+  if (typeof getHistoryForTicker !== 'function') return null;
+
+  // Cheap cache key: tickers + entry/exit/flags. Avoids recompute within a render.
+  const key = members.map(m => `${m.ticker}:${(m.entryDate||m.firstFlaggedAt||'').slice(0,10)}:${m.removedAt||''}:${(m.flags||[]).join('')}`).join('|');
+  if (_ggCurveCache.key === key && (Date.now() - _ggCurveCache.at) < 60000) return _ggCurveCache.curve;
+
+  const memberData = [];
+  for (const m of members) {
+    let hist;
+    try { hist = getHistoryForTicker(m.ticker); } catch { hist = null; }
+    if (!hist || hist.length < 2) continue;
+    const byDate = {};
+    for (const p of hist) {
+      const d = String(p.date || '').slice(0, 10);
+      const px = (p.close != null ? p.close : p.price);
+      if (d && px != null && isFinite(px) && px > 0) byDate[d] = +px;
+    }
+    if (Object.keys(byDate).length < 2) continue;
+    const entryDate = String(m.entryDate || m.firstFlaggedAt || '').slice(0, 10) || null;
+    const exitDate = m.removedFromIndex ? (String(m.removedAt || '').slice(0, 10) || null) : null;
+    memberData.push({ ticker: m.ticker, byDate, entryDate, exitDate, dir: _memberDirection(m) });
+  }
+  if (!memberData.length) return null;
+
+  // Union of trading dates within each member's active window.
+  const dateSet = new Set();
+  for (const md of memberData) {
+    for (const d of Object.keys(md.byDate)) {
+      if (md.entryDate && d < md.entryDate) continue;
+      if (md.exitDate && d > md.exitDate) continue;
+      dateSet.add(d);
+    }
+  }
+  const dates = Array.from(dateSet).sort();
+  if (dates.length < 2) return null;
+
+  const level = [];
+  let lvl = 100, prevDate = null;
+  for (const d of dates) {
+    if (prevDate) {
+      let sum = 0, n = 0;
+      for (const md of memberData) {
+        if (md.entryDate && d < md.entryDate) continue;
+        if (md.exitDate && d > md.exitDate) continue;
+        const pNow = md.byDate[d], pPrev = md.byDate[prevDate];
+        if (pNow != null && pPrev != null && pPrev > 0) {
+          sum += ((pNow / pPrev) - 1) * md.dir;   // short → inverse
+          n++;
+        }
+      }
+      if (n) lvl = lvl * (1 + sum / n);            // equal-weighted daily return
+    }
+    level.push({ date: d, level: +lvl.toFixed(4), members: 0 });
+    prevDate = d;
+  }
+  const curve = { level };
+  _ggCurveCache = { key, curve, at: Date.now() };
+  return curve;
 }
 
 // Record today's index snapshot + advance the compounded equal-weighted level.
@@ -1417,10 +1513,17 @@ function updateGoodGlobeIndexSnapshot() {
   let dailyReturn = 0;
   if (prevSnap && prevSnap.date !== today) {
     // Equal-weighted daily return across members present in BOTH snapshots.
+    // SHORT members contribute the INVERSE daily move (index gains when the
+    // shorted name falls). Direction is looked up per member.
+    const dirByTicker = {};
+    for (const m of members) dirByTicker[m.ticker] = _memberDirection(m);
     const both = Object.keys(todayPrices).filter(t => prevSnap.prices[t] != null && prevSnap.prices[t] > 0);
     if (both.length) {
       let sum = 0;
-      for (const t of both) sum += (todayPrices[t] / prevSnap.prices[t]) - 1;
+      for (const t of both) {
+        const raw = (todayPrices[t] / prevSnap.prices[t]) - 1;
+        sum += raw * (dirByTicker[t] || 1);
+      }
       dailyReturn = sum / both.length;
     }
   }
@@ -1450,7 +1553,14 @@ function updateGoodGlobeIndexSnapshot() {
 // entry price → current price, as a since-inception cross-check that doesn't
 // depend on daily snapshots having been recorded (useful right after adding).
 function goodGlobeIndexPerformance(windowName = 'all') {
-  const curve = updateGoodGlobeIndexSnapshot() || loadIndexCurve();
+  // Prefer the FULL curve reconstructed from members' price history (a real line
+  // from inception), falling back to the day-by-day recorded curve if history
+  // isn't available yet. The recorded curve still advances in the background.
+  const recorded = updateGoodGlobeIndexSnapshot() || loadIndexCurve();
+  const reconstructed = (typeof _reconstructIndexCurve === 'function') ? _reconstructIndexCurve() : null;
+  const useReconstructed = reconstructed && Array.isArray(reconstructed.level) && reconstructed.level.length >= 2 &&
+    reconstructed.level.length >= ((recorded.level || []).length);
+  const curve = useReconstructed ? reconstructed : recorded;
   const series = Array.isArray(curve.level) ? curve.level.slice() : [];
 
   // Windowed slice.
@@ -1487,8 +1597,12 @@ function goodGlobeIndexPerformance(windowName = 'all') {
           weight = (mc != null && isFinite(mc) && mc > 0) ? +mc : 1;
         } catch { weight = 1; }
       }
+      // SHORT members earn the inverse return (profit when price falls).
+      const dir = _memberDirection(m);
+      const rawRet = ((cur - m.entryPrice) / m.entryPrice) * 100;
       perMember.push({ ticker: m.ticker, entryPrice: m.entryPrice, current: cur, weight,
-        returnPct: +(((cur - m.entryPrice) / m.entryPrice) * 100).toFixed(2),
+        direction: dir < 0 ? 'short' : 'long',
+        returnPct: +(rawRet * dir).toFixed(2),
         since: m.entryDate || m.firstFlaggedAt });
     }
   }
@@ -1505,11 +1619,18 @@ function goodGlobeIndexPerformance(windowName = 'all') {
     ? +(perMember.reduce((s, x) => s + x.returnPct, 0) / perMember.length).toFixed(2)
     : null;
 
-  // Index money value: a base LEVEL of $20 (like an index/ETF share price) that
-  // moves with the index's since-add return. AAPL alone +10% → $22.00; AAPL +10%
-  // & GME +5% equal-weighted → +7.5% → $21.50.
+  // Index money value: a base LEVEL of $20 (like an ETF share price). When the
+  // chart is the reconstructed-from-history curve, the headline $ and % derive
+  // from the CURVE so the big number matches exactly where the line ends (and
+  // what hover shows when you scrub to today). Otherwise fall back to the simple
+  // weighted since-add return.
   const GG_BASE_VALUE = 20;
-  const headlineReturn = weightedSinceAdd != null ? weightedSinceAdd : 0;
+  const fullSeries = Array.isArray(curve.level) ? curve.level : [];
+  const curveLevelNow = fullSeries.length ? fullSeries[fullSeries.length - 1].level : 100;
+  const curveReturn = +((curveLevelNow / 100 - 1) * 100).toFixed(2);
+  const headlineReturn = useReconstructed
+    ? curveReturn
+    : (weightedSinceAdd != null ? weightedSinceAdd : 0);
   const indexValue = +(GG_BASE_VALUE * (1 + headlineReturn / 100)).toFixed(2);
 
   const levelNow = series.length ? series[series.length - 1].level : 100;
@@ -1525,7 +1646,8 @@ function goodGlobeIndexPerformance(windowName = 'all') {
     levelNow: +levelNow.toFixed(2),
     compoundedAllTime,        // compounded equal-weighted, from the daily curve
     windowReturnPct,          // return over the selected window
-    weightedSinceAdd,         // THE headline: weighted return since each member's add
+    weightedSinceAdd,         // weighted return since each member's add (simple avg)
+    headlineReturn,           // THE headline % — matches the chart curve when reconstructed
     equalWeightSinceAdd,      // equal-weight version (always available)
     weightMode: mode,         // 'equal' | 'mktcap'
     indexValue,               // $-value, base $20 (acts like an ETF/SPY level)
@@ -4278,13 +4400,13 @@ function importFullBackup() {
       const dump = JSON.parse(await file.text());
       if (dump._schema !== 'valuatio-backup-v1' || !dump.keys) throw new Error('not a Valuatio backup file');
       const n = Object.keys(dump.keys).length;
-      if (!confirm(`Restore ${n} keys from backup dated ${dump.exportedAt?.slice(0, 10)}? Existing values for those keys are overwritten.`)) return;
+      if (!await appConfirm(`Restore ${n} keys from backup dated ${dump.exportedAt?.slice(0, 10)}? Existing values for those keys are overwritten.`)) return;
       for (const [k, v] of Object.entries(dump.keys)) {
         try { localStorage.setItem(k, v); } catch (e) { console.warn('[restore] failed', k, e.message); }
       }
       if (typeof flashStatus === 'function') { try { flashStatus(`Restored ${n} keys — reloading`, 'success'); } catch {} }
       setTimeout(() => location.reload(), 800);
-    } catch (e) { alert('Restore failed: ' + e.message); }
+    } catch (e) { appAlert('Restore failed: ' + e.message); }
   };
   input.click();
 }
@@ -5934,7 +6056,7 @@ function renderSummary(s) {
     sectorEl.onclick = () => {
       const sbRow = getStockbookRow(s.ticker);
       if (sbRow) openOverrideModal(s.ticker);
-      else alert('Load Stock Book first to enable overrides');
+      else appAlert('Load Stock Book first to enable overrides');
     };
   }
 
@@ -6031,7 +6153,7 @@ function renderValuationPositionBar(stock) {
     btn.parentNode.replaceChild(newBtn, btn);
   });
   bar.querySelectorAll('.vpb-action-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       const act = btn.dataset.act;
       if (act === 'watching' || act === 'tracking' || act === 'avoid') {
         // One-click passive position — no modal needed
@@ -6039,7 +6161,7 @@ function renderValuationPositionBar(stock) {
         // Check if already exists
         const already = allPositions.find(p => p.position === posLabel);
         if (already) {
-          if (!confirm(`${ticker} is already in your ${posLabel} list. Remove it?`)) return;
+          if (!await appConfirm(`${ticker} is already in your ${posLabel} list. Remove it?`)) return;
           removeFromPortfolio(already.id);
           renderValuationPositionBar(stock);
           return;
@@ -6756,7 +6878,133 @@ function flashStatus(msg, cls = '') {
   const s = document.getElementById('status');
   s.textContent = msg;
   s.className = 'status ' + cls;
-  setTimeout(() => { s.textContent = 'Ready'; s.className = 'status'; }, 3000);
+  setTimeout(async () => { s.textContent = 'Ready'; s.className = 'status'; }, 3000);
+}
+
+// ============================================================
+//   APP DIALOGS — styled in-app replacements for the browser's native
+//   appAlert() / await appConfirm() / await appPrompt() boxes, so every popup matches Valuatio's
+//   look instead of the OS chrome. All three return Promises:
+//     await appAlert(message[, {title, okText}])            → undefined
+//     await appConfirm(message[, {title, okText, cancelText, danger}]) → bool
+//     await appPrompt(message[, {defaultValue, title, okText, placeholder}]) → string|null
+//   The native window.alert/confirm/prompt are overridden below to route
+//   through these, so existing call sites keep working (see the shim).
+// ============================================================
+let _appDialogOpen = false;
+function _ensureDialogStyles() {
+  if (document.getElementById('app-dialog-styles')) return;
+  const st = document.createElement('style');
+  st.id = 'app-dialog-styles';
+  st.textContent = `
+    .app-dialog-overlay{position:fixed;inset:0;z-index:100000;display:flex;align-items:center;justify-content:center;
+      background:rgba(8,10,14,0.72);backdrop-filter:blur(2px);animation:appDlgFade .12s ease}
+    @keyframes appDlgFade{from{opacity:0}to{opacity:1}}
+    .app-dialog{background:var(--bg-card,#14171c);border:1px solid var(--rule,#2a2f37);border-radius:6px;
+      box-shadow:0 18px 60px rgba(0,0,0,.55);width:min(440px,calc(100vw - 32px));overflow:hidden;
+      animation:appDlgRise .14s cubic-bezier(.2,.7,.3,1)}
+    @keyframes appDlgRise{from{transform:translateY(8px);opacity:.6}to{transform:translateY(0);opacity:1}}
+    .app-dialog-head{padding:14px 18px 0;font-family:var(--serif,Georgia,serif);font-size:16px;font-weight:700;
+      color:var(--amber,#e0a458)}
+    .app-dialog-body{padding:10px 18px 4px;font-family:var(--mono,ui-monospace,monospace);font-size:12.5px;
+      line-height:1.6;color:var(--ink,#d8dde3);white-space:pre-wrap;max-height:50vh;overflow:auto}
+    .app-dialog-input{width:100%;margin:10px 0 2px;background:var(--bg-elev,#0e1116);border:1px solid var(--rule,#2a2f37);
+      color:var(--ink,#d8dde3);font-family:var(--mono,monospace);font-size:13px;padding:9px 11px;border-radius:4px;outline:none}
+    .app-dialog-input:focus{border-color:var(--amber,#e0a458)}
+    .app-dialog-foot{display:flex;gap:8px;justify-content:flex-end;padding:14px 18px 16px}
+    .app-dialog-btn{font-family:var(--mono,monospace);font-size:12px;font-weight:700;padding:8px 16px;border-radius:4px;
+      border:1px solid var(--rule,#2a2f37);background:var(--bg-elev,#0e1116);color:var(--ink,#d8dde3);cursor:pointer;
+      transition:all .12s}
+    .app-dialog-btn:hover{border-color:var(--amber,#e0a458);color:var(--amber,#e0a458)}
+    .app-dialog-btn.primary{background:var(--amber,#e0a458);border-color:var(--amber,#e0a458);color:#0c0e12}
+    .app-dialog-btn.primary:hover{filter:brightness(1.08);color:#0c0e12}
+    .app-dialog-btn.danger{background:var(--neg,#d9534f);border-color:var(--neg,#d9534f);color:#fff}
+    .app-dialog-btn.danger:hover{filter:brightness(1.08);color:#fff}`;
+  (document.head || document.body).appendChild(st);
+}
+
+function _appDialog({ kind, message, title, okText, cancelText, defaultValue, placeholder, danger }) {
+  return new Promise((resolve) => {
+    try {
+      _ensureDialogStyles();
+      const overlay = document.createElement('div');
+      overlay.className = 'app-dialog-overlay';
+      const box = document.createElement('div');
+      box.className = 'app-dialog';
+      const head = title ? `<div class="app-dialog-head">${_dlgEsc(title)}</div>` : '';
+      const isPrompt = kind === 'prompt';
+      const inputHtml = isPrompt
+        ? `<input class="app-dialog-input" id="app-dialog-input" type="text" value="${_dlgEsc(defaultValue ?? '')}" placeholder="${_dlgEsc(placeholder || '')}">`
+        : '';
+      const cancelBtn = (kind === 'alert')
+        ? ''
+        : `<button class="app-dialog-btn" id="app-dialog-cancel">${_dlgEsc(cancelText || 'Cancel')}</button>`;
+      const okClass = danger ? 'app-dialog-btn danger' : 'app-dialog-btn primary';
+      box.innerHTML = `${head}
+        <div class="app-dialog-body">${_dlgEsc(message || '')}${inputHtml}</div>
+        <div class="app-dialog-foot">${cancelBtn}
+          <button class="${okClass}" id="app-dialog-ok">${_dlgEsc(okText || (kind === 'alert' ? 'OK' : kind === 'prompt' ? 'OK' : 'Confirm'))}</button>
+        </div>`;
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+      _appDialogOpen = true;
+
+      const input = box.querySelector('#app-dialog-input');
+      const cleanup = (val) => {
+        try { overlay.remove(); } catch {}
+        _appDialogOpen = false;
+        document.removeEventListener('keydown', onKey, true);
+        resolve(val);
+      };
+      const onOk = () => cleanup(isPrompt ? (input ? input.value : '') : true);
+      const onCancel = () => cleanup(isPrompt ? null : false);
+      box.querySelector('#app-dialog-ok').addEventListener('click', onOk);
+      const cancelEl = box.querySelector('#app-dialog-cancel');
+      if (cancelEl) cancelEl.addEventListener('click', onCancel);
+      // Click outside = cancel (alert: dismiss).
+      overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) onCancel(); });
+      const onKey = (e) => {
+        if (e.key === 'Escape') { e.preventDefault(); onCancel(); }
+        else if (e.key === 'Enter' && (!isPrompt || document.activeElement === input)) { e.preventDefault(); onOk(); }
+      };
+      document.addEventListener('keydown', onKey, true);
+      if (input) { input.focus(); input.select(); }
+      else box.querySelector('#app-dialog-ok').focus();
+    } catch (e) {
+      // Absolute fallback so a dialog failure never blocks the app.
+      console.warn('[app-dialog] fell back to native', e && e.message);
+      if (kind === 'alert') { try { window.__nativeAlert && window.__nativeAlert(message); } catch {} resolve(undefined); }
+      else if (kind === 'prompt') resolve(typeof window.__nativePrompt === 'function' ? window.__nativePrompt(message, defaultValue) : null);
+      else resolve(typeof window.__nativeConfirm === 'function' ? window.__nativeConfirm(message) : true);
+    }
+  });
+}
+function _dlgEsc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+function appAlert(message, opts = {})   { return _appDialog({ kind: 'alert',   message, title: opts.title, okText: opts.okText }); }
+function appConfirm(message, opts = {}) { return _appDialog({ kind: 'confirm', message, title: opts.title, okText: opts.okText, cancelText: opts.cancelText, danger: opts.danger }); }
+function appPrompt(message, opts = {})  {
+  // Allow appPrompt(msg, "default") shorthand as well as an options object.
+  if (typeof opts === 'string') opts = { defaultValue: opts };
+  return _appDialog({ kind: 'prompt', message, title: opts.title, okText: opts.okText, defaultValue: opts.defaultValue, placeholder: opts.placeholder });
+}
+if (typeof window !== 'undefined') {
+  window.appAlert = appAlert; window.appConfirm = appConfirm; window.appPrompt = appPrompt;
+  // Keep references to the native dialogs for the fallback path, then override
+  // the globals so any remaining synchronous-style callers still get a styled
+  // box. NOTE: the overridden confirm/prompt return a Promise — call sites that
+  // need the value use `await`. Pure fire-and-forget appAlert() still works.
+  try {
+    window.__nativeAlert = window.alert.bind(window);
+    window.__nativeConfirm = window.confirm.bind(window);
+    window.__nativePrompt = window.prompt.bind(window);
+  } catch {}
+  window.alert = (m) => { appAlert(m); };
+  window.confirm = (m) => appConfirm(m);
+  window.prompt = (m, d) => appPrompt(m, { defaultValue: d });
 }
 
 // ============================================================
@@ -8850,8 +9098,8 @@ function renderFedTab() {
   }
   const resetBtn = document.getElementById('fed-refresh-btn');
   if (resetBtn) {
-    resetBtn.addEventListener('click', () => {
-      if (confirm('Reset Fed data to seeded public values? This clears your predictions and odds edits.')) {
+    resetBtn.addEventListener('click', async () => {
+      if (await appConfirm('Reset Fed data to seeded public values? This clears your predictions and odds edits.')) {
         localStorage.removeItem(FED_KEY);
         renderFedTab();
       }
@@ -9371,6 +9619,108 @@ function extractOptionsSignal(ticker) {
 }
 if (typeof window !== 'undefined') window.extractOptionsSignal = extractOptionsSignal;
 
+// ============================================================
+//   MARKET-WIDE OPTIONS LAYER
+//
+//   The repo stores option chains for ~25 of the most liquid names + index
+//   proxies (SPY/QQQ/IWM). Aggregating their IV, put/call skew, and term
+//   structure gives a forward-looking read on the WHOLE market that price
+//   history can't: how much volatility is being priced in, how much the market
+//   is paying for crash protection, and whether near-term event risk is elevated.
+//
+//   This feeds three things: the market-options dashboard (Options tab "Market"
+//   view), the bot's regime (risk-on/off), and a market-trend tilt usable in
+//   grading. The index proxies (SPY/QQQ/IWM) are weighted toward the headline
+//   because they ARE the market.
+// ============================================================
+const _MKT_OPT_INDEXES = ['SPY', 'QQQ', 'IWM'];
+let _marketOptionsCache = { at: 0, data: null };
+
+// Load every options file in the manifest into _optionsCache (parallel, capped).
+async function loadAllOptions(force) {
+  const man = await loadOptionsManifest();
+  const tickers = (man && Array.isArray(man.tickers)) ? man.tickers.slice() : [];
+  if (!tickers.length) return [];
+  // Fetch any not already fresh in cache.
+  const need = tickers.filter(t => {
+    const c = _optionsCache[(t || '').toUpperCase()];
+    return force || !c || !c.data || (Date.now() - (c.t || 0)) > OPTIONS_TTL_MS;
+  });
+  // Cap concurrency to be kind to raw.githubusercontent.
+  const CONC = 6;
+  for (let i = 0; i < need.length; i += CONC) {
+    await Promise.all(need.slice(i, i + CONC).map(t => loadOptionsForTicker(t, force)));
+  }
+  return tickers;
+}
+
+// Aggregate per-ticker option signals into a single market read.
+function computeOptionsMarketSignal() {
+  if (_marketOptionsCache.data && (Date.now() - _marketOptionsCache.at) < 60000) return _marketOptionsCache.data;
+  const rows = [];
+  let indexIVsum = 0, indexIVn = 0;
+  for (const tk of Object.keys(_optionsCache)) {
+    const sig = extractOptionsSignal(tk);
+    if (!sig || sig.iv == null) continue;
+    const isIndex = _MKT_OPT_INDEXES.includes(tk);
+    rows.push({ ticker: tk, iv: sig.iv, skew: sig.skew, termSlope: sig.termSlope, ivSignal: sig.ivSignal, isIndex });
+    if (isIndex) { indexIVsum += sig.iv; indexIVn++; }
+  }
+  if (!rows.length) { _marketOptionsCache = { at: Date.now(), data: null }; return null; }
+
+  const avg = (arr) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
+  const breadthIV = avg(rows.map(r => r.iv));
+  const indexIV = indexIVn ? indexIVsum / indexIVn : breadthIV;     // SPY/QQQ/IWM-led "VIX-like" level
+  const avgSkew = avg(rows.map(r => r.skew).filter(v => v != null));
+  const avgTerm = avg(rows.map(r => r.termSlope).filter(v => v != null));
+  const avgIvSignal = avg(rows.map(r => r.ivSignal));
+
+  // Headline IV level → a market vol regime. Index ATM IV ~14-16% = calm,
+  // ~20% = normal, >26% = stressed, >32% = fear.
+  const ivPct = indexIV * 100;
+  let volRegime;
+  if (ivPct >= 32) volRegime = 'fear';
+  else if (ivPct >= 24) volRegime = 'stressed';
+  else if (ivPct >= 17) volRegime = 'normal';
+  else volRegime = 'calm';
+
+  // Market options TREND signal in [-1,+1]: positive = supportive (calm IV, low
+  // crash bid, no near-term event spike); negative = defensive (rich IV, heavy
+  // downside skew, backwardation). Built from the same pieces as the per-name
+  // signal but at the index level.
+  let marketTrend = 0;
+  if (ivPct < 17) marketTrend += Math.min(0.5, (17 - ivPct) / 17);
+  else if (ivPct > 24) marketTrend -= Math.min(0.8, (ivPct - 24) / 16);
+  if (avgSkew != null && avgSkew >= 0.05) marketTrend -= Math.min(0.4, (avgSkew - 0.05) / 0.15 * 0.4);
+  if (avgTerm != null && avgTerm > 0.05) marketTrend -= Math.min(0.3, (avgTerm - 0.05) / 0.15 * 0.3);
+  marketTrend = Math.max(-1, Math.min(1, +marketTrend.toFixed(3)));
+
+  // Rank names by richest IV (most expensive vol) and heaviest downside skew.
+  const byIV = rows.slice().sort((a, b) => b.iv - a.iv);
+  const bySkew = rows.filter(r => r.skew != null).sort((a, b) => b.skew - a.skew);
+
+  const data = {
+    asOf: Date.now(),
+    count: rows.length,
+    indexIV: +indexIV.toFixed(4),
+    breadthIV: +breadthIV.toFixed(4),
+    avgSkew: avgSkew != null ? +avgSkew.toFixed(4) : null,
+    avgTermSlope: avgTerm != null ? +avgTerm.toFixed(4) : null,
+    avgIvSignal: avgIvSignal != null ? +avgIvSignal.toFixed(3) : null,
+    volRegime,                 // 'calm' | 'normal' | 'stressed' | 'fear'
+    marketTrend,               // signed market-options tilt [-1,+1]
+    richestIV: byIV.slice(0, 6),
+    heaviestSkew: bySkew.slice(0, 6),
+    rows,
+  };
+  _marketOptionsCache = { at: Date.now(), data };
+  return data;
+}
+if (typeof window !== 'undefined') {
+  window.loadAllOptions = loadAllOptions;
+  window.computeOptionsMarketSignal = computeOptionsMarketSignal;
+}
+
 async function loadOptionsForTicker(ticker, force) {
   const tk = (ticker || '').toUpperCase();
   if (!tk) return null;
@@ -9504,6 +9854,7 @@ async function renderOptionsTab(ticker) {
   } catch {}
 
   body.innerHTML = `
+    ${_renderMarketOptionsPanel()}
     <div class="company-card" style="margin:0 0 12px">
       <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">
         <div>
@@ -9530,6 +9881,69 @@ async function renderOptionsTab(ticker) {
   // Wire selectors.
   body.querySelectorAll('.opt-expiry-pill').forEach(b => b.addEventListener('click', () => { OPTIONS_STATE.expiryIdx = +b.dataset.idx; renderOptionsTab(tk); }));
   body.querySelectorAll('.opt-side-btn').forEach(b => b.addEventListener('click', () => { OPTIONS_STATE.side = b.dataset.side; renderOptionsTab(tk); }));
+  _wireMarketOptionsPanel(tk);
+}
+
+// Render the market-wide options dashboard (aggregate of all chains in the repo).
+// Shows a placeholder + "Load market" button until all chains are fetched; once
+// loaded, shows the index-IV vol regime, breadth IV, skew, term slope, the market
+// trend tilt, and the richest-IV / heaviest-skew leaderboards.
+function _renderMarketOptionsPanel() {
+  const mo = (typeof computeOptionsMarketSignal === 'function') ? computeOptionsMarketSignal() : null;
+  if (!mo) {
+    return `<div class="company-card" id="mkt-opt-panel" style="margin:0 0 12px;border-left:3px solid var(--ink-faint)">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+        <div style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)"><strong style="color:var(--amber)">Market Options</strong> — load every chain in the repo for a market-wide IV / skew read.</div>
+        <button class="btn" id="mkt-opt-load" style="font-size:10px">Load market options</button>
+      </div>
+    </div>`;
+  }
+  const rc = { calm: 'var(--pos)', normal: 'var(--data-amber)', stressed: '#e08a4a', fear: 'var(--neg)' }[mo.volRegime] || 'var(--ink-dim)';
+  const tc = mo.marketTrend >= 0 ? 'var(--pos)' : 'var(--neg)';
+  const lead = (arr, field, fmt) => arr.map(r => `<span style="display:inline-block;font-family:var(--mono);font-size:9px;color:var(--ink-dim);margin-right:8px">${escapeHtml(r.ticker)} <span style="color:var(--ink)">${fmt(r[field])}</span></span>`).join('');
+  return `<div class="company-card" id="mkt-opt-panel" style="margin:0 0 12px;border-left:3px solid ${rc}">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;flex-wrap:wrap">
+      <div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Market Options · ${mo.count} names · index-led</div>
+        <div style="display:flex;align-items:baseline;gap:10px;margin-top:3px">
+          <span style="font-family:var(--mono);font-size:26px;font-weight:800;color:${rc};line-height:1">${(mo.indexIV*100).toFixed(1)}%</span>
+          <span style="font-family:var(--mono);font-size:12px;font-weight:700;color:${rc};text-transform:uppercase">${mo.volRegime}</span>
+          <span style="font-family:var(--mono);font-size:11px;color:${tc}">trend ${mo.marketTrend>=0?'+':''}${mo.marketTrend}</span>
+        </div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-dim);margin-top:2px">index ATM IV (SPY/QQQ/IWM) · breadth IV ${(mo.breadthIV*100).toFixed(1)}%${mo.avgSkew!=null?` · avg skew ${(mo.avgSkew*100).toFixed(1)}pp`:''}${mo.avgTermSlope!=null?` · term ${(mo.avgTermSlope*100).toFixed(1)}pp`:''}</div>
+      </div>
+      <button class="btn btn-ghost" id="mkt-opt-refresh" style="font-size:9px;padding:3px 8px">↻ Refresh</button>
+    </div>
+    <div style="margin-top:10px;display:flex;flex-direction:column;gap:4px">
+      <div><span style="font-family:var(--mono);font-size:8px;color:var(--ink-faint);text-transform:uppercase">Richest IV: </span>${lead(mo.richestIV, 'iv', v => (v*100).toFixed(0)+'%')}</div>
+      ${mo.heaviestSkew.length ? `<div><span style="font-family:var(--mono);font-size:8px;color:var(--ink-faint);text-transform:uppercase">Heaviest downside skew: </span>${lead(mo.heaviestSkew, 'skew', v => (v*100).toFixed(1)+'pp')}</div>` : ''}
+    </div>
+    <div style="font-family:var(--mono);font-size:8px;color:var(--ink-faint);margin-top:8px;opacity:0.85">Aggregated across the repo's option chains. Feeds the bot's regime (rich IV / fear de-risks) and a market-trend tilt. Index IV is the market's expected move; downside skew = crash-protection bid; term slope &gt;0 = near-term event risk.</div>
+  </div>`;
+}
+
+function _wireMarketOptionsPanel(currentTk) {
+  const loadBtn = document.getElementById('mkt-opt-load');
+  const refreshBtn = document.getElementById('mkt-opt-refresh');
+  const reload = async (force) => {
+    const panel = document.getElementById('mkt-opt-panel');
+    if (panel) {
+      const b = panel.querySelector('button');
+      if (b) { b.disabled = true; b.textContent = 'Loading…'; }
+    }
+    try {
+      await loadAllOptions(force);
+      _marketOptionsCache = { at: 0, data: null };  // force recompute
+      computeOptionsMarketSignal();
+    } catch {}
+    // Re-render the whole options tab so the panel + regime reflect new data.
+    if (typeof renderOptionsTab === 'function') renderOptionsTab(currentTk);
+  };
+  if (loadBtn) loadBtn.addEventListener('click', () => reload(false));
+  if (refreshBtn) refreshBtn.addEventListener('click', () => reload(true));
+}
+if (typeof window !== 'undefined') {
+  window._renderMarketOptionsPanel = _renderMarketOptionsPanel;
 }
 if (typeof window !== 'undefined') {
   window.loadOptionsForTicker = loadOptionsForTicker;
@@ -11206,6 +11620,9 @@ async function loadStockBook(forceRefresh = false) {
   // Capture an intraday tick per charted ticker so a refresh becomes a new chart
   // point (Robinhood-style "today"). No-op outside market hours.
   try { if (typeof captureIntradaySnapshot === 'function') captureIntradaySnapshot(); } catch {}
+  // Background-load the market option chains (non-blocking) so the market-options
+  // signal is ready for the engine/regime without the user opening the tab.
+  try { if (typeof loadAllOptions === 'function') loadAllOptions(false).then(() => { try { computeOptionsMarketSignal(); } catch {} }).catch(() => {}); } catch {}
   renderStockBook();
   maybeShowTickerTape();
 }
@@ -11547,7 +11964,7 @@ function renderStockBook() {
 
   // Wire action buttons
   content.querySelectorAll('[data-act]').forEach(btn => {
-    btn.addEventListener('click', e => {
+    btn.addEventListener('click', async e => {
       e.stopPropagation();
       const act = btn.dataset.act;
       const tic = btn.dataset.tic;
@@ -11562,7 +11979,7 @@ function renderStockBook() {
       } else if (act === 'holdings') {
         showEtfHoldings(tic);
       } else if (act === 'remove') {
-        if (confirm('Remove ' + tic + ' from your personal book?')) {
+        if (await appConfirm('Remove ' + tic + ' from your personal book?')) {
           removeFromPersonalBook(tic);
           loadStockBook();
         }
@@ -11751,7 +12168,7 @@ function attachColumnResizers(table) {
   });
 }
 
-function renderStockBookValuations(content) {
+async function renderStockBookValuations(content) {
   const saved = loadSaved();
   if (saved.length === 0) {
     content.innerHTML = `<div class="empty" style="padding:60px;text-align:center">
@@ -11799,7 +12216,7 @@ function renderStockBookValuations(content) {
     </div>
   `;
   content.querySelectorAll('[data-act]').forEach(btn => {
-    btn.addEventListener('click', e => {
+    btn.addEventListener('click', async e => {
       e.stopPropagation();
       const id = parseInt(btn.dataset.id);
       const v = loadSaved().find(x => x.id === id);
@@ -11809,7 +12226,7 @@ function renderStockBookValuations(content) {
         switchTab('valuation');
         loadValuation(v);
       } else if (btn.dataset.act === 'del') {
-        if (confirm('Delete saved valuation for ' + v.ticker + '?')) {
+        if (await appConfirm('Delete saved valuation for ' + v.ticker + '?')) {
           writeSaved(loadSaved().filter(x => x.id !== id));
           renderStockBookValuations(content);
         }
@@ -11962,8 +12379,8 @@ document.getElementById('stockbook-refresh-btn')?.addEventListener('click', () =
 });
 
 // Expose the cache-clear logic so the hamburger button can call it
-function openClearCachePrompt() {
-  const choice = prompt(
+async function openClearCachePrompt() {
+  const choice = await appPrompt(
     'Choose what to clear:\n' +
     '  N = NEWS cache ONLY (clears all stored articles — often several MB)\n' +
     '  S = SHEET cache ONLY (stock data snapshot — refetches on next load)\n' +
@@ -12022,7 +12439,7 @@ function openClearCachePrompt() {
     loadStockBook(true);
     flashStatus('Caches + personal book cleared', 'success');
   } else if (c === '3') {
-    if (!confirm('NUKE EVERYTHING? This deletes ALL Valuatio data: portfolio positions, notes, saved valuations, probability theses, risk portfolio, manual overrides, API keys, sheet URLs, and all caches. There is no undo. Continue?')) return;
+    if (!await appConfirm('NUKE EVERYTHING? This deletes ALL Valuatio data: portfolio positions, notes, saved valuations, probability theses, risk portfolio, manual overrides, API keys, sheet URLs, and all caches. There is no undo. Continue?', { danger: true })) return;
     Object.keys(localStorage)
       .filter(k => k.startsWith('valuatio.'))
       .forEach(k => localStorage.removeItem(k));
@@ -12202,14 +12619,14 @@ async function openSheetDiagnostics() {
 }
 document.getElementById('stockbook-diag-btn')?.addEventListener('click', openSheetDiagnostics);
 
-document.getElementById('stockbook-add-btn').addEventListener('click', () => {
-  const tic = prompt('Enter ticker symbol (e.g. AAPL):');
+document.getElementById('stockbook-add-btn').addEventListener('click', async () => {
+  const tic = await appPrompt('Enter ticker symbol (e.g. AAPL):');
   if (!tic) return;
   const ticker = tic.trim().toUpperCase();
   // Validation: ≤5 chars, alphanumeric only
   const stripped = ticker.replace(/[.\-]/g, '');
   if (!isValidTicker(ticker)) {
-    alert('Invalid ticker. Must be ≤5 letters and alphanumeric.');
+    appAlert('Invalid ticker. Must be ≤5 letters and alphanumeric.');
     return;
   }
   addToPersonalBook({ ticker });
@@ -15028,7 +15445,7 @@ const PDF_JSON_END_MARKER   = '<<<TRAPP2-LEADERSHIP-JSON-END>>>';
 
 function exportLeadershipToPDF() {
   if (!window.jspdf?.jsPDF) {
-    alert('PDF library failed to load. Check your internet connection and try again.');
+    appAlert('PDF library failed to load. Check your internet connection and try again.');
     return;
   }
   const { jsPDF } = window.jspdf;
@@ -15606,7 +16023,7 @@ document.addEventListener('DOMContentLoaded', () => {
     syncLeadershipEditingFromForm();
     const w = state.leadership.editing;
     if (!w?.name) {
-      alert('Name is required');
+      appAlert('Name is required');
       return;
     }
     if (!w.slug) w.slug = slugifyName(w.name);
@@ -15629,10 +16046,10 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // Delete button
-  document.getElementById('leadership-edit-delete-btn')?.addEventListener('click', () => {
+  document.getElementById('leadership-edit-delete-btn')?.addEventListener('click', async () => {
     const w = state.leadership.editing;
     if (!w?.slug) return;
-    if (!confirm(`Delete ${w.name}? This removes the override only — pipeline data (if any) for this person will reappear next time.`)) return;
+    if (!await appConfirm(`Delete ${w.name}? This removes the override only — pipeline data (if any) for this person will reappear next time.`)) return;
     deleteLeadershipPerson(w.slug);
     const cb = state.leadership.onEditComplete;
     closeLeadershipEditModal();
@@ -15643,7 +16060,7 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('leadership-edit-verify-btn')?.addEventListener('click', async () => {
     syncLeadershipEditingFromForm();
     const w = state.leadership.editing;
-    if (!w?.name) { alert('Name is required to verify'); return; }
+    if (!w?.name) { appAlert('Name is required to verify'); return; }
     // Save what we have so verify operates on persisted data
     if (!w.slug) w.slug = slugifyName(w.name);
     saveLeadershipPerson(w);
@@ -15709,7 +16126,7 @@ function triggerLeadershipImport(onComplete) {
     if (!file) return;
     const result = await importLeadershipFromFile(file);
     if (!result.ok) {
-      alert(`Import failed: ${result.reason}`);
+      appAlert(`Import failed: ${result.reason}`);
       return;
     }
     // Show diff confirmation
@@ -17176,10 +17593,10 @@ async function renderProbabilityTab() {
     const card = document.querySelector(`.thesis-archived-card[data-id="${thesis.id}"]`);
     if (!card) return;
     card.querySelectorAll('[data-act]').forEach(btn => {
-      btn.addEventListener('click', () => {
+      btn.addEventListener('click', async () => {
         const act = btn.dataset.act;
         if (act === 'restore') {
-          if (!confirm(`Restore "${thesis.ticker}" to active theses?`)) return;
+          if (!await appConfirm(`Restore "${thesis.ticker}" to active theses?`)) return;
           thesis.status = 'active';
           thesis.resolvedAt = null;
           thesis.resolution = null;
@@ -17190,7 +17607,7 @@ async function renderProbabilityTab() {
           saveTheses(state.probability.theses);
           renderProbabilityTab();
         } else if (act === 'delete') {
-          if (!confirm(`Permanently delete archived thesis for ${thesis.ticker}? This cannot be undone.`)) return;
+          if (!await appConfirm(`Permanently delete archived thesis for ${thesis.ticker}? This cannot be undone.`, { danger: true })) return;
           state.probability.theses = state.probability.theses.filter(t => t.id !== thesis.id);
           saveTheses(state.probability.theses);
           renderProbabilityTab();
@@ -17674,7 +18091,7 @@ function renderThesisCard(thesis, result) {
   `;
 }
 
-function wireThesisCard(thesis) {
+async function wireThesisCard(thesis) {
   const card = document.querySelector(`.thesis-card[data-id="${thesis.id}"]`);
   if (!card) return;
 
@@ -17723,10 +18140,10 @@ function wireThesisCard(thesis) {
 
   // Action buttons
   card.querySelectorAll('[data-act]').forEach(btn => {
-    btn.addEventListener('click', e => {
+    btn.addEventListener('click', async e => {
       const act = btn.dataset.act;
       if (act === 'delete') {
-        if (!confirm('Delete this thesis?')) return;
+        if (!await appConfirm('Delete this thesis?')) return;
         state.probability.theses = state.probability.theses.filter(t => t.id !== thesis.id);
         saveTheses(state.probability.theses);
         renderProbabilityTab();
@@ -17747,7 +18164,7 @@ function wireThesisCard(thesis) {
         // Manual archive — let the user call it early as YES or NO.
         // (Auto-archive on expiry is handled at render time and uses the
         // hit/miss check against snapshots.)
-        const choice = prompt(
+        const choice = await appPrompt(
           `Archive "${thesis.ticker} ${thesis.direction} $${thesis.strike}" as:\n\n` +
           `  yes  →  target was hit, resolves at 100%\n` +
           `  no   →  target NOT hit, resolves at 0%\n` +
@@ -17757,7 +18174,7 @@ function wireThesisCard(thesis) {
         if (!choice) return;
         const resolution = choice.trim().toLowerCase();
         if (resolution !== 'yes' && resolution !== 'no') {
-          alert(`Invalid choice "${choice}" — must be yes or no. Thesis not archived.`);
+          appAlert(`Invalid choice "${choice}" — must be yes or no. Thesis not archived.`);
           return;
         }
         thesis.status = 'archived';
@@ -17777,7 +18194,7 @@ function wireThesisCard(thesis) {
       } else if (act === 'restore') {
         // Restore an archived thesis to active. Resets status + clears the
         // resolution snapshot we appended so the chart returns to normal.
-        if (!confirm(`Restore "${thesis.ticker}" to active theses?`)) return;
+        if (!await appConfirm(`Restore "${thesis.ticker}" to active theses?`)) return;
         thesis.status = 'active';
         thesis.resolvedAt = null;
         thesis.resolution = null;
@@ -17931,7 +18348,7 @@ document.getElementById('thesis-create').addEventListener('click', () => {
   const direction = document.querySelector('#thesis-direction .seg-btn.active')?.dataset.val || 'above';
 
   if (!ticker || !strike || strike <= 0) {
-    alert('Need a valid ticker and strike price.');
+    appAlert('Need a valid ticker and strike price.');
     return;
   }
 
@@ -17943,7 +18360,7 @@ document.getElementById('thesis-create').addEventListener('click', () => {
     const ms = target - new Date();
     days = Math.ceil(ms / 86400000);
     if (days <= 0) {
-      alert('Target date must be in the future.');
+      appAlert('Target date must be in the future.');
       return;
     }
     targetDate = target.toISOString();
@@ -17976,8 +18393,8 @@ document.getElementById('thesis-create').addEventListener('click', () => {
 
 document.getElementById('prob-new-btn').addEventListener('click', openThesisModal);
 document.getElementById('prob-recalc-btn').addEventListener('click', renderProbabilityTab);
-document.getElementById('prob-clear-btn').addEventListener('click', () => {
-  if (!confirm('Delete all theses?')) return;
+document.getElementById('prob-clear-btn').addEventListener('click', async () => {
+  if (!await appConfirm('Delete all theses?', { danger: true })) return;
   state.probability.theses = [];
   saveTheses([]);
   renderProbabilityTab();
@@ -21331,7 +21748,7 @@ function exportOverridesForBackend() {
 
 function openEditor(ticker) {
   const tic = (ticker || state.stock?.ticker || '').toUpperCase();
-  if (!tic) { alert('Open or select a ticker first.'); return; }
+  if (!tic) { appAlert('Open or select a ticker first.'); return; }
   const row = (typeof getStockbookRow === 'function') ? getStockbookRow(tic) : null;
   const stock = (state.stock?.ticker === tic) ? state.stock : row;
 
@@ -21461,8 +21878,8 @@ function wireEditor(tic) {
     document.getElementById('editor-modal').style.display = 'none';
   });
 
-  document.getElementById('editor-clear-all')?.addEventListener('click', () => {
-    if (!confirm(`Clear all overrides for ${tic}? It will pull data normally.`)) return;
+  document.getElementById('editor-clear-all')?.addEventListener('click', async () => {
+    if (!await appConfirm(`Clear all overrides for ${tic}? It will pull data normally.`)) return;
     clearOverrides(tic);
     const row = (typeof getStockbookRow === 'function') ? getStockbookRow(tic) : null;
     if (row) delete row._preOverride;
@@ -21706,7 +22123,7 @@ function openDiscrepancyResolver(ticker, importObj) {
 async function handleCompanyDataImport(file) {
   const text = await file.text();
   const rows = parseImportCsv(text);
-  if (!rows.length) { alert('No recognizable company-data columns found in that file. Headers should include things like Ticker, Revenue, Net Income, Sector, etc.'); return; }
+  if (!rows.length) { appAlert('No recognizable company-data columns found in that file. Headers should include things like Ticker, Revenue, Net Income, Sector, etc.'); return; }
   // If rows have tickers, resolve each that matches the stockbook; else assume
   // single-company file for the currently-open ticker.
   const withTicker = rows.filter(r => r.ticker);
@@ -21717,10 +22134,10 @@ async function handleCompanyDataImport(file) {
       const row = (typeof getStockbookRow === 'function') ? getStockbookRow(tic) : null;
       if (row) { openDiscrepancyResolver(tic, r); return; }
     }
-    alert('None of the tickers in the file match your stockbook.');
+    appAlert('None of the tickers in the file match your stockbook.');
   } else {
     const tic = state.stock?.ticker;
-    if (!tic) { alert('Open a ticker first, or include a Ticker column in the file.'); return; }
+    if (!tic) { appAlert('Open a ticker first, or include a Ticker column in the file.'); return; }
     openDiscrepancyResolver(tic, rows[0]);
   }
 }
@@ -21991,7 +22408,7 @@ const STATUS_OPTIONS = ['', 'Trading', 'Watching', 'Tracking', 'Avoid', 'ETF', '
 // ============================================================
 function openOverrideModal(ticker) {
   const row = getStockbookRow(ticker);
-  if (!row) { alert('Ticker not in stock book'); return; }
+  if (!row) { appAlert('Ticker not in stock book'); return; }
 
   const tax = collectTaxonomyValues();
   const ovr = loadOverrides()[ticker] || {};
@@ -22064,8 +22481,8 @@ function openOverrideModal(ticker) {
     flashStatus('Override saved · ' + ticker, 'success');
   });
 
-  document.getElementById('ovr-clear').addEventListener('click', () => {
-    if (!confirm('Clear all overrides for ' + ticker + '?')) return;
+  document.getElementById('ovr-clear').addEventListener('click', async () => {
+    if (!await appConfirm('Clear all overrides for ' + ticker + '?')) return;
     clearOverrides(ticker);
     document.getElementById('ovr-modal').remove();
     // Reload from sheet to drop overrides
@@ -22717,8 +23134,23 @@ function _saveIntraday(obj) {
 
 // Record one intraday tick for a ticker at the current price. Called on every
 // price refresh. Stores { t: ms, p: price } under intraday[date][TICKER].
-// Keeps today + the previous trading day only (prunes the rest to stay small),
-// and caps points per ticker per day so a long session can't bloat storage.
+//
+// 15-MINUTE BUCKETS: ticks are bucketed into 15-minute slots of the trading day
+// so the cache holds at most one point per 15 minutes per ticker (the latest
+// price in that window wins). This captures price action through the day without
+// bloating storage — ~26 points for a 6.5h session.
+//
+// FIRM-ON-CLOSE: once the regular session closes (16:00 ET), the final tick of
+// the day is marked firm and further same-day ticks are ignored, so the day's
+// last point locks to the closing price.
+//
+// DAILY RESET: only today + the prior trading day are kept; older days are
+// pruned, so each new day effectively starts the intraday tape over.
+function _bucket15(when) {
+  // Minute-of-day in ET, floored to the 15-minute boundary (stable bucket key).
+  const p = _etParts(new Date(when));
+  return Math.floor(p.minutes / 15) * 15;
+}
 function recordIntradayTick(ticker, price, when = Date.now()) {
   if (!ticker || price == null || !isFinite(price) || price <= 0) return;
   const tk = String(ticker).toUpperCase();
@@ -22727,15 +23159,30 @@ function recordIntradayTick(ticker, price, when = Date.now()) {
   if (!store[date]) store[date] = {};
   if (!store[date][tk]) store[date][tk] = [];
   const arr = store[date][tk];
+
   const last = arr[arr.length - 1];
-  // Skip a duplicate if price unchanged AND <60s since the last point (avoids
-  // flat spam); otherwise record — a changed price always adds a point ("a new
-  // spike unless the ticker was flat", as requested).
-  if (last && Math.abs(last.p - price) < 1e-9 && (when - last.t) < 60000) return;
-  arr.push({ t: when, p: +(+price).toFixed(6) });
-  // Cap ~480 points/day/ticker (e.g. every ~1 min for 8h) — trim oldest.
-  if (arr.length > 480) arr.splice(0, arr.length - 480);
-  // Prune to today + the immediately prior date present.
+  // If the day already firmed on the close, don't move it anymore.
+  if (last && last.firm) return;
+
+  const et = _etParts(new Date(when));
+  const afterClose = et.minutes >= 960;            // 16:00 ET or later
+  const bucket = _bucket15(when);
+
+  if (last && last.b === bucket) {
+    // Same 15-min window → update the latest price in place (latest wins).
+    last.p = +(+price).toFixed(6);
+    last.t = when;
+  } else {
+    // New 15-min window → add a point.
+    arr.push({ t: when, p: +(+price).toFixed(6), b: bucket });
+  }
+  // At/after the close, mark the final point firm so it locks to the close price.
+  if (afterClose) arr[arr.length - 1].firm = true;
+
+  // Cap points/day/ticker (a full session is ~26 fifteen-min buckets; allow head-
+  // room for pre/post-market) — trim oldest if it somehow exceeds.
+  if (arr.length > 120) arr.splice(0, arr.length - 120);
+  // Prune to today + the immediately prior date present (daily reset).
   const dates = Object.keys(store).sort();
   while (dates.length > 2) { delete store[dates.shift()]; }
   _saveIntraday(store);
@@ -23457,7 +23904,7 @@ function renderRiskLegsTable() {
 
 function addRiskLeg(preset) {
   if (state.risk.legs.length >= 30) {
-    alert('Max 30 legs');
+    appAlert('Max 30 legs');
     return;
   }
   const defaultLeg = {
@@ -23494,9 +23941,9 @@ const RISK_PRESETS = [
   { name: 'Commodities',     expectedReturn: 7,  volatility: 20, weight: 12.5, avgCorr: 15 },
 ];
 
-function loadRiskPresets() {
+async function loadRiskPresets() {
   if (state.risk.legs.length > 0) {
-    if (!confirm('Replace current portfolio with Dalio preset (8 classic uncorrelated bets)?')) return;
+    if (!await appConfirm('Replace current portfolio with Dalio preset (8 classic uncorrelated bets)?')) return;
   }
   state.risk.legs = RISK_PRESETS.map(p => ({ ...p }));
   saveRiskPortfolio();
@@ -23505,16 +23952,16 @@ function loadRiskPresets() {
   renderRiskMetrics();
 }
 
-function importFromStockBook() {
+async function importFromStockBook() {
   const rows = state.stockbook?.rows || [];
   const equities = rows.filter(r => !r.isDerivative && r.marketCap && r.marketCap >= 10e9);
   if (equities.length === 0) {
-    alert('No mid+ cap equities found in Stock Book. Make sure your Stock Book is loaded.');
+    appAlert('No mid+ cap equities found in Stock Book. Make sure your Stock Book is loaded.');
     return;
   }
   // Take top 8 by market cap; group different sectors when possible
   const top = [...equities].sort((a, b) => (b.marketCap || 0) - (a.marketCap || 0)).slice(0, 12);
-  if (state.risk.legs.length > 0 && !confirm(`Add top ${top.length} stocks from your Stock Book? (Current portfolio will be replaced.)`)) return;
+  if (state.risk.legs.length > 0 && !await appConfirm(`Add top ${top.length} stocks from your Stock Book? (Current portfolio will be replaced.)`)) return;
 
   // Estimate vol from sheet (fallback to 25%) — uses sheet's `return52` or beta
   state.risk.legs = top.map(r => {
@@ -23758,9 +24205,9 @@ function initRiskCalculator() {
   document.getElementById('risk-add-leg')?.addEventListener('click', () => addRiskLeg());
   document.getElementById('risk-load-presets')?.addEventListener('click', loadRiskPresets);
   document.getElementById('risk-import-stockbook')?.addEventListener('click', importFromStockBook);
-  document.getElementById('risk-clear-portfolio')?.addEventListener('click', () => {
+  document.getElementById('risk-clear-portfolio')?.addEventListener('click', async () => {
     if (state.risk.legs.length === 0) return;
-    if (!confirm('Clear all legs?')) return;
+    if (!await appConfirm('Clear all legs?')) return;
     state.risk.legs = [];
     saveRiskPortfolio();
     renderRiskLegsTable();
@@ -24632,7 +25079,17 @@ function dedupeTransactions() {
   const sorted = arr.slice().sort((a, b) => new Date(a.ts || 0) - new Date(b.ts || 0));
   const kept = [];
   const DEDUP_MS = 2000;
+  const exactSeen = new Set();   // collapse byte-identical rows regardless of time
   for (const tx of sorted) {
+    // Exact-duplicate guard FIRST: same id, OR same type+ticker+qty+price+ts.
+    // This catches the same transaction re-imported/re-entered with identical
+    // content (the Supabase doubling the user hit), even outside the 2s window.
+    const exactKey = tx.id
+      ? `id:${tx.id}`
+      : [(tx.type || '').toLowerCase(), (tx.ticker || '').toUpperCase(),
+         (+tx.qty || 0), (+tx.price || 0), tx.ts || tx.date || ''].join('|');
+    if (exactSeen.has(exactKey)) continue;   // identical row already kept
+    exactSeen.add(exactKey);
     if (tx.type === 'deposit' || tx.type === 'withdrawal') { kept.push(tx); continue; }
     const tsMs = tx.ts ? new Date(tx.ts).getTime() : 0;
     const isDupe = kept.some(k =>
@@ -24738,9 +25195,9 @@ function addCashToPortfolio(amount) {
 }
 if (typeof window !== 'undefined') window.addCashToPortfolio = addCashToPortfolio;
 
-function editPortfolioCash() {
+async function editPortfolioCash() {
   const cur = (typeof getCashPosition === 'function') ? getCashPosition() : 0;
-  const v = prompt(
+  const v = await appPrompt(
     'Add cash to your portfolio (or use a negative number to withdraw).\n\n' +
     'Recorded as a capital deposit — raises your buying power, not counted as a gain.\n\n' +
     `Current cash: $${cur.toLocaleString()}\n\nAmount to add (USD):`, '10000');
@@ -26131,7 +26588,7 @@ function wirePortfolioRowEvents() {
   });
   // Actions — id-based for edit/remove, ticker-based for value (goes to Valuation tab)
   document.querySelectorAll('[data-portfolio-act]').forEach(btn => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       const act = btn.dataset.portfolioAct;
       const id = btn.dataset.id;
       const tic = btn.dataset.tic;
@@ -26144,7 +26601,7 @@ function wirePortfolioRowEvents() {
       } else if (act === 'remove') {
         const entry = findPortfolioEntry(id);
         if (!entry) return;
-        if (confirm(`Remove ${entry.ticker} (added ${entry.addedAt?.slice(0,10) || 'unknown'}) from portfolio?\n\nThis only affects the position. Any sell transactions remain in the Transactions tab.`)) {
+        if (await appConfirm(`Remove ${entry.ticker} (added ${entry.addedAt?.slice(0,10) || 'unknown'}) from portfolio?\n\nThis only affects the position. Any sell transactions remain in the Transactions tab.`)) {
           removeFromPortfolio(id);
           renderStockBook();
         }
@@ -26269,9 +26726,11 @@ function renderGoodGlobeIndexView(content, summary, subTabs) {
     // index, measured from its entry price to the current price.
     const mr = _memberReturns[e.ticker];
     const sinceColor = !mr ? 'var(--ink-faint)' : mr.returnPct >= 0 ? 'var(--pos)' : 'var(--neg)';
+    const isShortRow = mr && mr.direction === 'short';
     const sinceCell = mr
       ? `<span style="color:${sinceColor};font-weight:700">${mr.returnPct >= 0 ? '+' : ''}${mr.returnPct}%</span>`
-        + `<br><span style="font-size:8px;color:var(--ink-faint)">$${mr.entryPrice} → $${mr.current}</span>`
+        + (isShortRow ? `<span style="font-size:8px;color:#a85a3a;font-weight:700"> SHORT</span>` : '')
+        + `<br><span style="font-size:8px;color:var(--ink-faint)">$${mr.entryPrice} → $${mr.current}${isShortRow ? ' (inv)' : ''}</span>`
       : '<span style="color:var(--ink-faint)">—</span>';
     return `
       <tr>
@@ -26298,41 +26757,61 @@ function renderGoodGlobeIndexView(content, summary, subTabs) {
       }
       const win = state.goodglobeView?.perfWindow || 'all';
       // Headline = weighted return since each member was added (the user's spec).
-      const headlinePct = perf.weightedSinceAdd != null ? perf.weightedSinceAdd : (perf.equalWeightSinceAdd ?? 0);
+      const headlinePct = perf.headlineReturn != null ? perf.headlineReturn : (perf.weightedSinceAdd != null ? perf.weightedSinceAdd : (perf.equalWeightSinceAdd ?? 0));
       const allTimePct = headlinePct;
       const c = allTimePct == null ? 'var(--ink-dim)' : allTimePct >= 0 ? 'var(--pos)' : 'var(--neg)';
-      const weightLabel = perf.weightMode === 'mktcap' ? 'market-cap weighted (SPY-style)' : 'equal-weighted';
-      // Mini equity curve of the index level.
+      const weightLabel = perf.weightMode === 'mktcap' ? 'market-cap weighted' : 'equal-weighted';
+      // Floating area performance chart with hover. No baseline label, no axis
+      // numbers — just the curve, a soft gradient fill, and a crosshair on hover
+      // that reads out the index price + % change at that point.
       let chart = '';
       const pts = perf.levelSeries;
       if (pts.length >= 2) {
         const vals = pts.map(p => p.level);
-        const lo = Math.min(...vals, 100), hi = Math.max(...vals, 100);
-        const pad = (hi - lo) * 0.1 || 5; const L = lo - pad, H = hi + pad;
-        const W = 600, HT = 90;
+        const lo = Math.min(...vals), hi = Math.max(...vals);
+        const pad = (hi - lo) * 0.12 || (hi * 0.02) || 1; const L = lo - pad, H = hi + pad;
+        const W = 600, HT = 130;
         const x = i => pts.length > 1 ? (i / (pts.length - 1)) * W : 0;
         const y = v => HT - ((v - L) / (H - L)) * HT;
         const line = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(p.level).toFixed(1)}`).join(' ');
-        const baseY = y(100);
-        const up = pts[pts.length - 1].level >= 100;
-        chart = `<svg viewBox="0 0 ${W} ${HT}" preserveAspectRatio="none" style="width:100%;height:90px;display:block;margin-top:8px">
-          ${(100 >= L && 100 <= H) ? `<line x1="0" y1="${baseY.toFixed(1)}" x2="${W}" y2="${baseY.toFixed(1)}" stroke="var(--ink-faint)" stroke-width="1" stroke-dasharray="4,4" opacity="0.5"/><text x="4" y="${(baseY-3).toFixed(1)}" font-family="monospace" font-size="8" fill="var(--ink-faint)" opacity="0.7">100 base</text>` : ''}
-          <path d="${line}" fill="none" stroke="${up ? 'var(--pos)' : 'var(--neg)'}" stroke-width="2"/>
-        </svg>`;
+        const area = `${line} L${W},${HT} L0,${HT} Z`;
+        const up = pts[pts.length - 1].level >= pts[0].level;
+        const stroke = up ? 'var(--pos)' : 'var(--neg)';
+        const gid = 'ggGrad' + (up ? 'U' : 'D');
+        const base0 = pts[0].level;   // baseline = first point of the window (for % readout)
+        // Serialize points for the hover handler (date + level + pct vs window start).
+        const ptData = pts.map(p => ({ d: p.date, l: p.level, p: +(((p.level - base0) / base0) * 100).toFixed(2) }));
+        chart = `<div class="gg-chart-wrap" style="position:relative;margin-top:10px">
+          <svg id="gg-perf-svg" viewBox="0 0 ${W} ${HT}" preserveAspectRatio="none" style="width:100%;height:130px;display:block;overflow:visible">
+            <defs><linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="${stroke}" stop-opacity="0.28"/>
+              <stop offset="100%" stop-color="${stroke}" stop-opacity="0"/>
+            </linearGradient></defs>
+            <path d="${area}" fill="url(#${gid})" stroke="none"/>
+            <path d="${line}" fill="none" stroke="${stroke}" stroke-width="2" vector-effect="non-scaling-stroke"/>
+            <line id="gg-cross" x1="0" y1="0" x2="0" y2="${HT}" stroke="var(--ink-dim)" stroke-width="1" stroke-dasharray="3,3" opacity="0" vector-effect="non-scaling-stroke"/>
+            <circle id="gg-dot" r="3.5" fill="${stroke}" opacity="0"/>
+          </svg>
+          <div id="gg-hover" style="position:absolute;top:0;left:0;transform:translate(-50%,-100%);background:var(--bg-card);border:1px solid var(--rule);border-radius:4px;padding:4px 8px;font-family:var(--mono);font-size:10px;white-space:nowrap;pointer-events:none;opacity:0;box-shadow:0 4px 14px rgba(0,0,0,.4);z-index:5"></div>
+          <div id="gg-hit" data-pts='${escapeHtml(JSON.stringify(ptData))}' style="position:absolute;inset:0;cursor:crosshair"></div>
+        </div>`;
       }
       return `<div class="company-card" style="margin:0 0 14px;border-left:3px solid ${c}">
-        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px">
           <div>
-            <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">GoodGlobe Index · ${weightLabel} · ${perf.memberCount} members</div>
-            <div style="font-family:var(--mono);font-size:26px;font-weight:800;color:${c};margin-top:2px">$${perf.indexValue}<span style="font-size:13px;color:${c};font-weight:600"> (${allTimePct >= 0 ? '+' : ''}${allTimePct}%)</span><span style="font-size:11px;color:var(--ink-dim);font-weight:400"> since add · $20 base</span></div>
-            ${win !== 'all' && perf.windowReturnPct != null ? `<div style="font-family:var(--mono);font-size:11px;color:${perf.windowReturnPct>=0?'var(--pos)':'var(--neg)'}">${perf.windowReturnPct >= 0 ? '+' : ''}${perf.windowReturnPct}% this ${win}</div>` : ''}
+            <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">GoodGlobe Index · ${weightLabel} · ${perf.memberCount} member${perf.memberCount===1?'':'s'}</div>
+            <div style="display:flex;align-items:baseline;gap:10px;margin-top:3px">
+              <span id="gg-price-readout" style="font-family:var(--mono);font-size:30px;font-weight:800;color:${c};line-height:1">$${perf.indexValue}</span>
+              <span id="gg-pct-readout" style="font-family:var(--mono);font-size:14px;font-weight:700;color:${c}">${allTimePct >= 0 ? '+' : ''}${allTimePct}%</span>
+            </div>
+            <div id="gg-sub-readout" style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);margin-top:2px">since inception · hover to scrub</div>
           </div>
           <div class="seg-control" style="font-size:10px">
             ${['week','month','quarter','year','all'].map(w => `<button class="seg-btn ${win===w?'active':''}" data-ggperfwin="${w}" style="font-size:10px;text-transform:capitalize">${w==='all'?'All':w==='week'?'1W':w==='month'?'1M':w==='quarter'?'1Q':'1Y'}</button>`).join('')}
           </div>
         </div>
         ${chart}
-        <div style="font-family:var(--mono);font-size:8px;color:var(--ink-faint);margin-top:6px;opacity:0.8">${perf.weightMode === 'mktcap' ? 'Market-cap weighted (SPY-style): bigger companies move the index more, like SPY/XLF.' : 'Equal-weighted: every member counts the same (average of each member\'s return since it was added).'} Measured from each member\'s entry price. <button id="gg-weight-toggle" class="btn btn-ghost" style="font-size:8px;padding:2px 8px;margin-left:6px">Switch to ${perf.weightMode === 'mktcap' ? 'equal weight' : 'SPY-style (market-cap)'}</button></div>
+        <div style="font-family:var(--mono);font-size:8px;color:var(--ink-faint);margin-top:8px;opacity:0.8">${perf.weightMode === 'mktcap' ? 'Market-cap weighted: bigger companies move the index more.' : 'Equal-weighted: every member counts the same.'} Shorts tracked inverse. Removed tickers freeze (no retro change). <button id="gg-weight-toggle" class="btn btn-ghost" style="font-size:8px;padding:2px 8px;margin-left:6px">Switch to ${perf.weightMode === 'mktcap' ? 'equal weight' : 'market-cap'}</button> <button id="gg-ledger-btn" class="btn btn-ghost" style="font-size:8px;padding:2px 8px">Membership ledger ↗</button></div>
       </div>`;
     })()}
     <div class="gg-toolbar">
@@ -26415,7 +26894,7 @@ function renderGoodGlobeIndexView(content, summary, subTabs) {
       ta.value = txt;
       document.body.appendChild(ta);
       ta.select();
-      try { document.execCommand('copy'); flashStatus(`${label} copied`, 'success'); } catch { alert(txt); }
+      try { document.execCommand('copy'); flashStatus(`${label} copied`, 'success'); } catch { appAlert(txt); }
       ta.remove();
     }
   };
@@ -26472,21 +26951,161 @@ function renderGoodGlobeIndexView(content, summary, subTabs) {
     if (typeof flashStatus === 'function') flashStatus(`Index now ${cur === 'mktcap' ? 'equal-weighted' : 'market-cap weighted (SPY-style)'}`, 'success');
     renderStockBookPortfolio(content);
   });
+
+  // ---- Floating chart hover: scrub the curve, read out price + % ----
+  (function wireGgHover() {
+    const hit = document.getElementById('gg-hit');
+    const svg = document.getElementById('gg-perf-svg');
+    if (!hit || !svg) return;
+    let data; try { data = JSON.parse(hit.dataset.pts || '[]'); } catch { data = []; }
+    if (!data.length) return;
+    const cross = document.getElementById('gg-cross');
+    const dot = document.getElementById('gg-dot');
+    const tip = document.getElementById('gg-hover');
+    const priceEl = document.getElementById('gg-price-readout');
+    const pctEl = document.getElementById('gg-pct-readout');
+    const subEl = document.getElementById('gg-sub-readout');
+    const VBW = 600, VBH = 130;
+    const vals = data.map(d => d.l);
+    const lo = Math.min(...vals), hi = Math.max(...vals);
+    const pad = (hi - lo) * 0.12 || (hi * 0.02) || 1; const L = lo - pad, H = hi + pad;
+    const base = (typeof goodGlobeIndexPerformance === 'function') ? goodGlobeIndexPerformance(state.goodglobeView?.perfWindow || 'all') : null;
+    const baseVal = base ? base.baseValue : 20;
+    const firstLevel = data[0].l;
+    const move = (clientX) => {
+      const r = hit.getBoundingClientRect();
+      let frac = (clientX - r.left) / r.width;
+      frac = Math.max(0, Math.min(1, frac));
+      const idx = Math.round(frac * (data.length - 1));
+      const d = data[idx];
+      const xv = (idx / (data.length - 1)) * VBW;
+      const yv = VBH - ((d.l - L) / (H - L)) * VBH;
+      if (cross) { cross.setAttribute('x1', xv); cross.setAttribute('x2', xv); cross.style.opacity = '0.6'; }
+      if (dot) { dot.setAttribute('cx', xv); dot.setAttribute('cy', yv); dot.style.opacity = '1'; }
+      // Index $ price at this point = base value scaled by level vs first level.
+      const dollar = (baseVal * (d.l / firstLevel)).toFixed(2);
+      if (priceEl) priceEl.textContent = '$' + dollar;
+      if (pctEl) { pctEl.textContent = (d.p >= 0 ? '+' : '') + d.p + '%'; }
+      if (subEl) subEl.textContent = d.d + ' · hover to scrub';
+      if (tip) {
+        tip.style.opacity = '1';
+        tip.style.left = (frac * 100) + '%';
+        tip.style.top = ((yv / VBH) * 130) + 'px';
+        tip.innerHTML = `<span style="color:var(--ink)">$${dollar}</span> <span style="color:${d.p>=0?'var(--pos)':'var(--neg)'}">${d.p>=0?'+':''}${d.p}%</span><br><span style="color:var(--ink-faint);font-size:9px">${d.d}</span>`;
+      }
+    };
+    const reset = () => {
+      if (cross) cross.style.opacity = '0';
+      if (dot) dot.style.opacity = '0';
+      if (tip) tip.style.opacity = '0';
+      const perf2 = (typeof goodGlobeIndexPerformance === 'function') ? goodGlobeIndexPerformance(state.goodglobeView?.perfWindow || 'all') : null;
+      if (perf2 && priceEl) priceEl.textContent = '$' + perf2.indexValue;
+      const hp = perf2 ? (perf2.headlineReturn ?? perf2.weightedSinceAdd ?? perf2.equalWeightSinceAdd ?? 0) : 0;
+      if (pctEl) pctEl.textContent = (hp >= 0 ? '+' : '') + hp + '%';
+      if (subEl) subEl.textContent = 'since inception · hover to scrub';
+    };
+    hit.addEventListener('mousemove', e => move(e.clientX));
+    hit.addEventListener('mouseleave', reset);
+    hit.addEventListener('touchmove', e => { if (e.touches[0]) { move(e.touches[0].clientX); e.preventDefault(); } }, { passive: false });
+    hit.addEventListener('touchend', reset);
+  })();
+
+  // Membership ledger page (added/removed tickers + their in-index performance).
+  document.getElementById('gg-ledger-btn')?.addEventListener('click', () => {
+    if (typeof openGoodGlobeLedger === 'function') openGoodGlobeLedger();
+  });
   document.querySelectorAll('.gg-row-remove').forEach(btn => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       const tic = btn.dataset.tic;
-      if (!confirm(`Remove ${tic} from the GoodGlobe Index?\n\nThis only removes the ticker from the master roster.\nPortfolio positions (if any) are NOT affected.`)) return;
+      if (!await appConfirm(`Take ${tic} off the GoodGlobe Index?\n\nThe index price won't change \u2014 ${tic}'s performance up to now stays baked in. ${tic} moves to the membership ledger with its final in-index return recorded.`, { title: 'Remove from index' })) return;
       const idx = loadGoodGlobeIndex();
-      delete idx[tic];
-      saveGoodGlobeIndex(idx);
-      // Refresh the GoodGlobe index singleton in the Supabase mirror.
+      const entry = idx[tic];
+      if (entry) {
+        const cur = (typeof _currentPriceFor === 'function') ? _currentPriceFor(tic) : null;
+        const dir = (typeof _memberDirection === 'function') ? _memberDirection(entry) : 1;
+        if (entry.entryPrice && cur != null) {
+          const raw = ((cur - entry.entryPrice) / entry.entryPrice) * 100;
+          entry.finalReturnPct = +(raw * dir).toFixed(2);
+          entry.exitPrice = cur;
+        }
+        entry.removedFromIndex = true;
+        entry.removedAt = new Date().toISOString();
+        idx[tic] = entry;
+        saveGoodGlobeIndex(idx);
+      }
       try { if (typeof portSupabaseConfigured === 'function' && portSupabaseConfigured() && typeof portSupabaseUpsert === 'function') {
         portSupabaseUpsert({ id: '__goodglobe_index__', _kind: 'index', value: loadGoodGlobeIndex() });
       } } catch {}
+      if (typeof flashStatus === 'function') flashStatus(`${tic} moved to membership ledger (index price unchanged)`, 'success');
       renderStockBookPortfolio(content);
     });
   });
 }
+
+function openGoodGlobeLedger() {
+  const entries = (typeof getGoodGlobeIndexEntries === 'function') ? getGoodGlobeIndexEntries() : [];
+  const perf = (typeof goodGlobeIndexPerformance === 'function') ? goodGlobeIndexPerformance('all') : null;
+  const liveRet = {};
+  if (perf && Array.isArray(perf.perMember)) for (const pm of perf.perMember) liveRet[pm.ticker] = pm;
+  const rows = entries.filter(e => {
+    const f = e.flags || [];
+    return e.removedFromIndex || f.some(x => ['Tracking', 'Trading', 'Long', 'Short'].includes(x));
+  }).map(e => {
+    const isShort = (typeof _isShortMember === 'function') ? _isShortMember(e) : false;
+    const live = liveRet[e.ticker];
+    const ret = e.removedFromIndex ? (e.finalReturnPct != null ? e.finalReturnPct : null) : (live ? live.returnPct : null);
+    return { ticker: e.ticker, direction: isShort ? 'SHORT' : 'LONG', status: e.removedFromIndex ? 'REMOVED' : 'LIVE',
+      entryPrice: e.entryPrice, exitPrice: e.removedFromIndex ? (e.exitPrice != null ? e.exitPrice : null) : (live ? live.current : null),
+      added: e.firstFlaggedAt ? new Date(e.firstFlaggedAt).toISOString().slice(0, 10) : '\u2014',
+      removed: e.removedAt ? new Date(e.removedAt).toISOString().slice(0, 10) : '\u2014', returnPct: ret };
+  });
+  rows.sort((a, b) => (a.status === b.status ? (Math.abs(b.returnPct || 0) - Math.abs(a.returnPct || 0)) : (a.status === 'LIVE' ? -1 : 1)));
+  const live = rows.filter(r => r.status === 'LIVE');
+  const removed = rows.filter(r => r.status === 'REMOVED');
+  const avg = arr => arr.length ? +(arr.reduce((s, r) => s + (r.returnPct || 0), 0) / arr.length).toFixed(2) : null;
+  const liveAvg = avg(live), removedAvg = avg(removed);
+  const rowHtml = rows.map(r => {
+    const rc = r.returnPct == null ? 'var(--ink-faint)' : r.returnPct >= 0 ? 'var(--pos)' : 'var(--neg)';
+    const sc = r.status === 'LIVE' ? 'var(--pos)' : 'var(--ink-faint)';
+    const dc = r.direction === 'SHORT' ? '#a85a3a' : 'var(--pos)';
+    return `<tr>
+      <td style="font-family:var(--mono);font-weight:700">${escapeHtml(r.ticker)}</td>
+      <td style="font-family:var(--mono);font-size:10px;font-weight:700;color:${dc}">${r.direction}</td>
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${r.entryPrice != null ? '$' + (+r.entryPrice).toFixed(2) : '\u2014'}</td>
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${r.exitPrice != null ? '$' + (+r.exitPrice).toFixed(2) : '\u2014'}</td>
+      <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${rc}">${r.returnPct != null ? (r.returnPct >= 0 ? '+' : '') + r.returnPct + '%' : '\u2014'}</td>
+      <td style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${r.added}</td>
+      <td style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${r.removed}</td>
+      <td style="font-family:var(--mono);font-size:10px;font-weight:700;color:${sc}">${r.status}</td>
+    </tr>`;
+  }).join('');
+  const html = `
+    <div class="modal-backdrop" id="gg-ledger-modal" style="display:flex" onclick="if(event.target.id==='gg-ledger-modal')this.remove()">
+      <div class="modal-box" style="max-width:760px;width:95%">
+        <div class="modal-head">
+          <div class="modal-title">GoodGlobe Index \u00b7 Membership Ledger</div>
+          <button class="modal-close" onclick="document.getElementById('gg-ledger-modal').remove()">\u00d7</button>
+        </div>
+        <div class="modal-section" style="padding:10px 14px;background:var(--bg-elev);font-family:var(--mono);font-size:10px;color:var(--ink-faint);line-height:1.7;border-left:2px solid var(--amber)">
+          Every ticker that's been in the index, with the return it earned <strong style="color:var(--ink-dim)">while a member</strong>. Removed names freeze at their final in-index return \u2014 the index price already banked it. Shorts show inverse performance.
+        </div>
+        <div style="display:flex;gap:12px;padding:12px 14px;flex-wrap:wrap">
+          <div><div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase">Live members</div><div style="font-family:var(--mono);font-size:18px;font-weight:700;color:var(--ink)">${live.length}${liveAvg != null ? ` <span style="font-size:11px;color:${liveAvg>=0?'var(--pos)':'var(--neg)'}">${liveAvg>=0?'+':''}${liveAvg}% avg</span>` : ''}</div></div>
+          <div><div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase">Removed</div><div style="font-family:var(--mono);font-size:18px;font-weight:700;color:var(--ink)">${removed.length}${removedAvg != null ? ` <span style="font-size:11px;color:${removedAvg>=0?'var(--pos)':'var(--neg)'}">${removedAvg>=0?'+':''}${removedAvg}% avg</span>` : ''}</div></div>
+        </div>
+        <div class="modal-section" style="max-height:50vh;overflow:auto;padding:0 14px 14px">
+          <table class="sb-table" style="width:100%;min-width:680px">
+            <thead><tr><th>Ticker</th><th>Dir</th><th>Entry</th><th>Exit/Now</th><th>Return</th><th>Added</th><th>Removed</th><th>Status</th></tr></thead>
+            <tbody>${rowHtml || '<tr><td colspan="8" style="text-align:center;padding:30px;color:var(--ink-faint);font-family:var(--mono);font-size:11px">No members yet \u2014 track or trade a ticker to add it to the index.</td></tr>'}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>`;
+  const wrap = document.createElement('div');
+  wrap.innerHTML = html;
+  document.body.appendChild(wrap.firstElementChild);
+}
+if (typeof window !== 'undefined') window.openGoodGlobeLedger = openGoodGlobeLedger;
 
 
 function renderTransactionsLedger(content, summary, subTabs) {
@@ -26713,12 +27332,12 @@ function renderTransactionsLedger(content, summary, subTabs) {
   // Wire "Edit cash" button — opens a small inline prompt to manually adjust balance
   const editCashBtn = document.getElementById('edit-cash-btn');
   if (editCashBtn) {
-    editCashBtn.addEventListener('click', () => {
+    editCashBtn.addEventListener('click', async () => {
       const current = getCashPosition();
       // Two modes: ADD (logged as a deposit/withdrawal the backend understands)
       // or SET (silent reconcile to a brokerage statement). Default to ADD since
       // that's the common "feed the portfolio more cash" case and it's recorded.
-      const choice = prompt(
+      const choice = await appPrompt(
         'Cash: $' + current.toFixed(2) + '\n\n' +
         'Type an AMOUNT TO ADD (e.g. 10000, or -5000 to withdraw) — this is logged\n' +
         'as a capital deposit the backend tracks (raises buying power, not a gain).\n\n' +
@@ -26729,14 +27348,14 @@ function renderTransactionsLedger(content, summary, subTabs) {
       const setMatch = /^set\s+(-?[\d,.]+)/i.exec(trimmed);
       if (setMatch) {
         const v = parseFloat(setMatch[1].replace(/[,$\s]/g, ''));
-        if (!isFinite(v)) { alert('Not a valid number'); return; }
+        if (!isFinite(v)) { appAlert('Not a valid number'); return; }
         setCashPosition(v);
         flashStatus(`Cash reconciled to ${fmt$(v)} (no deposit logged)`, 'success');
         renderStockBookPortfolio(content);
         return;
       }
       const amt = parseFloat(trimmed.replace(/[,$\s]/g, ''));
-      if (!isFinite(amt) || amt === 0) { alert('Enter an amount to add (e.g. 10000), or "set 12345" to reconcile.'); return; }
+      if (!isFinite(amt) || amt === 0) { appAlert('Enter an amount to add (e.g. 10000), or "set 12345" to reconcile.'); return; }
       if (typeof addCashToPortfolio === 'function') addCashToPortfolio(amt);
       renderStockBookPortfolio(content);
     });
@@ -26834,12 +27453,12 @@ function openSellModal(entryId) {
   });
   updatePreview();
 
-  document.getElementById('sell-confirm').addEventListener('click', () => {
+  document.getElementById('sell-confirm').addEventListener('click', async () => {
     const qty = parseFloat(document.getElementById('sell-qty').value) || 0;
     const price = parseFloat(document.getElementById('sell-price').value) || 0;
     const fee = parseFloat(document.getElementById('sell-fee').value) || 0;
     if (qty <= 0 || qty > maxQty + 0.0001) {
-      alert(`Quantity must be between 0 and ${maxQty}`);
+      await appAlert(`Quantity must be between 0 and ${maxQty}`, { title: 'Invalid quantity' });
       return;
     }
     // GUARD: never sell more than is actually HELD across all lots of this
@@ -26850,21 +27469,17 @@ function openSellModal(entryId) {
         .filter(p => (p.ticker || '').toUpperCase() === (entry.ticker || '').toUpperCase() && ACTIVE_POSITIONS.includes(p.position) && (p.position || '').toLowerCase() !== 'short')
         .reduce((s, p) => s + (+p.qty || 0), 0);
       if (qty > heldSameTicker + 0.0001) {
-        alert(`You only hold ${heldSameTicker} shares of ${entry.ticker}. Can't sell ${qty}.\n\n(Selling more than you own would be a short — open that as a separate short position instead.)`);
+        await appAlert(`You only hold ${heldSameTicker} shares of ${entry.ticker}. Can't sell ${qty}.\n\n(Selling more than you own would be a short — open that as a separate short position instead.)`, { title: 'Not enough shares' });
         return;
       }
     } catch {}
     if (price <= 0) {
-      alert('Sell price must be > 0');
+      await appAlert('Sell price must be > 0', { title: 'Invalid price' });
       return;
     }
-    // Confirm the fee with the user before executing (the requested fee prompt):
-    // pre-filled with whatever they typed; they accept or correct it, then the
-    // sale fires exactly once.
-    const feeConfirmed = prompt(`Confirm the broker fee you paid on this sale of ${qty} ${entry.ticker} (USD):`, String(fee));
-    if (feeConfirmed === null) return;             // cancelled → no sale
-    const finalFee = parseFloat(feeConfirmed.replace(/[,$\s]/g, ''));
-    const useFee = isFinite(finalFee) ? finalFee : fee;
+    // The broker fee comes straight from the Broker Fee field above — no second
+    // prompt (the field already captures it before the sale).
+    const useFee = isFinite(fee) ? fee : 0;
     // Guard against a double-fire: disable the button immediately.
     const confirmBtn = document.getElementById('sell-confirm');
     if (confirmBtn) { if (confirmBtn.disabled) return; confirmBtn.disabled = true; confirmBtn.textContent = 'Selling…'; }
@@ -27364,7 +27979,7 @@ function openAddPositionModal(initialMode) {
       }
     } catch (e) {
       console.error('[add-modal] save failed:', e);
-      alert('Add failed: ' + e.message);
+      appAlert('Add failed: ' + e.message);
     }
   });
 }
@@ -27467,7 +28082,7 @@ async function ingestNewTicker(ticker, opts = {}) {
 
 function _saveEquityFromModal() {
   const tic = document.getElementById('port-add-tic').value.trim().toUpperCase();
-  if (!tic) { alert('Ticker required'); return; }
+  if (!tic) { appAlert('Ticker required'); return; }
   let pos = document.getElementById('port-add-pos').value;
   if (pos === 'Trading') {
     const dir = document.querySelector('#port-add-direction-seg .seg-btn.active')?.dataset.val || 'Long';
@@ -27519,9 +28134,9 @@ function _saveOptionFromModal() {
   const premium = parseFloat(document.getElementById('opt-add-premium').value) || null;
   const notesText = document.getElementById('opt-add-notes').value.trim();
 
-  if (!root) { alert('Underlying ticker required'); return; }
-  if (!exp) { alert('Expiration date required'); return; }
-  if (!isFinite(strike) || strike <= 0) { alert('Positive strike required'); return; }
+  if (!root) { appAlert('Underlying ticker required'); return; }
+  if (!exp) { appAlert('Expiration date required'); return; }
+  if (!isFinite(strike) || strike <= 0) { appAlert('Positive strike required'); return; }
 
   const occTicker = buildOccOptionTicker({ root, expiration: exp, type, strike });
   const typeName = type === 'C' ? 'Call' : 'Put';
@@ -27588,7 +28203,7 @@ function _saveFutureFromModal() {
   const qty = parseInt(document.getElementById('fut-add-qty').value, 10) || null;
   const cost = parseFloat(document.getElementById('fut-add-cost').value) || null;
   const notesText = document.getElementById('fut-add-notes').value.trim();
-  if (!tic) { alert('Future symbol required'); return; }
+  if (!tic) { appAlert('Future symbol required'); return; }
   const addedAt = new Date().toISOString();
   const noteText = qty && cost
     ? `${pos} ${qty} ${tic} @ ${fmt$(cost)}${notesText ? ` · ${notesText}` : ''}`
@@ -27612,7 +28227,7 @@ function _saveFxFromModal() {
   const qty = parseFloat(document.getElementById('fx-add-qty').value) || null;
   const cost = parseFloat(document.getElementById('fx-add-cost').value) || null;
   const notesText = document.getElementById('fx-add-notes').value.trim();
-  if (!tic) { alert('Symbol required'); return; }
+  if (!tic) { appAlert('Symbol required'); return; }
   const addedAt = new Date().toISOString();
   const noteText = qty && cost
     ? `${pos} ${qty} ${tic} @ ${cost}${notesText ? ` · ${notesText}` : ''}`
@@ -27632,7 +28247,7 @@ function _saveFxFromModal() {
 
 function _saveImportFromModal() {
   const text = document.getElementById('import-add-list').value;
-  if (!text || !text.trim()) { alert('Paste at least one ticker'); return; }
+  if (!text || !text.trim()) { appAlert('Paste at least one ticker'); return; }
   const lines = text.split(/[\n,]/);
   let added = 0, skipped = 0;
   const tickersToIngest = [];
@@ -32000,8 +32615,8 @@ function wireGeoEditor(ticker, geoData) {
     flashStatus(`Geography saved for ${ticker}`, 'success');
     renderCompanyGeography();
   });
-  document.getElementById('geo-reset-btn')?.addEventListener('click', () => {
-    if (!confirm('Reset geography for ' + ticker + ' to curated defaults? Your manual edits will be lost.')) return;
+  document.getElementById('geo-reset-btn')?.addEventListener('click', async () => {
+    if (!await appConfirm('Reset geography for ' + ticker + ' to curated defaults? Your manual edits will be lost.')) return;
     const overrides = loadCompanyGeoOverrides();
     delete overrides[ticker];
     saveCompanyGeoOverrides(overrides);
@@ -32205,10 +32820,15 @@ state.news = {
   items: [],
   loadedAt: 0,
   filterPriority: 'all',
-  filterRange: 1,               // default 24h — fast initial pull. Widen via the
-                                // range selector inside the News tab when needed.
+  filterRange: 7,               // default 1 week — matches the range selector's
+                                // default option so the UI and the actual filter
+                                // agree (previously 1 = 24h, which silently
+                                // capped the feed regardless of the dropdown).
   filterView: 'unread',         // 'unread' | 'read' | 'reported' | 'all'
   searchQuery: '',              // free-text search over headline + summary + ticker
+  sortOrder: 'newest',          // 'newest' | 'oldest'
+  pageSize: 25,                 // articles per page (user-editable; 0/'all' = no paging)
+  page: 1,                      // current page (1-indexed)
   myNewsActive: false,          // when true, restrict to user-selected tickers
   selectedTickers: null,        // null = all stockbook; Set of ticker strings otherwise
   isLoading: false,
@@ -33108,8 +33728,10 @@ function _startupNewsPrime() {
       console.log(`[news] startup prime: cache fresh (${Math.round(ageMs/60000)}m old), ${cached.items.length} articles ready`);
       return;
     }
-    console.log('[news] startup prime: fetching 24h headlines in background…');
-    state.news.filterRange = 1;  // 24h default for fast head-start
+    console.log('[news] startup prime: fetching headlines in background…');
+    // Keep the filter at its default (1 week) so the UI and filter agree; the
+    // prime still fetches quickly because loadPortfolioNews pulls the current
+    // range and the cache fills in. A subsequent Refresh deepens it.
     loadPortfolioNews(false).catch(e => console.warn('[news] startup prime failed:', e.message));
   } catch (e) {
     console.warn('[news] startup prime error:', e.message);
@@ -34491,6 +35113,14 @@ function renderNewsFeed() {
     return true;
   });
 
+  // 6. Sort by time (newest or oldest first).
+  const sortOrder = state.news.sortOrder || 'newest';
+  items.sort((a, b) => sortOrder === 'oldest'
+    ? (a.datetime || 0) - (b.datetime || 0)
+    : (b.datetime || 0) - (a.datetime || 0));
+
+  const totalMatched = items.length;
+
   if (items.length === 0) {
     const emptyMsg = q ? `No articles match "${escapeHtml(q)}".`
                     : view === 'unread' ? 'No unread articles. Try the Read tab or widen the date range.'
@@ -34508,6 +35138,16 @@ function renderNewsFeed() {
     return;
   }
 
+  // 7. Pagination. pageSize 0 (or 'all') shows everything on one page.
+  const rawSize = state.news.pageSize;
+  const pageSize = (rawSize === 0 || rawSize === 'all' || rawSize == null) ? totalMatched : Math.max(1, parseInt(rawSize, 10) || 25);
+  const totalPages = Math.max(1, Math.ceil(totalMatched / pageSize));
+  if (state.news.page > totalPages) state.news.page = totalPages;
+  if (state.news.page < 1) state.news.page = 1;
+  const page = state.news.page;
+  const startIdx = (page - 1) * pageSize;
+  const pageItems = items.slice(startIdx, startIdx + pageSize);
+
   // Precompute the My News ticker set so we can flag each article in the map
   // for the amber highlight in "All News" view.
   const myNewsTickerSet = (() => {
@@ -34519,7 +35159,7 @@ function renderNewsFeed() {
     } catch { return new Set(); }
   })();
 
-  feed.innerHTML = items.map(article => {
+  feed.innerHTML = pageItems.map(article => {
     const ts = new Date(article.datetime);
     const hoursAgo = Math.round((Date.now() - article.datetime) / 3600000);
     const timeLabel = hoursAgo < 1 ? '< 1h ago'
@@ -34724,9 +35364,51 @@ function renderNewsFeed() {
     `;
   }).join('');
 
+  // Pagination bar — appended after the cards. Shows page X of Y, prev/next,
+  // and an editable "per page" input so any page size can be entered.
+  if (totalMatched > 0) {
+    const showingFrom = startIdx + 1;
+    const showingTo = Math.min(startIdx + pageSize, totalMatched);
+    const isAll = pageSize >= totalMatched;
+    const pageBar = document.createElement('div');
+    pageBar.className = 'news-pagination';
+    pageBar.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:14px 4px 4px;margin-top:8px;border-top:1px solid var(--rule);font-family:var(--mono);font-size:11px;color:var(--ink-dim)';
+    pageBar.innerHTML = `
+      <div>Showing <strong style="color:var(--ink)">${showingFrom}–${showingTo}</strong> of <strong style="color:var(--ink)">${totalMatched}</strong>${isAll ? ' (all)' : ` · page ${page}/${totalPages}`}</div>
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        <label style="color:var(--ink-faint)">Per page:</label>
+        <input type="number" id="news-page-size" min="1" max="500" value="${isAll ? '' : pageSize}" placeholder="all" style="width:62px;background:var(--bg-elev);border:1px solid var(--rule);color:var(--ink);font-family:var(--mono);font-size:11px;padding:4px 6px;border-radius:3px;text-align:center" title="Articles per page — type any number, or clear for all">
+        <button class="btn btn-ghost" id="news-page-all" style="font-size:10px;padding:3px 8px;${isAll ? 'border-color:var(--amber);color:var(--amber)' : ''}">All</button>
+        <button class="btn btn-ghost" id="news-page-prev" style="font-size:10px;padding:3px 10px" ${page <= 1 ? 'disabled' : ''}>‹ Prev</button>
+        <button class="btn btn-ghost" id="news-page-next" style="font-size:10px;padding:3px 10px" ${page >= totalPages ? 'disabled' : ''}>Next ›</button>
+      </div>`;
+    feed.appendChild(pageBar);
+
+    const sizeInput = pageBar.querySelector('#news-page-size');
+    if (sizeInput) {
+      const applySize = () => {
+        const v = sizeInput.value.trim();
+        state.news.pageSize = (v === '' ) ? 'all' : Math.max(1, parseInt(v, 10) || 25);
+        state.news.page = 1;
+        renderNewsFeed();
+      };
+      sizeInput.addEventListener('change', applySize);
+      sizeInput.addEventListener('keydown', e => { if (e.key === 'Enter') applySize(); });
+    }
+    pageBar.querySelector('#news-page-all')?.addEventListener('click', () => {
+      state.news.pageSize = 'all'; state.news.page = 1; renderNewsFeed();
+    });
+    pageBar.querySelector('#news-page-prev')?.addEventListener('click', () => {
+      if (state.news.page > 1) { state.news.page--; renderNewsFeed(); feed.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+    });
+    pageBar.querySelector('#news-page-next')?.addEventListener('click', () => {
+      if (state.news.page < totalPages) { state.news.page++; renderNewsFeed(); feed.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+    });
+  }
+
   // Update status line to reflect the live filter set
   const totalCached = state.news.items.length;
-  const showing = items.length;
+  const showing = totalMatched;
   if (showing < totalCached) {
     updateNewsStatus(`Showing ${showing} of ${totalCached} articles · filtered live`);
   }
@@ -34825,6 +35507,7 @@ function onNewsTabActive() {
     document.getElementById('news-refresh-btn')?.addEventListener('click', () => loadPortfolioNews(true));
     document.getElementById('news-filter-priority')?.addEventListener('change', e => {
       state.news.filterPriority = e.target.value;
+      state.news.page = 1;
       renderNewsFeed();
     });
     // Time-range change: only re-fetch if the range expanded beyond what's cached.
@@ -34833,6 +35516,7 @@ function onNewsTabActive() {
       const newRange = parseInt(e.target.value, 10);
       const oldRange = state.news.filterRange;
       state.news.filterRange = newRange;
+      state.news.page = 1;
       if (newRange > oldRange) {
         // Expanding window — re-fetch so we can pull deeper history
         loadPortfolioNews(true);
@@ -34843,12 +35527,20 @@ function onNewsTabActive() {
     });
     document.getElementById('news-filter-view')?.addEventListener('change', e => {
       state.news.filterView = e.target.value;
+      state.news.page = 1;
+      renderNewsFeed();
+    });
+    // Sort order (newest / oldest first).
+    document.getElementById('news-filter-sort')?.addEventListener('change', e => {
+      state.news.sortOrder = e.target.value;
+      state.news.page = 1;
       renderNewsFeed();
     });
 
     // Search input — live filter (no refresh needed)
     document.getElementById('news-search')?.addEventListener('input', e => {
       state.news.searchQuery = e.target.value;
+      state.news.page = 1;
       renderNewsFeed();
     });
 
@@ -36668,8 +37360,8 @@ function openNotesModal(ticker) {
     }).join('');
     // Wire delete buttons
     list.querySelectorAll('.note-delete').forEach(btn => {
-      btn.addEventListener('click', () => {
-        if (!confirm('Delete this note?')) return;
+      btn.addEventListener('click', async () => {
+        if (!await appConfirm('Delete this note?')) return;
         const idx = parseInt(btn.dataset.noteIdx);
         entry.notes.splice(idx, 1);
         savePortfolio(arr);
@@ -40361,10 +41053,10 @@ function reviewApproveSelected() {
 }
 if (typeof window !== 'undefined') window.reviewApproveSelected = reviewApproveSelected;
 
-function reviewAutoApproveAll() {
+async function reviewAutoApproveAll() {
   const queue = loadReviewQueue();
   if (!queue.length) return;
-  if (typeof confirm === 'function' && !confirm(`Auto-approve all ${queue.length} pending items, accepting the current value for each?`)) return;
+  if (typeof confirm === 'function' && !await appConfirm(`Auto-approve all ${queue.length} pending items, accepting the current value for each?`)) return;
   let approved = 0;
   for (const q of [...queue]) {
     if (_reviewApproveOne(q)) approved++;
@@ -40855,9 +41547,9 @@ async function saveAllToReposAndSupabase() {
 }
 if (typeof window !== 'undefined') window.saveAllToReposAndSupabase = saveAllToReposAndSupabase;
 
-function setGitHubToken() {
+async function setGitHubToken() {
   const cur = localStorage.getItem(GH_TOKEN_KEY);
-  const t = prompt(
+  const t = await appPrompt(
     'Paste a FINE-GRAINED GitHub token with Contents: Read & write, scoped to your\n' +
     'GoodGlobeLLC data repos (TRAPP2-PORT, TRAPP2-BOT, TRAPP2-ANALYTICS, XTRAPP).\n' +
     '(github.com → Settings → Developer settings → Fine-grained tokens → select those repos)\n\n' +
@@ -41946,6 +42638,17 @@ async function portSupabaseDelete(id) {
 }
 if (typeof window !== 'undefined') window.portSupabaseDelete = portSupabaseDelete;
 
+// Fetch existing transaction rows (id + position jsonb) so the sync can detect
+// and purge content-duplicate txn rows left by the old random-id scheme.
+async function _portSupabaseTxnRows() {
+  const out = [];
+  try {
+    const r = await fetch(`${getPortSupabaseUrl()}/rest/v1/${PORT_SUPABASE_TABLE}?id=like.txn:*&select=id,position`, { headers: _portSupabaseHeaders() });
+    if (r.ok) { const rows = await r.json(); if (Array.isArray(rows)) for (const x of rows) out.push(x); }
+  } catch {}
+  return out;
+}
+
 // Existing ids in the portfolio table (for dedup on bulk sync).
 async function _portSupabaseExistingIds() {
   const ids = new Set();
@@ -41961,6 +42664,27 @@ async function _portSupabaseExistingIds() {
 // everything the user tracks: positions, watchlist, tracking, plus the cash,
 // transactions ledger, and GoodGlobe index as singleton records. Open holdings
 // always re-upsert (marks move); the rest upsert if new.
+// Deterministic, content-derived id for a transaction row in Supabase. The SAME
+// transaction (same id, or same type+ticker+qty+price+timestamp) ALWAYS produces
+// the SAME `txn:` id, so re-syncing can never create a duplicate. Prefers the
+// local `tx-...` id when present (already unique + stable); otherwise hashes the
+// transaction's content. NEVER random — that was the doubling bug.
+function _stableTxnId(t) {
+  if (t && t.id && String(t.id).startsWith('txn:')) return t.id;   // already stable
+  if (t && t.id && String(t.id).trim()) return `txn:${t.id}`;      // local tx- id → stable
+  // No id: derive one from content so it's reproducible across syncs.
+  const key = [
+    (t.type || '').toLowerCase(),
+    (t.ticker || '').toUpperCase(),
+    (+t.qty || 0),
+    (+t.price || 0),
+    (t.ts || t.date || ''),
+  ].join('|');
+  let h = 0;
+  for (let i = 0; i < key.length; i++) { h = ((h << 5) - h + key.charCodeAt(i)) | 0; }
+  return `txn:c${(h >>> 0).toString(36)}`;
+}
+
 async function portSupabaseSyncAll() {
   if (!portSupabaseConfigured()) { if (typeof flashStatus === 'function') flashStatus('Portfolio Supabase not configured — add the TRAPP2-PORT URL + anon key in Data Sources', 'error'); return 0; }
   // Make sure live prices are available so the enriched market value / P&L
@@ -41984,13 +42708,13 @@ async function portSupabaseSyncAll() {
     if (!rec.ticker && e.ticker) rec.ticker = e.ticker;
     records.push(rec);
   }
-  // Transactions ledger (immutable history). Give each a stable txn:-prefixed id
-  // so the reconcile step can recognize + preserve transaction rows.
+  // Transactions ledger (immutable history). Give each a stable, CONTENT-DERIVED
+  // txn:-prefixed id so re-syncing the SAME transaction always maps to the SAME
+  // Supabase row (no duplication). The old code fell back to Math.random() when a
+  // field was missing, which minted a new id every sync → the doubling bug.
   for (const t of (snap.transactions || [])) {
     const rec = Object.assign({ _kind: 'transaction' }, t);
-    if (!rec.id || !String(rec.id).startsWith('txn:')) {
-      rec.id = `txn:${t.id || (t.ticker || 'TX') + '-' + (t.ts || t.date || Math.random().toString(36).slice(2, 8))}`;
-    }
+    rec.id = _stableTxnId(t);
     records.push(rec);
   }
   // Singletons: cash, GoodGlobe index + curve, and a full snapshot for restore.
@@ -42060,6 +42784,40 @@ async function portSupabaseSyncAll() {
         }
       } catch (e) { console.warn('[port-supabase] reconcile error', e.message); }
     }
+    // ONE-TIME CLEANUP of legacy duplicate transaction rows: the old sync minted
+    // random ids, so the same transaction may exist under several txn: ids. Group
+    // existing txn rows by content; for any content with >1 row, keep the one
+    // whose id is the stable id we now emit (or the first) and DELETE the rest.
+    try {
+      const stableIds = new Set(rows.filter(r => String(r.id).startsWith('txn:')).map(r => r.id));
+      const dupeDelete = [];
+      const byContent = new Map();
+      const txnRows = await _portSupabaseTxnRows();   // [{id, position}]
+      for (const tr of txnRows) {
+        const p = tr.position || {};
+        const ck = [(p.type || '').toLowerCase(), (p.ticker || '').toUpperCase(),
+                    (+p.qty || 0), (+p.price || 0), p.ts || p.date || ''].join('|');
+        if (!byContent.has(ck)) byContent.set(ck, []);
+        byContent.get(ck).push(tr.id);
+      }
+      for (const [, ids] of byContent) {
+        if (ids.length < 2) continue;                 // no duplicates for this content
+        // keep the stable id if present, else the first; delete the others
+        const keep = ids.find(id => stableIds.has(id)) || ids[0];
+        for (const id of ids) if (id !== keep) dupeDelete.push(id);
+      }
+      if (dupeDelete.length) {
+        for (let i = 0; i < dupeDelete.length; i += 50) {
+          const chunk = dupeDelete.slice(i, i + 50);
+          const inList = chunk.map(id => `"${String(id).replace(/"/g, '')}"`).join(',');
+          const r = await fetch(`${getPortSupabaseUrl()}/rest/v1/${PORT_SUPABASE_TABLE}?id=in.(${encodeURIComponent(inList)})`, {
+            method: 'DELETE', headers: _portSupabaseHeaders({ 'Prefer': 'return=minimal' }),
+          });
+          if (r.ok) deleted += chunk.length;
+        }
+        console.warn(`[port-supabase] purged ${dupeDelete.length} duplicate transaction row(s)`);
+      }
+    } catch (e) { console.warn('[port-supabase] txn dedupe skipped', e.message); }
     if (!rows.length && !deleted) { if (typeof flashStatus === 'function') flashStatus('Portfolio Supabase already up to date', 'success'); return 0; }
     let sent = 0;
     for (let i = 0; i < rows.length; i += 100) {
@@ -43026,6 +43784,62 @@ const BOT_CONVICTION_THRESHOLD = 0.42;  // below this absolute conviction → no
 // all on a given day. A higher bar = fewer, higher-conviction trades. (This was
 // briefly 0.30 to farm training reps; raised back now that the journal exists.)
 
+// MIGRATION: recompute realized P&L for ALREADY-CLOSED trades that were saved
+// before the shares-based freeze (z35) and are sitting at $0. Builds before that
+// could close a trade with pnl=0 if mark-to-market hadn't run, wiping real gains
+// from the ledger, win rate, and realized total. Here we reconstruct realizedPL
+// deterministically from entry/exit/shares for any closed bet missing it — so
+// historical gains (e.g. the ~$10k that vanished) come back. Runs once per load,
+// only touching closed bets that are recoverable; idempotent.
+function _botRepairClosedPnl(state) {
+  try {
+    if (!state || !Array.isArray(state.bets)) return state;
+    let repaired = 0;
+    for (const bet of state.bets) {
+      if (bet.status !== 'closed') continue;
+      const hasRealized = bet.realizedPL != null && isFinite(bet.realizedPL) && bet.realizedPL !== 0;
+      if (hasRealized) continue;                 // already good
+      const entry = bet.entryPrice;
+      const exit = (bet.exitPrice != null && isFinite(bet.exitPrice)) ? bet.exitPrice : null;
+      if (entry == null || !isFinite(entry) || entry <= 0 || exit == null) continue;  // can't reconstruct
+      const shares = (bet.shares != null && isFinite(bet.shares) && bet.shares > 0)
+        ? bet.shares
+        : ((bet.notional || bet.dollars || 0) / entry);
+      if (!shares || !isFinite(shares)) continue;
+      const fees = (bet.fees != null && isFinite(bet.fees)) ? bet.fees : 0;
+      let realized;
+      if (bet.instrument === 'option' && bet.optionPremium > 0) {
+        const contracts = bet.optionContracts || 1;
+        const exitVal = (bet.optionValue != null && isFinite(bet.optionValue)) ? bet.optionValue
+          : (bet.optionType === 'put' ? Math.max(0, bet.optionStrike - exit) : Math.max(0, exit - bet.optionStrike));
+        realized = (exitVal - bet.optionPremium) * 100 * contracts - fees;
+      } else if (bet.instrument === 'leveraged_etf') {
+        realized = shares * (exit - entry) - fees;
+      } else {
+        const dir = bet.direction === 'short' ? -1 : 1;
+        realized = dir * (exit - entry) * shares * (bet.leverage || 1) - fees;
+        if (bet.direction === 'short' && bet.dividendCarry) realized -= bet.dividendCarry;
+      }
+      if (!isFinite(realized)) continue;
+      realized = +realized.toFixed(2);
+      // Only overwrite if it actually recovers a non-trivial value, or if the
+      // bet had literally no realized field at all.
+      bet.realizedPL = realized;
+      bet.pnl = realized;
+      bet.won = realized > 0;
+      const entryCap = shares * entry;
+      bet.returnPct = entryCap > 0 ? +((realized / entryCap) * 100).toFixed(2) : (bet.returnPct || 0);
+      if (bet.sharesAtExit == null) bet.sharesAtExit = +shares.toFixed(4);
+      repaired++;
+    }
+    if (repaired > 0) {
+      console.log(`[bot] repaired realized P&L on ${repaired} closed trade(s) that were showing $0`);
+      try { localStorage.setItem(BOT_KEY, JSON.stringify(state)); } catch {}
+    }
+  } catch (e) { console.warn('[bot] closed-PnL repair failed', e.message); }
+  return state;
+}
+
 function loadBotState() {
   try {
     const raw = localStorage.getItem(BOT_KEY);
@@ -43036,7 +43850,7 @@ function loadBotState() {
       // partial object. If bets isn't an array, treat it as corrupt and try the
       // backup rather than silently returning fresh state (which looked like the
       // bot "lost all data").
-      if (parsed && Array.isArray(parsed.bets)) return parsed;
+      if (parsed && Array.isArray(parsed.bets)) return _botRepairClosedPnl(parsed);
       console.warn('[bot] stored state malformed — trying backup');
     }
   } catch (e) {
@@ -43175,17 +43989,36 @@ function botAssessRegime() {
   let mode = 'choppy';
   if (trendDown || (volHigh && !trendUp)) mode = 'risk-off';
   else if (trendUp && !volHigh) mode = 'risk-on';
-  _botRegime = _regimeProfile(mode, `${benchName}: ${trendUp ? 'uptrend' : trendDown ? 'downtrend' : 'flat'}, vol ${(vol20 * 100).toFixed(2)}%/d`);
+
+  // OPTIONS OVERLAY: the market's option chains price in forward risk the price
+  // history hasn't shown yet. Rich index IV + heavy downside skew ('fear'/
+  // 'stressed') pushes the regime defensive even if price still looks calm;
+  // genuinely calm IV can confirm risk-on. This makes the regime forward-looking.
+  let optNote = '';
+  try {
+    const mo = (typeof computeOptionsMarketSignal === 'function') ? computeOptionsMarketSignal() : null;
+    if (mo) {
+      optNote = ` · options IV ${(mo.indexIV * 100).toFixed(0)}% (${mo.volRegime})`;
+      if ((mo.volRegime === 'fear' || mo.volRegime === 'stressed') && mode !== 'risk-off') {
+        mode = (mode === 'risk-on') ? 'choppy' : 'risk-off';   // de-risk a notch
+        optNote += ' → de-risked';
+      } else if (mo.volRegime === 'calm' && mode === 'choppy' && !trendDown) {
+        mode = 'risk-on';                                       // calm vol confirms
+        optNote += ' → calm confirms risk-on';
+      }
+    }
+  } catch {}
+  _botRegime = _regimeProfile(mode, `${benchName}: ${trendUp ? 'uptrend' : trendDown ? 'downtrend' : 'flat'}, vol ${(vol20 * 100).toFixed(2)}%/d${optNote}`);
   return _botRegime;
 }
 function _regimeProfile(mode, evidence) {
   const profiles = {
     'risk-on':  { mode, evidence, leverageOK: true,  thresholdMod: 0,     shortBar: 0.10, longBar: 0,
-                  weightMods: { trend: 1.3, momentum: 1.3, meanReversion: 0.7, health: 1.0, fundamentals: 1.0, crossAsset: 1.1, regimeGrade: 1.4, peerGrade: 1.2, momentumGrade: 1.4, optionsIV: 0.8 } },
+                  weightMods: { trend: 1.3, momentum: 1.3, meanReversion: 0.7, health: 1.0, fundamentals: 1.0, crossAsset: 1.1, regimeGrade: 1.4, peerGrade: 1.2, momentumGrade: 1.4, optionsIV: 0.8, optionsMarket: 0.9 } },
     'risk-off': { mode, evidence, leverageOK: false, thresholdMod: 0.03,  shortBar: 0,    longBar: 0.10,
-                  weightMods: { trend: 0.7, momentum: 0.8, meanReversion: 1.0, health: 1.3, fundamentals: 1.3, fed: 1.2, regimeGrade: 1.5, peerGrade: 1.3, momentumGrade: 0.8, optionsIV: 1.4 } },
+                  weightMods: { trend: 0.7, momentum: 0.8, meanReversion: 1.0, health: 1.3, fundamentals: 1.3, fed: 1.2, regimeGrade: 1.5, peerGrade: 1.3, momentumGrade: 0.8, optionsIV: 1.4, optionsMarket: 1.5 } },
     'choppy':   { mode, evidence, leverageOK: false, thresholdMod: 0.06,  shortBar: 0.05, longBar: 0.05,
-                  weightMods: { trend: 0.7, momentum: 0.8, meanReversion: 1.3, health: 1.1, fundamentals: 1.1, regimeGrade: 1.2, peerGrade: 1.1, momentumGrade: 1.0, optionsIV: 1.3 } },
+                  weightMods: { trend: 0.7, momentum: 0.8, meanReversion: 1.3, health: 1.1, fundamentals: 1.1, regimeGrade: 1.2, peerGrade: 1.1, momentumGrade: 1.0, optionsIV: 1.3, optionsMarket: 1.3 } },
   };
   return profiles[mode] || profiles['choppy'];
 }
@@ -44102,6 +44935,19 @@ async function botScoreTicker(ticker) {
       const _skewNote = _optSig.skew != null && _optSig.skew > 0.04 ? `, downside skew ${(_optSig.skew * 100).toFixed(0)}pp` : '';
       add('optionsIV', _optSig.ivSignal, 0.07, `Options: ATM IV ${_ivPct}%${_skewNote} (${_optSig.refDte}d)`);
       decisionPath.push(`optionsIV: iv ${_ivPct}% skew ${_optSig.skew != null ? (_optSig.skew*100).toFixed(0)+'pp' : '?'} term ${_optSig.termSlope != null ? (_optSig.termSlope*100).toFixed(0)+'pp' : '?'} → ${_optSig.ivSignal > 0 ? '+' : ''}${_optSig.ivSignal}`);
+    }
+  } catch {}
+
+  // 13b. MARKET-WIDE options tilt: the aggregate IV/skew/term across the repo's
+  //      chains is a forward read on the whole tape. When the market prices in
+  //      fear (rich index IV, heavy downside skew), it's a small headwind for
+  //      every name; genuine calm is a mild tailwind. Small weight — a market
+  //      backdrop nudge, applied uniformly so it shifts the whole book together.
+  try {
+    const _mo = (typeof computeOptionsMarketSignal === 'function') ? computeOptionsMarketSignal() : null;
+    if (_mo && _mo.marketTrend != null && Math.abs(_mo.marketTrend) > 0.03) {
+      add('optionsMarket', _mo.marketTrend, 0.05, `Market options: index IV ${(_mo.indexIV*100).toFixed(0)}% (${_mo.volRegime})`);
+      decisionPath.push(`optionsMarket: index IV ${(_mo.indexIV*100).toFixed(0)}% ${_mo.volRegime} → ${_mo.marketTrend > 0 ? '+' : ''}${_mo.marketTrend}`);
     }
   } catch {}
 
@@ -45543,6 +46389,11 @@ function botBookValue() {
     openPnl: +openPnl.toFixed(2),               // unrealized
     feesPaid: +feesPaid.toFixed(2),             // total fees (explicit + estimated)
     cashAdded: +(bot.cashAdded || 0).toFixed(2),// external cash injected by the user
+    // Capital base = the starting bankroll plus net external cash in/out. The
+    // "from $X" baseline and return % measure against THIS, so a withdrawal or
+    // deposit re-baselines correctly instead of pretending you still started at
+    // exactly $100k.
+    capitalBase: +((bot.capitalBase != null && isFinite(bot.capitalBase) && bot.capitalBase > 0) ? bot.capitalBase : BOT_STARTING_BANKROLL).toFixed(2),
     totalValue: +(bot.bankroll + openPnl).toFixed(2),  // mark-to-market book value
     // Open-position return %: unrealized P&L as a % of the capital committed to
     // open positions (your "$35k up 6.84%" read). This is the CURRENT TRADES'
@@ -45591,14 +46442,14 @@ function botAddCash(amount) {
 if (typeof window !== 'undefined') window.botAddCash = botAddCash;
 
 // Prompt wrapper for the editable cash card.
-function botEditCash() {
+async function botEditCash() {
   const cur = (typeof botBookValue === 'function') ? botBookValue() : null;
   const msg = `Feed the bot cash (or use a negative number to withdraw).\n\n` +
     `This is recorded as a capital deposit — it raises available cash and lets the\n` +
     `bot size new trades larger, but it is NOT counted as trading profit.\n\n` +
     (cur ? `Current cash: $${cur.cash.toLocaleString()} · book value: $${cur.totalValue.toLocaleString()}\n\n` : '') +
     `Amount to add (USD):`;
-  const v = prompt(msg, '10000');
+  const v = await appPrompt(msg, '10000');
   if (v == null) return;
   const amt = parseFloat(v.replace(/[,$\s]/g, ''));
   if (!isFinite(amt) || amt === 0) { if (typeof flashStatus === 'function') flashStatus('No change — enter a non-zero number', ''); return; }
@@ -45749,6 +46600,12 @@ function botPerformance(filterTicker = null) {
     avgWin: wins.length ? +(wins.reduce((s, b) => s + b.pnl, 0) / wins.length).toFixed(2) : null,
     avgLoss: losses.length ? +(losses.reduce((s, b) => s + b.pnl, 0) / losses.length).toFixed(2) : null,
     spyReturn: spyReturn != null ? +spyReturn.toFixed(2) : null,
+    // vs SPY = how much the bot is OUTPERFORMING the market, i.e. the DIFFERENCE
+    // in returns. If the bot is +1.66% and SPY is −1.76%, the bot is +3.42%
+    // ahead — that's the number that matters, not SPY's raw return. Positive =
+    // bot ahead (green), negative = bot behind (red).
+    vsSpyDiff: (spyReturn != null && totalPnl != null)
+      ? +(((totalPnl / capBase) * 100) - spyReturn).toFixed(2) : null,
     bets,
   };
 }
@@ -46025,44 +46882,44 @@ function renderBetsTab() {
   // ---- Performance summary cards ----
   const book = (typeof botBookValue === 'function') ? botBookValue() : null;
   const beatingYou = '';  // (user portfolio comparison wired separately)
-  const vsSpyColor = (perf.spyReturn != null && perf.totalReturnPct != null)
-    ? (perf.totalReturnPct > perf.spyReturn ? 'var(--pos)' : 'var(--neg)') : 'var(--ink-dim)';
+  const vsSpyColor = (perf.vsSpyDiff != null)
+    ? (perf.vsSpyDiff >= 0 ? 'var(--pos)' : 'var(--neg)') : 'var(--ink-dim)';
   const summary = `
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:18px 0">
-      <div class="company-card" style="margin:0;border-left:3px solid ${pnlColor(perf.totalPnl)}">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:10px;margin:18px 0">
+      <div class="company-card" style="margin:0;border-left:3px solid ${pnlColor(perf.totalPnl)};min-width:0;overflow:hidden">
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Portfolio Value</div>
-        <div style="font-family:var(--mono);font-size:24px;font-weight:700;color:${pnlColor(perf.totalPnl)};margin-top:4px">$${(book ? book.totalValue : perf.currentValue).toLocaleString(undefined,{maximumFractionDigits:0})}</div>
-        <div style="font-family:var(--mono);font-size:9px;color:${pnlColor(perf.totalPnl)};margin-top:2px">${perf.totalReturnPct >= 0 ? '+' : ''}${perf.totalReturnPct}% from $${(book && book.cashAdded ? (100000 + book.cashAdded) : 100000).toLocaleString(undefined,{maximumFractionDigits:0})}${book && book.cashAdded ? ' (incl. added cash)' : ''}</div>
+        <div style="font-family:var(--mono);font-size:22px;font-weight:700;color:${pnlColor(perf.totalPnl)};margin-top:4px;white-space:nowrap">$${(book ? book.totalValue : perf.currentValue).toLocaleString(undefined,{maximumFractionDigits:0})}</div>
+        <div style="font-family:var(--mono);font-size:9px;color:${pnlColor(perf.totalPnl)};margin-top:2px">${perf.totalReturnPct >= 0 ? '+' : ''}${perf.totalReturnPct}% from $${(book && book.capitalBase ? book.capitalBase : 100000).toLocaleString(undefined,{maximumFractionDigits:0})}</div>
       </div>
-      ${book ? `<div class="company-card" style="margin:0;border-left:3px solid var(--amber)">
+      ${book ? `<div class="company-card" style="margin:0;border-left:3px solid var(--amber);min-width:0;overflow:hidden">
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Open Positions</div>
-        <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:var(--ink);margin-top:4px">$${book.openNotional.toLocaleString(undefined,{maximumFractionDigits:0})}${book.openReturnPct != null ? ` <span style="font-size:13px;color:${pnlColor(book.openPnl)}">${book.openReturnPct >= 0 ? '+' : ''}${book.openReturnPct}%</span>` : ''}</div>
+        <div style="font-family:var(--mono);font-size:19px;font-weight:700;color:var(--ink);margin-top:4px;white-space:nowrap">$${book.openNotional.toLocaleString(undefined,{maximumFractionDigits:0})}${book.openReturnPct != null ? ` <span style="font-size:12px;color:${pnlColor(book.openPnl)}">${book.openReturnPct >= 0 ? '+' : ''}${book.openReturnPct}%</span>` : ''}</div>
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">${book.openPositions} open · $${book.openExposure.toLocaleString(undefined,{maximumFractionDigits:0})} exposure (${book.grossLeverage}× gross)</div>
       </div>
-      <div class="company-card" style="margin:0;cursor:pointer" id="bets-cash-card" title="Click to feed the bot cash (or withdraw). Recorded as a capital deposit, not P&L — gives the bot more to size trades with.">
+      <div class="company-card" style="margin:0;cursor:pointer;min-width:0;overflow:hidden" id="bets-cash-card" title="Click to feed the bot cash (or withdraw). Recorded as a capital deposit, not P&L — gives the bot more to size trades with.">
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Cash <span style="color:var(--amber);text-transform:none;letter-spacing:0">✎ edit</span></div>
-        <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:var(--ink);margin-top:4px">$${book.cash.toLocaleString(undefined,{maximumFractionDigits:0})}</div>
-        <div style="font-family:var(--mono);font-size:9px;color:${pnlColor(book.openPnl)};margin-top:2px">${book.openPnl >= 0 ? '+' : ''}$${book.openPnl.toLocaleString(undefined,{maximumFractionDigits:0})} unrealized${book.cashAdded ? ` · $${book.cashAdded.toLocaleString(undefined,{maximumFractionDigits:0})} added` : ''}</div>
+        <div style="font-family:var(--mono);font-size:19px;font-weight:700;color:var(--ink);margin-top:4px;white-space:nowrap">$${book.cash.toLocaleString(undefined,{maximumFractionDigits:0})}</div>
+        <div style="font-family:var(--mono);font-size:9px;color:${pnlColor(book.openPnl)};margin-top:2px">${book.openPnl >= 0 ? '+' : ''}$${book.openPnl.toLocaleString(undefined,{maximumFractionDigits:0})} unrealized${book.cashAdded ? ` · $${book.cashAdded.toLocaleString(undefined,{maximumFractionDigits:0})} ${book.cashAdded >= 0 ? 'added' : 'withdrawn'}` : ''}</div>
       </div>` : ''}
-      ${book ? `<div class="company-card" style="margin:0">
+      ${book ? `<div class="company-card" style="margin:0;min-width:0;overflow:hidden">
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Fees Paid</div>
-        <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:var(--ink);margin-top:4px">$${book.feesPaid.toLocaleString(undefined,{maximumFractionDigits:0})}</div>
+        <div style="font-family:var(--mono);font-size:19px;font-weight:700;color:var(--ink);margin-top:4px;white-space:nowrap">$${book.feesPaid.toLocaleString(undefined,{maximumFractionDigits:0})}</div>
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">est. commission + spread, all trades</div>
       </div>` : ''}
-      <div class="company-card" style="margin:0">
+      <div class="company-card" style="margin:0;min-width:0;overflow:hidden">
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Total P/L</div>
-        <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:${pnlColor(perf.totalPnl)};margin-top:4px">${fmtPnl(perf.totalPnl)}</div>
+        <div style="font-family:var(--mono);font-size:19px;font-weight:700;color:${pnlColor(perf.totalPnl)};margin-top:4px;white-space:nowrap">${fmtPnl(perf.totalPnl)}</div>
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">${fmtPnl(perf.realizedPnl)} realized</div>
       </div>
-      <div class="company-card" style="margin:0">
+      <div class="company-card" style="margin:0;min-width:0;overflow:hidden">
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Win Rate</div>
-        <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:var(--ink);margin-top:4px">${perf.winRate != null ? perf.winRate + '%' : '—'}</div>
+        <div style="font-family:var(--mono);font-size:19px;font-weight:700;color:var(--ink);margin-top:4px;white-space:nowrap">${perf.winRate != null ? perf.winRate + '%' : '—'}</div>
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">${perf.winCount}W / ${perf.lossCount}L · ${perf.closedCount} closed</div>
       </div>
-      <div class="company-card" style="margin:0">
+      <div class="company-card" style="margin:0;min-width:0;overflow:hidden">
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">vs SPY</div>
-        <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:${vsSpyColor};margin-top:4px">${perf.spyReturn != null ? (perf.spyReturn >= 0 ? '+' : '') + perf.spyReturn + '%' : '—'}</div>
-        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">${perf.totalReturnPct != null && perf.spyReturn != null ? (perf.totalReturnPct > perf.spyReturn ? 'bot winning' : 'SPY winning') : 'benchmark'}</div>
+        <div style="font-family:var(--mono);font-size:19px;font-weight:700;color:${vsSpyColor};margin-top:4px;white-space:nowrap">${perf.vsSpyDiff != null ? (perf.vsSpyDiff >= 0 ? '+' : '') + perf.vsSpyDiff + '%' : '—'}</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">${perf.spyReturn != null ? `SPY ${perf.spyReturn >= 0 ? '+' : ''}${perf.spyReturn}% · you ${perf.totalReturnPct >= 0 ? '+' : ''}${perf.totalReturnPct}%` : 'benchmark'}</div>
       </div>
       ${(() => {
         // Confidence card — the bot's EARNED aggressiveness (distinct from any
@@ -46072,9 +46929,9 @@ function renderBetsTab() {
         if (!cf) return '';
         const col = cf.conservative ? 'var(--neg)' : cf.aggressive ? 'var(--pos)' : cf.sampleSize < 8 ? 'var(--data-amber)' : 'var(--ink)';
         const mode = cf.conservative ? 'Conservative' : cf.aggressive ? 'Aggressive' : cf.sampleSize < 8 ? 'Warming up' : 'Steady';
-        return `<div class="company-card" style="margin:0;border-left:3px solid ${col}" title="${escapeHtml(cf.label)}">
+        return `<div class="company-card" style="margin:0;border-left:3px solid ${col};min-width:0;overflow:hidden" title="${escapeHtml(cf.label)}">
           <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Confidence</div>
-          <div style="font-family:var(--mono);font-size:20px;font-weight:700;color:${col};margin-top:4px">${mode}</div>
+          <div style="font-family:var(--mono);font-size:15px;font-weight:700;color:${col};margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${mode}</div>
           <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">×${cf.factor.toFixed(2)} sizing · ${cf.sampleSize} settled · PF ${cf.profitFactor}</div>
         </div>`;
       })()}
@@ -46314,16 +47171,40 @@ function renderBetsTab() {
   // ---- Full bet ledger — every transaction, click a row for the receipt,
   //      click a COLUMN HEADER to sort (A-Z / Z-A or latest/earliest), default
   //      latest-to-oldest. Mirrors the Stock Book's sortable columns. ----
+  // Helpers for the split entry/sale values (replacing the loose "Size $"):
+  //   entryValue = what was put in  = shares × entry price (or notional)
+  //   saleValue  = what came out    = shares × exit price (closed only)
+  const _betShares = (b) => (b.shares != null && isFinite(b.shares) && b.shares > 0)
+    ? b.shares : ((b.entryPrice > 0) ? ((b.notional || b.dollars || 0) / b.entryPrice) : 0);
+  const _entryValue = (b) => {
+    const sh = _betShares(b);
+    if (sh && b.entryPrice) return sh * b.entryPrice;
+    return b.notional ?? b.dollars ?? 0;
+  };
+  const _saleValue = (b) => {
+    if (b.status !== 'closed') return null;       // only a closed trade has a sale
+    const sh = (b.sharesAtExit != null && isFinite(b.sharesAtExit)) ? b.sharesAtExit : _betShares(b);
+    const exit = (b.exitPrice != null && isFinite(b.exitPrice)) ? b.exitPrice : null;
+    if (sh && exit != null) return sh * exit;
+    // fall back: entry value + realized P/L = proceeds
+    const r = (b.realizedPL != null && isFinite(b.realizedPL)) ? b.realizedPL : (b.pnl || 0);
+    return _entryValue(b) + r;
+  };
+  // Type = BUY when still accumulating/open, SELL once any exit happened. A fully
+  // closed position reads SELL; a partial would stay OPEN but is tagged SELL too.
+  const _betType = (b) => (b.status === 'closed' || b.exitPrice != null || b._partialSold) ? 'SELL' : 'BUY';
+
   const _ledgerCols = [
     { key: 'date',      label: 'Date',       type: 'date',   get: b => b.entryDate || '' },
     { key: 'ticker',    label: 'Ticker',     type: 'text',   get: b => b.ticker || '' },
     { key: 'direction', label: 'Direction',  type: 'text',   get: b => b.direction || '' },
-    { key: 'size',      label: 'Size',       type: 'num',    get: b => (b.dollars ?? b.notional ?? 0) },
-    { key: 'entry',     label: 'Entry',      type: 'num',    get: b => (b.entryPrice != null ? Number(b.entryPrice) : null) },
-    { key: 'last',      label: 'Last',       type: 'num',    get: b => (b.lastPrice != null && isFinite(b.lastPrice) ? Number(b.lastPrice) : null) },
+    { key: 'entryVal',  label: 'Entry $',    type: 'num',    get: b => _entryValue(b) },
+    { key: 'saleVal',   label: 'Sale $',     type: 'num',    get: b => _saleValue(b) },
+    { key: 'entry',     label: 'Entry Px',   type: 'num',    get: b => (b.entryPrice != null ? Number(b.entryPrice) : null) },
+    { key: 'exit',      label: 'Exit Px',    type: 'num',    get: b => (b.status === 'closed' && b.exitPrice != null ? Number(b.exitPrice) : (b.lastPrice != null && isFinite(b.lastPrice) ? Number(b.lastPrice) : null)) },
     { key: 'return',    label: 'Return',     type: 'num',    get: b => (b.returnPct != null ? Number(b.returnPct) : null) },
     { key: 'pnl',       label: 'P/L',        type: 'num',    get: b => (b.pnl != null ? Number(b.pnl) : null) },
-    { key: 'cash',      label: 'Cash After', type: 'num',    get: b => (b.cashAfter != null ? Number(b.cashAfter) : null) },
+    { key: 'type',      label: 'Type',       type: 'text',   get: b => _betType(b) },
     { key: 'status',    label: 'Status',     type: 'text',   get: b => b.status || '' },
   ];
   const _lsCol = _ledgerCols.find(c => c.key === LEDGER_SORT.col) || _ledgerCols[0];
@@ -46340,20 +47221,28 @@ function renderBetsTab() {
     else cmp = String(va).localeCompare(String(vb));
     return cmp * _lsDir;
   });
-  const ledgerRows = _sortedBets.map(b => `
+  const ledgerRows = _sortedBets.map(b => {
+    const ev = _entryValue(b);
+    const sv = _saleValue(b);
+    const typ = _betType(b);
+    const exitPx = (b.status === 'closed' && b.exitPrice != null) ? Number(b.exitPrice)
+      : (b.lastPrice != null && isFinite(b.lastPrice) ? Number(b.lastPrice) : null);
+    return `
     <tr class="bot-receipt-row" data-bet-id="${b.id || ''}" style="cursor:pointer" title="Tap for the bot's full decision receipt">
       <td style="font-family:var(--mono);font-size:11px">${b.entryDate}</td>
       <td style="font-family:var(--mono);font-weight:700"><span class="bot-ticker-link" data-ticker="${b.ticker}" style="cursor:pointer;color:var(--amber);text-decoration:underline;text-decoration-style:dotted" title="Open ${b.ticker} in Valuation">${b.ticker}</span></td>
       <td style="font-family:var(--mono);font-size:11px">${dirBadge(b.direction)}${b.instrument === 'option' ? ` <span style="color:#c08ae0;font-weight:700">${(b.optionType||'').toUpperCase()}</span>` : b.instrument === 'leveraged_etf' ? ` <span style="color:#4ec9a8;font-weight:700">${b.leveragedEtf}</span>` : (b.leverage > 1 ? ` ${b.leverage}x` : '')}${b.hedge ? ' 🛡' : ''}</td>
-      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">$${(b.dollars ?? b.notional ?? 0).toFixed(0)}</td>
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${ev ? '$' + ev.toLocaleString(undefined,{maximumFractionDigits:0}) : '—'}</td>
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${sv != null ? '$' + sv.toLocaleString(undefined,{maximumFractionDigits:0}) : '—'}</td>
       <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${b.entryPrice != null ? '$' + Number(b.entryPrice).toFixed(2) : '—'}</td>
-      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${(b.lastPrice != null && isFinite(b.lastPrice)) ? '$' + Number(b.lastPrice).toFixed(2) : '—'}</td>
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${exitPx != null ? '$' + exitPx.toFixed(2) : '—'}</td>
       <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${pnlColor(b.returnPct)}">${b.returnPct != null ? (b.returnPct >= 0 ? '+' : '') + b.returnPct + '%' : '—'}</td>
       <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${pnlColor(b.pnl)}">${fmtPnl(b.pnl)}</td>
-      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${b.cashAfter != null ? '$' + Number(b.cashAfter).toLocaleString(undefined, {maximumFractionDigits: 0}) : '—'}</td>
+      <td style="font-family:var(--mono);font-size:10px;font-weight:700;color:${typ === 'SELL' ? 'var(--neg)' : 'var(--pos)'}">${typ}</td>
       <td style="font-family:var(--mono);font-size:10px;color:${b.status === 'open' ? 'var(--amber)' : 'var(--ink-faint)'}">${b.status.toUpperCase()} ›</td>
     </tr>
-  `).join('');
+  `;
+  }).join('');
 
   // Clickable sortable headers with an arrow on the active column. Clicking the
   // active column flips direction; clicking a new column sorts it (date/numeric
@@ -46368,7 +47257,7 @@ function renderBetsTab() {
     <div class="company-card">
       <h4>${filter ? filter + ' — ' : ''}Transaction Ledger <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· every transaction permanent · ${perf.bets.length} total · tap a row for the receipt · tap a column to sort</span></h4>
       <div style="overflow-x:auto">
-        <table class="sb-table" style="width:100%;min-width:720px">
+        <table class="sb-table" style="width:100%;min-width:780px">
           <thead><tr>${ledgerHead}</tr></thead>
           <tbody>${ledgerRows}</tbody>
         </table>
@@ -49289,7 +50178,7 @@ function renderStorageStats() {
 //   classify, the text is captured locally and surfaced in the import log.
 // ============================================================
 async function handleHomeImportFile(file, logEl) {
-  const append = (msg, cls = '') => {
+  const append = async (msg, cls = '') => {
     const div = document.createElement('div');
     div.className = `home-import-log-entry ${cls}`;
     div.innerHTML = msg;
@@ -49311,7 +50200,7 @@ async function handleHomeImportFile(file, logEl) {
       // Full snapshot has a _valuatio.exportFormat marker we wrote on export
       if (parsed._valuatio && parsed._valuatio.exportFormat === 'full-snapshot') {
         const keys = Object.keys(parsed.localStorage || {});
-        if (!confirm(`Restore ${keys.length} keys from snapshot taken ${parsed._valuatio.exportedAt}?\n\nThis OVERWRITES existing data. A backup of your current state will be downloaded first.`)) {
+        if (!await appConfirm(`Restore ${keys.length} keys from snapshot taken ${parsed._valuatio.exportedAt}?\n\nThis OVERWRITES existing data. A backup of your current state will be downloaded first.`)) {
           append('Restore cancelled', 'warn');
           return;
         }
@@ -49543,7 +50432,7 @@ function downloadJsonBlob(obj, filename) {
 async function exportPdfReport() {
   // Optional user note — prepended to the report. Notifications are an internal
   // reminder system and are intentionally NOT included in shared/exported PDFs.
-  const userNote = prompt('Add a note to the top of this report? (optional — leave blank to skip)') || '';
+  const userNote = await appPrompt('Add a note to the top of this report? (optional — leave blank to skip)') || '';
 
   // Aggregate the report content
   const portfolio = (typeof loadPortfolio === 'function') ? loadPortfolio() : [];
@@ -49608,7 +50497,7 @@ async function exportPdfReport() {
   `;
   const w = window.open('', '_blank');
   if (!w) {
-    alert('Pop-up blocked. Please allow pop-ups for this site and try again.');
+    appAlert('Pop-up blocked. Please allow pop-ups for this site and try again.');
     return;
   }
   w.document.write(html);
@@ -49668,10 +50557,10 @@ document.addEventListener('DOMContentLoaded', () => {
     else if (when === '1w') fireAt = new Date(Date.now() + 7 * 86400000);
     else if (when === 'custom') {
       const v = document.getElementById('notif-new-custom').value;
-      if (!v) { alert('Pick a custom date/time first'); return; }
+      if (!v) { appAlert('Pick a custom date/time first'); return; }
       fireAt = new Date(v);
     }
-    if (!title.trim()) { alert('Title is required'); return; }
+    if (!title.trim()) { appAlert('Title is required'); return; }
     addNotification({
       title, detail, category, fireAt: fireAt.toISOString(), source: 'manual',
     });
@@ -49942,8 +50831,8 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // ---- Home → Cache clearing ----
-  document.getElementById('home-clear-news-btn')?.addEventListener('click', () => {
-    if (!confirm('Clear cached news articles? Article read-states will be preserved.')) return;
+  document.getElementById('home-clear-news-btn')?.addEventListener('click', async () => {
+    if (!await appConfirm('Clear cached news articles? Article read-states will be preserved.')) return;
     // Use the real keys (valuatio.news.v1, valuatio.news.mynews.v1). The old
     // code looked for "valuatio.news.cache" which never existed, so nothing
     // was cleared — this is the bug where 4.5MB of news wouldn't clear.
@@ -49961,8 +50850,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (typeof renderNews === 'function') { try { renderNews(); } catch {} }
     if (typeof flashStatus === 'function') flashStatus(`News cache cleared — freed ~${(freed / 1024 / 1024).toFixed(1)}MB`, 'success');
   });
-  document.getElementById('home-clear-prices-btn')?.addEventListener('click', () => {
-    if (!confirm('Clear price history cache? Will re-fetch on next load (may be slow on first refresh).')) return;
+  document.getElementById('home-clear-prices-btn')?.addEventListener('click', async () => {
+    if (!await appConfirm('Clear price history cache? Will re-fetch on next load (may be slow on first refresh).')) return;
     // Real key is valuatio.priceHist.cache.v1 (the old prefixes never matched).
     localStorage.removeItem('valuatio.priceHist.cache.v1');
     if (typeof _priceHistMemCache === 'object') {
@@ -49971,8 +50860,8 @@ document.addEventListener('DOMContentLoaded', () => {
     renderStorageStats();
     if (typeof flashStatus === 'function') flashStatus('Price history cache cleared', 'success');
   });
-  document.getElementById('home-clear-all-btn')?.addEventListener('click', () => {
-    if (!confirm('⚠️  CLEAR ALL local data?\n\nThis wipes:\n• Portfolio + transactions\n• GoodGlobe Index\n• Notifications\n• Preferences\n• All caches\n\nA backup will be downloaded first. Continue?')) return;
+  document.getElementById('home-clear-all-btn')?.addEventListener('click', async () => {
+    if (!await appConfirm('⚠️  CLEAR ALL local data?\n\nThis wipes:\n• Portfolio + transactions\n• GoodGlobe Index\n• Notifications\n• Preferences\n• All caches\n\nA backup will be downloaded first. Continue?', { danger: true })) return;
     try {
       const backup = exportFullSnapshot();
       downloadJsonBlob(backup, `valuatio-backup-before-wipe-${Date.now()}.json`);
@@ -49981,7 +50870,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const k = localStorage.key(i);
       if (k && k.startsWith('valuatio.')) localStorage.removeItem(k);
     }
-    alert('All local data cleared. Reloading page…');
+    appAlert('All local data cleared. Reloading page…');
     location.reload();
   });
 
@@ -50351,6 +51240,66 @@ function renderGlobalTradeBilateral() {
   const out = document.getElementById('gt-bilateral-output');
   if (!fromSel || !toSel || !out) return;
 
+  // Render rich bilateral detail from live Comtrade data (any country pair).
+  const renderComtrade = (found, fCountry, tCountry) => {
+    const { pair, reversed } = found;
+    // Orient flows relative to the SELECTED "from → to" direction. The stored
+    // pair is reporter→partner with exports = reporter→partner. If the user's
+    // "from" is the partner, swap exports/imports.
+    const fromIsReporter = !reversed;
+    const fwd = fromIsReporter ? pair.exports : pair.imports;   // from → to
+    const rev = fromIsReporter ? pair.imports : pair.exports;   // to → from
+    const fromBalance = fwd.total - rev.total;                  // from's balance with to
+    const fmtB = (v) => `$${(v / 1e9).toFixed(1)}B`;
+    const yoy = pair.yoy || {};
+    const fwdYoy = fromIsReporter ? yoy.exports : yoy.imports;
+    const prodRows = (fwd.topProducts || []).slice(0, 10).map((p, i) => {
+      const pct = fwd.total ? (p.value / fwd.total * 100) : 0;
+      return `<div style="display:flex;align-items:center;gap:8px;padding:3px 0;font-family:var(--mono);font-size:10px">
+        <span style="color:var(--ink-faint);width:16px">${i + 1}</span>
+        <span style="flex:1;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="HS ${escapeHtml(p.code)} · ${escapeHtml(p.desc)}">${escapeHtml(p.desc)}</span>
+        <span style="color:var(--ink-dim);width:54px;text-align:right">${fmtB(p.value)}</span>
+        <span style="color:var(--ink-faint);width:38px;text-align:right">${pct.toFixed(0)}%</span>
+      </div>`;
+    }).join('');
+    // Mini trend sparkline of the from→to flow.
+    const tr = pair.trend || {};
+    const trKeys = Object.keys(tr).sort();
+    let spark = '';
+    if (trKeys.length >= 2) {
+      const vals = trKeys.map(k => fromIsReporter ? tr[k].exports : tr[k].imports);
+      const min = Math.min(...vals), max = Math.max(...vals), rng = (max - min) || 1;
+      const W = 200, H = 30;
+      const pts = vals.map((v, i) => `${(i / (vals.length - 1) * W).toFixed(1)},${(H - (v - min) / rng * H).toFixed(1)}`).join(' ');
+      const up = vals[vals.length - 1] >= vals[0];
+      spark = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:30px;margin-top:4px"><polyline points="${pts}" fill="none" stroke="${up ? 'var(--pos)' : 'var(--neg)'}" stroke-width="1.5"/></svg>
+        <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:8px;color:var(--ink-faint)"><span>${trKeys[0]}</span><span>${trKeys[trKeys.length - 1]}</span></div>`;
+    }
+    out.innerHTML = `
+      <div style="background:var(--bg-card);border:1px solid var(--rule);padding:18px;border-radius:3px">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">
+          <div style="font-family:var(--serif);font-size:18px;font-weight:700;color:var(--amber)">${escapeHtml(fCountry?.name || '')} → ${escapeHtml(tCountry?.name || '')}</div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint)">UN Comtrade · HS · ${pair.latestPeriod} annual</div>
+        </div>
+        <div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:10px">
+          <div><div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase">${escapeHtml(fCountry?.name || '')} → ${escapeHtml(tCountry?.name || '')}</div>
+            <div style="font-family:var(--mono);font-size:18px;font-weight:700;color:var(--ink)">${fmtB(fwd.total)}${fwdYoy != null ? `<span style="font-size:10px;color:${fwdYoy >= 0 ? 'var(--pos)' : 'var(--neg)'}"> ${fwdYoy >= 0 ? '+' : ''}${(fwdYoy * 100).toFixed(1)}%</span>` : ''}</div></div>
+          <div><div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase">${escapeHtml(tCountry?.name || '')} → ${escapeHtml(fCountry?.name || '')}</div>
+            <div style="font-family:var(--mono);font-size:18px;font-weight:700;color:var(--ink)">${fmtB(rev.total)}</div></div>
+          <div><div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-transform:uppercase">${escapeHtml(fCountry?.name || '')} balance</div>
+            <div style="font-family:var(--mono);font-size:18px;font-weight:700;color:${fromBalance >= 0 ? 'var(--pos)' : 'var(--neg)'}">${fromBalance >= 0 ? '+' : ''}${fmtB(fromBalance)}</div></div>
+        </div>
+        ${spark}
+        <div style="margin-top:14px;padding-top:12px;border-top:1px dashed var(--rule)">
+          <div style="font-family:var(--mono);font-size:10px;color:var(--amber);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:4px">Top products · ${escapeHtml(fCountry?.name || '')} → ${escapeHtml(tCountry?.name || '')}</div>
+          ${prodRows || '<div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">No product breakdown available</div>'}
+        </div>
+        <div style="margin-top:12px;padding-top:10px;border-top:1px dashed var(--rule);font-family:var(--mono);font-size:9px;color:var(--ink-faint);line-height:1.6">
+          Tradeable: ${escapeHtml(tCountry?.name || '')} equity exposure via <strong style="color:var(--ink)">${escapeHtml(tCountry?.countryEtf || '—')}</strong>. Trade values are gross goods (HS), USD, as reported to UN Comtrade.
+        </div>
+      </div>`;
+  };
+
   const update = () => {
     const f = fromSel.value;
     const t = toSel.value;
@@ -50358,18 +51307,23 @@ function renderGlobalTradeBilateral() {
       out.innerHTML = `<div style="padding:20px;text-align:center;color:var(--ink-faint);font-family:var(--mono);font-size:11px">Pick two different countries</div>`;
       return;
     }
-    // We only have detailed bilateral data for US-anchored pairs in this static set.
-    // For non-US pairs, we explicitly say so rather than fabricating.
+    const fromCountry = GT_COUNTRIES.find(c => c.code === f);
+    const toCountry = GT_COUNTRIES.find(c => c.code === t);
+    // PREFER live Comtrade data — works for ANY pair we fetched, not just US.
+    const fM49 = fromCountry && ISO3_TO_M49[fromCountry.iso];
+    const tM49 = toCountry && ISO3_TO_M49[toCountry.iso];
+    if (_gtComtradeData && fM49 && tM49) {
+      const found = _gtComtradePair(fM49, tM49);
+      if (found) { renderComtrade(found, fromCountry, toCountry); return; }
+    }
+    // Fall back to the static US-anchored set if Comtrade doesn't have the pair.
     if (f !== 'us' && t !== 'us') {
-      const fromCountry = GT_COUNTRIES.find(c => c.code === f);
-      const toCountry   = GT_COUNTRIES.find(c => c.code === t);
       out.innerHTML = `
         <div style="padding:20px;background:var(--bg-card);border-left:3px solid var(--data-amber);font-family:var(--mono);font-size:12px;line-height:1.7">
-          <strong style="color:var(--data-amber)">Bilateral data for ${escapeHtml(fromCountry?.name || f)} ↔ ${escapeHtml(toCountry?.name || t)} requires the IMF DOTS API integration.</strong><br><br>
-          The current static dataset only covers US-anchored bilateral flows. The pipeline upgrade needed to support non-US pairs is documented in the Data Sources tab.<br><br>
-          <strong>What you can do today:</strong> open the country ETFs side by side (${escapeHtml(fromCountry?.countryEtf || '?')} and ${escapeHtml(toCountry?.countryEtf || '?')}) to compare equity-market moves, which often correlate with bilateral trade health.
-        </div>
-      `;
+          <strong style="color:var(--data-amber)">No Comtrade data on file yet for ${escapeHtml(fromCountry?.name || f)} ↔ ${escapeHtml(toCountry?.name || t)}.</strong><br><br>
+          This pair isn't in the curated Comtrade set. Run the UN Comtrade workflow, or add the pair to <code>fetch_comtrade.py</code>'s PAIRS list.<br><br>
+          <strong>Today:</strong> compare the country ETFs (${escapeHtml(fromCountry?.countryEtf || '?')} and ${escapeHtml(toCountry?.countryEtf || '?')}) side by side.
+        </div>`;
       return;
     }
     const usPartner = f === 'us' ? t : f;
@@ -50580,6 +51534,40 @@ async function loadGtTrade() {
   return null;
 }
 
+// ---- UN Comtrade bilateral product flows (data/comtrade_flows.json) ----
+let _gtComtradeData = null;
+// ISO3 → M49 numeric, so the GT country selector codes map to Comtrade rows.
+const ISO3_TO_M49 = {
+  USA: 842, CHN: 156, DEU: 276, JPN: 392, GBR: 826, FRA: 250, IND: 356,
+  KOR: 410, MEX: 484, CAN: 124, BRA: 76, ITA: 380, NLD: 528, CHE: 756,
+  AUS: 36, RUS: 643, VNM: 704, TWN: 490, SGP: 702, SAU: 682, ARE: 784,
+  ESP: 724, IRL: 372, IDN: 360,
+};
+async function loadGtComtrade() {
+  if (_gtComtradeData) return _gtComtradeData;
+  const base = (typeof DYNAMIC_DATA_BASE !== 'undefined') ? DYNAMIC_DATA_BASE
+    : 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-1/main/data/';
+  try {
+    const r = await fetch(base + 'comtrade_flows.json', { cache: 'no-cache' });
+    if (r.ok) {
+      _gtComtradeData = await r.json();
+      console.log(`[global-trade] Comtrade loaded — ${(_gtComtradeData.pairs || []).length} pairs · latest ${_gtComtradeData.latestPeriod}`);
+      return _gtComtradeData;
+    }
+  } catch (e) { console.warn('[global-trade] Comtrade load failed:', e.message); }
+  return null;
+}
+// Find the Comtrade pair for two M49 codes (either direction). Returns the pair
+// plus whether it's stored reversed, so the renderer can orient flows correctly.
+function _gtComtradePair(m49a, m49b) {
+  if (!_gtComtradeData || !Array.isArray(_gtComtradeData.pairs)) return null;
+  for (const p of _gtComtradeData.pairs) {
+    if (p.reporterCode === m49a && p.partnerCode === m49b) return { pair: p, reversed: false };
+    if (p.reporterCode === m49b && p.partnerCode === m49a) return { pair: p, reversed: true };
+  }
+  return null;
+}
+
 // Render the live US trade-balance card from FRED data.
 function renderGtTradeBalanceCard() {
   const host = document.getElementById('gt-trade-balance-card');
@@ -50643,6 +51631,13 @@ function loadGlobalTradeTab() {
   if (typeof loadGtTrade === 'function') {
     loadGtTrade().then(() => {
       if (typeof renderGtTradeBalanceCard === 'function') renderGtTradeBalanceCard();
+    }).catch(() => {});
+  }
+  // Pull UN Comtrade product-level bilateral flows, then refresh the bilateral
+  // explorer so any country pair shows real top-product detail + balance + trend.
+  if (typeof loadGtComtrade === 'function') {
+    loadGtComtrade().then((d) => {
+      if (d && typeof renderGlobalTradeBilateral === 'function') renderGlobalTradeBilateral();
     }).catch(() => {});
   }
   // Refresh logistics every 60s while the tab is open

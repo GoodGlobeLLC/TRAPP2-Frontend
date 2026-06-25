@@ -7062,11 +7062,17 @@
         <option value="small">Small-cap +</option>
         <option value="micro">Micro-cap +</option>
       </select>
+      <select class="news-filter" id="news-filter-sort" title="Sort articles by time">
+        <option value="newest" selected>Newest first</option>
+        <option value="oldest">Oldest first</option>
+      </select>
       <select class="news-filter" id="news-filter-range">
         <option value="1">Last 24h</option>
         <option value="3">Last 3 days</option>
         <option value="7" selected>Last week</option>
+        <option value="14">Last 2 weeks</option>
         <option value="30">Last 30 days</option>
+        <option value="90">Last 90 days</option>
       </select>
       <button class="btn" id="news-refresh-btn">Refresh</button>
     </div>
@@ -7798,10 +7804,10 @@
   <div class="prob-toolbar">
     <button class="btn" id="prob-new-btn">+ New Thesis</button>
     <button class="btn btn-ghost" id="prob-recalc-btn">Recalculate All</button>
-    <button class="btn btn-ghost" id="prob-export-btn" title="Download probability_data.json to commit to TRAPP2-PORT (keeps your theses for future reference)">⤓ Export Theses</button>
-    <button class="btn btn-ghost" id="prob-import-repo-btn" title="Pull probability_data.json from TRAPP2-PORT and merge your theses back in (no duplicates)">⤒ Load from Repo</button>
-    <button class="btn btn-ghost" id="prob-sync-supabase-btn" title="Push every thesis to Supabase analytics_kv now (needs analytics_anon_write.sql + Analytics config)">↗ Sync to Supabase</button>
-    <button class="btn btn-ghost" id="prob-commit-btn" title="Open the TRAPP2-PORT editor to paste/commit probability_data.json">Open Repo to Commit ↗</button>
+    <button class="btn btn-ghost" id="prob-export-btn" title="Download probability_data.json to commit to TRAPP2-PORT">⤓ Export Theses</button>
+    <button class="btn btn-ghost" id="prob-import-repo-btn" title="Pull probability_data.json from TRAPP2-PORT and merge">⤒ Load from Repo</button>
+    <button class="btn btn-ghost" id="prob-sync-supabase-btn" title="Push every thesis to Supabase analytics_kv now">↗ Sync to Supabase</button>
+    <button class="btn btn-ghost" id="prob-commit-btn" title="Open the TRAPP2-PORT editor to paste/commit">Open Repo to Commit ↗</button>
     <button class="btn btn-ghost" id="prob-clear-btn">Clear All</button>
     <div class="status" id="prob-status">—</div>
   </div>
@@ -8536,7 +8542,7 @@
         <button class="btn btn-ghost" id="analytics-supabase-sync-btn" title="Push research grades + regime + KV to Supabase">Sync Analytics Now ↗</button>
         <span id="analytics-supabase-status" style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);align-self:center"></span>
       </div>
-      <div class="modal-help">Also the home of <code>ticker_snapshot</code> — the flat price+grade+financials table the app screens against. The hourly workflow keeps it fresh with the service key.</div>
+      <div class="modal-help">Also the home of <code>ticker_snapshot</code> — the flat price+grade+financials table the app screens against.</div>
     </div>
 
     <div class="modal-section" style="border-top:1px solid var(--rule);padding-top:14px">
@@ -8876,6 +8882,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260615z41"></script>
+<script src="app.js?v=20260615z50"></script>
 </body>
 </html>
