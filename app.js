@@ -12397,7 +12397,7 @@ async function openClearCachePrompt() {
   if (c === 'N') {
     const freed = clearNewsCache();
     if (typeof renderStorageStats === 'function') renderStorageStats();
-    if (typeof renderNews === 'function') { try { renderNews(); } catch {} }
+    if (typeof renderNewsFeed === 'function') { try { renderNewsFeed(); } catch {} }
     flashStatus(`News cache cleared — freed ~${(freed / 1024 / 1024).toFixed(1)}MB`, 'success');
     return;
   }
@@ -14367,7 +14367,7 @@ async function fnGMM() {
   if (missingHist.length > 0 && state._historyManifest?.baseUrl && typeof primeHistoryForTickers === 'function') {
     primeHistoryForTickers(missingHist).then(() => {
       // Re-render macro tab once history lands
-      if (typeof renderMacroTab === 'function') renderMacroTab();
+      if (typeof loadMacroTab === 'function') loadMacroTab();
     }).catch(() => {});
   }
 
@@ -24784,7 +24784,7 @@ function computeAllWeather() {
     return (e.qty > 0 || ['holding', 'trading', 'long', 'active'].includes(role)) && role !== 'watching' && role !== 'tracking' && role !== 'avoid';
   });
   const valueOf = (e) => {
-    const px = (typeof getRowLivePrice === 'function' ? getRowLivePrice(e.ticker) : null) || e.lastPrice || e.costBasis || 0;
+    const px = (typeof getStockbookRow === 'function' ? (getStockbookRow(e.ticker)?.price) : null) || e.lastPrice || e.costBasis || 0;
     const qty = e.qty || 0;
     const v = px * qty;
     return isFinite(v) && v > 0 ? v : (e.marketValue || 0);
@@ -35472,11 +35472,16 @@ window.reportAndRetryArticle = async function(articleId) {
     // Try the OTHER news source than what's currently configured
     const hasFinnhub = !!localStorage.getItem('valuatio.finnhub.key');
     const hasMarketaux = !!localStorage.getItem('valuatio.marketaux.key');
+    const hasFmp = !!localStorage.getItem('valuatio.fmp.key');
     let fresh = null;
-    if (hasFinnhub && typeof fetchMarketauxNews === 'function') {
-      fresh = await fetchMarketauxNews(article.ticker, state.news.filterRange).catch(() => null);
-    } else if (hasMarketaux && typeof fetchFinnhubNews === 'function') {
+    // Retry from a DIFFERENT provider than the one that mis-tagged it. Only
+    // Finnhub + FMP are implemented, so: Finnhub-primary -> FMP, otherwise Finnhub/FMP.
+    if (hasFinnhub && hasFmp && typeof fetchFmpStockNews === 'function') {
+      fresh = await fetchFmpStockNews(article.ticker, 12).catch(() => null);
+    } else if (typeof fetchFinnhubNews === 'function' && hasFinnhub) {
       fresh = await fetchFinnhubNews(article.ticker, state.news.filterRange).catch(() => null);
+    } else if (hasFmp && typeof fetchFmpStockNews === 'function') {
+      fresh = await fetchFmpStockNews(article.ticker, 12).catch(() => null);
     }
     if (fresh && fresh.length > 0) {
       // Merge fresh into the items list, marking them as retried so the UI can show a badge
@@ -40736,6 +40741,7 @@ function queueForReview(parsed, reason) {
 }
 
 function renderReviewHub() {
+  if (typeof updateReviewBadge === 'function') { try { updateReviewBadge(); } catch {} }
   const body = document.getElementById('review-body');
   if (!body) return;
   const queue = loadReviewQueue();
@@ -44016,9 +44022,9 @@ function _regimeProfile(mode, evidence) {
     'risk-on':  { mode, evidence, leverageOK: true,  thresholdMod: 0,     shortBar: 0.10, longBar: 0,
                   weightMods: { trend: 1.3, momentum: 1.3, meanReversion: 0.7, health: 1.0, fundamentals: 1.0, crossAsset: 1.1, regimeGrade: 1.4, peerGrade: 1.2, momentumGrade: 1.4, optionsIV: 0.8, optionsMarket: 0.9 } },
     'risk-off': { mode, evidence, leverageOK: false, thresholdMod: 0.03,  shortBar: 0,    longBar: 0.10,
-                  weightMods: { trend: 0.7, momentum: 0.8, meanReversion: 1.0, health: 1.3, fundamentals: 1.3, fed: 1.2, regimeGrade: 1.5, peerGrade: 1.3, momentumGrade: 0.8, optionsIV: 1.4, optionsMarket: 1.5 } },
+                  weightMods: { trend: 0.7, momentum: 0.8, meanReversion: 1.0, health: 1.3, fundamentals: 1.3, crossAsset: 1.2, fed: 1.2, regimeGrade: 1.5, peerGrade: 1.3, momentumGrade: 0.8, optionsIV: 1.4, optionsMarket: 1.5 } },
     'choppy':   { mode, evidence, leverageOK: false, thresholdMod: 0.06,  shortBar: 0.05, longBar: 0.05,
-                  weightMods: { trend: 0.7, momentum: 0.8, meanReversion: 1.3, health: 1.1, fundamentals: 1.1, regimeGrade: 1.2, peerGrade: 1.1, momentumGrade: 1.0, optionsIV: 1.3, optionsMarket: 1.3 } },
+                  weightMods: { trend: 0.7, momentum: 0.8, meanReversion: 1.3, health: 1.1, fundamentals: 1.1, crossAsset: 1.0, fed: 1.1, regimeGrade: 1.2, peerGrade: 1.1, momentumGrade: 1.0, optionsIV: 1.3, optionsMarket: 1.3 } },
   };
   return profiles[mode] || profiles['choppy'];
 }
@@ -44166,7 +44172,7 @@ function computeRegimeGrade(ticker) {
   // Current quad (1-4) from the macro tab, and the bot's risk regime.
   let quad = null;
   try {
-    if (typeof getCurrentQuad === 'function') quad = getCurrentQuad();
+    if (typeof state !== 'undefined' && state.macro?.current?.quad != null) quad = state.macro.current.quad;
     else if (typeof state !== 'undefined' && state.macro?.currentQuad) quad = state.macro.currentQuad;
   } catch {}
   const regime = (typeof botAssessRegime === 'function') ? botAssessRegime() : null;
@@ -44375,11 +44381,11 @@ function analyzePriceTrend(ticker, opts = {}) {
   try {
     const row = (typeof getStockbookRow === 'function') ? getStockbookRow(t) : null;
     const sector = row?.sector;
-    if (sector && typeof getStockbookRows === 'function') {
+    if (sector && state.stockbook?.rows?.length) {
       const my3 = momByH.d63 ? momByH.d63.retPct : null;
       if (my3 != null) {
         const peerRets = [];
-        for (const r of getStockbookRows()) {
+        for (const r of state.stockbook.rows) {
           if (r.ticker === t) continue;
           if ((r.sector || '') !== sector) continue;
           const ph = (typeof getHistoryForTicker === 'function') ? getHistoryForTicker(r.ticker) : null;
@@ -45332,6 +45338,7 @@ async function _botDailyRunInner(bot, today, rows, force = false) {
     if (final && final.confidence >= effThreshold) scored.push(final);
   }
   try { await idbDel('botScanCheckpoint'); } catch {}
+  if (typeof updateBotStatus === 'function') { try { updateBotStatus(''); } catch {} }
   console.log(`[bot] ■ scan complete: ${candidates.length} candidates scored → ${scored.length} above the ${(effThreshold * 100).toFixed(0)}% conviction bar`);
   if (!scored.length) {
     console.log('[bot] nothing cleared the bar today — no new bets (this is a valid outcome, not an error)');
@@ -49923,6 +49930,44 @@ function updateNotifBadge() {
   }
 }
 
+// Review-queue count badge on the Review nav button. The queue holds ONLY
+// pending items (resolved items are filtered out on dismiss), so length = count.
+function updateReviewBadge() {
+  const btn = document.querySelector('.tab-btn[data-tab="review"]');
+  if (!btn) return;
+  let badge = document.getElementById('review-badge');
+  if (!badge) {
+    try { if (getComputedStyle(btn).position === 'static') btn.style.position = 'relative'; } catch {}
+    badge = document.createElement('span');
+    badge.className = 'notif-badge';
+    badge.id = 'review-badge';
+    btn.appendChild(badge);
+  }
+  let count = 0;
+  try { const q = (typeof loadReviewQueue === 'function') ? loadReviewQueue() : []; count = Array.isArray(q) ? q.length : 0; } catch { count = 0; }
+  if (count > 0) { badge.textContent = count > 99 ? '99+' : String(count); badge.style.display = ''; }
+  else { badge.style.display = 'none'; }
+}
+
+// Live bot-scan progress line, injected at the top of the Bets tab body while a
+// scan runs. No-ops gracefully when the Bets tab isn't open; call with a falsy
+// message to clear it when the scan finishes.
+function updateBotStatus(msg) {
+  try {
+    const host = document.getElementById('bets-body');
+    if (!host) return;
+    let el = document.getElementById('bot-scan-status');
+    if (!msg) { if (el) el.remove(); return; }
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'bot-scan-status';
+      el.style.cssText = 'margin:8px 0;padding:8px 12px;border:1px solid var(--border,#2a2a2a);border-radius:6px;background:var(--panel,#111);color:var(--ink-muted,#9aa);font-family:var(--mono,monospace);font-size:11px;display:flex;align-items:center;gap:8px;';
+      host.insertBefore(el, host.firstChild);
+    }
+    el.innerHTML = '<span style="color:var(--amber,#fb0)">&#9679;</span> Bot &middot; ' + String(msg);
+  } catch {}
+}
+
 // Format relative time: "5m ago", "2h ago", "3d ago", "in 2h", "in 3d"
 function fmtRelativeTime(iso) {
   if (!iso) return '';
@@ -50239,8 +50284,8 @@ async function handleHomeImportFile(file, logEl) {
       }
       // Bot training data (TRAPP2-BOT).
       if (parsed && (String(parsed.schema || '').indexOf('valuatio-bot') === 0 || (parsed.bankroll != null && parsed.learnedWeights))) {
-        if (typeof applyBotTrainingData === 'function') {
-          applyBotTrainingData(parsed);
+        if (typeof _mergeBotTrainingData === 'function') {
+          _mergeBotTrainingData(parsed, file.name);
           append(`Imported bot training data from <strong>${escapeHtml(file.name)}</strong>`, 'ok');
           try { if (typeof renderBetsTab === 'function' && state.tab === 'bets') renderBetsTab(); } catch {}
           return;
@@ -50847,7 +50892,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if (typeof state !== 'undefined' && state.news) { state.news.items = []; state.news.lastFetch = 0; }
     renderStorageStats();
-    if (typeof renderNews === 'function') { try { renderNews(); } catch {} }
+    if (typeof renderNewsFeed === 'function') { try { renderNewsFeed(); } catch {} }
     if (typeof flashStatus === 'function') flashStatus(`News cache cleared — freed ~${(freed / 1024 / 1024).toFixed(1)}MB`, 'success');
   });
   document.getElementById('home-clear-prices-btn')?.addEventListener('click', async () => {
@@ -50876,6 +50921,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // ---- Initial badge state + processing loop ----
   updateNotifBadge();
+  if (typeof updateReviewBadge === 'function') { try { updateReviewBadge(); } catch {} }
   processNotificationQueue();
   setInterval(processNotificationQueue, 60_000);    // every minute
 });
