@@ -2586,6 +2586,58 @@ if (typeof window !== 'undefined') window.loadRegimeCanonical = loadRegimeCanoni
 // ============================================================
 let _currentForecastStep = '1_step';
 
+let _regimeStreakCache = { key: null, val: null };
+
+// Count consecutive most-recent sessions whose regime matches `currentRegime`.
+// Source: dated regime rows in Supabase; falls back to raw regime_history.json.
+// Returns { sessions, since, latest } or null.
+async function analyticsSupabaseLoadRegimeStreak(currentRegime) {
+  if (!currentRegime) return null;
+  let series = null;
+  if (typeof analyticsSupabaseConfigured === 'function' && analyticsSupabaseConfigured()) {
+    const queries = [
+      '/rest/v1/regime_timeline?select=regime,snap_date&order=snap_date.desc&limit=500',
+      '/rest/v1/regime_snapshots?id=neq.current&select=regime,snap_date&order=snap_date.desc&limit=500',
+    ];
+    for (const q of queries) {
+      try {
+        const resp = await fetch(`${getAnalyticsSupabaseUrl()}${q}`, { headers: _analyticsSupabaseHeaders() });
+        if (!resp.ok) continue;
+        const rows = await resp.json();
+        if (Array.isArray(rows) && rows.length) {
+          const mapped = rows.map(x => ({ regime: x.regime, date: x.snap_date })).filter(x => x.regime && x.date);
+          if (mapped.length) { series = mapped; break; }
+        }
+      } catch {}
+    }
+  }
+  if (!series || !series.length) {
+    try {
+      const resp = await fetch(`${CANONICAL_REGIME_BASE}regime_history.json`, { cache: 'no-store' });
+      if (resp.ok) {
+        // The pipeline writes raw NaN/Infinity into nested signal notes, which is
+        // invalid JSON — sanitize before parsing so this fallback never throws.
+        const raw = await resp.text();
+        let hist = null;
+        try { hist = JSON.parse(raw); }
+        catch { try { hist = JSON.parse(raw.replace(/\bNaN\b/g, 'null').replace(/\b-?Infinity\b/g, 'null')); } catch {} }
+        if (Array.isArray(hist)) series = hist.map(x => ({ regime: x.regime, date: x.date })).filter(x => x.regime && x.date);
+      }
+    } catch {}
+  }
+  if (!series || !series.length) return null;
+  const seen = new Set(); const clean = [];
+  for (const x of series) { if (!seen.has(x.date)) { seen.add(x.date); clean.push(x); } }
+  clean.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+  let sessions = 0, since = null;
+  for (const x of clean) {
+    if (x.regime === currentRegime) { sessions++; since = x.date; }
+    else break;
+  }
+  if (!sessions) return null;
+  return { sessions, since, latest: clean[0].date };
+}
+
 function renderRegimeDashboard() {
   const r = state.marketRegime;
   const hero = document.getElementById('regime-hero');
@@ -2632,6 +2684,7 @@ function renderRegimeDashboard() {
         <div class="regime-hero-label">CURRENT MARKET REGIME · ${r.date || ''}</div>
         <div class="regime-hero-name" style="color:${info.color}">${info.label}</div>
         <div class="regime-hero-mood">${info.mood}</div>
+        <div class="regime-hero-mood" id="regime-streak" style="margin-top:5px;color:var(--ink-faint)"></div>
       </div>
       <div class="regime-hero-confidence">
         <div class="regime-hero-label">MODEL CONFIDENCE</div>
@@ -2643,6 +2696,30 @@ function renderRegimeDashboard() {
       </div>
     </div>
   `;
+
+  // Trend duration — how long the market has held THIS regime, counted from the
+  // dated regime rows in Supabase (regime_snapshots / regime_timeline), with raw
+  // regime_history.json as a fallback. Cached per (regime,date) so re-renders
+  // don't re-hit the network.
+  (async () => {
+    try {
+      if (!r.regime || !document.getElementById('regime-streak')) return;
+      const key = `${r.regime}|${r.date || ''}`;
+      let streak;
+      if (_regimeStreakCache.key === key) {
+        streak = _regimeStreakCache.val;
+      } else {
+        streak = await analyticsSupabaseLoadRegimeStreak(r.regime);
+        _regimeStreakCache = { key, val: streak };
+      }
+      const el = document.getElementById('regime-streak');
+      if (!el || !streak || !streak.sessions) return;
+      const wk = streak.sessions >= 10 ? ` \u00b7 \u2248 ${(streak.sessions / 5).toFixed(streak.sessions >= 25 ? 0 : 1)} weeks` : '';
+      let sinceTxt = streak.since;
+      try { sinceTxt = new Date(streak.since + 'T00:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }); } catch {}
+      el.innerHTML = `In this trend for <strong style="color:${info.color}">${streak.sessions}</strong> session${streak.sessions === 1 ? '' : 's'}${wk} \u00b7 since ${sinceTxt}`;
+    } catch {}
+  })();
 
   // Signal scores
   if (r.scores && scoresGrid) {
@@ -7432,6 +7509,9 @@ document.getElementById('github-connect-btn')?.addEventListener('click', () => {
   if (typeof setGitHubToken === 'function') setGitHubToken();
   const st = document.getElementById('github-status');
   if (st) st.textContent = (typeof hasGitHubToken === 'function' && hasGitHubToken()) ? '● token set' : '';
+});
+document.getElementById('github-repos-btn')?.addEventListener('click', () => {
+  if (typeof openGitHubReposModal === 'function') openGitHubReposModal();
 });
 document.getElementById('github-save-all-btn')?.addEventListener('click', async () => {
   const btn = document.getElementById('github-save-all-btn');
@@ -26530,8 +26610,8 @@ function wirePortfolioToolbar() {
     const orig = btn ? btn.textContent : '';
     if (btn) { btn.textContent = 'Saving…'; btn.disabled = true; }
     try {
-      if (typeof commitFileToRepo === 'function' && typeof buildPortfolioData === 'function') {
-        await commitFileToRepo('TRAPP2-PORT', 'data/portfolio_data.json', buildPortfolioData(), 'portfolio: app save');
+      if (typeof commitTarget === 'function') {
+        await commitTarget('portfolio', 'portfolio: app save');   // routes to the configured repo
       }
       // Also mirror to Supabase if configured.
       try { if (typeof portSupabaseSyncAll === 'function' && typeof portSupabaseConfigured === 'function' && portSupabaseConfigured()) await portSupabaseSyncAll(); } catch {}
@@ -27116,7 +27196,7 @@ function renderTransactionsLedger(content, summary, subTabs) {
   let totalCashFlow = 0;
   let totalCostBuys = 0;     // for computing total realized P/L %
   let totalProceedsSells = 0;
-  const totalRealizedPL = transactions.reduce((s, t) => s + (t.realizedPL || 0), 0);
+  const totalRealizedPL = transactions.reduce((s, t) => s + ((t.realizedPL != null && isFinite(t.realizedPL)) ? t.realizedPL : (t.type === 'sell' && t.entryPrice != null && t.qty ? (t.price - t.entryPrice) * t.qty - (t.fee || 0) : 0)), 0);
   const totalFees = transactions.reduce((s, t) => s + (t.fee || 0), 0);
 
   transactions.forEach(tx => {
@@ -27204,8 +27284,9 @@ function renderTransactionsLedger(content, summary, subTabs) {
     else if (tx.type === 'short') cashFlow = tx.qty * tx.price - (tx.fee || 0);
     else if (tx.type === 'sell')  cashFlow = tx.proceeds || (tx.qty * tx.price - (tx.fee || 0));
     const cashColor = cashFlow >= 0 ? 'var(--pos)' : 'var(--neg)';
-    const showPL = tx.type === 'sell' && tx.realizedPL != null;
-    const plColor = (tx.realizedPL || 0) >= 0 ? 'var(--pos)' : 'var(--neg)';
+    const _rpl = (tx.realizedPL != null && isFinite(tx.realizedPL)) ? tx.realizedPL : (tx.type === 'sell' && tx.entryPrice != null && tx.qty ? (tx.price - tx.entryPrice) * tx.qty * txMultiplier(tx) - (tx.fee || 0) : null);
+    const showPL = tx.type === 'sell' && _rpl != null;
+    const plColor = (_rpl || 0) >= 0 ? 'var(--pos)' : 'var(--neg)';
     const plPct = tx.realizedPLPct != null ? tx.realizedPLPct
                 : (tx.type === 'sell' && tx.entryPrice ? ((tx.price - tx.entryPrice) / tx.entryPrice) * 100 : null);
 
@@ -27235,7 +27316,7 @@ function renderTransactionsLedger(content, summary, subTabs) {
               <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));gap:14px;margin-bottom:10px">
                 <div><span style="color:var(--ink-faint);font-size:9px;letter-spacing:0.08em">COST BASIS</span><br><strong style="color:var(--ink)">${fmt$(tx.entryPrice)}</strong></div>
                 <div><span style="color:var(--ink-faint);font-size:9px;letter-spacing:0.08em">SELL PRICE</span><br><strong style="color:var(--ink)">${fmt$(tx.price)}</strong></div>
-                <div><span style="color:var(--ink-faint);font-size:9px;letter-spacing:0.08em">PROFIT / LOSS</span><br><strong style="color:${plColor}">${(tx.realizedPL || 0) >= 0 ? '+' : ''}${fmt$(tx.realizedPL || 0)}${plPct != null ? ` (${plPct >= 0 ? '+' : ''}${plPct.toFixed(2)}%)` : ''}</strong></div>
+                <div><span style="color:var(--ink-faint);font-size:9px;letter-spacing:0.08em">PROFIT / LOSS</span><br><strong style="color:${plColor}">${(_rpl || 0) >= 0 ? '+' : ''}${fmt$(_rpl || 0)}${plPct != null ? ` (${plPct >= 0 ? '+' : ''}${plPct.toFixed(2)}%)` : ''}</strong></div>
                 <div><span style="color:var(--ink-faint);font-size:9px;letter-spacing:0.08em">DATE PURCHASED</span><br><strong style="color:var(--ink-dim)">${tx.entryDate?.slice(0, 10) || '—'}</strong></div>
                 <div><span style="color:var(--ink-faint);font-size:9px;letter-spacing:0.08em">DATE SOLD</span><br><strong style="color:var(--ink-dim)">${(tx.soldDate || tx.ts).slice(0, 10)}</strong></div>
               </div>
@@ -27256,7 +27337,7 @@ function renderTransactionsLedger(content, summary, subTabs) {
         <td style="font-family:var(--mono);font-size:11px">${fmt$(tx.price || 0)}</td>
         <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${tx.fee ? fmt$(tx.fee) : '—'}</td>
         <td style="font-family:var(--mono);font-size:11px;color:${cashColor};font-weight:600">${cashFlow >= 0 ? '+' : ''}${fmt$(cashFlow)}</td>
-        <td style="font-family:var(--mono);font-size:11px;color:${showPL ? plColor : 'var(--ink-faint)'};font-weight:${showPL ? '600' : '400'}">${showPL ? ((tx.realizedPL || 0) >= 0 ? '+' : '') + fmt$(tx.realizedPL || 0) : '—'}</td>
+        <td style="font-family:var(--mono);font-size:11px;color:${showPL ? plColor : 'var(--ink-faint)'};font-weight:${showPL ? '600' : '400'}">${showPL ? ((_rpl || 0) >= 0 ? '+' : '') + fmt$(_rpl || 0) : '—'}</td>
         <td style="font-family:var(--mono);font-size:11px;color:${showUPL ? uplColor : 'var(--ink-faint)'};font-weight:${showUPL ? '600' : '400'}" title="${showUPL ? `Mark-to-market vs entry @ ${fmt$(tx.price)} · live ${fmt$(sbPriceFor(tx.ticker))}${txMultiplier(tx) > 1 ? ` · ${txMultiplier(tx)}× contract` : ''}` : 'No live price · or position already closed'}">${showUPL ? ((unrealizedPL || 0) >= 0 ? '+' : '') + fmt$(unrealizedPL) : '—'}</td>
         <td style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)">${tx.entryPrice != null && tx.type === 'sell' ? fmt$(tx.entryPrice) + ' @ ' + (tx.entryDate?.slice(0,10) || '—') : '—'}</td>
       </tr>
@@ -41468,87 +41549,231 @@ const XTRAPP_FILE_EDIT = 'https://github.com/GoodGlobeLLC/XTRAPP/edit/main/data/
 function getGitHubToken() { return localStorage.getItem(GH_TOKEN_KEY) || ''; }
 function hasGitHubToken() { return !!getGitHubToken(); }
 
-// owner/repo/path → the Contents API + web-edit URLs.
-function _ghUrls(repo, path) {
+// ============================================================
+//   MULTI-REPO REGISTRY — route each data type to its own repo
+//
+//   Each writable data type (portfolio / theses / bot journal / social) commits
+//   to its OWN repo. The registry lets the user point every one at THEIR repo
+//   (owner + name + branch + path), toggle which ones "Save Everything" pushes,
+//   and test the connection. Defaults reproduce the original GoodGlobeLLC layout,
+//   so nothing changes until the user edits it. One fine-grained token with
+//   Contents:read&write on these repos covers them all.
+// ============================================================
+const GH_REPOS_KEY = 'valuatio.github.repos.v1';
+const GH_DEFAULT_OWNER = 'GoodGlobeLLC';
+const GH_DEFAULT_BRANCH = 'main';
+
+// Canonical writable destinations: stable key + builder + DEFAULT target.
+const GH_DATA_TARGETS = [
+  { key: 'portfolio',   label: 'Portfolio',          builder: 'buildPortfolioData',   repo: 'TRAPP2-PORT', path: 'data/portfolio_data.json',    def: true },
+  { key: 'probability', label: 'Probability theses', builder: 'buildProbabilityData', repo: 'TRAPP2-PORT', path: 'data/probability_data.json',  def: true },
+  { key: 'bot',         label: 'Bot journal',        builder: 'buildBotTrainingData', repo: 'TRAPP2-BOT',  path: 'data/bot_training_data.json', def: true },
+  { key: 'xtrapp',      label: 'Social / XTRAPP',    builder: '_buildXtrappPayload',  repo: 'XTRAPP',      path: 'data/xtrapp_data.json',       def: true },
+];
+
+// Saved map merged over defaults → [{key,label,builder,enabled,owner,repo,branch,path}].
+function getGitHubTargets() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(GH_REPOS_KEY) || '{}') || {}; } catch {}
+  return GH_DATA_TARGETS.map(t => {
+    const s = saved[t.key] || {};
+    return {
+      key: t.key, label: t.label, builder: t.builder,
+      enabled: s.enabled != null ? !!s.enabled : t.def,
+      owner: (s.owner || GH_DEFAULT_OWNER).trim(),
+      repo: (s.repo || t.repo).trim(),
+      branch: (s.branch || GH_DEFAULT_BRANCH).trim(),
+      path: (s.path || t.path).trim(),
+    };
+  });
+}
+function _ghTarget(key) { return getGitHubTargets().find(t => t.key === key) || null; }
+function setGitHubTargets(map) { try { localStorage.setItem(GH_REPOS_KEY, JSON.stringify(map)); } catch {} }
+if (typeof window !== 'undefined') { window.getGitHubTargets = getGitHubTargets; window.openGitHubReposModal = openGitHubReposModal; }
+
+// owner/repo/branch/path → the Contents API + web-edit URLs.
+function _ghUrls(repo, path, owner, branch) {
+  owner = owner || GH_DEFAULT_OWNER; branch = branch || GH_DEFAULT_BRANCH;
   return {
-    api: `https://api.github.com/repos/GoodGlobeLLC/${repo}/contents/${path}`,
-    edit: `https://github.com/GoodGlobeLLC/${repo}/edit/main/${path}`,
+    api: `https://api.github.com/repos/${owner}/${repo}/contents/${path}`,
+    edit: `https://github.com/${owner}/${repo}/edit/${branch}/${path}`,
   };
 }
 
-// Commit `obj` (stringified pretty) to GoodGlobeLLC/<repo>/<path>. Returns true on
-// a real push, false if it fell back to clipboard/editor.
-async function commitFileToRepo(repo, path, obj, message) {
+// Core committer — PUTs `obj` to owner/repo@branch:path via the Contents API.
+// Returns true on a real push, false if it fell back to clipboard + web editor.
+async function _ghCommit(target, obj, message) {
   const json = (typeof obj === 'string') ? obj : JSON.stringify(obj, null, 2);
-  const { api, edit } = _ghUrls(repo, path);
+  const { api, edit } = _ghUrls(target.repo, target.path, target.owner, target.branch);
+  const dest = `${target.owner}/${target.repo}`;
   const token = getGitHubToken();
   if (!token) {
     try { await navigator.clipboard.writeText(json); } catch {}
     window.open(edit, '_blank', 'noopener');
-    if (typeof flashStatus === 'function') flashStatus(`No GitHub token — JSON copied, ${repo} editor opened. Paste + Commit. (Set a token once via "Connect GitHub" for one-tap saves.)`, 'success');
+    if (typeof flashStatus === 'function') flashStatus(`No GitHub token — JSON copied, ${dest} editor opened. Paste + Commit. (Connect GitHub once for one-tap saves.)`, 'success');
     return false;
   }
   try {
-    if (typeof flashStatus === 'function') flashStatus(`Saving to ${repo}…`, 'success');
+    if (typeof flashStatus === 'function') flashStatus(`Saving to ${dest}…`, 'success');
     const headers = { Authorization: 'Bearer ' + token, Accept: 'application/vnd.github+json' };
     let sha;
-    const cur = await fetch(api, { headers });
+    const cur = await fetch(`${api}?ref=${encodeURIComponent(target.branch)}`, { headers });
     if (cur.ok) sha = (await cur.json()).sha;
     else if (cur.status !== 404) throw new Error('read HTTP ' + cur.status);
     const b64 = btoa(unescape(encodeURIComponent(json)));
     const put = await fetch(api, {
       method: 'PUT', headers,
-      body: JSON.stringify({ message: message || `${repo}: app save ${new Date().toISOString()}`, content: b64, ...(sha ? { sha } : {}) }),
+      body: JSON.stringify({ message: message || `${target.repo}: app save ${new Date().toISOString()}`, content: b64, branch: target.branch, ...(sha ? { sha } : {}) }),
     });
     if (!put.ok) { const e = await put.json().catch(() => ({})); throw new Error('HTTP ' + put.status + (e.message ? ' — ' + e.message : '')); }
-    if (typeof flashStatus === 'function') flashStatus(`✓ Saved to ${repo}/${path.split('/').pop()}`, 'success');
+    if (typeof flashStatus === 'function') flashStatus(`✓ Saved to ${dest}/${target.path.split('/').pop()}`, 'success');
     return true;
   } catch (e) {
-    console.error('[gh-commit]', repo, e);
-    if (typeof flashStatus === 'function') flashStatus(`Save to ${repo} failed (${e.message}) — copied to clipboard, opening editor`, 'error');
+    console.error('[gh-commit]', dest, e);
+    if (typeof flashStatus === 'function') flashStatus(`Save to ${dest} failed (${e.message}) — copied to clipboard, opening editor`, 'error');
     try { await navigator.clipboard.writeText(json); } catch {}
     window.open(edit, '_blank', 'noopener');
     return false;
   }
 }
-if (typeof window !== 'undefined') {
-  window.commitFileToRepo = commitFileToRepo;
-  window.getGitHubToken = getGitHubToken;
-  window.hasGitHubToken = hasGitHubToken;
+
+// Build a data type's JSON via its builder and commit to its configured repo.
+async function commitTarget(key, message) {
+  const t = _ghTarget(key);
+  if (!t) { console.warn('[gh] unknown target', key); return false; }
+  const fn = (typeof window !== 'undefined') ? window[t.builder] : undefined;
+  const builder = (typeof fn === 'function') ? fn : (typeof globalThis !== 'undefined' ? globalThis[t.builder] : null);
+  if (typeof builder !== 'function') { console.warn('[gh] no builder', t.builder); return false; }
+  let data;
+  try { data = builder(); } catch (e) { console.warn('[gh] builder failed', t.builder, e); return false; }
+  if (data == null) return false;
+  return _ghCommit(t, data, message || `${t.key}: app save`);
 }
 
-// One-tap "save everything to its repo" — portfolio→PORT, theses→PORT, bot→BOT.
-// Also pushes to Supabase if configured, so a single tap fans out everywhere.
+// Back-compat: commit an arbitrary object to <repo>/<path>. Resolves owner/branch
+// from the registry by repo-name match (defaults to GoodGlobeLLC/main).
+async function commitFileToRepo(repo, path, obj, message) {
+  const m = getGitHubTargets().find(t => t.repo.toLowerCase() === String(repo).toLowerCase());
+  return _ghCommit({ owner: m ? m.owner : GH_DEFAULT_OWNER, repo, branch: m ? m.branch : GH_DEFAULT_BRANCH, path }, obj, message);
+}
+
+// Verify the token can reach (and ideally write) a target's repo.
+async function _ghTestTarget(t) {
+  const token = getGitHubToken();
+  if (!token) return { ok: false, msg: 'no token' };
+  if (!t.owner || !t.repo) return { ok: false, msg: 'owner/repo blank' };
+  try {
+    const r = await fetch(`https://api.github.com/repos/${t.owner}/${t.repo}`, { headers: { Authorization: 'Bearer ' + token, Accept: 'application/vnd.github+json' } });
+    if (r.status === 404) return { ok: false, msg: 'not found / no access' };
+    if (r.status === 401 || r.status === 403) return { ok: false, msg: 'token lacks access' };
+    if (!r.ok) return { ok: false, msg: 'HTTP ' + r.status };
+    const j = await r.json();
+    const canWrite = j.permissions ? !!(j.permissions.push || j.permissions.admin) : null;
+    return { ok: true, write: canWrite, msg: canWrite === false ? 'read-only (needs Contents:write)' : 'connected' };
+  } catch (e) { return { ok: false, msg: e.message }; }
+}
+if (typeof window !== 'undefined') { window.commitFileToRepo = commitFileToRepo; window.commitTarget = commitTarget; window.getGitHubToken = getGitHubToken; window.hasGitHubToken = hasGitHubToken; }
+
+function _ensureGhReposCSS() {
+  if (document.getElementById('gh-repos-css')) return;
+  const st = document.createElement('style'); st.id = 'gh-repos-css';
+  st.textContent = '.gh-f{display:flex;flex-direction:column;gap:2px}.gh-f>span{font-family:var(--mono);font-size:9px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-faint)}.gh-f input{font-family:var(--mono);font-size:11px;padding:5px 7px;background:var(--bg);border:1px solid var(--rule);border-radius:5px;color:var(--ink);width:100%;box-sizing:border-box}.gh-f input:focus{outline:none;border-color:var(--amber)}';
+  (document.head || document.documentElement).appendChild(st);
+}
+
+// The repo-mapping manager modal.
+function openGitHubReposModal() {
+  _ensureGhReposCSS();
+  document.getElementById('gh-repos-modal')?.remove();
+  const targets = getGitHubTargets();
+  const esc = (v) => String(v == null ? '' : v).replace(/"/g, '&quot;');
+  const rows = targets.map(t => `
+    <div class="modal-section" style="border:1px solid var(--rule);border-radius:8px;padding:12px;margin-bottom:10px" data-key="${t.key}">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px">
+        <label style="display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12px;font-weight:700;cursor:pointer">
+          <input type="checkbox" class="gh-en" ${t.enabled ? 'checked' : ''}> ${t.label}
+        </label>
+        <span class="gh-test-status" style="font-family:var(--mono);font-size:10px;color:var(--ink-faint)"></span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+        <label class="gh-f"><span>Owner</span><input class="gh-owner" value="${esc(t.owner)}" placeholder="user-or-org"></label>
+        <label class="gh-f"><span>Repo</span><input class="gh-repo" value="${esc(t.repo)}" placeholder="repo-name"></label>
+        <label class="gh-f"><span>Branch</span><input class="gh-branch" value="${esc(t.branch)}"></label>
+        <label class="gh-f"><span>File path</span><input class="gh-path" value="${esc(t.path)}"></label>
+      </div>
+      <div style="display:flex;justify-content:flex-end;margin-top:8px">
+        <button class="btn btn-ghost gh-test-one" style="font-size:10px;padding:3px 10px">Test connection</button>
+      </div>
+    </div>`).join('');
+  const html = `
+    <div class="modal-backdrop" id="gh-repos-modal" style="display:flex" onclick="if(event.target.id==='gh-repos-modal')this.remove()">
+      <div class="modal-box" style="max-width:640px">
+        <div class="modal-head">
+          <div class="modal-title">GitHub repos — route data to the right repo</div>
+          <button class="modal-close" onclick="document.getElementById('gh-repos-modal').remove()">×</button>
+        </div>
+        <div class="modal-help" style="margin:0 0 12px">Each data type commits to its own repo. Point them at YOUR repos (owner + name + branch), toggle which ones <strong>Save Everything</strong> pushes, and test that your token can write. One fine-grained token with Contents:read&amp;write across these repos covers them all.</div>
+        <div id="gh-repos-rows">${rows}</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px">
+          <button class="btn" id="gh-repos-save">Save mapping</button>
+          <button class="btn btn-ghost" id="gh-repos-testall">Test all</button>
+          <button class="btn btn-ghost" id="gh-repos-reset" title="Restore GoodGlobeLLC defaults">Reset defaults</button>
+          <span id="gh-repos-msg" style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);align-self:center"></span>
+        </div>
+      </div>
+    </div>`;
+  document.body.insertAdjacentHTML('beforeend', html);
+  const modal = document.getElementById('gh-repos-modal');
+  const readRow = (row) => ({
+    key: row.getAttribute('data-key'),
+    enabled: row.querySelector('.gh-en').checked,
+    owner: row.querySelector('.gh-owner').value.trim(),
+    repo: row.querySelector('.gh-repo').value.trim(),
+    branch: row.querySelector('.gh-branch').value.trim() || 'main',
+    path: row.querySelector('.gh-path').value.trim(),
+  });
+  const setMsg = (txt, good) => { const m = modal.querySelector('#gh-repos-msg'); if (m) { m.textContent = txt; m.style.color = good ? 'var(--pos)' : 'var(--neg)'; } };
+  modal.querySelector('#gh-repos-save').addEventListener('click', () => {
+    const map = {};
+    modal.querySelectorAll('[data-key]').forEach(row => { const r = readRow(row); map[r.key] = { enabled: r.enabled, owner: r.owner, repo: r.repo, branch: r.branch, path: r.path }; });
+    setGitHubTargets(map);
+    setMsg('✓ saved', true);
+    if (typeof flashStatus === 'function') flashStatus('Repo mapping saved', 'success');
+  });
+  modal.querySelector('#gh-repos-reset').addEventListener('click', () => { try { localStorage.removeItem(GH_REPOS_KEY); } catch {} modal.remove(); openGitHubReposModal(); });
+  const testRow = async (row) => {
+    const st = row.querySelector('.gh-test-status'); const r = readRow(row);
+    if (st) { st.textContent = 'testing…'; st.style.color = 'var(--ink-faint)'; }
+    const res = await _ghTestTarget(r);
+    if (st) { st.textContent = (res.ok ? '● ' : '✕ ') + res.msg; st.style.color = res.ok ? (res.write === false ? 'var(--data-amber)' : 'var(--pos)') : 'var(--neg)'; }
+    return res.ok;
+  };
+  modal.querySelectorAll('.gh-test-one').forEach(btn => btn.addEventListener('click', () => testRow(btn.closest('[data-key]'))));
+  modal.querySelector('#gh-repos-testall').addEventListener('click', async () => {
+    if (!hasGitHubToken()) { setMsg('connect a token first (Connect GitHub)', false); return; }
+    setMsg('testing all…', true);
+    let ok = 0, tot = 0;
+    for (const row of modal.querySelectorAll('[data-key]')) { tot++; if (await testRow(row)) ok++; }
+    setMsg(`${ok}/${tot} reachable`, ok === tot);
+  });
+}
+if (typeof window !== 'undefined') window.openGitHubReposModal = openGitHubReposModal;
+
+// One-tap "save everything to its repo" — iterates the ENABLED registry targets,
+// building each data type and committing it to its configured repo, then fans out
+// to Supabase. Right data → right repo, entirely driven by the mapping above.
 async function saveAllToReposAndSupabase() {
+  const targets = getGitHubTargets().filter(t => t.enabled);
   let ok = 0, total = 0;
-  // Portfolio → PORT/portfolio_data.json
-  try {
-    if (typeof buildPortfolioData === 'function') {
-      total++;
-      if (await commitFileToRepo('TRAPP2-PORT', 'data/portfolio_data.json', buildPortfolioData(), 'portfolio: app save')) ok++;
-    }
-  } catch (e) { console.warn(e); }
-  // Theses → PORT/probability_data.json
-  try {
-    if (typeof buildProbabilityData === 'function') {
-      total++;
-      if (await commitFileToRepo('TRAPP2-PORT', 'data/probability_data.json', buildProbabilityData(), 'theses: app save')) ok++;
-    }
-  } catch (e) { console.warn(e); }
-  // Bot → BOT/bot_training_data.json
-  try {
-    if (typeof buildBotTrainingData === 'function') {
-      total++;
-      if (await commitFileToRepo('TRAPP2-BOT', 'data/bot_training_data.json', buildBotTrainingData(), 'bot: app save')) ok++;
-    }
-  } catch (e) { console.warn(e); }
-  // Supabase fan-out (best-effort).
+  for (const t of targets) {
+    total++;
+    try { if (await commitTarget(t.key, `${t.key}: app save`)) ok++; }
+    catch (e) { console.warn('[gh] save', t.key, e); }
+  }
   try { if (typeof supabaseSyncAllTrades === 'function' && typeof supabaseConfigured === 'function' && supabaseConfigured()) await supabaseSyncAllTrades(); } catch {}
   try { if (typeof portSupabaseSyncAll === 'function' && typeof portSupabaseConfigured === 'function' && portSupabaseConfigured()) await portSupabaseSyncAll(); } catch {}
   try { if (typeof analyticsSupabasePushAll === 'function' && typeof analyticsSupabaseConfigured === 'function' && analyticsSupabaseConfigured()) await analyticsSupabasePushAll(); } catch {}
-  if (typeof flashStatus === 'function') {
-    if (hasGitHubToken()) flashStatus(`Saved ${ok}/${total} repo files${ok < total ? ' (some failed — see console)' : ''} + Supabase`, ok === total ? 'success' : 'error');
-  }
+  if (typeof flashStatus === 'function' && hasGitHubToken()) flashStatus(`Saved ${ok}/${total} repo files${ok < total ? ' (some failed — see console)' : ''} + Supabase`, ok === total ? 'success' : 'error');
   return ok;
 }
 if (typeof window !== 'undefined') window.saveAllToReposAndSupabase = saveAllToReposAndSupabase;
@@ -46473,46 +46698,57 @@ function _wireBotEquityHover() {
     const wrap = document.getElementById('bot-eq-chart-wrap');
     if (!wrap || wrap._hoverWired) return;
     const svg = wrap.querySelector('svg');
-    const tip = document.getElementById('bot-eq-tip');
-    const cross = document.getElementById('bot-eq-cross');
+    const crossV = document.getElementById('bot-eq-cross');
+    const crossH = document.getElementById('bot-eq-crossh');
     const dot = document.getElementById('bot-eq-hover-dot');
-    if (!svg || !tip) return;
+    const pillY = document.getElementById('bot-eq-pill-y');
+    const pillX = document.getElementById('bot-eq-pill-x');
+    const readout = document.getElementById('bot-eq-readout');
+    const card = wrap.closest('.bot-chart');
+    if (!svg) return;
     let pts = [];
     try { pts = JSON.parse(wrap.getAttribute('data-points') || '[]'); } catch {}
     if (!pts.length) return;
-    const W = +wrap.getAttribute('data-w') || 600;
-    const H = +wrap.getAttribute('data-h') || 170;
+    const W = +wrap.getAttribute('data-w') || 1000;
+    const H = +wrap.getAttribute('data-h') || 320;
     const lo = +wrap.getAttribute('data-lo');
     const hi = +wrap.getAttribute('data-hi');
     const basisRaw = wrap.getAttribute('data-basis');
     const basis = basisRaw ? +basisRaw : null;
     const xAt = (i) => pts.length > 1 ? (i / (pts.length - 1)) * W : W / 2;
     const yAt = (v) => H - ((v - lo) / ((hi - lo) || 1)) * H;
+    const fmtK = (v) => Math.abs(v) >= 1000 ? '$' + (v / 1000).toFixed(2) + 'k' : '$' + v.toFixed(0);
     const move = (ev) => {
       const r = svg.getBoundingClientRect();
       const clientX = ev.touches ? ev.touches[0].clientX : ev.clientX;
-      let fx = (clientX - r.left) / r.width;
-      if (fx < 0) fx = 0; if (fx > 1) fx = 1;
+      let fx = (clientX - r.left) / (r.width || 1);
+      fx = Math.max(0, Math.min(1, fx));
       let idx = Math.round(fx * (pts.length - 1));
-      if (idx < 0) idx = 0; if (idx >= pts.length) idx = pts.length - 1;
+      idx = Math.max(0, Math.min(pts.length - 1, idx));
       const p = pts[idx];
       const vbX = xAt(idx), vbY = yAt(p.v);
-      if (cross) { cross.setAttribute('x1', vbX); cross.setAttribute('x2', vbX); cross.setAttribute('opacity', '0.5'); }
-      if (dot) { dot.setAttribute('cx', vbX); dot.setAttribute('cy', vbY); dot.setAttribute('opacity', '1'); }
-      const pxX = (vbX / W) * r.width, pxY = (vbY / H) * r.height;
-      const chg = basis != null ? ((p.v - basis) / basis * 100) : null;
-      const prev = pts[0].v;
-      const since = prev ? ((p.v - prev) / prev * 100) : 0;
-      tip.innerHTML = `<div style="color:var(--ink-faint);font-size:9px">${p.d}</div>` +
-        `<div style="font-weight:700;color:var(--ink)">$${p.v.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>` +
-        (chg != null ? `<div style="font-size:9px;color:${chg >= 0 ? 'var(--pos)' : 'var(--neg)'}">${chg >= 0 ? '+' : ''}${chg.toFixed(1)}% vs basis</div>` : '') +
-        `<div style="font-size:9px;color:${since >= 0 ? 'var(--pos)' : 'var(--neg)'}">${since >= 0 ? '+' : ''}${since.toFixed(1)}% window</div>`;
-      // Keep the tip inside the chart horizontally.
-      tip.style.left = Math.max(28, Math.min(r.width - 28, pxX)) + 'px';
-      tip.style.top = Math.max(8, pxY) + 'px';
-      tip.style.opacity = '1';
+      const xPct = (vbX / W * 100), yPct = (vbY / H * 100);
+      if (crossV) { crossV.setAttribute('x1', vbX); crossV.setAttribute('x2', vbX); crossV.setAttribute('opacity', '0.55'); }
+      if (crossH) { crossH.setAttribute('y1', vbY); crossH.setAttribute('y2', vbY); crossH.setAttribute('opacity', '0.4'); }
+      if (dot) { dot.style.left = xPct + '%'; dot.style.top = yPct + '%'; dot.style.opacity = '1'; }
+      if (pillY) { pillY.style.top = yPct + '%'; pillY.textContent = fmtK(p.v); pillY.style.opacity = '1'; }
+      if (pillX) { pillX.style.left = xPct + '%'; const pr = String(p.d).split('-'); pillX.textContent = p.t ? String(p.t).slice(11, 16) : (pr.length === 3 ? `${+pr[1]}/${+pr[2]}` : p.d); pillX.style.opacity = '1'; }
+      const sinceBasis = basis ? ((p.v - basis) / basis * 100) : null;
+      const sinceStart = pts[0].v ? ((p.v - pts[0].v) / pts[0].v * 100) : 0;
+      if (readout) readout.innerHTML =
+        `<span style="color:var(--ink-dim)">${p.t ? p.d + ' ' + String(p.t).slice(11, 16) : p.d}</span> \u00b7 <strong style="color:var(--ink)">$${p.v.toLocaleString(undefined, { maximumFractionDigits: 0 })}</strong>` +
+        ` \u00b7 <span style="color:${sinceStart >= 0 ? 'var(--pos)' : 'var(--neg)'}">${sinceStart >= 0 ? '+' : ''}${sinceStart.toFixed(1)}% window</span>` +
+        (sinceBasis != null ? ` \u00b7 <span style="color:${sinceBasis >= 0 ? 'var(--pos)' : 'var(--neg)'}">${sinceBasis >= 0 ? '+' : ''}${sinceBasis.toFixed(1)}% vs basis</span>` : '');
+      if (card) card.classList.add('is-hovering');
     };
-    const leave = () => { tip.style.opacity = '0'; if (cross) cross.setAttribute('opacity', '0'); if (dot) dot.setAttribute('opacity', '0'); };
+    const leave = () => {
+      if (crossV) crossV.setAttribute('opacity', '0');
+      if (crossH) crossH.setAttribute('opacity', '0');
+      if (dot) dot.style.opacity = '0';
+      if (pillY) pillY.style.opacity = '0';
+      if (pillX) pillX.style.opacity = '0';
+      if (card) card.classList.remove('is-hovering');
+    };
     wrap.addEventListener('mousemove', move);
     wrap.addEventListener('mouseleave', leave);
     wrap.addEventListener('touchstart', move, { passive: true });
@@ -46564,6 +46800,120 @@ async function botRefreshLiveQuotes() {
 if (typeof window !== 'undefined') window.botRefreshLiveQuotes = botRefreshLiveQuotes;
 
 // ---- Aggregate performance (optionally filtered to one ticker) ----
+// Live price for a bot ticker: fresh quote cache first, then the stockbook row.
+function _botPriceOf(tic) {
+  if (!tic) return null;
+  const t = String(tic).toUpperCase();
+  const lq = _botQuoteCache[t];
+  if (lq && lq.live && isFinite(lq.price)) return Number(lq.price);
+  const row = (typeof getStockbookRow === 'function') ? getStockbookRow(t) : null;
+  if (row && row.price != null && isFinite(row.price)) return Number(row.price);
+  return null;
+}
+
+// ============================================================
+//   PER-TICKER POSITION ACCOUNTING — the bot's true book.
+//   Every bet is exploded into its real transactions and replayed per ticker on
+//   a running AVERAGE COST:
+//     buy into a flat book  = BUY  (opens the position)
+//     buy into an open book = ADD  (raises avg cost, stays OPEN)
+//     sell PART of the book = TRIM (realizes P/L on sold shares vs avg cost, stays OPEN)
+//     sell the WHOLE book   = SELL (position CLOSED)
+//   Realized P/L is booked on every trim/sell vs the running avg cost. Unrealized
+//   is open shares x (live - avg cost) x direction. Total realized = Σ over all
+//   sales; total unrealized = Σ over OPEN positions. Options / leveraged ETFs are
+//   non-linear, so each such bet stays standalone (its own pnl/realizedPL).
+// ============================================================
+function botTickerLedger(bets, priceOf) {
+  priceOf = priceOf || (() => null);
+  const num = (v) => { const n = Number(v); return isFinite(n) ? n : null; };
+  const isLinear = (b) => b.instrument !== 'option' && b.instrument !== 'leveraged_etf';
+  const books = {};
+  const push = (key, meta, txn) => { (books[key] = books[key] || Object.assign({ txns: [] }, meta)).txns.push(txn); };
+  for (const b of (bets || [])) {
+    if (!b || !b.ticker) continue;
+    const tic = String(b.ticker).toUpperCase();
+    const dir = b.direction === 'short' ? -1 : 1;
+    if (isLinear(b)) {
+      const key = `${tic}|${dir}|shares`;
+      const trims = Array.isArray(b.trims) ? b.trims : [];
+      const trimShares = trims.reduce((x, t) => x + (num(t.shares) || 0), 0);
+      const curShares = num(b.shares) || 0;
+      const origShares = +(curShares + trimShares).toFixed(6);
+      if (origShares > 0 && num(b.entryPrice) != null) push(key, { ticker: tic, dir, linear: true }, { betId: b.id, side: 'buy', date: b.entryDate, price: num(b.entryPrice), shares: origShares });
+      for (const t of trims) if ((num(t.shares) || 0) > 0 && num(t.price) != null) push(key, { ticker: tic, dir, linear: true }, { betId: b.id, side: 'sell', date: t.date || b.exitDate || b.entryDate, price: num(t.price), shares: num(t.shares) });
+      if (b.status === 'closed' && num(b.exitPrice) != null && curShares > 0) push(key, { ticker: tic, dir, linear: true }, { betId: b.id, side: 'sell', date: b.exitDate || b.entryDate, price: num(b.exitPrice), shares: curShares });
+    } else {
+      const key = `bet:${b.id}`;
+      const q = num(b.shares) || (num(b.optionContracts) || 1);
+      push(key, { ticker: tic, dir, linear: false, bet: b }, { betId: b.id, side: 'buy', date: b.entryDate, price: num(b.entryPrice), shares: q });
+      if (b.status === 'closed') push(key, { ticker: tic, dir, linear: false, bet: b }, { betId: b.id, side: 'sell', date: b.exitDate || b.entryDate, price: num(b.exitPrice), shares: q, _closeBet: b });
+    }
+  }
+  const legs = [];
+  const byTicker = {};
+  for (const key of Object.keys(books)) {
+    const bk = books[key];
+    const txns = bk.txns.slice().sort((a, b) => {
+      const da = a.date || '', db = b.date || '';
+      if (da !== db) return da < db ? -1 : 1;
+      return (a.side === 'buy' ? 0 : 1) - (b.side === 'buy' ? 0 : 1);
+    });
+    let shares = 0, avgCost = 0, realized = 0;
+    for (const t of txns) {
+      let label, pl = null, statusAfter;
+      if (t.side === 'buy') {
+        label = shares > 1e-6 ? 'ADD' : 'BUY';
+        const ns = +(shares + t.shares).toFixed(6);
+        avgCost = ns > 0 ? (shares * avgCost + t.shares * (t.price != null ? t.price : avgCost)) / ns : (t.price || 0);
+        shares = ns; statusAfter = 'open';
+      } else {
+        const sold = Math.min(t.shares, shares);
+        if (bk.linear) pl = (t.price != null) ? +(sold * (t.price - avgCost) * bk.dir).toFixed(2) : null;
+        else { const cb = t._closeBet; pl = cb ? ((cb.realizedPL != null && isFinite(cb.realizedPL)) ? cb.realizedPL : (isFinite(cb.pnl) ? cb.pnl : null)) : null; }
+        if (pl != null) realized += pl;
+        shares = +(shares - sold).toFixed(6);
+        const closed = shares <= 1e-6;
+        label = closed ? 'SELL' : 'TRIM';
+        statusAfter = closed ? 'closed' : 'open';
+      }
+      legs.push({ ticker: bk.ticker, dir: bk.dir, betId: t.betId, date: t.date, side: t.side, label, price: t.price, shares: t.shares, value: (t.price != null ? +(t.price * t.shares).toFixed(2) : null), pl, statusAfter });
+    }
+    const open = shares > 1e-6;
+    const live = open ? priceOf(bk.ticker) : null;
+    let unrealized = null;
+    if (open) {
+      if (bk.linear && live != null) {
+        // Guard against foreign-currency / bad-price marks (a >10x or <0.1x move vs
+        // cost is a data error, e.g. a KRW/JPY price on a USD entry) so one bad
+        // quote can't corrupt the book. US class shares (.A/.B/.C) are fine.
+        const _foreign = bk.ticker.indexOf('.') >= 0 && ['A','B','C'].indexOf(bk.ticker.split('.').pop().toUpperCase()) < 0;
+        const _ratio = avgCost > 0 ? (live / avgCost) : null;
+        if (!_foreign && _ratio != null && _ratio >= 0.1 && _ratio <= 10) unrealized = +(shares * (live - avgCost) * bk.dir).toFixed(2);
+      } else if (!bk.linear && bk.bet && isFinite(bk.bet.pnl)) unrealized = +Number(bk.bet.pnl).toFixed(2);
+    }
+    const agg = byTicker[bk.ticker] || (byTicker[bk.ticker] = { ticker: bk.ticker, shares: 0, dir: bk.dir, avgCost: 0, costBasis: 0, realized: 0, unrealized: 0, open: false, live: null, linear: bk.linear });
+    agg.realized += realized;
+    if (open) {
+      agg.open = true; agg.live = live; agg.dir = bk.dir; agg.linear = bk.linear;
+      const ns = agg.shares + shares;
+      agg.avgCost = ns > 0 ? (agg.avgCost * agg.shares + avgCost * shares) / ns : avgCost;
+      agg.shares = ns; agg.costBasis += avgCost * shares;
+      if (unrealized != null) agg.unrealized += unrealized;
+    }
+  }
+  const positions = Object.values(byTicker).map(p => ({
+    ticker: p.ticker, shares: +p.shares.toFixed(6), dir: p.dir, avgCost: +p.avgCost.toFixed(4),
+    costBasis: +p.costBasis.toFixed(2), realized: +p.realized.toFixed(2),
+    unrealized: p.open ? +p.unrealized.toFixed(2) : null, live: p.live,
+    status: p.open ? 'open' : 'closed', linear: p.linear,
+  }));
+  const totalRealized = +positions.reduce((x, p) => x + p.realized, 0).toFixed(2);
+  const totalUnrealized = +positions.reduce((x, p) => x + (p.unrealized || 0), 0).toFixed(2);
+  const openPositions = positions.filter(p => p.status === 'open').sort((a, b) => (b.unrealized || 0) - (a.unrealized || 0));
+  return { legs, positions, openPositions, totalRealized, totalUnrealized };
+}
+
 function botPerformance(filterTicker = null) {
   const bot = botMarkToMarket();
   let bets = bot.bets;
@@ -46571,14 +46921,21 @@ function botPerformance(filterTicker = null) {
 
   const closed = bets.filter(b => b.status === 'closed');
   const open = bets.filter(b => b.status === 'open');
-  // Closed bets: use the frozen shares-based realizedPL; fall back to pnl.
-  const _plOf = (b) => (b.realizedPL != null && isFinite(b.realizedPL)) ? b.realizedPL : (b.pnl || 0);
-  const wins = closed.filter(b => _plOf(b) > 0);
-  const losses = closed.filter(b => _plOf(b) < 0);
-  // Total P&L = realized (closed) + unrealized (open marks). Deposits/withdrawals
-  // are NOT bets, so they never enter here.
-  const realizedPnl = closed.reduce((s, b) => s + _plOf(b), 0);
-  const openPnl = open.reduce((s, b) => s + (b.pnl || 0), 0);
+  // Per-ticker average-cost book: realized on every trim/sell vs running avg cost,
+  // unrealized on open shares at live prices. Win rate is per CLOSED position.
+  const _acct = botTickerLedger(bets, _botPriceOf);
+  const _closedPos = _acct.positions.filter(p => p.status === 'closed' && p.realized !== 0);
+  const wins = _closedPos.filter(p => p.realized > 0);
+  const losses = _closedPos.filter(p => p.realized < 0);
+  // Realized is authoritative from the running bankroll (starting + everything the
+  // bot has ever booked), so it stands even if an OLD closed record lost its exit
+  // fields. Unrealized is the live per-ticker mark. Together the book value is
+  //   value = bankroll + unrealized = starting + realized + unrealized
+  // which is exactly what the 30-minute equity tape stores — so chart == ledger.
+  const _startBank = (bot.startingBankroll != null && isFinite(bot.startingBankroll)) ? bot.startingBankroll : BOT_STARTING_BANKROLL;
+  const _bankNow = (bot.bankroll != null && isFinite(bot.bankroll)) ? bot.bankroll : _startBank;
+  const realizedPnl = +(_bankNow - _startBank).toFixed(2);
+  const openPnl = _acct.totalUnrealized;
   const totalPnl = realizedPnl + openPnl;
   // Capital base for return %: starting bankroll PLUS any user cash injections,
   // so feeding the bot cash doesn't masquerade as a gain/loss.
@@ -46603,10 +46960,11 @@ function botPerformance(filterTicker = null) {
     closedCount: closed.length,
     winCount: wins.length,
     lossCount: losses.length,
-    winRate: closed.length ? +((wins.length / closed.length) * 100).toFixed(1) : null,
-    avgWin: wins.length ? +(wins.reduce((s, b) => s + b.pnl, 0) / wins.length).toFixed(2) : null,
-    avgLoss: losses.length ? +(losses.reduce((s, b) => s + b.pnl, 0) / losses.length).toFixed(2) : null,
+    winRate: (wins.length + losses.length) ? +((wins.length / (wins.length + losses.length)) * 100).toFixed(1) : null,
+    avgWin: wins.length ? +(wins.reduce((s, p) => s + p.realized, 0) / wins.length).toFixed(2) : null,
+    avgLoss: losses.length ? +(losses.reduce((s, p) => s + p.realized, 0) / losses.length).toFixed(2) : null,
     spyReturn: spyReturn != null ? +spyReturn.toFixed(2) : null,
+    _acct,
     // vs SPY = how much the bot is OUTPERFORMING the market, i.e. the DIFFERENCE
     // in returns. If the bot is +1.66% and SPY is −1.76%, the bot is +3.42%
     // ahead — that's the number that matters, not SPY's raw return. Positive =
@@ -46753,21 +47111,60 @@ function botReconstructEquityCurve(bot) {
   } catch { return []; }
 }
 
-function botWindowedPerformance() {
-  const bot = botMarkToMarket();
-  let curve = Array.isArray(bot.equityCurve) ? bot.equityCurve.slice() : [];
-  // Enrich the stored curve with a daily reconstruction from trade history so
-  // the chart and all time windows have enough points to be meaningful. The
-  // stored points (real recorded marks) take precedence on any shared date.
+let _botEquityTape = null; let _botEquityTapeAt = 0;
+const BOT_EQUITY_TAPE_URL = 'https://raw.githubusercontent.com/GoodGlobeLLC/TRAPP2-BOT/main/data/bot_equity_history.json';
+// Pull the backend's 30-minute equity tape (Robinhood-style intraday marks). Cached
+// for 5 min; re-render the Bets tab when fresh data lands.
+async function loadBotEquityTape(force) {
+  const nowMs = Date.now();
+  if (!force && _botEquityTape && (nowMs - _botEquityTapeAt) < 300000) return _botEquityTape;
   try {
-    const recon = botReconstructEquityCurve(bot);
-    if (recon.length) {
-      const byDate = new Map();
-      for (const p of recon) byDate.set(p.date, p);       // reconstructed base
-      for (const p of curve) byDate.set(p.date, p);        // real points override
-      curve = Array.from(byDate.values()).sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    const r = await fetch(BOT_EQUITY_TAPE_URL + '?t=' + Math.floor(nowMs / 300000), { cache: 'no-store' });
+    if (r.ok) {
+      const raw = await r.text();
+      let arr = null;
+      try { arr = JSON.parse(raw); } catch { try { arr = JSON.parse(raw.replace(/\bNaN\b/g, 'null')); } catch {} }
+      if (Array.isArray(arr)) {
+        _botEquityTape = arr.filter(p => p && p.t && isFinite(p.value)).map(p => ({ t: p.t, value: +p.value }));
+        _botEquityTapeAt = nowMs;
+        return _botEquityTape;
+      }
     }
   } catch {}
+  return _botEquityTape;
+}
+if (typeof window !== 'undefined') window.loadBotEquityTape = loadBotEquityTape;
+
+function botWindowedPerformance() {
+  const bot = botMarkToMarket();
+  // Prefer the backend's 30-minute equity tape (intraday marks, Robinhood-style).
+  const _tape = Array.isArray(_botEquityTape) ? _botEquityTape : null;
+  let curve, intraday = false;
+  if (_tape && _tape.length >= 2) {
+    intraday = true;
+    curve = _tape.map(p => ({ date: String(p.t).slice(0, 10), t: p.t, value: p.value }));
+  } else {
+    curve = Array.isArray(bot.equityCurve) ? bot.equityCurve.slice() : [];
+    try {
+      const recon = botReconstructEquityCurve(bot);
+      if (recon.length) {
+        const byDate = new Map();
+        for (const p of recon) byDate.set(p.date, p);
+        for (const p of curve) byDate.set(p.date, p);
+        curve = Array.from(byDate.values()).sort((a, b) => String(a.date).localeCompare(String(b.date)));
+      }
+    } catch {}
+  }
+  // Live "now" mark = bankroll + open unrealized (the same formula the tape stores),
+  // so the last point tracks live between backend snapshots.
+  const _openUnreal = (bot.bets || []).filter(b => b.status === 'open').reduce((s, b) => s + (isFinite(b.pnl) ? b.pnl : 0), 0);
+  const _liveVal = +(((isFinite(bot.bankroll) ? bot.bankroll : BOT_STARTING_BANKROLL)) + _openUnreal).toFixed(2);
+  if (curve.length && intraday) {
+    const nowIso = new Date().toISOString();
+    const lastT = curve[curve.length - 1].t;
+    if (lastT && (Date.now() - new Date(lastT).getTime()) > 60000) curve.push({ date: nowIso.slice(0, 10), t: nowIso, value: _liveVal, live: true });
+    else curve[curve.length - 1] = Object.assign({}, curve[curve.length - 1], { value: _liveVal, live: true });
+  }
   const now = curve.length ? curve[curve.length - 1].value : BOT_STARTING_BANKROLL;
   const today = new Date();
   const windows = {
@@ -46783,7 +47180,7 @@ function botWindowedPerformance() {
     // start, rather than a blank "—".
     let start = null;
     for (const p of curve) {
-      const t = new Date(p.date + 'T00:00:00Z').getTime();
+      const t = p.t ? new Date(p.t).getTime() : new Date(p.date + 'T00:00:00Z').getTime();
       if (t <= cutoffMs) start = p; else break;
     }
     if (!start && curve.length) start = curve[0];   // window older than all history → since-inception
@@ -46814,16 +47211,57 @@ function botWindowedPerformance() {
       };
     }
   }
-  return { curve, now, windows: out };
+  return { curve, now, windows: out, intraday };
 }
 if (typeof window !== 'undefined') window.botWindowedPerformance = botWindowedPerformance;
 
 // ============================================================
 //   BETS TAB RENDERER + TODAY'S-BETS TOP BANNER
 // ============================================================
+function _ensureBetsPolishCSS() {
+  if (document.getElementById("bets-polish-css")) return;
+  const st = document.createElement("style");
+  st.id = "bets-polish-css";
+  st.textContent = `#bets-body .bot-chart{background:var(--bg-elev);border:1px solid var(--rule);border-radius:12px;padding:16px 18px 12px;margin:0 0 20px}
+#bets-body .bot-chart__head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+#bets-body .bot-chart__title{font-family:var(--mono);font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-faint)}
+#bets-body .bot-chart__val{font-family:var(--mono);font-size:26px;font-weight:700;line-height:1.15;margin-top:3px;letter-spacing:-.01em}
+#bets-body .bot-chart__sub{font-family:var(--mono);font-size:11px;margin-top:3px;color:var(--ink-dim)}
+#bets-body .bot-chart__readout{font-family:var(--mono);font-size:10px;color:var(--ink-faint);min-height:13px;margin-top:3px;opacity:.5}
+#bets-body .bot-chart.is-hovering .bot-chart__readout{opacity:1}
+#bets-body .rng-tabs{display:inline-flex;background:rgba(0,0,0,.16);border:1px solid var(--rule);border-radius:9px;padding:2px;gap:2px}
+#bets-body .rng-tab{font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:.03em;color:var(--ink-dim);background:transparent;border:none;border-radius:7px;padding:5px 12px;cursor:pointer;transition:background .12s,color .12s}
+#bets-body .rng-tab:hover{color:var(--ink)}
+#bets-body .rng-tab.active{background:var(--amber);color:#000}
+#bets-body .bot-chart__plot{position:relative;height:300px;padding:0 56px 20px 0;touch-action:pan-y}
+#bets-body .bot-chart__svg{position:absolute;left:0;top:0;right:56px;bottom:20px;width:auto;height:auto;overflow:visible;cursor:crosshair}
+#bets-body .bot-chart__overlay{position:absolute;left:0;top:0;right:56px;bottom:20px;pointer-events:none}
+#bets-body .bot-chart__last{position:absolute;width:9px;height:9px;border-radius:50%;transform:translate(-50%,-50%);animation:botEqPulse 2.2s ease-out infinite}
+#bets-body .bot-chart__hoverdot{position:absolute;left:0;top:0;width:10px;height:10px;border-radius:50%;transform:translate(-50%,-50%);border:2px solid var(--bg-elev);opacity:0;transition:opacity .08s}
+@keyframes botEqPulse{0%{box-shadow:0 0 0 0 var(--pulse,rgba(91,138,114,.5))}70%{box-shadow:0 0 0 10px rgba(0,0,0,0)}100%{box-shadow:0 0 0 0 rgba(0,0,0,0)}}
+#bets-body .bot-chart__axis-y{position:absolute;right:0;top:0;bottom:20px;width:54px;pointer-events:none}
+#bets-body .bot-chart__axis-y>span{position:absolute;right:3px;transform:translateY(-50%);font-family:var(--mono);font-size:9px;color:var(--ink-faint);white-space:nowrap}
+#bets-body .bot-chart__axis-x{position:absolute;left:0;right:56px;bottom:0;height:16px;pointer-events:none}
+#bets-body .bot-chart__axis-x>span{position:absolute;font-family:var(--mono);font-size:9px;color:var(--ink-faint);white-space:nowrap}
+#bets-body .bot-chart__pill{position:absolute;font-family:var(--mono);font-size:9px;font-weight:700;padding:2px 5px;border-radius:3px;opacity:0;white-space:nowrap;z-index:4;transition:opacity .08s}
+#bets-body .bot-chart__pill--y{right:0;transform:translateY(-50%);color:#000}
+#bets-body .bot-chart__pill--x{bottom:-1px;transform:translateX(-50%);background:var(--ink);color:var(--bg-elev)}
+#bets-body .leg-badge{display:inline-block;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.06em;padding:1px 6px;border-radius:3px}
+#bets-body .leg-badge--buy{color:var(--pos);background:rgba(91,138,114,.16)}
+#bets-body .leg-badge--sell{color:var(--neg);background:rgba(165,100,90,.16)}
+#bets-body table.sb-table tbody tr{transition:background .1s}
+#bets-body table.sb-table tbody tr:hover{background:rgba(224,176,76,.06)}`;
+  (document.head || document.documentElement).appendChild(st);
+}
+
 function renderBetsTab() {
   const body = document.getElementById('bets-body');
   if (!body) return;
+  _ensureBetsPolishCSS();
+  if (typeof loadBotEquityTape === 'function' && !window._botTapeTried) {
+    window._botTapeTried = true;
+    loadBotEquityTape().then(t => { if (t && t.length && document.getElementById('bets-body')) renderBetsTab(); }).catch(() => {});
+  }
   // Make sure every bet has a stable id BEFORE we render — the receipt rows key
   // off data-bet-id, and a bet with no id makes "tap for receipt" a no-op. IDs
   // were previously only assigned during Supabase sync, so locally-created bets
@@ -46991,78 +47429,81 @@ function renderBetsTab() {
     const minV = Math.min(...vals), maxV = Math.max(...vals);
     const pad = (maxV - minV) * 0.10 || 1000;
     const lo = minV - pad, hi = maxV + pad;
-    const W = 600, H = 170, PADL = 0;
-    const x = (i) => pts.length > 1 ? (i / (pts.length - 1)) * W : 0;
-    const y = (v) => H - ((v - lo) / (hi - lo)) * H;
-    const linePath = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(p.value).toFixed(1)}`).join(' ');
-    const basisY = y(BOT_STARTING_BANKROLL);
-    const showBasis = BOT_STARTING_BANKROLL >= lo && BOT_STARTING_BANKROLL <= hi;
+    const W = 1000, H = 320;
+    const x = (i) => pts.length > 1 ? (i / (pts.length - 1)) * W : W / 2;
+    const y = (v) => H - ((v - lo) / ((hi - lo) || 1)) * H;
     const first = pts[0].value, lastV = pts[pts.length - 1].value;
     const up = lastV >= first;
     const lineColor = up ? 'var(--pos)' : 'var(--neg)';
-    const areaPath = linePath + ` L${W},${H} L0,${H} Z`;
+    const gA = up ? 'rgba(91,138,114,0.28)' : 'rgba(165,100,90,0.28)';
+    const gB = up ? 'rgba(91,138,114,0.03)' : 'rgba(165,100,90,0.03)';
+    const linePath = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(p.value).toFixed(1)}`).join(' ');
+    const areaPath = linePath + ` L${W.toFixed(1)},${H} L0,${H} Z`;
     const winData = wp.windows[activeWin];
     const winPct = winData?.returnPct;
     const winColor = winPct == null ? 'var(--ink-dim)' : winPct >= 0 ? 'var(--pos)' : 'var(--neg)';
-    // Horizontal gridlines with $ labels (like the Valuation chart) — 4 evenly
-    // spaced levels across the value range.
+    const showBasis = BOT_STARTING_BANKROLL >= lo && BOT_STARTING_BANKROLL <= hi;
+    const basisY = y(BOT_STARTING_BANKROLL);
     const _fmtK = (v) => Math.abs(v) >= 1000 ? '$' + (v / 1000).toFixed(1) + 'k' : '$' + v.toFixed(0);
+    // Horizontal grid lines (SVG) + right-side price axis labels (HTML overlay so
+    // the text never distorts under the stretched, edge-to-edge plot).
     const gridN = 4;
-    let gridHtml = '';
+    let gridSvg = '', yAxis = '';
     for (let g = 0; g <= gridN; g++) {
-      const gv = lo + (hi - lo) * (g / gridN);
-      const gy = y(gv).toFixed(1);
-      gridHtml += `<line x1="0" y1="${gy}" x2="${W}" y2="${gy}" stroke="var(--rule)" stroke-width="0.5" opacity="0.35"/>
-        <text x="2" y="${(parseFloat(gy) - 2).toFixed(1)}" font-family="monospace" font-size="8" fill="var(--ink-faint)" opacity="0.6">${_fmtK(gv)}</text>`;
+      const gv = hi - (hi - lo) * (g / gridN);
+      const gy = y(gv);
+      gridSvg += `<line x1="0" y1="${gy.toFixed(1)}" x2="${W}" y2="${gy.toFixed(1)}" stroke="var(--rule)" stroke-width="1" vector-effect="non-scaling-stroke" opacity="0.32"/>`;
+      yAxis += `<span style="top:${(gy / H * 100).toFixed(2)}%">${_fmtK(gv)}</span>`;
     }
-    // Peak + trough markers (highest/lowest equity in the window).
-    const maxI = vals.indexOf(maxV), minI = vals.indexOf(minV);
-    const peakMark = (maxV !== minV && pts.length > 3)
-      ? `<circle cx="${x(maxI).toFixed(1)}" cy="${y(maxV).toFixed(1)}" r="2.5" fill="var(--pos)" opacity="0.7"/>
-         <circle cx="${x(minI).toFixed(1)}" cy="${y(minV).toFixed(1)}" r="2.5" fill="var(--neg)" opacity="0.7"/>` : '';
-    const pointCount = pts.length;
+    // ~5 evenly spaced date labels along the bottom.
+    let xAxis = '';
+    const xTicks = Math.min(5, pts.length);
+    for (let t = 0; t < xTicks; t++) {
+      const idx = xTicks > 1 ? Math.round(t * (pts.length - 1) / (xTicks - 1)) : 0;
+      const leftPct = (x(idx) / W * 100).toFixed(2);
+      const dp = String(pts[idx].date).split('-');
+      const lbl = pts[idx].t ? String(pts[idx].t).slice(11, 16) : (dp.length === 3 ? `${+dp[1]}/${+dp[2]}` : pts[idx].date);
+      const anchor = t === 0 ? 'left:0' : t === xTicks - 1 ? `left:${leftPct}%;transform:translateX(-100%)` : `left:${leftPct}%;transform:translateX(-50%)`;
+      xAxis += `<span style="${anchor}">${lbl}</span>`;
+    }
+    const rangeTabs = [['week','1W'],['month','1M'],['year','1Y'],['all','ALL']].map(([k, lbl]) =>
+      `<button class="rng-tab ${activeWin === k ? 'active' : ''}" data-perfwin="${k}">${lbl}</button>`).join('');
+    const dollarChg = winData?.dollars;
+    const lastLeft = (x(pts.length - 1) / W * 100).toFixed(2);
+    const lastTop = (y(lastV) / H * 100).toFixed(2);
+    const pulseRGBA = up ? 'rgba(91,138,114,.5)' : 'rgba(165,100,90,.5)';
     chartHtml = `
-    <div class="company-card" style="margin:0 0 18px">
-      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px">
-        <div>
-          <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Equity Curve</div>
-          <div style="font-family:var(--mono);font-size:11px;color:var(--ink-dim);margin-top:2px">
-            ${activeWin === 'all' ? 'All-time vs $100,000 basis' : activeWin + ' window'} ·
-            <span style="color:${winColor};font-weight:700">${winPct == null ? '—' : (winPct >= 0 ? '+' : '') + winPct + '%'}</span>
-            ${winData?.dollars != null ? `<span style="color:${winColor}"> (${winData.dollars >= 0 ? '+' : ''}$${Math.abs(winData.dollars).toLocaleString(undefined,{maximumFractionDigits:0})})</span>` : ''}
-            <span style="color:var(--ink-faint)"> · ${pointCount} pts</span>
-          </div>
+    <div class="bot-chart">
+      <div class="bot-chart__head">
+        <div style="min-width:0">
+          <div class="bot-chart__title">Bot Equity \u00b7 ${activeWin === 'all' ? 'all-time' : activeWin} window</div>
+          <div class="bot-chart__val" style="color:${lineColor}">$${lastV.toLocaleString(undefined,{maximumFractionDigits:0})}</div>
+          <div class="bot-chart__sub"><span style="color:${winColor};font-weight:700">${winPct == null ? '\u2014' : (winPct >= 0 ? '+' : '') + winPct + '%'}</span>${dollarChg != null ? `<span style="color:${winColor}"> \u00b7 ${dollarChg >= 0 ? '+' : ''}$${Math.abs(dollarChg).toLocaleString(undefined,{maximumFractionDigits:0})}</span>` : ''}<span style="color:var(--ink-faint)"> \u00b7 ${pts.length} sessions</span></div>
+          <div class="bot-chart__readout" id="bot-eq-readout">&nbsp;</div>
         </div>
-        <div class="seg-control" style="font-size:10px">
-          ${['week','month','year','all'].map(w => `<button class="seg-btn ${activeWin===w?'active':''}" data-perfwin="${w}" style="font-size:10px;text-transform:capitalize">${w==='all'?'All':w==='week'?'1W':w==='month'?'1M':'1Y'}</button>`).join('')}
+        <div class="rng-tabs">${rangeTabs}</div>
+      </div>
+      <div class="bot-chart__plot" id="bot-eq-chart-wrap" data-points="${escapeHtml(JSON.stringify(pts.map(p => ({ d: p.date, v: +(+p.value).toFixed(2), t: p.t || null }))))}" data-lo="${lo}" data-hi="${hi}" data-w="${W}" data-h="${H}" data-basis="${showBasis ? BOT_STARTING_BANKROLL : ''}" data-up="${up ? 1 : 0}">
+        <svg class="bot-chart__svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+          <defs>
+            <linearGradient id="botEqGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="${gA}"/>
+              <stop offset="100%" stop-color="${gB}"/>
+            </linearGradient>
+          </defs>
+          ${gridSvg}
+          ${showBasis ? `<line x1="0" y1="${basisY.toFixed(1)}" x2="${W}" y2="${basisY.toFixed(1)}" stroke="var(--amber)" stroke-width="1" stroke-dasharray="5,4" vector-effect="non-scaling-stroke" opacity="0.5"/>` : ''}
+          <path d="${areaPath}" fill="url(#botEqGrad)"/>
+          <path d="${linePath}" fill="none" stroke="${lineColor}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
+          <line id="bot-eq-crossh" x1="0" y1="0" x2="${W}" y2="0" stroke="var(--ink-dim)" stroke-width="1" stroke-dasharray="3,3" vector-effect="non-scaling-stroke" opacity="0"/>
+          <line id="bot-eq-cross" x1="0" y1="0" x2="0" y2="${H}" stroke="var(--ink-dim)" stroke-width="1" stroke-dasharray="3,3" vector-effect="non-scaling-stroke" opacity="0"/>
+        </svg>
+        <div class="bot-chart__overlay">
+          <span class="bot-chart__last" style="left:${lastLeft}%;top:${lastTop}%;background:${lineColor};--pulse:${pulseRGBA}"></span>
+          <span class="bot-chart__hoverdot" id="bot-eq-hover-dot" style="background:${lineColor}"></span>
         </div>
-      </div>
-      <div class="bot-chart-wrap" id="bot-eq-chart-wrap" data-points="${escapeHtml(JSON.stringify(pts.map(p => ({ d: p.date, v: +(+p.value).toFixed(2) }))))}" data-lo="${lo}" data-hi="${hi}" data-w="${W}" data-h="${H}" data-basis="${showBasis ? 100000 : ''}" style="position:relative">
-      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:170px;display:block">
-        <defs>
-          <linearGradient id="botEqGrad" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stop-color="${up ? 'rgba(61,220,132,0.30)' : 'rgba(255,92,92,0.30)'}"/>
-            <stop offset="55%" stop-color="${up ? 'rgba(61,220,132,0.08)' : 'rgba(255,92,92,0.08)'}"/>
-            <stop offset="100%" stop-color="${up ? 'rgba(61,220,132,0)' : 'rgba(255,92,92,0)'}"/>
-          </linearGradient>
-        </defs>
-        ${gridHtml}
-        ${showBasis ? `<line x1="0" y1="${basisY.toFixed(1)}" x2="${W}" y2="${basisY.toFixed(1)}" stroke="var(--amber)" stroke-width="1" stroke-dasharray="4,4" opacity="0.55"/>
-        <text x="${W - 4}" y="${(basisY - 4).toFixed(1)}" text-anchor="end" font-family="monospace" font-size="9" fill="var(--amber)" opacity="0.85">$100k basis</text>` : ''}
-        <path d="${areaPath}" fill="url(#botEqGrad)"/>
-        <path d="${linePath}" fill="none" stroke="${lineColor}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-        ${peakMark}
-        <circle cx="${x(pts.length-1).toFixed(1)}" cy="${y(lastV).toFixed(1)}" r="3.5" fill="${lineColor}"/>
-        <circle cx="${x(pts.length-1).toFixed(1)}" cy="${y(lastV).toFixed(1)}" r="6" fill="none" stroke="${lineColor}" stroke-width="1" opacity="0.4"/>
-        <line id="bot-eq-cross" x1="0" y1="0" x2="0" y2="${H}" stroke="var(--ink-dim)" stroke-width="1" stroke-dasharray="3,3" opacity="0" vector-effect="non-scaling-stroke"/>
-        <circle id="bot-eq-hover-dot" cx="0" cy="0" r="4" fill="${lineColor}" stroke="var(--bg)" stroke-width="1.5" opacity="0"/>
-      </svg>
-      <div id="bot-eq-tip" style="position:absolute;pointer-events:none;opacity:0;transform:translate(-50%,-110%);background:var(--bg-elev);border:1px solid var(--rule);border-radius:4px;padding:5px 8px;font-family:var(--mono);font-size:10px;white-space:nowrap;z-index:5;box-shadow:0 2px 8px rgba(0,0,0,0.3)"></div>
-      </div>
-      <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:4px">
-        <span>${pts[0].date}</span>
-        <span style="color:${lineColor};font-weight:700">$${lastV.toLocaleString(undefined,{maximumFractionDigits:0})}</span>
-        <span>${pts[pts.length-1].date}</span>
+        <div class="bot-chart__axis-y">${yAxis}<span class="bot-chart__pill bot-chart__pill--y" id="bot-eq-pill-y" style="background:${lineColor}"></span></div>
+        <div class="bot-chart__axis-x">${xAxis}<span class="bot-chart__pill bot-chart__pill--x" id="bot-eq-pill-x"></span></div>
       </div>
     </div>`;
   } else {
@@ -47201,23 +47642,22 @@ function renderBetsTab() {
   // closed position reads SELL; a partial would stay OPEN but is tagged SELL too.
   const _betType = (b) => (b.status === 'closed' || b.exitPrice != null || b._partialSold) ? 'SELL' : 'BUY';
 
+  const _acct = perf._acct || botTickerLedger(perf.bets, _botPriceOf);
+
   const _ledgerCols = [
-    { key: 'date',      label: 'Date',       type: 'date',   get: b => b.entryDate || '' },
-    { key: 'ticker',    label: 'Ticker',     type: 'text',   get: b => b.ticker || '' },
-    { key: 'direction', label: 'Direction',  type: 'text',   get: b => b.direction || '' },
-    { key: 'entryVal',  label: 'Entry $',    type: 'num',    get: b => _entryValue(b) },
-    { key: 'saleVal',   label: 'Sale $',     type: 'num',    get: b => _saleValue(b) },
-    { key: 'entry',     label: 'Entry Px',   type: 'num',    get: b => (b.entryPrice != null ? Number(b.entryPrice) : null) },
-    { key: 'exit',      label: 'Exit Px',    type: 'num',    get: b => (b.status === 'closed' && b.exitPrice != null ? Number(b.exitPrice) : (b.lastPrice != null && isFinite(b.lastPrice) ? Number(b.lastPrice) : null)) },
-    { key: 'return',    label: 'Return',     type: 'num',    get: b => (b.returnPct != null ? Number(b.returnPct) : null) },
-    { key: 'pnl',       label: 'P/L',        type: 'num',    get: b => (b.pnl != null ? Number(b.pnl) : null) },
-    { key: 'type',      label: 'Type',       type: 'text',   get: b => _betType(b) },
-    { key: 'status',    label: 'Status',     type: 'text',   get: b => b.status || '' },
+    { key: 'date',    label: 'Date',         type: 'date', get: L => L.date || '' },
+    { key: 'ticker',  label: 'Ticker',       type: 'text', get: L => L.ticker || '' },
+    { key: 'action',  label: 'Action',       type: 'text', get: L => L.label },
+    { key: 'shares',  label: 'Shares',       type: 'num',  get: L => (L.shares != null ? L.shares : null) },
+    { key: 'price',   label: 'Price',        type: 'num',  get: L => (L.price != null ? L.price : null) },
+    { key: 'value',   label: 'Value',        type: 'num',  get: L => (L.value != null ? L.value : null) },
+    { key: 'pnl',     label: 'Realized P/L', type: 'num',  get: L => (L.side === 'sell' ? (L.pl != null ? L.pl : null) : null) },
+    { key: 'status',  label: 'Status',       type: 'text', get: L => L.statusAfter || '' },
   ];
+  const _legs = _acct.legs.slice();
   const _lsCol = _ledgerCols.find(c => c.key === LEDGER_SORT.col) || _ledgerCols[0];
   const _lsDir = LEDGER_SORT.dir === 'asc' ? 1 : -1;
-  // Stable sort: nulls always sink to the bottom regardless of direction.
-  const _sortedBets = perf.bets.slice().sort((a, b) => {
+  const _sortedLegs = _legs.slice().sort((a, b) => {
     const va = _lsCol.get(a), vb = _lsCol.get(b);
     const na = (va == null || va === ''), nb = (vb == null || vb === '');
     if (na && nb) return 0;
@@ -47228,25 +47668,22 @@ function renderBetsTab() {
     else cmp = String(va).localeCompare(String(vb));
     return cmp * _lsDir;
   });
-  const ledgerRows = _sortedBets.map(b => {
-    const ev = _entryValue(b);
-    const sv = _saleValue(b);
-    const typ = _betType(b);
-    const exitPx = (b.status === 'closed' && b.exitPrice != null) ? Number(b.exitPrice)
-      : (b.lastPrice != null && isFinite(b.lastPrice) ? Number(b.lastPrice) : null);
+
+  const ledgerRows = _sortedLegs.map(L => {
+    const isSell = L.side === 'sell';
+    const badgeClass = (L.label === 'BUY' || L.label === 'ADD') ? 'buy' : 'sell';
+    const st = L.statusAfter === 'closed' ? 'CLOSED' : 'OPEN';
+    const dirTxt = L.dir < 0 ? 'SHORT' : 'LONG';
     return `
-    <tr class="bot-receipt-row" data-bet-id="${b.id || ''}" style="cursor:pointer" title="Tap for the bot's full decision receipt">
-      <td style="font-family:var(--mono);font-size:11px">${b.entryDate}</td>
-      <td style="font-family:var(--mono);font-weight:700"><span class="bot-ticker-link" data-ticker="${b.ticker}" style="cursor:pointer;color:var(--amber);text-decoration:underline;text-decoration-style:dotted" title="Open ${b.ticker} in Valuation">${b.ticker}</span></td>
-      <td style="font-family:var(--mono);font-size:11px">${dirBadge(b.direction)}${b.instrument === 'option' ? ` <span style="color:#c08ae0;font-weight:700">${(b.optionType||'').toUpperCase()}</span>` : b.instrument === 'leveraged_etf' ? ` <span style="color:#4ec9a8;font-weight:700">${b.leveragedEtf}</span>` : (b.leverage > 1 ? ` ${b.leverage}x` : '')}${b.hedge ? ' 🛡' : ''}</td>
-      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${ev ? '$' + ev.toLocaleString(undefined,{maximumFractionDigits:0}) : '—'}</td>
-      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${sv != null ? '$' + sv.toLocaleString(undefined,{maximumFractionDigits:0}) : '—'}</td>
-      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${b.entryPrice != null ? '$' + Number(b.entryPrice).toFixed(2) : '—'}</td>
-      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${exitPx != null ? '$' + exitPx.toFixed(2) : '—'}</td>
-      <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${pnlColor(b.returnPct)}">${b.returnPct != null ? (b.returnPct >= 0 ? '+' : '') + b.returnPct + '%' : '—'}</td>
-      <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${pnlColor(b.pnl)}">${fmtPnl(b.pnl)}</td>
-      <td style="font-family:var(--mono);font-size:10px;font-weight:700;color:${typ === 'SELL' ? 'var(--neg)' : 'var(--pos)'}">${typ}</td>
-      <td style="font-family:var(--mono);font-size:10px;color:${b.status === 'open' ? 'var(--amber)' : 'var(--ink-faint)'}">${b.status.toUpperCase()} ›</td>
+    <tr class="bot-receipt-row" data-bet-id="${L.betId || ''}" style="cursor:pointer" title="Tap for the bot's decision receipt">
+      <td style="font-family:var(--mono);font-size:11px">${L.date || '\u2014'}</td>
+      <td style="font-family:var(--mono);font-weight:700"><span class="bot-ticker-link" data-ticker="${L.ticker}" style="cursor:pointer;color:var(--amber);text-decoration:underline;text-decoration-style:dotted" title="Open ${L.ticker}">${L.ticker}</span> <span style="color:var(--ink-faint);font-size:9px">${dirTxt}</span></td>
+      <td><span class="leg-badge leg-badge--${badgeClass}">${L.label}</span></td>
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${L.shares ? L.shares.toLocaleString(undefined,{maximumFractionDigits:2}) : '\u2014'}</td>
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${L.price != null ? '$' + L.price.toFixed(2) : '\u2014'}</td>
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${L.value != null ? '$' + L.value.toLocaleString(undefined,{maximumFractionDigits:0}) : '\u2014'}</td>
+      <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${isSell && L.pl != null ? pnlColor(L.pl) : 'var(--ink-faint)'}" title="${isSell ? 'Realized vs average cost' : 'Buys/adds book cost basis — P/L is realized on the sell'}">${isSell && L.pl != null ? fmtPnl(L.pl) : '\u2014'}</td>
+      <td style="font-family:var(--mono);font-size:10px;color:${st === 'OPEN' ? 'var(--amber)' : 'var(--ink-faint)'}">${st}${isSell ? '' : ' \u203a'}</td>
     </tr>
   `;
   }).join('');
@@ -47260,9 +47697,40 @@ function renderBetsTab() {
     return `<th class="ledger-sort-th" data-lcol="${c.key}" data-ltype="${c.type}" style="cursor:pointer;user-select:none;white-space:nowrap${active ? ';color:var(--amber)' : ''}" title="Sort by ${c.label}">${c.label}${arrow}</th>`;
   }).join('');
 
-  const ledger = perf.bets.length ? `
+  const _openRows = _acct.openPositions.map(p => {
+    const upl = p.unrealized;
+    return `
+    <tr class="bot-receipt-row" data-ticker="${p.ticker}" style="cursor:pointer" title="Open ${p.ticker}">
+      <td style="font-family:var(--mono);font-weight:700"><span class="bot-ticker-link" data-ticker="${p.ticker}" style="color:var(--amber);text-decoration:underline;text-decoration-style:dotted">${p.ticker}</span></td>
+      <td style="font-family:var(--mono);font-size:10px;font-weight:700;color:${p.dir < 0 ? 'var(--neg)' : 'var(--pos)'}">${p.dir < 0 ? 'SHORT' : 'LONG'}</td>
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${p.shares.toLocaleString(undefined,{maximumFractionDigits:2})}</td>
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">$${p.avgCost.toFixed(2)}</td>
+      <td style="font-family:var(--mono);font-size:11px;color:var(--ink-dim)">${p.live != null ? '$' + p.live.toFixed(2) : '\u2014'}</td>
+      <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${upl != null ? pnlColor(upl) : 'var(--ink-faint)'}">${upl != null ? fmtPnl(upl) : '\u2014'}</td>
+      <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:${p.realized > 0 ? 'var(--pos)' : p.realized < 0 ? 'var(--neg)' : 'var(--ink-faint)'}">${p.realized ? fmtPnl(p.realized) : '\u2014'}</td>
+    </tr>`;
+  }).join('');
+  const _openCard = _acct.openPositions.length ? `
     <div class="company-card">
-      <h4>${filter ? filter + ' — ' : ''}Transaction Ledger <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· every transaction permanent · ${perf.bets.length} total · tap a row for the receipt · tap a column to sort</span></h4>
+      <h4>Open Positions <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">\u00b7 ${_acct.openPositions.length} held \u00b7 marked at live prices \u00b7 unrealized = shares \u00d7 (live \u2212 avg cost)</span></h4>
+      <div style="overflow-x:auto">
+        <table class="sb-table" style="width:100%;min-width:560px">
+          <thead><tr>
+            <th style="text-align:left">Ticker</th><th style="text-align:left">Side</th><th>Shares</th><th>Avg cost</th><th>Live</th><th>Unrealized P/L</th><th>Realized (trims)</th>
+          </tr></thead>
+          <tbody>${_openRows}</tbody>
+        </table>
+      </div>
+      <div style="display:flex;gap:20px;flex-wrap:wrap;margin-top:10px;font-family:var(--mono);font-size:11px" title="Cash (bankroll = starting + realized) + unrealized marks = total value — the same number the equity chart plots.">
+        <span style="color:var(--ink-faint)">Cash (bankroll): <strong style="color:var(--ink)">$${perf.bankroll.toLocaleString(undefined,{maximumFractionDigits:0})}</strong></span>
+        <span style="color:var(--ink-faint)">Unrealized (open): <strong style="color:${_acct.totalUnrealized >= 0 ? 'var(--pos)' : 'var(--neg)'}">${fmtPnl(_acct.totalUnrealized)}</strong></span>
+        <span style="color:var(--ink-faint)">= Total value: <strong style="color:${pnlColor(perf.totalPnl)}">$${perf.currentValue.toLocaleString(undefined,{maximumFractionDigits:0})}</strong></span>
+        <span style="color:var(--ink-faint)">Realized since start: <strong style="color:${perf.realizedPnl >= 0 ? 'var(--pos)' : 'var(--neg)'}">${fmtPnl(perf.realizedPnl)}</strong></span>
+      </div>
+    </div>` : '';
+  const ledger = perf.bets.length ? _openCard + `
+    <div class="company-card">
+      <h4>${filter ? filter + ' — ' : ''}Transaction Ledger <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· every transaction permanent · ${_legs.length} legs across ${perf.bets.length} trades · tap a row for the receipt · tap a column to sort</span></h4>
       <div style="overflow-x:auto">
         <table class="sb-table" style="width:100%;min-width:780px">
           <thead><tr>${ledgerHead}</tr></thead>
