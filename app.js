@@ -10328,17 +10328,53 @@ function renderQuadHero() {
   document.getElementById('quad-current-name').textContent = q.name;
   document.getElementById('quad-current-desc').textContent = q.desc;
 
-  const stats = [
-    { l: 'GDP YoY (latest)', v: (m.current.growthYoY * 100).toFixed(2) + '%', dir: m.current.growthYoY > 0 ? 'up' : 'down' },
-    { l: 'CPI YoY (latest)', v: (m.current.inflationYoY * 100).toFixed(2) + '%', dir: m.current.inflationYoY > 0 ? 'up' : 'down' },
-    { l: 'Growth Δ (RoC)', v: (m.current.growthRoC > 0 ? '+' : '') + (m.current.growthRoC * 100).toFixed(2) + 'pp', dir: m.current.growthRoC > 0 ? 'up' : 'down' },
-    { l: 'Inflation Δ (RoC)', v: (m.current.inflationRoC > 0 ? '+' : '') + (m.current.inflationRoC * 100).toFixed(2) + 'pp', dir: m.current.inflationRoC > 0 ? 'up' : 'down' },
-    { l: '10Y Treasury', v: isFinite(m.latest10y) ? m.latest10y.toFixed(2) + '%' : '—', dir: '' },
-    { l: 'Fed Funds', v: isFinite(m.latestFed) ? m.latestFed.toFixed(2) + '%' : '—', dir: '' },
-  ];
+  const cur = m.current;
+  const isNowcast = cur.method === 'market-nowcast';
+  let stats;
+  if (isNowcast) {
+    // Fresh market nowcast: show growth/inflation MOMENTUM + trend, not lagged YoY.
+    stats = [
+      { l: 'Growth momentum', v: ((cur.growthScore || 0) >= 0 ? '+' : '') + Math.round((cur.growthScore || 0) * 100), dir: (cur.growthScore || 0) >= 0 ? 'up' : 'down' },
+      { l: 'Inflation momentum', v: ((cur.inflationScore || 0) >= 0 ? '+' : '') + Math.round((cur.inflationScore || 0) * 100), dir: (cur.inflationScore || 0) >= 0 ? 'up' : 'down' },
+      { l: 'Growth trend', v: cur.growthDir || '—', dir: cur.growthDir === 'accelerating' ? 'up' : cur.growthDir === 'decelerating' ? 'down' : '' },
+      { l: 'Inflation trend', v: cur.inflationDir || '—', dir: cur.inflationDir === 'accelerating' ? 'up' : cur.inflationDir === 'decelerating' ? 'down' : '' },
+      { l: '10Y Treasury', v: isFinite(m.latest10y) ? m.latest10y.toFixed(2) + '%' : '—', dir: '' },
+      { l: 'Fed Funds', v: isFinite(m.latestFed) ? m.latestFed.toFixed(2) + '%' : '—', dir: '' },
+    ];
+  } else {
+    stats = [
+      { l: 'GDP YoY (latest)', v: (cur.growthYoY * 100).toFixed(2) + '%', dir: cur.growthYoY > 0 ? 'up' : 'down' },
+      { l: 'CPI YoY (latest)', v: (cur.inflationYoY * 100).toFixed(2) + '%', dir: cur.inflationYoY > 0 ? 'up' : 'down' },
+      { l: 'Growth Δ (RoC)', v: (cur.growthRoC > 0 ? '+' : '') + (cur.growthRoC * 100).toFixed(2) + 'pp', dir: cur.growthRoC > 0 ? 'up' : 'down' },
+      { l: 'Inflation Δ (RoC)', v: (cur.inflationRoC > 0 ? '+' : '') + (cur.inflationRoC * 100).toFixed(2) + 'pp', dir: cur.inflationRoC > 0 ? 'up' : 'down' },
+      { l: '10Y Treasury', v: isFinite(m.latest10y) ? m.latest10y.toFixed(2) + '%' : '—', dir: '' },
+      { l: 'Fed Funds', v: isFinite(m.latestFed) ? m.latestFed.toFixed(2) + '%' : '—', dir: '' },
+    ];
+  }
   document.getElementById('quad-stats').innerHTML = stats.map(s =>
     `<div><div class="l">${s.l}</div><div class="v ${s.dir}">${s.v}</div></div>`
   ).join('');
+
+  // ── Market-nowcast context (fresh, independent of the monthly history chart) ──
+  {
+    let ncHost = document.getElementById('quad-nowcast-ctx');
+    const host = document.querySelector('.quad-hero');
+    if (isNowcast && host) {
+      if (!ncHost) { ncHost = document.createElement('div'); ncHost.id = 'quad-nowcast-ctx'; ncHost.style.cssText = 'margin-top:12px;padding:10px 14px;background:var(--bg-elev);border-left:2px solid var(--data-amber);font-family:var(--mono);font-size:11px;line-height:1.6'; host.appendChild(ncHost); }
+      const drivers = (cur.drivers || []).slice(0, 4).map(d => {
+        const nm = ({ DCOILWTICO: 'Oil', BAMLH0A0HYM2: 'HY spread', T10Y2Y: '2s10s', VIXCLS: 'VIX', DGS10: '10Y', DGS2: '2Y', DEXUSEU: 'USD' })[d.signal] || d.signal;
+        const col = d.value >= 0 ? 'var(--pos)' : 'var(--neg)';
+        return `<span style="color:var(--ink-dim)">${nm}</span> <span style="color:${col};font-weight:700">${d.value >= 0 ? '+' : ''}${d.value.toFixed(2)}</span>`;
+      }).join(' \u00b7 ');
+      const offRef = (cur.growthYoY != null && cur.inflationYoY != null)
+        ? `<div style="color:var(--ink-faint);font-size:10px;margin-top:5px">Last official print${cur.officialAsOf ? ' (' + cur.officialAsOf + ')' : ''}: GDP ${(cur.growthYoY * 100).toFixed(1)}% YoY \u00b7 CPI ${(cur.inflationYoY * 100).toFixed(1)}% YoY \u2014 the monthly series drives the history chart below.</div>` : '';
+      ncHost.innerHTML =
+        `<span style="color:var(--data-amber);font-size:10px;letter-spacing:0.15em;font-weight:700">MARKET NOWCAST</span>` +
+        `<span style="color:var(--ink-faint);margin-left:8px">as of ${cur.asOf || 'today'} \u00b7 ${Math.round((cur.confidence || 0) * 100)}% conf \u00b7 daily market ROC</span>` +
+        `<div style="color:var(--ink-dim);font-size:10px;margin-top:4px">Fresh estimate from live markets (independent of the lagged GDP/CPI history). Drivers: ${drivers}</div>` +
+        offRef;
+    } else if (ncHost) { ncHost.remove(); }
+  }
 
   // ── REGIME CROSS-REFERENCE ──
   // Show whether the new unified Regime engine agrees with the legacy GIP Quad classification.
@@ -30977,6 +31013,12 @@ const COUNTRY_FLAGS = {
   'sweden': '🇸🇪', 'norway': '🇳🇴', 'denmark': '🇩🇰', 'finland': '🇫🇮',
   'canada': '🇨🇦', 'mexico': '🇲🇽', 'brazil': '🇧🇷', 'argentina': '🇦🇷',
   'eu': '🇪🇺', 'europe': '🇪🇺', 'emea': '🇪🇺',
+  'vietnam': '🇻🇳', 'thailand': '🇹🇭', 'indonesia': '🇮🇩', 'malaysia': '🇲🇾',
+  'philippines': '🇵🇭', 'vietnam ': '🇻🇳', 'south africa': '🇿🇦', 'saudi arabia': '🇸🇦',
+  'united arab emirates': '🇦🇪', 'uae': '🇦🇪', 'israel': '🇮🇱', 'ireland': '🇮🇪',
+  'poland': '🇵🇱', 'turkey': '🇹🇷', 'russia': '🇷🇺', 'new zealand': '🇳🇿',
+  'belgium': '🇧🇪', 'austria': '🇦🇹', 'portugal': '🇵🇹', 'greece': '🇬🇷',
+  'chile': '🇨🇱', 'colombia': '🇨🇴', 'nigeria': '🇳🇬', 'egypt': '🇪🇬',
   'asia': '🌏', 'apac': '🌏', 'americas': '🌎', 'rest of world': '🌐', 'other': '🌐',
 };
 function countryFlag(name) {
@@ -31392,6 +31434,119 @@ async function renderCompanyTab() {
 }
 
 // ---- Overview tab ----
+const COMPANY_FACTS_STORAGE = 'valuatio.company.facts.v1';
+function loadCompanyFacts() { try { return JSON.parse(localStorage.getItem(COMPANY_FACTS_STORAGE) || '{}') || {}; } catch { return {}; } }
+function saveCompanyFacts(obj) { try { localStorage.setItem(COMPANY_FACTS_STORAGE, JSON.stringify(obj)); } catch {} }
+
+// Back up ALL user company edits (geography + facts) to a repo so they persist and
+// can be restored. Routes through the multi-repo registry (owner/branch/path
+// resolved there); defaults to XTRAPP/data/company_overrides.json.
+async function backupCompanyOverrides() {
+  const payload = {
+    _schema: 'valuatio-company-overrides-v1',
+    updatedAt: new Date().toISOString(),
+    geography: (typeof loadCompanyGeoOverrides === 'function') ? loadCompanyGeoOverrides() : {},
+    facts: loadCompanyFacts(),
+  };
+  if (typeof commitFileToRepo === 'function') {
+    return commitFileToRepo('XTRAPP', 'data/company_overrides.json', payload, 'company overrides: manual edits backup');
+  }
+  try { await navigator.clipboard.writeText(JSON.stringify(payload, null, 2)); } catch {}
+  if (typeof flashStatus === 'function') flashStatus('Copied company overrides JSON (no repo tool available)', 'success');
+  return false;
+}
+
+// Prepend an editable "Your Company Info" card to the overview: tab-scoped
+// watching/tracking/avoid tags + the user's description/products/services edits,
+// with Edit and Back-up actions.
+function _cfPositions(ticker) {
+  try { return (typeof loadPortfolio === 'function' ? loadPortfolio() : []).filter(p => (p.ticker || '').toUpperCase() === (ticker || '').toUpperCase()); } catch { return []; }
+}
+function _injectCompanyFactsCard(el, ticker) {
+  if (!el || !ticker) return;
+  const facts = (loadCompanyFacts()[ticker]) || {};
+  const esc = (v) => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const list = (arr) => Array.isArray(arr) && arr.length
+    ? `<div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:4px">${arr.map(x => `<span class="company-tag">${esc(x)}</span>`).join('')}</div>` : '';
+  const posMap = { watching: 'Watching', tracking: 'Tracking', avoid: 'Avoid' };
+  let current = [];
+  try { current = _cfPositions(ticker).map(p => p.position); } catch {}
+  const tagBtn = (act) => {
+    const on = current.indexOf(posMap[act]) >= 0;
+    return `<button class="btn ${on ? '' : 'btn-ghost'}" data-cf-tag="${act}" style="font-size:10px;padding:4px 10px">${on ? '\u2713 ' : '+ '}${posMap[act]}</button>`;
+  };
+  const body = `
+    <div class="company-card" id="company-facts-card" style="border-left:3px solid var(--amber)">
+      <h4>Your Company Info <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">\u00b7 editable \u00b7 saved on this device \u00b7 back up to keep it</span></h4>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
+        ${tagBtn('watching')}${tagBtn('tracking')}${tagBtn('avoid')}
+      </div>
+      ${facts.description ? `<div style="font-family:var(--serif);font-size:13px;line-height:1.6;color:var(--ink);margin-bottom:8px">${esc(facts.description)}</div>` : ''}
+      ${(Array.isArray(facts.products) && facts.products.length) ? `<div class="company-kv-label">Products</div>${list(facts.products)}` : ''}
+      ${(Array.isArray(facts.services) && facts.services.length) ? `<div class="company-kv-label" style="margin-top:8px">Services</div>${list(facts.services)}` : ''}
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:12px">
+        <button class="btn" id="company-facts-edit" style="font-size:11px">\u270e Edit info</button>
+        <button class="btn btn-ghost" id="company-facts-backup" style="font-size:11px" title="Save all your company edits (this ticker and others) to your XTRAPP repo">\u2601 Back up to repo</button>
+      </div>
+    </div>`;
+  el.insertAdjacentHTML('afterbegin', body);
+  el.querySelector('#company-facts-edit')?.addEventListener('click', () => openCompanyFactsEditor(ticker));
+  el.querySelector('#company-facts-backup')?.addEventListener('click', async (e) => {
+    const b = e.currentTarget; b.disabled = true; b.textContent = '\u2601 Backing up\u2026';
+    await backupCompanyOverrides(); b.disabled = false; b.textContent = '\u2601 Back up to repo';
+  });
+  el.querySelectorAll('[data-cf-tag]').forEach(btn => btn.addEventListener('click', async () => {
+    const act = btn.getAttribute('data-cf-tag'); const label = posMap[act];
+    try {
+      const existing = _cfPositions(ticker).find(p => p.position === label);
+      if (existing) { if (typeof removeFromPortfolio === 'function') removeFromPortfolio(existing.id); }
+      else if (typeof addToPortfolio === 'function') {
+        addToPortfolio({ ticker, position: label, notes: [{ ts: new Date().toISOString(), text: `Added to ${label} from Company/Overview`, priceAtNote: (state.stock && state.stock.price) || null }] });
+      }
+      if (typeof flashStatus === 'function') flashStatus(`${ticker} \u2192 ${existing ? 'removed from ' : ''}${label}`, 'success');
+    } catch {}
+    if (typeof renderCompanyOverview === 'function') renderCompanyOverview();
+  }));
+}
+
+function openCompanyFactsEditor(ticker) {
+  document.getElementById('company-facts-modal')?.remove();
+  const all = loadCompanyFacts();
+  const f = all[ticker] || {};
+  const esc = (v) => String(v == null ? '' : v).replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const lines = (arr) => Array.isArray(arr) ? arr.join('\n') : '';
+  const html = `
+    <div class="modal-backdrop" id="company-facts-modal" style="display:flex" onclick="if(event.target.id==='company-facts-modal')this.remove()">
+      <div class="modal-box" style="max-width:600px">
+        <div class="modal-head">
+          <div class="modal-title">Edit company info \u2014 ${esc(ticker)}</div>
+          <button class="modal-close" onclick="document.getElementById('company-facts-modal').remove()">\u00d7</button>
+        </div>
+        <div class="modal-help" style="margin:0 0 12px">Your edits are saved on this device and shown on the Overview. Use <strong>Back up to repo</strong> to store them in XTRAPP. This is your data \u2014 fill in what the automated sources miss.</div>
+        <label class="gh-f" style="margin-bottom:10px"><span>Description</span><textarea id="cf-desc" rows="4" style="font-family:var(--serif);font-size:13px;padding:8px;background:var(--bg);border:1px solid var(--rule);border-radius:6px;color:var(--ink);width:100%;box-sizing:border-box">${esc(f.description || '')}</textarea></label>
+        <label class="gh-f" style="margin-bottom:10px"><span>Products (one per line)</span><textarea id="cf-products" rows="5" style="font-family:var(--mono);font-size:12px;padding:8px;background:var(--bg);border:1px solid var(--rule);border-radius:6px;color:var(--ink);width:100%;box-sizing:border-box">${esc(lines(f.products))}</textarea></label>
+        <label class="gh-f" style="margin-bottom:10px"><span>Services (one per line)</span><textarea id="cf-services" rows="4" style="font-family:var(--mono);font-size:12px;padding:8px;background:var(--bg);border:1px solid var(--rule);border-radius:6px;color:var(--ink);width:100%;box-sizing:border-box">${esc(lines(f.services))}</textarea></label>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px">
+          <button class="btn" id="cf-save">Save</button>
+          <button class="btn btn-ghost" id="cf-save-backup">Save &amp; back up</button>
+          <span id="cf-msg" style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);align-self:center"></span>
+        </div>
+      </div>
+    </div>`;
+  document.body.insertAdjacentHTML('beforeend', html);
+  if (typeof _ensureGhReposCSS === 'function') _ensureGhReposCSS();
+  const modal = document.getElementById('company-facts-modal');
+  const collect = () => {
+    const toArr = (id) => (document.getElementById(id).value || '').split('\n').map(x => x.trim()).filter(Boolean);
+    const rec = { description: (document.getElementById('cf-desc').value || '').trim(), products: toArr('cf-products'), services: toArr('cf-services'), updatedAt: new Date().toISOString() };
+    const store = loadCompanyFacts(); store[ticker] = rec; saveCompanyFacts(store); return rec;
+  };
+  const done = (msg) => { const m = modal.querySelector('#cf-msg'); if (m) m.textContent = msg; if (typeof renderCompanyOverview === 'function') renderCompanyOverview(); };
+  modal.querySelector('#cf-save').addEventListener('click', () => { collect(); done('\u2713 saved'); setTimeout(() => modal.remove(), 400); });
+  modal.querySelector('#cf-save-backup').addEventListener('click', async (e) => { collect(); const b = e.currentTarget; b.disabled = true; b.textContent = 'Backing up\u2026'; await backupCompanyOverrides(); b.disabled = false; b.textContent = 'Save & back up'; done('\u2713 saved + backed up'); });
+}
+if (typeof window !== 'undefined') { window.openCompanyFactsEditor = openCompanyFactsEditor; window.backupCompanyOverrides = backupCompanyOverrides; }
+
 async function renderCompanyOverview() {
   const s = state.stock;
   if (!s) {
@@ -32210,6 +32365,7 @@ async function renderCompanyContact() {
       </div>
     </div>
   `;
+  try { _injectCompanyFactsCard(el, s.ticker); } catch (e) { console.warn('[facts-card]', e); }
 }
 
 // ---- Leadership tab ----
@@ -47264,7 +47420,7 @@ function _ensureBetsPolishCSS() {
 #bets-body .leg-badge--buy{color:var(--pos);background:rgba(91,138,114,.16)}
 #bets-body .leg-badge--sell{color:var(--neg);background:rgba(165,100,90,.16)}
 #bets-body table.sb-table tbody tr{transition:background .1s}
-#bets-body table.sb-table tbody tr:hover{background:rgba(224,176,76,.06)}#bets-body .bot-eq-plot{position:relative;height:280px;margin-top:8px}#bets-body #bot-eq-canvas{width:100%;height:100%;display:block;cursor:crosshair}#bets-body .bot-eq-tip{position:absolute;display:none;pointer-events:none;background:var(--bg);border:1px solid var(--rule);border-radius:7px;padding:7px 10px;z-index:5;box-shadow:0 8px 22px -8px rgba(0,0,0,.7);min-width:135px}#bets-body .bot-eq-tip .pct-date{font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-bottom:2px}#bets-body .bot-eq-tip .pct-price{font-family:var(--mono);font-size:15px;font-weight:700;color:var(--ink)}#bets-body .bot-eq-tip .pct-change{font-family:var(--mono);font-size:10px;font-weight:600;margin-top:2px}`;
+#bets-body table.sb-table tbody tr:hover{background:rgba(224,176,76,.06)}#bets-body table.sb-table th,#bets-body table.sb-table td{white-space:nowrap;padding:5px 8px}#bets-body table.sb-table td:first-child,#bets-body table.sb-table th:first-child{padding-left:4px}#bets-body .company-card{overflow:hidden}#bets-body .bot-eq-plot{position:relative;height:280px;margin-top:8px}#bets-body #bot-eq-canvas{width:100%;height:100%;display:block;cursor:crosshair}#bets-body .bot-eq-tip{position:absolute;display:none;pointer-events:none;background:var(--bg);border:1px solid var(--rule);border-radius:7px;padding:7px 10px;z-index:5;box-shadow:0 8px 22px -8px rgba(0,0,0,.7);min-width:135px}#bets-body .bot-eq-tip .pct-date{font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-bottom:2px}#bets-body .bot-eq-tip .pct-price{font-family:var(--mono);font-size:15px;font-weight:700;color:var(--ink)}#bets-body .bot-eq-tip .pct-change{font-family:var(--mono);font-size:10px;font-weight:600;margin-top:2px}`;
   (document.head || document.documentElement).appendChild(st);
 }
 
@@ -47822,10 +47978,10 @@ function renderBetsTab() {
   const _openCard = _acct.openPositions.length ? `
     <div class="company-card">
       <h4>Open Positions <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">\u00b7 ${_acct.openPositions.length} held \u00b7 marked at live prices \u00b7 unrealized = shares \u00d7 (live \u2212 avg cost)</span></h4>
-      <div style="overflow-x:auto">
-        <table class="sb-table" style="width:100%;min-width:560px">
+      <div style="overflow-x:auto;-webkit-overflow-scrolling:touch">
+        <table class="sb-table" style="width:100%;min-width:520px">
           <thead><tr>
-            <th style="text-align:left">Ticker</th><th style="text-align:left">Side</th><th>Shares</th><th>Avg cost</th><th>Live</th><th>Unrealized P/L</th><th>Realized (trims)</th>
+            <th style="text-align:left">Ticker</th><th style="text-align:left">Side</th><th>Shares</th><th>Avg cost</th><th>Live</th><th>Unreal. P/L</th><th>Real.</th>
           </tr></thead>
           <tbody>${_openRows}</tbody>
         </table>
