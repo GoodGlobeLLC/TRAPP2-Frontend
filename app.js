@@ -43892,7 +43892,7 @@ function showBotReceipt(betId) {
 if (typeof window !== 'undefined') window.showBotReceipt = showBotReceipt;
 
 const BOT_STARTING_BANKROLL = 100000;
-const BETS_STATE = { perfWindow: 'all', selectedPosition: null };   // equity-curve window + selected open position (ticker|direction|instrument key)
+const BETS_STATE = { perfWindow: 'all', perfGran: null, selectedPosition: null };   // perfGran: 'daily'|'weekly'|'monthly'|null(auto)   // equity-curve window + selected open position (ticker|direction|instrument key)
 // Ledger sort: which column + direction. Default = date descending (latest first).
 // Columns: date|ticker|direction|size|entry|last|return|pnl|cash|status.
 const LEDGER_SORT = { col: 'date', dir: 'desc' };
@@ -46807,7 +46807,13 @@ function _botPriceOf(tic) {
   const lq = _botQuoteCache[t];
   if (lq && lq.live && isFinite(lq.price)) return Number(lq.price);
   const row = (typeof getStockbookRow === 'function') ? getStockbookRow(t) : null;
-  if (row && row.price != null && isFinite(row.price)) return Number(row.price);
+  if (row && row.price != null && isFinite(row.price)) {
+    // Foreign rows quote in local currency (SK Hynix in KRW, etc.) — normalize to USD.
+    if (typeof normalizeRowToUSD === 'function') {
+      try { const n = normalizeRowToUSD(row); if (n && n.price != null && isFinite(n.price)) return Number(n.price); } catch {}
+    }
+    return Number(row.price);
+  }
   return null;
 }
 
@@ -46884,12 +46890,11 @@ function botTickerLedger(bets, priceOf) {
     let unrealized = null;
     if (open) {
       if (bk.linear && live != null) {
-        // Guard against foreign-currency / bad-price marks (a >10x or <0.1x move vs
-        // cost is a data error, e.g. a KRW/JPY price on a USD entry) so one bad
-        // quote can't corrupt the book. US class shares (.A/.B/.C) are fine.
-        const _foreign = bk.ticker.indexOf('.') >= 0 && ['A','B','C'].indexOf(bk.ticker.split('.').pop().toUpperCase()) < 0;
+        // `live` is USD-normalized. Backstop only against an absurd mark vs cost
+        // (>10x / <0.1x ⇒ a bad quote or an un-converted currency), so one bad
+        // price can't corrupt the book.
         const _ratio = avgCost > 0 ? (live / avgCost) : null;
-        if (!_foreign && _ratio != null && _ratio >= 0.1 && _ratio <= 10) unrealized = +(shares * (live - avgCost) * bk.dir).toFixed(2);
+        if (_ratio != null && _ratio >= 0.1 && _ratio <= 10) unrealized = +(shares * (live - avgCost) * bk.dir).toFixed(2);
       } else if (!bk.linear && bk.bet && isFinite(bk.bet.pnl)) unrealized = +Number(bk.bet.pnl).toFixed(2);
     }
     const agg = byTicker[bk.ticker] || (byTicker[bk.ticker] = { ticker: bk.ticker, shares: 0, dir: bk.dir, avgCost: 0, costBasis: 0, realized: 0, unrealized: 0, open: false, live: null, linear: bk.linear });
@@ -46932,7 +46937,10 @@ function botPerformance(filterTicker = null) {
   // fields. Unrealized is the live per-ticker mark. Together the book value is
   //   value = bankroll + unrealized = starting + realized + unrealized
   // which is exactly what the 30-minute equity tape stores — so chart == ledger.
-  const _startBank = (bot.startingBankroll != null && isFinite(bot.startingBankroll)) ? bot.startingBankroll : BOT_STARTING_BANKROLL;
+  // Base for realized = capital put in (starting + any cash injections), so a
+  // deposit never reads as a gain and value never double-counts it.
+  const _startBank = (bot.capitalBase != null && isFinite(bot.capitalBase) && bot.capitalBase > 0) ? bot.capitalBase
+    : ((bot.startingBankroll != null && isFinite(bot.startingBankroll)) ? bot.startingBankroll : BOT_STARTING_BANKROLL);
   const _bankNow = (bot.bankroll != null && isFinite(bot.bankroll)) ? bot.bankroll : _startBank;
   const realizedPnl = +(_bankNow - _startBank).toFixed(2);
   const openPnl = _acct.totalUnrealized;
@@ -46951,7 +46959,7 @@ function botPerformance(filterTicker = null) {
   return {
     startedAt: bot.startedAt,
     bankroll: bot.bankroll,
-    currentValue: +(bot.bankroll + totalPnl).toFixed(2),
+    currentValue: +(capBase + totalPnl).toFixed(2),   // = bankroll + unrealized (NOT bankroll + realized + unrealized)
     totalReturnPct: +((totalPnl / capBase) * 100).toFixed(2),
     totalPnl: +totalPnl.toFixed(2),
     realizedPnl: +realizedPnl.toFixed(2),
@@ -47159,11 +47167,17 @@ function botWindowedPerformance() {
   // so the last point tracks live between backend snapshots.
   const _openUnreal = (bot.bets || []).filter(b => b.status === 'open').reduce((s, b) => s + (isFinite(b.pnl) ? b.pnl : 0), 0);
   const _liveVal = +(((isFinite(bot.bankroll) ? bot.bankroll : BOT_STARTING_BANKROLL)) + _openUnreal).toFixed(2);
-  if (curve.length && intraday) {
+  if (curve.length) {
     const nowIso = new Date().toISOString();
-    const lastT = curve[curve.length - 1].t;
-    if (lastT && (Date.now() - new Date(lastT).getTime()) > 60000) curve.push({ date: nowIso.slice(0, 10), t: nowIso, value: _liveVal, live: true });
-    else curve[curve.length - 1] = Object.assign({}, curve[curve.length - 1], { value: _liveVal, live: true });
+    const lastP = curve[curve.length - 1];
+    const lastMs = lastP.t ? new Date(lastP.t).getTime() : new Date(String(lastP.date) + 'T00:00:00Z').getTime();
+    if (intraday && lastP.t && (Date.now() - lastMs) > 60000) {
+      curve.push({ date: nowIso.slice(0, 10), t: nowIso, value: _liveVal, live: true });
+    } else {
+      // Refresh the endpoint to the live book value (bankroll + unrealized) so the
+      // chart's last point equals the value/return shown everywhere else.
+      curve[curve.length - 1] = Object.assign({}, lastP, { value: _liveVal, live: true });
+    }
   }
   const now = curve.length ? curve[curve.length - 1].value : BOT_STARTING_BANKROLL;
   const today = new Date();
@@ -47250,9 +47264,164 @@ function _ensureBetsPolishCSS() {
 #bets-body .leg-badge--buy{color:var(--pos);background:rgba(91,138,114,.16)}
 #bets-body .leg-badge--sell{color:var(--neg);background:rgba(165,100,90,.16)}
 #bets-body table.sb-table tbody tr{transition:background .1s}
-#bets-body table.sb-table tbody tr:hover{background:rgba(224,176,76,.06)}`;
+#bets-body table.sb-table tbody tr:hover{background:rgba(224,176,76,.06)}#bets-body .bot-eq-plot{position:relative;height:280px;margin-top:8px}#bets-body #bot-eq-canvas{width:100%;height:100%;display:block;cursor:crosshair}#bets-body .bot-eq-tip{position:absolute;display:none;pointer-events:none;background:var(--bg);border:1px solid var(--rule);border-radius:7px;padding:7px 10px;z-index:5;box-shadow:0 8px 22px -8px rgba(0,0,0,.7);min-width:135px}#bets-body .bot-eq-tip .pct-date{font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-bottom:2px}#bets-body .bot-eq-tip .pct-price{font-family:var(--mono);font-size:15px;font-weight:700;color:var(--ink)}#bets-body .bot-eq-tip .pct-change{font-family:var(--mono);font-size:10px;font-weight:600;margin-top:2px}`;
   (document.head || document.documentElement).appendChild(st);
 }
+
+// Per-range granularity options + defaults (week→daily, month→weekly, year→monthly).
+const BOT_GRAN_OPTS = { week: ['daily'], month: ['weekly', 'daily'], year: ['monthly', 'weekly', 'daily'], all: ['monthly', 'weekly'] };
+const BOT_GRAN_DEFAULT = { week: 'daily', month: 'weekly', year: 'monthly', all: 'monthly' };
+const BOT_GRAN_LABEL = { daily: 'D', weekly: 'W', monthly: 'M' };
+
+// Full daily equity series (recorded marks + trade-history reconstruction), one
+// point per day, with a live final point (bankroll + unrealized).
+function _botDailySeries() {
+  const bot = botMarkToMarket();
+  let curve = Array.isArray(bot.equityCurve) ? bot.equityCurve.slice() : [];
+  try {
+    const recon = (typeof botReconstructEquityCurve === 'function') ? botReconstructEquityCurve(bot) : [];
+    if (recon && recon.length) {
+      const byDate = new Map();
+      for (const p of recon) byDate.set(p.date, { date: p.date, value: p.value });
+      for (const p of curve) byDate.set(p.date, { date: p.date, value: p.value });
+      curve = Array.from(byDate.values());
+    }
+  } catch {}
+  const byDay = new Map();
+  for (const p of curve) { if (p && p.date && isFinite(p.value)) byDay.set(String(p.date).slice(0, 10), +p.value); }
+  const series = Array.from(byDay.entries()).map(([date, value]) => ({ date, value })).sort((a, b) => a.date < b.date ? -1 : 1);
+  const openUnreal = (bot.bets || []).filter(b => b.status === 'open').reduce((s, b) => s + (isFinite(b.pnl) ? b.pnl : 0), 0);
+  const liveVal = +(((isFinite(bot.bankroll) ? bot.bankroll : BOT_STARTING_BANKROLL)) + openUnreal).toFixed(2);
+  const todayISO = new Date().toISOString().slice(0, 10);
+  if (series.length && series[series.length - 1].date === todayISO) series[series.length - 1] = { date: todayISO, value: liveVal };
+  else series.push({ date: todayISO, value: liveVal });
+  return series;
+}
+
+// Resample a daily series to daily / weekly (ISO-Monday) / monthly — last value per bucket.
+function _botResample(series, gran) {
+  if (gran === 'daily' || !gran) return series.slice();
+  const keyOf = gran === 'monthly'
+    ? (d) => d.slice(0, 7)
+    : (d) => { const dt = new Date(d + 'T00:00:00Z'); const dow = dt.getUTCDay(); const mon = new Date(dt); mon.setUTCDate(dt.getUTCDate() - ((dow + 6) % 7)); return mon.toISOString().slice(0, 10); };
+  const byKey = new Map();
+  for (const p of series) byKey.set(keyOf(p.date), p);   // series sorted asc ⇒ last wins
+  return Array.from(byKey.values()).sort((a, b) => a.date < b.date ? -1 : 1);
+}
+
+// Range-filtered + granularity-resampled data for the current toggles.
+function getBotChartData() {
+  const range = BETS_STATE.perfWindow || 'all';
+  const opts = BOT_GRAN_OPTS[range] || ['monthly'];
+  let gran = BETS_STATE.perfGran;
+  if (!gran || opts.indexOf(gran) < 0) gran = BOT_GRAN_DEFAULT[range] || opts[0];
+  let series = _botDailySeries();
+  if (range !== 'all' && series.length) {
+    const lastD = new Date(series[series.length - 1].date + 'T00:00:00Z');
+    const cut = new Date(lastD);
+    if (range === 'week') cut.setUTCDate(cut.getUTCDate() - 7);
+    else if (range === 'month') cut.setUTCMonth(cut.getUTCMonth() - 1);
+    else if (range === 'year') cut.setUTCFullYear(cut.getUTCFullYear() - 1);
+    const cutISO = cut.toISOString().slice(0, 10);
+    series = series.filter(p => p.date >= cutISO);
+  }
+  return { data: _botResample(series, gran), gran, opts, range };
+}
+
+// Canvas equity chart — modeled on the valuation price chart (glow line, gradient
+// area, live endpoint, floating tooltip, pixel-exact hover). No y-axis; x-axis =
+// dates at the current granularity; subtle $100k basis line.
+function renderBotEquityChart() {
+  const canvas = document.getElementById('bot-eq-canvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  if (!W || !H) return;
+  canvas.width = W * dpr; canvas.height = H * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, W, H);
+  const { data, gran } = getBotChartData();
+  if (data.length < 2) return;
+  const padL = 12, padR = 14, padT = 14, padB = 26;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const vals = data.map(d => d.value);
+  let minV = Math.min(...vals), maxV = Math.max(...vals);
+  const span = (maxV - minV) || Math.max(1, maxV * 0.02);
+  minV -= span * 0.08; maxV += span * 0.08;
+  const basis = BOT_STARTING_BANKROLL;
+  if (basis >= minV - span * 0.5 && basis <= maxV + span * 0.5) { minV = Math.min(minV, basis - span * 0.04); maxV = Math.max(maxV, basis + span * 0.04); }
+  const yRange = (maxV - minV) || 1;
+  const x = (i) => padL + (i / Math.max(data.length - 1, 1)) * plotW;
+  const y = (v) => padT + plotH - ((v - minV) / yRange) * plotH;
+  state._botChartGeom = { padL, padR, padT, padB, plotW, plotH, W, H, data, x, y, minV, maxV, gran };
+
+  // $100k basis line (subtle dashed + tiny inline tag; no y-axis clutter).
+  const basisY = y(basis);
+  if (basis >= minV && basis <= maxV) {
+    ctx.strokeStyle = 'rgba(224,176,76,0.32)'; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(padL, basisY); ctx.lineTo(padL + plotW, basisY); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(224,176,76,0.55)'; ctx.font = '9px JetBrains Mono'; ctx.textAlign = 'left';
+    ctx.fillText('$100k basis', padL + 2, basisY - 4);
+  }
+
+  const first = data[0].value, last = data[data.length - 1].value, up = last >= first;
+  const hi = up ? '#3ddc84' : '#ff5c5c', lo = up ? '#1a9e5c' : '#c93838', glow = up ? 'rgba(61,220,132,0.5)' : 'rgba(255,92,92,0.45)';
+  const areaGrad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+  if (up) { areaGrad.addColorStop(0, 'rgba(61,220,132,0.34)'); areaGrad.addColorStop(0.55, 'rgba(61,220,132,0.10)'); areaGrad.addColorStop(1, 'rgba(61,220,132,0.01)'); }
+  else { areaGrad.addColorStop(0, 'rgba(255,92,92,0.30)'); areaGrad.addColorStop(0.55, 'rgba(255,92,92,0.09)'); areaGrad.addColorStop(1, 'rgba(255,92,92,0.01)'); }
+  ctx.beginPath(); data.forEach((d, i) => { const px = x(i), py = y(d.value); i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py); });
+  ctx.lineTo(x(data.length - 1), padT + plotH); ctx.lineTo(x(0), padT + plotH); ctx.closePath(); ctx.fillStyle = areaGrad; ctx.fill();
+  const lineGrad = ctx.createLinearGradient(padL, 0, padL + plotW, 0); lineGrad.addColorStop(0, lo); lineGrad.addColorStop(1, hi);
+  ctx.save(); ctx.shadowColor = glow; ctx.shadowBlur = 11; ctx.strokeStyle = lineGrad; ctx.lineWidth = 2.4; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  ctx.beginPath(); data.forEach((d, i) => { const px = x(i), py = y(d.value); i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py); }); ctx.stroke(); ctx.restore();
+  const lx = x(data.length - 1), ly = y(last);
+  ctx.save(); ctx.shadowColor = glow; ctx.shadowBlur = 14; ctx.fillStyle = hi; ctx.beginPath(); ctx.arc(lx, ly, 4, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+  ctx.strokeStyle = glow; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(lx, ly, 7, 0, Math.PI * 2); ctx.stroke();
+
+  // X-axis date labels — every point when few, thinned to fit when many (never crammed).
+  ctx.fillStyle = '#8a8275'; ctx.font = '9px JetBrains Mono'; ctx.textAlign = 'center';
+  const fmtLbl = (dstr) => { const dt = new Date(dstr + 'T00:00:00Z'); return gran === 'monthly' ? dt.toLocaleDateString('en-US', { month: 'short' }) : (dt.getUTCMonth() + 1) + '/' + dt.getUTCDate(); };
+  const maxLabels = Math.max(3, Math.min(data.length, Math.floor(plotW / 58)));
+  const step = Math.max(1, Math.ceil(data.length / maxLabels));
+  for (let i = 0; i < data.length; i += step) ctx.fillText(fmtLbl(data[i].date), x(i), padT + plotH + 15);
+  if ((data.length - 1) % step !== 0) ctx.fillText(fmtLbl(data[data.length - 1].date), x(data.length - 1), padT + plotH + 15);
+}
+
+function attachBotEquityHover() {
+  const canvas = document.getElementById('bot-eq-canvas');
+  const tip = document.getElementById('bot-eq-tooltip');
+  if (!canvas || !tip || canvas._eqWired) return;
+  const at = (e) => {
+    const geom = state._botChartGeom; if (!geom) return;
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    if (mx < geom.padL || mx > geom.padL + geom.plotW) { tip.style.display = 'none'; renderBotEquityChart(); return; }
+    const frac = (mx - geom.padL) / geom.plotW;
+    const idx = Math.max(0, Math.min(geom.data.length - 1, Math.round(frac * (geom.data.length - 1))));
+    const d = geom.data[idx]; if (!d) return;
+    renderBotEquityChart();
+    const c = canvas.getContext('2d'); const px = geom.x(idx), py = geom.y(d.value);
+    c.strokeStyle = 'rgba(232,223,201,0.45)'; c.lineWidth = 1; c.setLineDash([2, 3]);
+    c.beginPath(); c.moveTo(px, geom.padT); c.lineTo(px, geom.padT + geom.plotH); c.moveTo(geom.padL, py); c.lineTo(geom.padL + geom.plotW, py); c.stroke(); c.setLineDash([]);
+    c.fillStyle = '#d4a24c'; c.beginPath(); c.arc(px, py, 5, 0, Math.PI * 2); c.fill(); c.strokeStyle = '#0d0d0d'; c.lineWidth = 2; c.stroke();
+    const chg = ((d.value - BOT_STARTING_BANKROLL) / BOT_STARTING_BANKROLL) * 100;
+    const col = chg >= 0 ? 'var(--pos)' : 'var(--neg)';
+    const dt = new Date(d.date + 'T00:00:00Z');
+    tip.innerHTML = `<div class="pct-date">${dt.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}</div>` +
+      `<div class="pct-price">${fmt$(d.value)}</div>` +
+      `<div class="pct-change" style="color:${col}">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}% vs $100k</div>`;
+    tip.style.display = 'block';
+    const tipW = 175; let leftPx = mx + 14; if (leftPx + tipW > rect.width - 8) leftPx = mx - tipW - 14;
+    tip.style.left = Math.max(4, leftPx) + 'px'; tip.style.top = Math.max(6, my - 58) + 'px';
+  };
+  canvas.onmousemove = at;
+  canvas.ontouchstart = (e) => { if (e.touches[0]) at(e.touches[0]); };
+  canvas.ontouchmove = (e) => { if (e.touches[0]) { at(e.touches[0]); } };
+  canvas.onmouseleave = () => { tip.style.display = 'none'; renderBotEquityChart(); };
+  canvas.ontouchend = () => { tip.style.display = 'none'; renderBotEquityChart(); };
+  canvas._eqWired = true;
+  if (!window._botEqResizeWired) { window._botEqResizeWired = true; window.addEventListener('resize', () => { clearTimeout(window._botEqRT); window._botEqRT = setTimeout(renderBotEquityChart, 120); }); }
+}
+if (typeof window !== 'undefined') { window.renderBotEquityChart = renderBotEquityChart; window.attachBotEquityHover = attachBotEquityHover; }
 
 function renderBetsTab() {
   const body = document.getElementById('bets-body');
@@ -47418,93 +47587,33 @@ function renderBetsTab() {
     chartHtml = renderPositionChart(_selPos);
   } else if (wp && wp.curve.length >= 2) {
     // Slice the curve to the active window.
-    const winDays = { week: 7, month: 30, year: 365, all: null }[activeWin];
-    let pts = wp.curve;
-    if (winDays != null) {
-      const cutoff = Date.now() - winDays * 86400000;
-      pts = wp.curve.filter(p => new Date(p.date + 'T00:00:00Z').getTime() >= cutoff);
-      if (pts.length < 2) pts = wp.curve.slice(-2);  // always show something
-    }
-    const vals = pts.map(p => p.value);
-    const minV = Math.min(...vals), maxV = Math.max(...vals);
-    const pad = (maxV - minV) * 0.10 || 1000;
-    const lo = minV - pad, hi = maxV + pad;
-    const W = 1000, H = 320;
-    const x = (i) => pts.length > 1 ? (i / (pts.length - 1)) * W : W / 2;
-    const y = (v) => H - ((v - lo) / ((hi - lo) || 1)) * H;
-    const first = pts[0].value, lastV = pts[pts.length - 1].value;
-    const up = lastV >= first;
-    const lineColor = up ? 'var(--pos)' : 'var(--neg)';
-    const gA = up ? 'rgba(91,138,114,0.28)' : 'rgba(165,100,90,0.28)';
-    const gB = up ? 'rgba(91,138,114,0.03)' : 'rgba(165,100,90,0.03)';
-    const linePath = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(p.value).toFixed(1)}`).join(' ');
-    const areaPath = linePath + ` L${W.toFixed(1)},${H} L0,${H} Z`;
-    const winData = wp.windows[activeWin];
-    const winPct = winData?.returnPct;
-    const winColor = winPct == null ? 'var(--ink-dim)' : winPct >= 0 ? 'var(--pos)' : 'var(--neg)';
-    const showBasis = BOT_STARTING_BANKROLL >= lo && BOT_STARTING_BANKROLL <= hi;
-    const basisY = y(BOT_STARTING_BANKROLL);
-    const _fmtK = (v) => Math.abs(v) >= 1000 ? '$' + (v / 1000).toFixed(1) + 'k' : '$' + v.toFixed(0);
-    // Horizontal grid lines (SVG) + right-side price axis labels (HTML overlay so
-    // the text never distorts under the stretched, edge-to-edge plot).
-    const gridN = 4;
-    let gridSvg = '', yAxis = '';
-    for (let g = 0; g <= gridN; g++) {
-      const gv = hi - (hi - lo) * (g / gridN);
-      const gy = y(gv);
-      gridSvg += `<line x1="0" y1="${gy.toFixed(1)}" x2="${W}" y2="${gy.toFixed(1)}" stroke="var(--rule)" stroke-width="1" vector-effect="non-scaling-stroke" opacity="0.32"/>`;
-      yAxis += `<span style="top:${(gy / H * 100).toFixed(2)}%">${_fmtK(gv)}</span>`;
-    }
-    // ~5 evenly spaced date labels along the bottom.
-    let xAxis = '';
-    const xTicks = Math.min(5, pts.length);
-    for (let t = 0; t < xTicks; t++) {
-      const idx = xTicks > 1 ? Math.round(t * (pts.length - 1) / (xTicks - 1)) : 0;
-      const leftPct = (x(idx) / W * 100).toFixed(2);
-      const dp = String(pts[idx].date).split('-');
-      const lbl = pts[idx].t ? String(pts[idx].t).slice(11, 16) : (dp.length === 3 ? `${+dp[1]}/${+dp[2]}` : pts[idx].date);
-      const anchor = t === 0 ? 'left:0' : t === xTicks - 1 ? `left:${leftPct}%;transform:translateX(-100%)` : `left:${leftPct}%;transform:translateX(-50%)`;
-      xAxis += `<span style="${anchor}">${lbl}</span>`;
-    }
-    const rangeTabs = [['week','1W'],['month','1M'],['year','1Y'],['all','ALL']].map(([k, lbl]) =>
+    const _bcd = getBotChartData();
+    const _cdata = _bcd.data;
+    const _lastV = _cdata.length ? _cdata[_cdata.length - 1].value : BOT_STARTING_BANKROLL;
+    const _firstV = _cdata.length ? _cdata[0].value : BOT_STARTING_BANKROLL;
+    const _upWin = _lastV >= _firstV;
+    const _lineColor = _upWin ? 'var(--pos)' : 'var(--neg)';
+    const _winPct = _firstV ? ((_lastV - _firstV) / _firstV * 100) : 0;
+    const _allPct = ((_lastV - BOT_STARTING_BANKROLL) / BOT_STARTING_BANKROLL * 100);
+    const _rangeTabs = [['week', '1W'], ['month', '1M'], ['year', '1Y'], ['all', 'ALL']].map(([k, lbl]) =>
       `<button class="rng-tab ${activeWin === k ? 'active' : ''}" data-perfwin="${k}">${lbl}</button>`).join('');
-    const dollarChg = winData?.dollars;
-    const lastLeft = (x(pts.length - 1) / W * 100).toFixed(2);
-    const lastTop = (y(lastV) / H * 100).toFixed(2);
-    const pulseRGBA = up ? 'rgba(91,138,114,.5)' : 'rgba(165,100,90,.5)';
+    const _granTabs = (_bcd.opts.length > 1)
+      ? `<div class="rng-tabs" id="bot-gran-tabs" title="Daily / Weekly / Monthly">${_bcd.opts.map(g => `<button class="rng-tab ${_bcd.gran === g ? 'active' : ''}" data-perfgran="${g}">${BOT_GRAN_LABEL[g]}</button>`).join('')}</div>`
+      : '';
     chartHtml = `
     <div class="bot-chart">
       <div class="bot-chart__head">
         <div style="min-width:0">
-          <div class="bot-chart__title">Bot Equity \u00b7 ${activeWin === 'all' ? 'all-time' : activeWin} window</div>
-          <div class="bot-chart__val" style="color:${lineColor}">$${lastV.toLocaleString(undefined,{maximumFractionDigits:0})}</div>
-          <div class="bot-chart__sub"><span style="color:${winColor};font-weight:700">${winPct == null ? '\u2014' : (winPct >= 0 ? '+' : '') + winPct + '%'}</span>${dollarChg != null ? `<span style="color:${winColor}"> \u00b7 ${dollarChg >= 0 ? '+' : ''}$${Math.abs(dollarChg).toLocaleString(undefined,{maximumFractionDigits:0})}</span>` : ''}<span style="color:var(--ink-faint)"> \u00b7 ${pts.length} sessions</span></div>
-          <div class="bot-chart__readout" id="bot-eq-readout">&nbsp;</div>
+          <div class="bot-chart__title">Bot Equity \u00b7 ${activeWin === 'all' ? 'all-time' : activeWin}</div>
+          <div class="bot-chart__val" style="color:${_lineColor}">$${_lastV.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+          <div class="bot-chart__sub"><span style="color:${_upWin ? 'var(--pos)' : 'var(--neg)'};font-weight:700">${_winPct >= 0 ? '+' : ''}${_winPct.toFixed(2)}%</span> this window \u00b7 <span style="color:${_allPct >= 0 ? 'var(--pos)' : 'var(--neg)'}">${_allPct >= 0 ? '+' : ''}${_allPct.toFixed(2)}%</span> all-time</div>
         </div>
-        <div class="rng-tabs">${rangeTabs}</div>
-      </div>
-      <div class="bot-chart__plot" id="bot-eq-chart-wrap" data-points="${escapeHtml(JSON.stringify(pts.map(p => ({ d: p.date, v: +(+p.value).toFixed(2), t: p.t || null }))))}" data-lo="${lo}" data-hi="${hi}" data-w="${W}" data-h="${H}" data-basis="${showBasis ? BOT_STARTING_BANKROLL : ''}" data-up="${up ? 1 : 0}">
-        <svg class="bot-chart__svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
-          <defs>
-            <linearGradient id="botEqGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stop-color="${gA}"/>
-              <stop offset="100%" stop-color="${gB}"/>
-            </linearGradient>
-          </defs>
-          ${gridSvg}
-          ${showBasis ? `<line x1="0" y1="${basisY.toFixed(1)}" x2="${W}" y2="${basisY.toFixed(1)}" stroke="var(--amber)" stroke-width="1" stroke-dasharray="5,4" vector-effect="non-scaling-stroke" opacity="0.5"/>` : ''}
-          <path d="${areaPath}" fill="url(#botEqGrad)"/>
-          <path d="${linePath}" fill="none" stroke="${lineColor}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
-          <line id="bot-eq-crossh" x1="0" y1="0" x2="${W}" y2="0" stroke="var(--ink-dim)" stroke-width="1" stroke-dasharray="3,3" vector-effect="non-scaling-stroke" opacity="0"/>
-          <line id="bot-eq-cross" x1="0" y1="0" x2="0" y2="${H}" stroke="var(--ink-dim)" stroke-width="1" stroke-dasharray="3,3" vector-effect="non-scaling-stroke" opacity="0"/>
-        </svg>
-        <div class="bot-chart__overlay">
-          <span class="bot-chart__last" style="left:${lastLeft}%;top:${lastTop}%;background:${lineColor};--pulse:${pulseRGBA}"></span>
-          <span class="bot-chart__hoverdot" id="bot-eq-hover-dot" style="background:${lineColor}"></span>
+        <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end">
+          <div class="rng-tabs">${_rangeTabs}</div>
+          ${_granTabs}
         </div>
-        <div class="bot-chart__axis-y">${yAxis}<span class="bot-chart__pill bot-chart__pill--y" id="bot-eq-pill-y" style="background:${lineColor}"></span></div>
-        <div class="bot-chart__axis-x">${xAxis}<span class="bot-chart__pill bot-chart__pill--x" id="bot-eq-pill-x"></span></div>
       </div>
+      <div class="bot-eq-plot"><canvas id="bot-eq-canvas"></canvas><div id="bot-eq-tooltip" class="bot-eq-tip"></div></div>
     </div>`;
   } else {
     chartHtml = `<div class="company-card" style="margin:0 0 18px"><div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);padding:8px 0">Equity curve builds as the bot runs daily — one point per day. Run the scan over multiple days to see the chart and weekly/monthly/yearly performance.</div></div>`;
@@ -47833,7 +47942,7 @@ function renderBetsTab() {
     renderBetsTab();
   });
   // Equity-curve hover: nearest-point crosshair + tooltip (mouse + touch).
-  if (typeof _wireBotEquityHover === 'function') _wireBotEquityHover();
+  if (typeof renderBotEquityChart === 'function') { requestAnimationFrame(() => { try { renderBotEquityChart(); attachBotEquityHover(); } catch {} }); }
   // Editable Cash card — feed the bot capital (recorded as a deposit).
   body.querySelector('#bets-cash-card')?.addEventListener('click', () => {
     if (typeof botEditCash === 'function') botEditCash();
@@ -47851,9 +47960,13 @@ function renderBetsTab() {
   });
 
   // Wire the equity-curve window selector.
+  body.querySelectorAll('[data-perfgran]').forEach(btn => {
+    btn.addEventListener('click', () => { BETS_STATE.perfGran = btn.dataset.perfgran; renderBetsTab(); });
+  });
   body.querySelectorAll('[data-perfwin]').forEach(btn => {
     btn.addEventListener('click', () => {
       BETS_STATE.perfWindow = btn.dataset.perfwin;
+      BETS_STATE.perfGran = null;   // auto-pick the default granularity for the new range
       renderBetsTab();
     });
   });
