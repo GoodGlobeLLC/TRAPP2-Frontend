@@ -880,6 +880,12 @@ function normalizeRowToUSD(row) {
   if (!row || !row.ticker) return { price: row?.price, marketCap: row?.marketCap, converted: false };
   // Prefer the sheet's explicit currency field; fall back to suffix mapping.
   let currency = (row.currency && row.currency !== 'USD') ? row.currency : _tickerLocalCurrency(row.ticker);
+  // US cents (commodity futures like corn/coffee, currency 'USX') = 1/100 USD.
+  if (currency === 'USX' || currency === 'USd') {
+    const cp = (typeof row.price === 'number' && isFinite(row.price)) ? row.price * 0.01 : row.price;
+    const cm = (typeof row.marketCap === 'number' && isFinite(row.marketCap)) ? row.marketCap * 0.01 : row.marketCap;
+    return { price: cp, marketCap: cm, converted: true, currency: 'USD', rate: 0.01 };
+  }
   if (!currency || currency === 'USD') {
     return { price: row.price, marketCap: row.marketCap, converted: false, currency: 'USD', rate: 1 };
   }
@@ -3690,8 +3696,22 @@ document.addEventListener('DOMContentLoaded', () => {
   // (and the Company tab's holders section) have data to read.
   if (typeof load13fByCusip === 'function') load13fByCusip().catch(() => {});
   if (typeof loadSecFilings === 'function') loadSecFilings().catch(() => {});
-  // Warm the XTRAPP lexicon + posts so the Calls/Review brain reflects prior training.
-  if (typeof fetchXtrappData === 'function') fetchXtrappData().catch(() => {});
+  // Pull XTRAPP (lexicon + posts + human corrections/overwrites — the FINAL data
+  // layer). fetchXtrappData re-applies overrides and re-renders when it resolves,
+  // so it corrects the view even if the base stockbook rendered from cache first.
+  if (typeof loadCompanyOverridesRemote === 'function') loadCompanyOverridesRemote().catch(() => {});
+  if (typeof fetchXtrappData === 'function') {
+    fetchXtrappData().then(() => {
+      // Belt-and-suspenders: if rows exist now, make sure the corrections are on.
+      try {
+        if (state.stockbook?.rows?.length && typeof applyOverridesToRow === 'function') {
+          state.stockbook.rows.forEach(applyOverridesToRow);
+          _researchCache = null;
+          if (typeof renderStockBook === 'function' && ['stockbook', 'valuation', 'research'].includes(state.tab)) renderStockBook();
+        }
+      } catch {}
+    }).catch(() => {});
+  }
   // Analytics backend: research grades for the verification layer + the
   // backend-pulled news corpus (live API calls become the supplement).
   if (typeof loadBackendResearch === 'function') loadBackendResearch().catch(() => {});
@@ -10232,7 +10252,20 @@ async function loadMacroTab(forceRefresh = false) {
     const history = buildQuadHistory(gdpYoY, cpiYoY, 30);
     if (history.length === 0) throw new Error('Could not align GDP and CPI');
 
-    const current = history[history.length - 1];
+    let current = history[history.length - 1];
+    // The CURRENT quad is owned by quad_nowcast.py — a FRESH market nowcast in
+    // TRAPP2-1/data/macro/quad.json, NOT the ~2-month-lagged GDP/CPI point above.
+    // Pull it and let it win; the history chart keeps the FRED-derived path.
+    try {
+      const _mb = (typeof resolveMacroBase === 'function') ? resolveMacroBase() : null;
+      if (_mb) {
+        const _qr = await fetch(_mb + 'quad.json', { cache: 'no-store' });
+        if (_qr.ok) {
+          const _qj = await _qr.json();
+          if (_qj && _qj.current && _qj.current.quad) current = { ...current, ..._qj.current };
+        }
+      }
+    } catch (e) { console.warn('[quad] nowcast fetch failed — using FRED point', e.message); }
 
     // Latest yields — FRED returns oldest-first arrays, so take the LAST entry
     const tsyArr = (macro.tsyRaw || []).filter(d => isFinite(d.value));
@@ -12474,6 +12507,12 @@ async function refreshAllStockBookData() {
   purgeAllDataCaches();
   // Reload stockbook from source (forces fresh sheet fetch)
   try { await loadStockBook(true); } catch (e) { console.warn('stockbook reload failed', e); }
+  // FINAL LAYER: pull XTRAPP corrections / overwritten data (repo wins) and
+  // re-apply on top of the freshly-loaded base. This was missing — a refresh
+  // reloaded the base sheets but never re-pulled XTRAPP, so human corrections
+  // only appeared after a later, unrelated XTRAPP fetch.
+  if (typeof fetchXtrappData === 'function') { try { await fetchXtrappData(); } catch (e) { console.warn('xtrapp refresh failed', e); } }
+  if (typeof loadCompanyOverridesRemote === 'function') { try { await loadCompanyOverridesRemote(); } catch (e) { console.warn('overrides restore failed', e); } }
   // Reload macro tab if previously loaded
   if (state.macro && typeof loadMacroTab === 'function') {
     try { await loadMacroTab(true); } catch {}
@@ -16951,6 +16990,111 @@ state.probability = {
 };
 const PROB_STORAGE = 'valuatio.probability.theses.v1';
 
+// ============================================================
+//   ANALYST / INSTITUTION CALL TRACKER
+//   Log the calls you see all day ("JPM: buy the dip in semis", "BofA:
+//   downgrade energy") with WHO said it and WHEN, then measure how they
+//   actually performed. Deliberately lenient on horizon: a call has no hard
+//   expiry — performance is tracked FROM the call date to now, and scored over
+//   1M / 3M / 1Y / all-time windows. Sources build a reusable roster so a
+//   repeat name is one dropdown pick.
+// ============================================================
+const CALLS_STORAGE = 'valuatio.calls.v1';
+const CALL_SOURCES_STORAGE = 'valuatio.callSources.v1';
+const CALL_SEED_SOURCES = ['J.P. Morgan', 'Bank of America', 'Goldman Sachs', 'Morgan Stanley',
+  'Wells Fargo', 'Citi', 'UBS', 'Barclays', 'Jefferies', 'Piper Sandler', 'Wedbush',
+  'Evercore ISI', 'Bernstein', 'RBC', 'Deutsche Bank', 'Me'];
+
+function loadCalls() { try { const a = JSON.parse(localStorage.getItem(CALLS_STORAGE) || '[]'); return Array.isArray(a) ? a : []; } catch { return []; } }
+function saveCalls(arr) { try { localStorage.setItem(CALLS_STORAGE, JSON.stringify(arr)); } catch {} }
+function loadCallSources() {
+  let saved = [];
+  try { saved = JSON.parse(localStorage.getItem(CALL_SOURCES_STORAGE) || '[]') || []; } catch {}
+  const used = Array.from(new Set(loadCalls().map(c => c.source).filter(Boolean)));
+  return Array.from(new Set([...saved, ...used, ...CALL_SEED_SOURCES])).sort((a, b) => a.localeCompare(b));
+}
+function addCallSource(name) {
+  if (!name) return;
+  let saved = [];
+  try { saved = JSON.parse(localStorage.getItem(CALL_SOURCES_STORAGE) || '[]') || []; } catch {}
+  if (!saved.includes(name)) { saved.push(name); try { localStorage.setItem(CALL_SOURCES_STORAGE, JSON.stringify(saved)); } catch {} }
+}
+
+// Price on/near a date from the ticker's history (nearest prior close), else live.
+function _callPriceAt(ticker, isoDate) {
+  try {
+    const h = (typeof getHistoryForTicker === 'function') ? getHistoryForTicker(ticker) : null;
+    if (h && h.length) {
+      const want = String(isoDate).slice(0, 10);
+      let best = null;
+      for (const x of h) {
+        const d = Array.isArray(x) ? x[0] : x.date;
+        const v = Array.isArray(x) ? x[1] : (x.close != null ? x.close : x.price);
+        if (!d || !isFinite(v) || v <= 0) continue;
+        const ds = String(d).slice(0, 10);
+        if (ds <= want && (!best || ds > best.d)) best = { d: ds, v: +v };
+      }
+      if (best) return best.v;
+    }
+  } catch {}
+  const row = (typeof getStockbookRow === 'function') ? getStockbookRow(String(ticker).toUpperCase()) : null;
+  if (row && row.price != null && isFinite(row.price)) {
+    if (typeof normalizeRowToUSD === 'function') { try { const n = normalizeRowToUSD(row); if (n && isFinite(n.price)) return n.price; } catch {} }
+    return +row.price;
+  }
+  return null;
+}
+
+// Score one call: return since the call date, signed by direction. A bullish
+// call wins when price is up; a bearish call wins when price is down.
+function scoreCall(c) {
+  const live = _callPriceAt(c.ticker, new Date().toISOString());
+  const entry = (c.priceAtCall != null && isFinite(c.priceAtCall)) ? +c.priceAtCall : _callPriceAt(c.ticker, c.date);
+  if (entry == null || live == null || entry <= 0) return { ...c, entry, live, retPct: null, alpha: null, win: null, days: null };
+  const dir = (c.direction === 'bearish' || c.direction === 'sell') ? -1 : 1;
+  const raw = ((live - entry) / entry) * 100;
+  const retPct = raw * dir;
+  const days = Math.max(0, Math.round((Date.now() - new Date(c.date).getTime()) / 86400000));
+  return { ...c, entry, live, rawPct: +raw.toFixed(2), retPct: +retPct.toFixed(2), win: retPct > 0, days };
+}
+
+// Aggregate scorecard over a time window (calls MADE within the window).
+function callsScorecard(calls, windowKey) {
+  const now = Date.now();
+  // Lenient windows (a "1-month call" made 5 weeks ago still counts) — the point
+  // is tracking since the call was made, not enforcing a strict expiry.
+  const cutoff = { month: 45, quarter: 115, year: 400, all: null }[windowKey];
+  const inWin = calls.filter(c => {
+    if (cutoff == null) return true;
+    const t = new Date(c.date).getTime();
+    return isFinite(t) && (now - t) <= cutoff * 86400000;
+  });
+  const scored = inWin.map(scoreCall).filter(c => c.retPct != null);
+  const wins = scored.filter(c => c.win), losses = scored.filter(c => !c.win);
+  const avg = scored.length ? scored.reduce((s, c) => s + c.retPct, 0) / scored.length : null;
+  const best = scored.length ? scored.reduce((a, b) => (b.retPct > a.retPct ? b : a)) : null;
+  const worst = scored.length ? scored.reduce((a, b) => (b.retPct < a.retPct ? b : a)) : null;
+  return {
+    n: scored.length, pending: inWin.length - scored.length,
+    winRate: (wins.length + losses.length) ? +((wins.length / (wins.length + losses.length)) * 100).toFixed(1) : null,
+    wins: wins.length, losses: losses.length,
+    avgReturn: avg == null ? null : +avg.toFixed(2),
+    best, worst, scored,
+  };
+}
+
+// Per-source leaderboard for a window.
+function callsBySource(calls, windowKey) {
+  const bySrc = {};
+  for (const c of calls) (bySrc[c.source || 'Unknown'] = bySrc[c.source || 'Unknown'] || []).push(c);
+  return Object.entries(bySrc).map(([source, list]) => {
+    const sc = callsScorecard(list, windowKey);
+    return { source, ...sc };
+  }).filter(x => x.n > 0 || x.pending > 0)
+    .sort((a, b) => (b.winRate ?? -1) - (a.winRate ?? -1) || b.n - a.n);
+}
+if (typeof window !== 'undefined') { window.loadCalls = loadCalls; window.saveCalls = saveCalls; window.callsScorecard = callsScorecard; window.callsBySource = callsBySource; }
+
 function loadTheses() {
   try {
     const arr = JSON.parse(localStorage.getItem(PROB_STORAGE) || '[]');
@@ -17559,15 +17703,187 @@ function thesisFromParsedPost(parsed) {
   };
 }
 
+const PROB_VIEW = { view: 'theses', win: 'all', src: 'all' };
+
+function _ensureCallsCSS() {
+  if (document.getElementById('calls-css')) return;
+  const st = document.createElement('style'); st.id = 'calls-css';
+  st.textContent = '.calls-sub{display:inline-flex;background:rgba(0,0,0,.16);border:1px solid var(--rule);border-radius:9px;padding:2px;gap:2px;margin-bottom:14px}'
+    + '.calls-sub button{font-family:var(--mono);font-size:10px;font-weight:600;color:var(--ink-dim);background:transparent;border:none;border-radius:7px;padding:6px 14px;cursor:pointer}'
+    + '.calls-sub button.active{background:var(--amber);color:#000}'
+    + '.call-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;align-items:end}'
+    + '.call-form label{display:flex;flex-direction:column;gap:3px}'
+    + '.call-form span{font-family:var(--mono);font-size:9px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-faint)}'
+    + '.call-form input,.call-form select{font-family:var(--mono);font-size:12px;padding:6px 8px;background:var(--bg);border:1px solid var(--rule);border-radius:5px;color:var(--ink);width:100%;box-sizing:border-box}'
+    + '.call-form input:focus,.call-form select:focus{outline:none;border-color:var(--amber)}'
+    + '.calls-table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px}'
+    + '.calls-table th{text-align:left;font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-faint);padding:6px 8px;border-bottom:1px solid var(--rule);white-space:nowrap}'
+    + '.calls-table td{padding:6px 8px;border-bottom:1px solid rgba(255,255,255,.04);white-space:nowrap}'
+    + '.calls-table tr:hover td{background:rgba(224,176,76,.06)}';
+  (document.head || document.documentElement).appendChild(st);
+}
+
+function _callsSubNav() {
+  const v = PROB_VIEW.view;
+  return `<div class="calls-sub">
+    <button data-probview="theses" class="${v === 'theses' ? 'active' : ''}">Theses</button>
+    <button data-probview="calls" class="${v === 'calls' ? 'active' : ''}">Analyst Calls</button>
+    <button data-probview="score" class="${v === 'score' ? 'active' : ''}">Scorecard</button>
+  </div>`;
+}
+
+function _winTabs(attr) {
+  const w = PROB_VIEW.win;
+  return `<div class="calls-sub" style="margin-bottom:10px">${[['month', '1M'], ['quarter', '3M'], ['year', '1Y'], ['all', 'ALL']]
+    .map(([k, l]) => `<button data-${attr}="${k}" class="${w === k ? 'active' : ''}">${l}</button>`).join('')}</div>`;
+}
+
+function renderCallsView(host) {
+  _ensureCallsCSS();
+  const calls = loadCalls();
+  const sources = loadCallSources();
+  const today = new Date().toISOString().slice(0, 10);
+  const scored = calls.map(scoreCall).sort((a, b) => (a.date < b.date ? 1 : -1));
+  const rows = scored.map(c => `
+    <tr>
+      <td style="color:var(--ink-dim)">${c.date || ''}</td>
+      <td style="font-weight:700">${c.source || ''}</td>
+      <td><span class="bot-ticker-link" data-ticker="${c.ticker}" style="color:var(--amber);cursor:pointer;text-decoration:underline;text-decoration-style:dotted">${c.ticker}</span></td>
+      <td style="color:${c.direction === 'bearish' ? 'var(--neg)' : 'var(--pos)'};font-weight:700">${(c.direction || 'bullish').toUpperCase()}</td>
+      <td style="color:var(--ink-faint);max-width:220px;overflow:hidden;text-overflow:ellipsis">${(c.note || '').replace(/</g, '&lt;')}</td>
+      <td style="color:var(--ink-dim)">${c.entry != null ? '$' + c.entry.toFixed(2) : '—'}</td>
+      <td style="color:var(--ink-dim)">${c.live != null ? '$' + c.live.toFixed(2) : '—'}</td>
+      <td style="font-weight:700;color:${c.retPct == null ? 'var(--ink-faint)' : c.retPct >= 0 ? 'var(--pos)' : 'var(--neg)'}">${c.retPct == null ? '—' : (c.retPct >= 0 ? '+' : '') + c.retPct + '%'}</td>
+      <td style="color:var(--ink-faint)">${c.days != null ? c.days + 'd' : '—'}</td>
+      <td><button class="btn btn-ghost" data-callrm="${c.id}" style="font-size:9px;padding:2px 7px">✕</button></td>
+    </tr>`).join('');
+  host.innerHTML = _callsSubNav() + `
+    <div class="company-card">
+      <h4>Log a call <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· who said it, what they said, when · tracked from that date forward</span></h4>
+      <div class="call-form">
+        <label><span>Source</span>
+          <select id="call-source">${sources.map(x => `<option value="${x}">${x}</option>`).join('')}<option value="__new">+ Add new…</option></select>
+        </label>
+        <label id="call-newsrc-wrap" style="display:none"><span>New source</span><input id="call-newsrc" placeholder="e.g. Raymond James"></label>
+        <label><span>Ticker / ETF</span><input id="call-ticker" placeholder="NVDA" style="text-transform:uppercase"></label>
+        <label><span>Call</span><select id="call-dir"><option value="bullish">Bullish / Buy</option><option value="bearish">Bearish / Sell</option></select></label>
+        <label><span>Date</span><input id="call-date" type="date" value="${today}"></label>
+        <label style="grid-column:span 2"><span>Note (optional)</span><input id="call-note" placeholder="buy the dip in semis"></label>
+        <button class="btn" id="call-add" style="font-size:11px">+ Add call</button>
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
+        <button class="btn btn-ghost" id="calls-sync" style="font-size:10px">↑ Sync calls to Supabase</button>
+        <span id="calls-msg" style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);align-self:center"></span>
+      </div>
+    </div>
+    <div class="company-card">
+      <h4>Calls <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· ${calls.length} logged · return measured from the call date to now, signed by direction</span></h4>
+      <div style="overflow-x:auto">
+        <table class="calls-table"><thead><tr>
+          <th>Date</th><th>Source</th><th>Ticker</th><th>Call</th><th>Note</th><th>At call</th><th>Now</th><th>Return</th><th>Held</th><th></th>
+        </tr></thead><tbody>${rows || '<tr><td colspan="10" style="color:var(--ink-faint);padding:14px">No calls logged yet — add one above.</td></tr>'}</tbody></table>
+      </div>
+    </div>`;
+  const srcSel = host.querySelector('#call-source');
+  srcSel?.addEventListener('change', () => {
+    host.querySelector('#call-newsrc-wrap').style.display = srcSel.value === '__new' ? '' : 'none';
+  });
+  host.querySelector('#call-add')?.addEventListener('click', () => {
+    let source = srcSel.value;
+    if (source === '__new') { source = (host.querySelector('#call-newsrc').value || '').trim(); if (source) addCallSource(source); }
+    const ticker = (host.querySelector('#call-ticker').value || '').trim().toUpperCase();
+    const date = host.querySelector('#call-date').value || today;
+    const direction = host.querySelector('#call-dir').value;
+    const note = (host.querySelector('#call-note').value || '').trim();
+    if (!source || !ticker) { host.querySelector('#calls-msg').textContent = 'source + ticker required'; return; }
+    const all = loadCalls();
+    all.push({ id: `${ticker}-${date}-${Date.now()}`, source, ticker, direction, date, note,
+      priceAtCall: _callPriceAt(ticker, date), createdAt: new Date().toISOString() });
+    saveCalls(all);
+    if (typeof flashStatus === 'function') flashStatus(`Logged ${source} · ${direction} ${ticker}`, 'success');
+    renderProbabilityTab();
+  });
+  host.querySelectorAll('[data-callrm]').forEach(b => b.addEventListener('click', () => {
+    const id = b.getAttribute('data-callrm');
+    saveCalls(loadCalls().filter(c => c.id !== id));
+    renderProbabilityTab();
+  }));
+  host.querySelector('#calls-sync')?.addEventListener('click', async () => {
+    const msg = host.querySelector('#calls-msg');
+    if (typeof analyticsSupabasePushKV !== 'function') { msg.textContent = 'analytics Supabase not configured'; return; }
+    msg.textContent = 'syncing…';
+    try { const n = await analyticsSupabasePushKV(); msg.textContent = `✓ pushed ${n} row(s)`; }
+    catch { msg.textContent = 'sync failed — check Analytics Supabase config'; }
+  });
+  host.querySelectorAll('.bot-ticker-link').forEach(el => el.addEventListener('click', () => {
+    const t = el.getAttribute('data-ticker');
+    if (t && typeof lookupTicker === 'function') lookupTicker(t);
+  }));
+}
+
+function renderCallsScorecard(host) {
+  _ensureCallsCSS();
+  const all = loadCalls();
+  const w = PROB_VIEW.win;
+  const mine = all.filter(c => (c.source || '').toLowerCase() === 'me');
+  const analysts = all.filter(c => (c.source || '').toLowerCase() !== 'me');
+  const card = (title, sc, sub) => {
+    const wr = sc.winRate;
+    return `<div class="company-card" style="margin-bottom:14px">
+      <h4>${title} <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· ${sub}</span></h4>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:14px 12px">
+        ${[['Win rate', wr == null ? '—' : wr + '%', wr == null ? 'var(--ink-faint)' : wr >= 50 ? 'var(--pos)' : 'var(--neg)', `${sc.wins}W / ${sc.losses}L`],
+           ['Calls scored', String(sc.n), 'var(--ink)', sc.pending ? sc.pending + ' pending price' : 'all priced'],
+           ['Avg return', sc.avgReturn == null ? '—' : (sc.avgReturn >= 0 ? '+' : '') + sc.avgReturn + '%', sc.avgReturn == null ? 'var(--ink-faint)' : sc.avgReturn >= 0 ? 'var(--pos)' : 'var(--neg)', 'per call, direction-signed'],
+           ['Best', sc.best ? `${sc.best.ticker} ${sc.best.retPct >= 0 ? '+' : ''}${sc.best.retPct}%` : '—', 'var(--pos)', sc.best ? sc.best.source : ''],
+           ['Worst', sc.worst ? `${sc.worst.ticker} ${sc.worst.retPct >= 0 ? '+' : ''}${sc.worst.retPct}%` : '—', 'var(--neg)', sc.worst ? sc.worst.source : '']]
+          .map(([l, v, c, s2]) => `<div><div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:.1em;text-transform:uppercase">${l}</div><div style="font-family:var(--mono);font-size:17px;font-weight:700;color:${c};margin-top:3px;white-space:nowrap">${v}</div><div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:1px">${s2 || ''}</div></div>`).join('')}
+      </div>
+    </div>`;
+  };
+  const board = callsBySource(all, w);
+  const boardRows = board.map(b => `
+    <tr>
+      <td style="font-weight:700">${b.source}</td>
+      <td style="font-weight:700;color:${b.winRate == null ? 'var(--ink-faint)' : b.winRate >= 50 ? 'var(--pos)' : 'var(--neg)'}">${b.winRate == null ? '—' : b.winRate + '%'}</td>
+      <td style="color:var(--ink-dim)">${b.wins}W / ${b.losses}L</td>
+      <td style="color:${(b.avgReturn ?? 0) >= 0 ? 'var(--pos)' : 'var(--neg)'}">${b.avgReturn == null ? '—' : (b.avgReturn >= 0 ? '+' : '') + b.avgReturn + '%'}</td>
+      <td style="color:var(--ink-faint)">${b.n}${b.pending ? ' (+' + b.pending + ')' : ''}</td>
+    </tr>`).join('');
+  host.innerHTML = _callsSubNav() + _winTabs('probwin') +
+    card('Analyst &amp; institution calls', callsScorecard(analysts, w), `${w === 'all' ? 'all time' : w === 'month' ? 'last 30 days' : w === 'quarter' ? 'last 3 months' : 'last year'} · calls made in the window`) +
+    card('Your calls', callsScorecard(mine, w), 'logged under source "Me"') + `
+    <div class="company-card">
+      <h4>Leaderboard <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· by source · sorted by win rate</span></h4>
+      <div style="overflow-x:auto">
+        <table class="calls-table"><thead><tr><th>Source</th><th>Win rate</th><th>W/L</th><th>Avg return</th><th>Calls</th></tr></thead>
+        <tbody>${boardRows || '<tr><td colspan="5" style="color:var(--ink-faint);padding:14px">No calls in this window.</td></tr>'}</tbody></table>
+      </div>
+    </div>`;
+  host.querySelectorAll('[data-probwin]').forEach(b => b.addEventListener('click', () => { PROB_VIEW.win = b.getAttribute('data-probwin'); renderProbabilityTab(); }));
+}
+
 async function renderProbabilityTab() {
   const grid = document.getElementById('prob-grid');
   const empty = document.getElementById('prob-empty');
+  // Sub-views: Theses (the original) | Analyst Calls | Scorecard.
+  if (grid && PROB_VIEW.view !== 'theses') {
+    if (empty) empty.style.display = 'none';
+    if (PROB_VIEW.view === 'calls') renderCallsView(grid); else renderCallsScorecard(grid);
+    grid.querySelectorAll('[data-probview]').forEach(b => b.addEventListener('click', () => { PROB_VIEW.view = b.getAttribute('data-probview'); renderProbabilityTab(); }));
+    return;
+  }
   const allTheses = state.probability.theses;
+  const _subNav = (typeof _callsSubNav === 'function') ? _callsSubNav() : '';
+  const _wireSub = () => grid.querySelectorAll('[data-probview]').forEach(b => b.addEventListener('click', () => { PROB_VIEW.view = b.getAttribute('data-probview'); renderProbabilityTab(); }));
   if (allTheses.length === 0) {
-    grid.innerHTML = '';
+    if (typeof _ensureCallsCSS === 'function') _ensureCallsCSS();
+    grid.innerHTML = _subNav;
+    _wireSub();
     empty.style.display = 'block';
     return;
   }
+  if (typeof _ensureCallsCSS === 'function') _ensureCallsCSS();
   empty.style.display = 'none';
 
   // ===== AUTO-RESOLVE EXPIRED THESES =====
@@ -17696,7 +18012,8 @@ async function renderProbabilityTab() {
     ? renderArchivedThesesSection(archivedTheses)
     : '';
 
-  grid.innerHTML = summaryHtml + activeCardsHtml + archivedHtml;
+  grid.innerHTML = _subNav + summaryHtml + activeCardsHtml + archivedHtml;
+  _wireSub();
 
   // Wire up interactions
   computed.forEach(({ thesis }) => {
@@ -31438,6 +31755,44 @@ const COMPANY_FACTS_STORAGE = 'valuatio.company.facts.v1';
 function loadCompanyFacts() { try { return JSON.parse(localStorage.getItem(COMPANY_FACTS_STORAGE) || '{}') || {}; } catch { return {}; } }
 function saveCompanyFacts(obj) { try { localStorage.setItem(COMPANY_FACTS_STORAGE, JSON.stringify(obj)); } catch {} }
 
+// Restore the company edits (geography + facts) backed up to
+// XTRAPP/data/company_overrides.json by the Overview editor — so your corrections
+// survive a cache clear or follow you to another device. Merge is timestamp-aware:
+// a newer remote record wins, but a fresher LOCAL edit is never clobbered; remote
+// also fills in any ticker the device doesn't have yet.
+async function loadCompanyOverridesRemote() {
+  try {
+    const r = await fetch('https://raw.githubusercontent.com/GoodGlobeLLC/XTRAPP/main/data/company_overrides.json', { cache: 'no-store' });
+    if (!r.ok) return;
+    let j = null;
+    try { j = await r.json(); } catch { return; }
+    if (!j || typeof j !== 'object') return;
+    let changed = false;
+    const mergeByTime = (remote, load, save, fillOnlyIfNoTs) => {
+      if (!remote || typeof remote !== 'object') return;
+      const local = load();
+      for (const tic of Object.keys(remote)) {
+        const rec = remote[tic];
+        if (!rec || typeof rec !== 'object') continue;
+        const cur = local[tic];
+        const rt = new Date(rec.updatedAt || 0).getTime();
+        const lt = new Date((cur && cur.updatedAt) || 0).getTime();
+        const hasTs = !!rec.updatedAt;
+        if (!cur || (hasTs && rt >= lt) || (!hasTs && !cur && fillOnlyIfNoTs)) { local[tic] = rec; changed = true; }
+      }
+      save(local);
+    };
+    mergeByTime(j.facts, loadCompanyFacts, saveCompanyFacts, false);
+    mergeByTime(j.geography, loadCompanyGeoOverrides, saveCompanyGeoOverrides, true);
+    if (changed) {
+      // Reflect restored edits: overrides feed the sheet + the company view.
+      try { if (state.stockbook && state.stockbook.rows && typeof applyOverridesToRow === 'function') state.stockbook.rows.forEach(applyOverridesToRow); } catch {}
+      try { if (typeof renderCompanyOverview === 'function' && state.tab === 'company') renderCompanyOverview(); } catch {}
+    }
+  } catch (e) { console.warn('[company-overrides] restore failed:', e.message); }
+}
+if (typeof window !== 'undefined') window.loadCompanyOverridesRemote = loadCompanyOverridesRemote;
+
 // Back up ALL user company edits (geography + facts) to a repo so they persist and
 // can be restored. Routes through the multi-repo registry (owner/branch/path
 // resolved there); defaults to XTRAPP/data/company_overrides.json.
@@ -42137,6 +42492,15 @@ async function fetchXtrappData() {
           if (typeof normalizeRowFields === 'function') normalizeRowFields(r);
         }
         _researchCache = null;  // force research recompute with the applied overrides
+        // Re-render the active view so XTRAPP corrections show immediately. The
+        // merge used to apply silently, so on first load it LOOKED like XTRAPP was
+        // ignored (the base data had already rendered before the fetch resolved).
+        try {
+          if (typeof renderStockBook === 'function' && ['stockbook', 'valuation', 'research'].includes(state.tab)) renderStockBook();
+          if (typeof renderBetsTab === 'function' && state.tab === 'bets') renderBetsTab();
+          if (typeof renderCompanyOverview === 'function' && state.tab === 'company') { try { renderCompanyOverview(); } catch {} }
+          if (typeof renderResearch === 'function' && state.tab === 'research') { try { renderResearch(); } catch {} }
+        } catch {}
       }
     } catch {}
     if (Array.isArray(j.reviewQueue) && typeof loadReviewQueue === 'function' && typeof saveReviewQueue === 'function') {
@@ -43708,6 +44072,21 @@ async function analyticsSupabasePushKV() {
       for (const th of list) {
         const tic = th && (th.ticker || th.primaryTicker);
         if (tic) rows.push({ key: `probability:${String(tic).toUpperCase()}`, value: th, updated_at: now });
+      }
+    }
+    // Analyst / institution calls — one row per call, plus a per-source rollup so
+    // the win-rate leaderboard is queryable straight from the DB.
+    if (typeof loadCalls === 'function') {
+      const calls = loadCalls();
+      for (const c of calls) {
+        if (!c || !c.id) continue;
+        rows.push({ key: `call:${c.id}`, value: (typeof scoreCall === 'function' ? scoreCall(c) : c), updated_at: now });
+      }
+      if (typeof callsBySource === 'function' && calls.length) {
+        for (const w of ['month', 'quarter', 'year', 'all']) {
+          const board = callsBySource(calls, w).map(({ scored, best, worst, ...rest }) => rest);
+          rows.push({ key: `calls:leaderboard:${w}`, value: board, updated_at: now });
+        }
       }
     }
     // Regime drivers + probabilities (handy for a dashboard).
@@ -47075,6 +47454,57 @@ function botTickerLedger(bets, priceOf) {
   return { legs, positions, openPositions, totalRealized, totalUnrealized };
 }
 
+// NET EXTERNAL CAPITAL — the only thing the all-time return is measured against.
+// It is the money YOU put in: initial deposit + deposits − withdrawals. Realizing a
+// gain never changes it (that's P&L, not capital), so selling a winner can't move
+// the all-time %. Derived from the deposit/withdrawal ledger so it self-heals if a
+// stored scalar ever drifted; falls back to the stored base, then the start balance.
+function botNetCapital(bot) {
+  const start = (bot && isFinite(bot.startingBankroll) && bot.startingBankroll > 0) ? bot.startingBankroll : BOT_STARTING_BANKROLL;
+  const txns = Array.isArray(bot && bot.transactions) ? bot.transactions : null;
+  if (txns) {
+    let flows = 0, seen = false;
+    for (const t of txns) {
+      if (!t) continue;
+      const ty = String(t.type || '').toLowerCase();
+      if (ty !== 'deposit' && ty !== 'withdrawal') continue;
+      const amt = Number(t.amount);
+      if (!isFinite(amt)) continue;
+      flows += (ty === 'withdrawal' && amt > 0) ? -amt : amt;   // withdrawals may be stored +ve
+      seen = true;
+    }
+    if (seen) return +(start + flows).toFixed(2);
+  }
+  // botAddCash always records BOTH a ledger entry and cashAdded, so this counter is
+  // the next-best authority.
+  if (bot && isFinite(bot.cashAdded) && bot.cashAdded !== 0) return +(start + bot.cashAdded).toFixed(2);
+  // A stored capitalBase that disagrees with the start balance WITHOUT any deposit
+  // record is unexplained drift (an old/foreign write), not real capital — trusting
+  // it silently understates the all-time return. Prefer the start balance; the
+  // discrepancy is surfaced as `baseDrift` so it can be reconciled rather than hidden.
+  if (bot && !isFinite(bot.startingBankroll) && isFinite(bot.capitalBase) && bot.capitalBase > 0) return +bot.capitalBase.toFixed(2);
+  return start;
+}
+
+// Net external flows (deposits − withdrawals) inside a time window, so a deposit
+// mid-window can't read as performance.
+function botFlowsBetween(bot, fromMs, toMs) {
+  const txns = Array.isArray(bot && bot.transactions) ? bot.transactions : [];
+  let f = 0;
+  for (const t of txns) {
+    if (!t) continue;
+    const ty = String(t.type || '').toLowerCase();
+    if (ty !== 'deposit' && ty !== 'withdrawal') continue;
+    const ts = new Date(t.ts || t.date || 0).getTime();
+    if (!isFinite(ts) || ts <= fromMs || ts > toMs) continue;
+    const amt = Number(t.amount);
+    if (!isFinite(amt)) continue;
+    f += (ty === 'withdrawal' && amt > 0) ? -amt : amt;
+  }
+  return +f.toFixed(2);
+}
+if (typeof window !== 'undefined') { window.botNetCapital = botNetCapital; window.botFlowsBetween = botFlowsBetween; }
+
 function botPerformance(filterTicker = null) {
   const bot = botMarkToMarket();
   let bets = bot.bets;
@@ -47095,15 +47525,16 @@ function botPerformance(filterTicker = null) {
   // which is exactly what the 30-minute equity tape stores — so chart == ledger.
   // Base for realized = capital put in (starting + any cash injections), so a
   // deposit never reads as a gain and value never double-counts it.
-  const _startBank = (bot.capitalBase != null && isFinite(bot.capitalBase) && bot.capitalBase > 0) ? bot.capitalBase
-    : ((bot.startingBankroll != null && isFinite(bot.startingBankroll)) ? bot.startingBankroll : BOT_STARTING_BANKROLL);
+  const _startBank = botNetCapital(bot);
   const _bankNow = (bot.bankroll != null && isFinite(bot.bankroll)) ? bot.bankroll : _startBank;
   const realizedPnl = +(_bankNow - _startBank).toFixed(2);
   const openPnl = _acct.totalUnrealized;
   const totalPnl = realizedPnl + openPnl;
   // Capital base for return %: starting bankroll PLUS any user cash injections,
   // so feeding the bot cash doesn't masquerade as a gain/loss.
-  const capBase = (bot.capitalBase != null && isFinite(bot.capitalBase) && bot.capitalBase > 0) ? bot.capitalBase : BOT_STARTING_BANKROLL;
+  // Base = net external capital (deposits − withdrawals). Realized gains never move it.
+  const capBase = botNetCapital(bot);
+  const _originBase = capBase;
 
   // vs SPY benchmark
   let spyReturn = null;
@@ -47116,7 +47547,17 @@ function botPerformance(filterTicker = null) {
     startedAt: bot.startedAt,
     bankroll: bot.bankroll,
     currentValue: +(capBase + totalPnl).toFixed(2),   // = bankroll + unrealized (NOT bankroll + realized + unrealized)
+    // ALL-TIME % is measured against the ORIGINAL starting balance ($100k), not the
+    // capital base (which grows with any injections). $107k on a $100k start is
+    // +7% — quoting it against an inflated base was showing +2.7%.
+    // All-time = P&L earned on the capital you put in. Deposits raise the base
+    // (never a gain); realizing a gain doesn't change it (already in P&L).
     totalReturnPct: +((totalPnl / capBase) * 100).toFixed(2),
+    originBase: capBase,
+    netCapital: capBase,
+    baseDrift: (isFinite(bot.capitalBase) && bot.capitalBase > 0) ? +(bot.capitalBase - capBase).toFixed(2) : 0,
+    startingBankroll: (isFinite(bot.startingBankroll) && bot.startingBankroll > 0) ? bot.startingBankroll : BOT_STARTING_BANKROLL,
+    cashAdded: +(capBase - ((isFinite(bot.startingBankroll) && bot.startingBankroll > 0) ? bot.startingBankroll : BOT_STARTING_BANKROLL)).toFixed(2),
     totalPnl: +totalPnl.toFixed(2),
     realizedPnl: +realizedPnl.toFixed(2),
     betCount: bets.length,
@@ -47338,11 +47779,14 @@ function botWindowedPerformance() {
   const now = curve.length ? curve[curve.length - 1].value : BOT_STARTING_BANKROLL;
   const today = new Date();
   const windows = {
+    day:   1,
     week:  7,
     month: 30,
+    ytd:   null,      // handled specially: since Jan 1
     year:  365,
     all:   null,
   };
+  const _origin = botNetCapital(bot);
   const valueAtOrBefore = (cutoffMs) => {
     // The curve point on/just before the cutoff is the window's starting value.
     // If the cutoff predates all history (e.g. a 1Y window on a 40-day-old bot),
@@ -47359,25 +47803,39 @@ function botWindowedPerformance() {
   const out = {};
   for (const [name, days] of Object.entries(windows)) {
     if (name === 'all') {
-      // All-time: anchored to the fixed $100k basis (never moves).
+      // All-time / MAX: measured against net external capital.
       out.all = {
-        startValue: BOT_STARTING_BANKROLL,
-        endValue: now,
-        returnPct: +(((now - BOT_STARTING_BANKROLL) / BOT_STARTING_BANKROLL) * 100).toFixed(2),
-        dollars: +(now - BOT_STARTING_BANKROLL).toFixed(2),
+        startValue: _origin, endValue: now,
+        returnPct: +(((now - _origin) / _origin) * 100).toFixed(2),
+        dollars: +(now - _origin).toFixed(2), flows: 0,
+      };
+      continue;
+    }
+    if (name === 'ytd') {
+      const jan1 = Date.UTC(new Date().getUTCFullYear(), 0, 1);
+      const sv = valueAtOrBefore(jan1) ?? _origin;
+      const fl = botFlowsBetween(bot, jan1, Date.now());
+      out.ytd = {
+        startValue: sv, endValue: now, flows: fl,
+        returnPct: sv ? +((((now - fl) - sv) / sv) * 100).toFixed(2) : null,
+        dollars: +((now - fl) - sv).toFixed(2),
       };
       continue;
     }
     const cutoff = today.getTime() - days * 86400000;
     const startVal = valueAtOrBefore(cutoff);
     if (startVal == null || startVal === 0) {
-      out[name] = { startValue: null, endValue: now, returnPct: null, dollars: null };
+      out[name] = { startValue: null, endValue: now, returnPct: null, dollars: null, flows: 0 };
     } else {
+      // Subtract any deposits/withdrawals made INSIDE the window — added cash is
+      // not performance. Gain = (end − flows) − start, measured on the start value.
+      const fl = botFlowsBetween(bot, cutoff, Date.now());
       out[name] = {
         startValue: startVal,
         endValue: now,
-        returnPct: +(((now - startVal) / startVal) * 100).toFixed(2),
-        dollars: +(now - startVal).toFixed(2),
+        flows: fl,
+        returnPct: +(((((now - fl) - startVal)) / startVal) * 100).toFixed(2),
+        dollars: +((now - fl) - startVal).toFixed(2),
       };
     }
   }
@@ -47392,17 +47850,17 @@ function _ensureBetsPolishCSS() {
   if (document.getElementById("bets-polish-css")) return;
   const st = document.createElement("style");
   st.id = "bets-polish-css";
-  st.textContent = `#bets-body .bot-chart{background:var(--bg-elev);border:1px solid var(--rule);border-radius:12px;padding:16px 18px 12px;margin:0 0 20px}
+  st.textContent = `#bets-body .bot-chart{background:var(--bg-elev);border:1px solid var(--rule);border-radius:14px;padding:18px 18px 10px;margin:0 0 20px}
 #bets-body .bot-chart__head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:12px}
 #bets-body .bot-chart__title{font-family:var(--mono);font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-faint)}
-#bets-body .bot-chart__val{font-family:var(--mono);font-size:26px;font-weight:700;line-height:1.15;margin-top:3px;letter-spacing:-.01em}
-#bets-body .bot-chart__sub{font-family:var(--mono);font-size:11px;margin-top:3px;color:var(--ink-dim)}
+#bets-body .bot-chart__val{font-family:var(--mono);font-size:30px;font-weight:700;line-height:1.12;margin-top:4px;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+#bets-body .bot-chart__sub{font-family:var(--mono);font-size:11.5px;margin-top:4px;color:var(--ink-dim);min-height:15px;font-variant-numeric:tabular-nums}
 #bets-body .bot-chart__readout{font-family:var(--mono);font-size:10px;color:var(--ink-faint);min-height:13px;margin-top:3px;opacity:.5}
 #bets-body .bot-chart.is-hovering .bot-chart__readout{opacity:1}
 #bets-body .rng-tabs{display:inline-flex;background:rgba(0,0,0,.16);border:1px solid var(--rule);border-radius:9px;padding:2px;gap:2px}
 #bets-body .rng-tab{font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:.03em;color:var(--ink-dim);background:transparent;border:none;border-radius:7px;padding:5px 12px;cursor:pointer;transition:background .12s,color .12s}
 #bets-body .rng-tab:hover{color:var(--ink)}
-#bets-body .rng-tab.active{background:var(--amber);color:#000}
+#bets-body .rng-tab.active{background:rgba(0,200,5,.15);color:#00c805;box-shadow:inset 0 0 0 1px rgba(0,200,5,.35)}
 #bets-body .bot-chart__plot{position:relative;height:300px;padding:0 56px 20px 0;touch-action:pan-y}
 #bets-body .bot-chart__svg{position:absolute;left:0;top:0;right:56px;bottom:20px;width:auto;height:auto;overflow:visible;cursor:crosshair}
 #bets-body .bot-chart__overlay{position:absolute;left:0;top:0;right:56px;bottom:20px;pointer-events:none}
@@ -47420,13 +47878,13 @@ function _ensureBetsPolishCSS() {
 #bets-body .leg-badge--buy{color:var(--pos);background:rgba(91,138,114,.16)}
 #bets-body .leg-badge--sell{color:var(--neg);background:rgba(165,100,90,.16)}
 #bets-body table.sb-table tbody tr{transition:background .1s}
-#bets-body table.sb-table tbody tr:hover{background:rgba(224,176,76,.06)}#bets-body table.sb-table th,#bets-body table.sb-table td{white-space:nowrap;padding:5px 8px}#bets-body table.sb-table td:first-child,#bets-body table.sb-table th:first-child{padding-left:4px}#bets-body .company-card{overflow:hidden}#bets-body .bot-eq-plot{position:relative;height:280px;margin-top:8px}#bets-body #bot-eq-canvas{width:100%;height:100%;display:block;cursor:crosshair}#bets-body .bot-eq-tip{position:absolute;display:none;pointer-events:none;background:var(--bg);border:1px solid var(--rule);border-radius:7px;padding:7px 10px;z-index:5;box-shadow:0 8px 22px -8px rgba(0,0,0,.7);min-width:135px}#bets-body .bot-eq-tip .pct-date{font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-bottom:2px}#bets-body .bot-eq-tip .pct-price{font-family:var(--mono);font-size:15px;font-weight:700;color:var(--ink)}#bets-body .bot-eq-tip .pct-change{font-family:var(--mono);font-size:10px;font-weight:600;margin-top:2px}`;
+#bets-body table.sb-table tbody tr:hover{background:rgba(224,176,76,.06)}#bets-body table.sb-table th,#bets-body table.sb-table td{white-space:nowrap;padding:5px 8px}#bets-body table.sb-table td:first-child,#bets-body table.sb-table th:first-child{padding-left:4px}#bets-body .company-card{overflow:hidden}#bets-body .bot-eq-plot{position:relative;height:300px;margin-top:10px}#bets-body #bot-eq-canvas{width:100%;height:100%;display:block;cursor:crosshair}#bets-body .bot-eq-tip{position:absolute;display:none;pointer-events:none;background:var(--bg);border:1px solid var(--rule);border-radius:7px;padding:7px 10px;z-index:5;box-shadow:0 8px 22px -8px rgba(0,0,0,.7);min-width:135px}#bets-body .bot-eq-tip .pct-date{font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-bottom:2px}#bets-body .bot-eq-tip .pct-price{font-family:var(--mono);font-size:15px;font-weight:700;color:var(--ink)}#bets-body .bot-eq-tip .pct-change{font-family:var(--mono);font-size:10px;font-weight:600;margin-top:2px}`;
   (document.head || document.documentElement).appendChild(st);
 }
 
 // Per-range granularity options + defaults (week→daily, month→weekly, year→monthly).
-const BOT_GRAN_OPTS = { week: ['daily'], month: ['weekly', 'daily'], year: ['monthly', 'weekly', 'daily'], all: ['monthly', 'weekly'] };
-const BOT_GRAN_DEFAULT = { week: 'daily', month: 'weekly', year: 'monthly', all: 'monthly' };
+const BOT_GRAN_OPTS = { day: ['daily'], week: ['daily'], month: ['weekly', 'daily'], ytd: ['monthly', 'weekly', 'daily'], year: ['monthly', 'weekly', 'daily'], all: ['monthly', 'weekly', 'daily'] };
+const BOT_GRAN_DEFAULT = { day: 'daily', week: 'daily', month: 'weekly', ytd: 'monthly', year: 'monthly', all: 'monthly' };
 const BOT_GRAN_LABEL = { daily: 'D', weekly: 'W', monthly: 'M' };
 
 // Full daily equity series (recorded marks + trade-history reconstruction), one
@@ -47462,7 +47920,12 @@ function _botResample(series, gran) {
     : (d) => { const dt = new Date(d + 'T00:00:00Z'); const dow = dt.getUTCDay(); const mon = new Date(dt); mon.setUTCDate(dt.getUTCDate() - ((dow + 6) % 7)); return mon.toISOString().slice(0, 10); };
   const byKey = new Map();
   for (const p of series) byKey.set(keyOf(p.date), p);   // series sorted asc ⇒ last wins
-  return Array.from(byKey.values()).sort((a, b) => a.date < b.date ? -1 : 1);
+  const out = Array.from(byKey.values()).sort((a, b) => a.date < b.date ? -1 : 1);
+  // Always keep the window's OPENING value as the first plotted point. Bucketing
+  // takes the last value per bucket, which would otherwise swallow the opening
+  // (and the $100k basis anchor on MAX), making the window's % read too small.
+  if (series.length && out.length && out[0] !== series[0]) out.unshift(series[0]);
+  return out;
 }
 
 // Range-filtered + granularity-resampled data for the current toggles.
@@ -47472,14 +47935,32 @@ function getBotChartData() {
   let gran = BETS_STATE.perfGran;
   if (!gran || opts.indexOf(gran) < 0) gran = BOT_GRAN_DEFAULT[range] || opts[0];
   let series = _botDailySeries();
+  // The ALL/MAX window must start at the ORIGINAL $100k basis so its % equals the
+  // all-time return. Reconstruction can begin after the bot was already up, which
+  // is why "ALL" was quoting a smaller gain than the headline.
+  // MAX anchors to NET EXTERNAL CAPITAL (deposits − withdrawals), so the chart's
+  // all-time % equals the headline and a deposit never looks like a gain.
+  const origin = (typeof botNetCapital === 'function' && typeof botMarkToMarket === 'function')
+    ? botNetCapital(botMarkToMarket()) : BOT_STARTING_BANKROLL;
+  if (range === 'all' && series.length && Math.abs(series[0].value - origin) > 0.01) {
+    const d0 = new Date(series[0].date + 'T00:00:00Z'); d0.setUTCDate(d0.getUTCDate() - 1);
+    series = [{ date: d0.toISOString().slice(0, 10), value: origin, basis: true }, ...series];
+  }
   if (range !== 'all' && series.length) {
     const lastD = new Date(series[series.length - 1].date + 'T00:00:00Z');
     const cut = new Date(lastD);
-    if (range === 'week') cut.setUTCDate(cut.getUTCDate() - 7);
+    if (range === 'day') cut.setUTCDate(cut.getUTCDate() - 1);
+    else if (range === 'week') cut.setUTCDate(cut.getUTCDate() - 7);
     else if (range === 'month') cut.setUTCMonth(cut.getUTCMonth() - 1);
+    else if (range === 'ytd') { cut.setUTCMonth(0); cut.setUTCDate(1); }
     else if (range === 'year') cut.setUTCFullYear(cut.getUTCFullYear() - 1);
     const cutISO = cut.toISOString().slice(0, 10);
-    series = series.filter(p => p.date >= cutISO);
+    const filtered = series.filter(p => p.date >= cutISO);
+    // Keep the point just BEFORE the window so the % is measured from the window's
+    // opening value (a 1D move needs yesterday's close as its base).
+    const idx = series.findIndex(p => p.date >= cutISO);
+    if (idx > 0) filtered.unshift(series[idx - 1]);
+    series = filtered.length >= 2 ? filtered : series.slice(-2);
   }
   return { data: _botResample(series, gran), gran, opts, range };
 }
@@ -47487,7 +47968,7 @@ function getBotChartData() {
 // Canvas equity chart — modeled on the valuation price chart (glow line, gradient
 // area, live endpoint, floating tooltip, pixel-exact hover). No y-axis; x-axis =
 // dates at the current granularity; subtle $100k basis line.
-function renderBotEquityChart() {
+function renderBotEquityChart(hoverIdx) {
   const canvas = document.getElementById('bot-eq-canvas');
   if (!canvas) return;
   const ctx = canvas.getContext('2d');
@@ -47495,89 +47976,346 @@ function renderBotEquityChart() {
   const W = canvas.clientWidth, H = canvas.clientHeight;
   if (!W || !H) return;
   canvas.width = W * dpr; canvas.height = H * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, W, H);
-  const { data, gran } = getBotChartData();
+  const { data, gran, range } = getBotChartData();
   if (data.length < 2) return;
-  const padL = 12, padR = 14, padT = 14, padB = 26;
+
+  // Robinhood-style geometry: the line breathes edge-to-edge, only the date strip
+  // at the bottom is reserved. No y-axis, no boxed grid.
+  const padL = 2, padR = 2, padT = 16, padB = 22;
   const plotW = W - padL - padR, plotH = H - padT - padB;
   const vals = data.map(d => d.value);
+  const open = vals[0], last = vals[vals.length - 1];
   let minV = Math.min(...vals), maxV = Math.max(...vals);
-  const span = (maxV - minV) || Math.max(1, maxV * 0.02);
-  minV -= span * 0.08; maxV += span * 0.08;
-  const basis = BOT_STARTING_BANKROLL;
-  if (basis >= minV - span * 0.5 && basis <= maxV + span * 0.5) { minV = Math.min(minV, basis - span * 0.04); maxV = Math.max(maxV, basis + span * 0.04); }
+  // Always keep the period-open baseline in frame — it's the reference the whole
+  // chart is colored against.
+  minV = Math.min(minV, open); maxV = Math.max(maxV, open);
+  const span = (maxV - minV) || Math.max(1, maxV * 0.01);
+  minV -= span * 0.12; maxV += span * 0.12;
   const yRange = (maxV - minV) || 1;
   const x = (i) => padL + (i / Math.max(data.length - 1, 1)) * plotW;
   const y = (v) => padT + plotH - ((v - minV) / yRange) * plotH;
-  state._botChartGeom = { padL, padR, padT, padB, plotW, plotH, W, H, data, x, y, minV, maxV, gran };
+  state._botChartGeom = { padL, padR, padT, padB, plotW, plotH, W, H, data, x, y, minV, maxV, gran, range, open };
 
-  // $100k basis line (subtle dashed + tiny inline tag; no y-axis clutter).
-  const basisY = y(basis);
-  if (basis >= minV && basis <= maxV) {
-    ctx.strokeStyle = 'rgba(224,176,76,0.32)'; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
-    ctx.beginPath(); ctx.moveTo(padL, basisY); ctx.lineTo(padL + plotW, basisY); ctx.stroke(); ctx.setLineDash([]);
-    ctx.fillStyle = 'rgba(224,176,76,0.55)'; ctx.font = '9px JetBrains Mono'; ctx.textAlign = 'left';
-    ctx.fillText('$100k basis', padL + 2, basisY - 4);
+  const up = last >= open;
+  const line = up ? '#00c805' : '#ff5000';                 // Robinhood green / red
+  const glow = up ? 'rgba(0,200,5,0.55)' : 'rgba(255,80,0,0.5)';
+
+  // Monotone-cubic smoothing: a flowing curve instead of a jagged polyline, without
+  // overshooting real data points (important — this is money, not decoration).
+  const pts = data.map((d, i) => ({ x: x(i), y: y(d.value) }));
+  const tracePath = (c) => {
+    c.beginPath(); c.moveTo(pts[0].x, pts[0].y);
+    if (pts.length === 2) { c.lineTo(pts[1].x, pts[1].y); return; }
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p0 = pts[i - 1] || pts[i], p1 = pts[i], p2 = pts[i + 1], p3 = pts[i + 2] || p2;
+      const t = 0.32;
+      c.bezierCurveTo(p1.x + (p2.x - p0.x) * t / 2, p1.y + (p2.y - p0.y) * t / 2,
+                      p2.x - (p3.x - p1.x) * t / 2, p2.y - (p3.y - p1.y) * t / 2, p2.x, p2.y);
+    }
+  };
+
+  // Gradient area under the curve.
+  const g = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+  g.addColorStop(0, up ? 'rgba(0,200,5,0.22)' : 'rgba(255,80,0,0.20)');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.save(); tracePath(ctx);
+  ctx.lineTo(pts[pts.length - 1].x, padT + plotH); ctx.lineTo(pts[0].x, padT + plotH); ctx.closePath();
+  ctx.fillStyle = g; ctx.fill(); ctx.restore();
+
+  // Period-open baseline — the dotted reference Robinhood draws at the open.
+  const openY = y(open);
+  ctx.save(); ctx.setLineDash([2, 4]); ctx.strokeStyle = 'rgba(232,223,201,0.28)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(padL, openY); ctx.lineTo(padL + plotW, openY); ctx.stroke(); ctx.restore();
+
+  // The line itself.
+  ctx.save(); ctx.shadowColor = glow; ctx.shadowBlur = 9;
+  ctx.strokeStyle = line; ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  tracePath(ctx); ctx.stroke(); ctx.restore();
+
+  // Live endpoint dot (hidden while scrubbing, like Robinhood).
+  if (hoverIdx == null) {
+    const lx = pts[pts.length - 1].x, ly = pts[pts.length - 1].y;
+    ctx.save(); ctx.shadowColor = glow; ctx.shadowBlur = 12; ctx.fillStyle = line;
+    ctx.beginPath(); ctx.arc(lx, ly, 3.5, 0, Math.PI * 2); ctx.fill(); ctx.restore();
   }
 
-  const first = data[0].value, last = data[data.length - 1].value, up = last >= first;
-  const hi = up ? '#3ddc84' : '#ff5c5c', lo = up ? '#1a9e5c' : '#c93838', glow = up ? 'rgba(61,220,132,0.5)' : 'rgba(255,92,92,0.45)';
-  const areaGrad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
-  if (up) { areaGrad.addColorStop(0, 'rgba(61,220,132,0.34)'); areaGrad.addColorStop(0.55, 'rgba(61,220,132,0.10)'); areaGrad.addColorStop(1, 'rgba(61,220,132,0.01)'); }
-  else { areaGrad.addColorStop(0, 'rgba(255,92,92,0.30)'); areaGrad.addColorStop(0.55, 'rgba(255,92,92,0.09)'); areaGrad.addColorStop(1, 'rgba(255,92,92,0.01)'); }
-  ctx.beginPath(); data.forEach((d, i) => { const px = x(i), py = y(d.value); i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py); });
-  ctx.lineTo(x(data.length - 1), padT + plotH); ctx.lineTo(x(0), padT + plotH); ctx.closePath(); ctx.fillStyle = areaGrad; ctx.fill();
-  const lineGrad = ctx.createLinearGradient(padL, 0, padL + plotW, 0); lineGrad.addColorStop(0, lo); lineGrad.addColorStop(1, hi);
-  ctx.save(); ctx.shadowColor = glow; ctx.shadowBlur = 11; ctx.strokeStyle = lineGrad; ctx.lineWidth = 2.4; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
-  ctx.beginPath(); data.forEach((d, i) => { const px = x(i), py = y(d.value); i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py); }); ctx.stroke(); ctx.restore();
-  const lx = x(data.length - 1), ly = y(last);
-  ctx.save(); ctx.shadowColor = glow; ctx.shadowBlur = 14; ctx.fillStyle = hi; ctx.beginPath(); ctx.arc(lx, ly, 4, 0, Math.PI * 2); ctx.fill(); ctx.restore();
-  ctx.strokeStyle = glow; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(lx, ly, 7, 0, Math.PI * 2); ctx.stroke();
+  // Scrub crosshair: thin vertical line + dot, no boxes.
+  if (hoverIdx != null && data[hoverIdx]) {
+    const hx = x(hoverIdx), hy = y(data[hoverIdx].value);
+    ctx.save(); ctx.strokeStyle = 'rgba(232,223,201,0.30)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(hx, padT); ctx.lineTo(hx, padT + plotH); ctx.stroke(); ctx.restore();
+    ctx.save(); ctx.fillStyle = line; ctx.shadowColor = glow; ctx.shadowBlur = 10;
+    ctx.beginPath(); ctx.arc(hx, hy, 4.5, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+    ctx.strokeStyle = '#0d0d0d'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(hx, hy, 4.5, 0, Math.PI * 2); ctx.stroke();
+  }
 
-  // X-axis date labels — every point when few, thinned to fit when many (never crammed).
-  ctx.fillStyle = '#8a8275'; ctx.font = '9px JetBrains Mono'; ctx.textAlign = 'center';
-  const fmtLbl = (dstr) => { const dt = new Date(dstr + 'T00:00:00Z'); return gran === 'monthly' ? dt.toLocaleDateString('en-US', { month: 'short' }) : (dt.getUTCMonth() + 1) + '/' + dt.getUTCDate(); };
-  const maxLabels = Math.max(3, Math.min(data.length, Math.floor(plotW / 58)));
+  // Date strip — spaced to fit, never crammed.
+  ctx.fillStyle = 'rgba(138,130,117,0.85)'; ctx.font = '9px ui-monospace, monospace'; ctx.textAlign = 'center';
+  const fmt = (ds) => {
+    const dt = new Date(ds + 'T00:00:00Z');
+    if (range === 'day') return '';
+    if (gran === 'monthly') return dt.toLocaleDateString('en-US', { month: 'short' });
+    return (dt.getUTCMonth() + 1) + '/' + dt.getUTCDate();
+  };
+  const maxLabels = Math.max(2, Math.min(data.length, Math.floor(plotW / 62)));
   const step = Math.max(1, Math.ceil(data.length / maxLabels));
-  for (let i = 0; i < data.length; i += step) ctx.fillText(fmtLbl(data[i].date), x(i), padT + plotH + 15);
-  if ((data.length - 1) % step !== 0) ctx.fillText(fmtLbl(data[data.length - 1].date), x(data.length - 1), padT + plotH + 15);
+  for (let i = 0; i < data.length; i += step) {
+    const lbl = fmt(data[i].date); if (!lbl) continue;
+    const px = Math.max(16, Math.min(W - 16, x(i)));
+    ctx.fillText(lbl, px, padT + plotH + 15);
+  }
 }
 
+// Scrubbing updates the BIG header number + change line (the Robinhood signature),
+// not just a tooltip — so the value you're pointing at is the value you read.
 function attachBotEquityHover() {
   const canvas = document.getElementById('bot-eq-canvas');
-  const tip = document.getElementById('bot-eq-tooltip');
-  if (!canvas || !tip || canvas._eqWired) return;
-  const at = (e) => {
-    const geom = state._botChartGeom; if (!geom) return;
+  if (!canvas || canvas._eqWired) return;
+  const valEl = () => document.getElementById('bot-eq-val');
+  const subEl = () => document.getElementById('bot-eq-sub');
+  const baseVal = () => canvas.getAttribute('data-baseval');
+  const baseSub = () => canvas.getAttribute('data-basesub');
+  const fmtMoney = (v) => '$' + v.toLocaleString(undefined, { maximumFractionDigits: 2, minimumFractionDigits: 2 });
+  const at = (clientX) => {
+    const geom = state._botChartGeom; if (!geom || !geom.data.length) return;
     const rect = canvas.getBoundingClientRect();
-    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-    if (mx < geom.padL || mx > geom.padL + geom.plotW) { tip.style.display = 'none'; renderBotEquityChart(); return; }
+    const mx = clientX - rect.left;
     const frac = (mx - geom.padL) / geom.plotW;
     const idx = Math.max(0, Math.min(geom.data.length - 1, Math.round(frac * (geom.data.length - 1))));
     const d = geom.data[idx]; if (!d) return;
-    renderBotEquityChart();
-    const c = canvas.getContext('2d'); const px = geom.x(idx), py = geom.y(d.value);
-    c.strokeStyle = 'rgba(232,223,201,0.45)'; c.lineWidth = 1; c.setLineDash([2, 3]);
-    c.beginPath(); c.moveTo(px, geom.padT); c.lineTo(px, geom.padT + geom.plotH); c.moveTo(geom.padL, py); c.lineTo(geom.padL + geom.plotW, py); c.stroke(); c.setLineDash([]);
-    c.fillStyle = '#d4a24c'; c.beginPath(); c.arc(px, py, 5, 0, Math.PI * 2); c.fill(); c.strokeStyle = '#0d0d0d'; c.lineWidth = 2; c.stroke();
-    const chg = ((d.value - BOT_STARTING_BANKROLL) / BOT_STARTING_BANKROLL) * 100;
-    const col = chg >= 0 ? 'var(--pos)' : 'var(--neg)';
-    const dt = new Date(d.date + 'T00:00:00Z');
-    tip.innerHTML = `<div class="pct-date">${dt.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}</div>` +
-      `<div class="pct-price">${fmt$(d.value)}</div>` +
-      `<div class="pct-change" style="color:${col}">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}% vs $100k</div>`;
-    tip.style.display = 'block';
-    const tipW = 175; let leftPx = mx + 14; if (leftPx + tipW > rect.width - 8) leftPx = mx - tipW - 14;
-    tip.style.left = Math.max(4, leftPx) + 'px'; tip.style.top = Math.max(6, my - 58) + 'px';
+    renderBotEquityChart(idx);
+    const chg = d.value - geom.open;
+    const pct = geom.open ? (chg / geom.open) * 100 : 0;
+    const col = chg >= 0 ? '#00c805' : '#ff5000';
+    const v = valEl(), sb = subEl();
+    if (v) { v.textContent = fmtMoney(d.value); v.style.color = col; }
+    if (sb) {
+      const dt = new Date(d.date + 'T00:00:00Z');
+      const when = d.t ? String(d.t).slice(11, 16) : dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+      sb.innerHTML = `<span style="color:${col};font-weight:700">${chg >= 0 ? '+' : '\u2212'}${fmtMoney(Math.abs(chg)).slice(1)} (${chg >= 0 ? '+' : '\u2212'}${Math.abs(pct).toFixed(2)}%)</span> <span style="color:var(--ink-faint)">${when}</span>`;
+    }
   };
-  canvas.onmousemove = at;
-  canvas.ontouchstart = (e) => { if (e.touches[0]) at(e.touches[0]); };
-  canvas.ontouchmove = (e) => { if (e.touches[0]) { at(e.touches[0]); } };
-  canvas.onmouseleave = () => { tip.style.display = 'none'; renderBotEquityChart(); };
-  canvas.ontouchend = () => { tip.style.display = 'none'; renderBotEquityChart(); };
+  const reset = () => {
+    renderBotEquityChart();
+    const v = valEl(), sb = subEl();
+    if (v && baseVal()) { v.textContent = baseVal(); v.style.color = canvas.getAttribute('data-basecol') || ''; }
+    if (sb && baseSub()) sb.innerHTML = baseSub();
+  };
+  canvas.onmousemove = (e) => at(e.clientX);
+  canvas.onmouseleave = reset;
+  canvas.ontouchstart = (e) => { if (e.touches[0]) at(e.touches[0].clientX); };
+  canvas.ontouchmove = (e) => { if (e.touches[0]) { e.preventDefault(); at(e.touches[0].clientX); } };
+  canvas.ontouchend = reset;
   canvas._eqWired = true;
-  if (!window._botEqResizeWired) { window._botEqResizeWired = true; window.addEventListener('resize', () => { clearTimeout(window._botEqRT); window._botEqRT = setTimeout(renderBotEquityChart, 120); }); }
+  if (!window._botEqResizeWired) { window._botEqResizeWired = true; window.addEventListener('resize', () => { clearTimeout(window._botEqRT); window._botEqRT = setTimeout(() => renderBotEquityChart(), 120); }); }
 }
 if (typeof window !== 'undefined') { window.renderBotEquityChart = renderBotEquityChart; window.attachBotEquityHover = attachBotEquityHover; }
+
+// Institutional risk/performance analytics for the bot book: drawdown, annualized
+// vol, Sharpe/Sortino, profit factor, expectancy, exposure and concentration —
+// computed from the daily equity series + the per-ticker position book.
+function botRiskMetrics() {
+  const series = (typeof _botDailySeries === 'function') ? _botDailySeries() : [];
+  const bot = botMarkToMarket();
+  const acct = botTickerLedger(bot.bets || [], _botPriceOf);
+  const startBank = (bot.capitalBase != null && isFinite(bot.capitalBase) && bot.capitalBase > 0) ? bot.capitalBase
+    : ((bot.startingBankroll != null && isFinite(bot.startingBankroll)) ? bot.startingBankroll : BOT_STARTING_BANKROLL);
+
+  const rets = [];
+  for (let i = 1; i < series.length; i++) {
+    const a = series[i - 1].value, b = series[i].value;
+    if (a > 0 && isFinite(a) && isFinite(b)) rets.push((b - a) / a);
+  }
+  const n = rets.length;
+  const mean = n ? rets.reduce((x, y) => x + y, 0) / n : 0;
+  const varc = n > 1 ? rets.reduce((x, y) => x + (y - mean) ** 2, 0) / (n - 1) : 0;
+  const dailyVol = Math.sqrt(varc);
+  const annVol = dailyVol * Math.sqrt(252);
+  const rfDaily = 0.044 / 252;                          // ~4.4% risk-free
+  const sharpe = (n >= 5 && dailyVol > 0) ? ((mean - rfDaily) / dailyVol) * Math.sqrt(252) : null;
+  const dn = rets.filter(r => r < 0);
+  const ddev = dn.length ? Math.sqrt(dn.reduce((x, y) => x + y * y, 0) / dn.length) : 0;
+  const sortino = (n >= 5 && ddev > 0) ? ((mean - rfDaily) / ddev) * Math.sqrt(252) : null;
+  let peak = -Infinity, maxDD = 0;
+  for (const p of series) { if (p.value > peak) peak = p.value; const d = peak > 0 ? (p.value - peak) / peak : 0; if (d < maxDD) maxDD = d; }
+  const bestDay = n ? Math.max(...rets) : null;
+  const worstDay = n ? Math.min(...rets) : null;
+
+  const closed = acct.positions.filter(p => p.status === 'closed' && p.realized !== 0);
+  const wins = closed.filter(p => p.realized > 0), losses = closed.filter(p => p.realized < 0);
+  const grossWin = wins.reduce((x, p) => x + p.realized, 0);
+  const grossLoss = Math.abs(losses.reduce((x, p) => x + p.realized, 0));
+  const profitFactor = grossLoss > 0 ? grossWin / grossLoss : (grossWin > 0 ? Infinity : null);
+  const avgWin = wins.length ? grossWin / wins.length : 0;
+  const avgLoss = losses.length ? grossLoss / losses.length : 0;
+  const winRate = closed.length ? wins.length / closed.length : 0;
+  const expectancy = closed.length ? (winRate * avgWin - (1 - winRate) * avgLoss) : null;
+
+  const open = acct.openPositions;
+  let grossExp = 0, longExp = 0, shortExp = 0; const posVals = [];
+  for (const p of open) {
+    const mv = (p.live != null && isFinite(p.live)) ? Math.abs(p.shares * p.live) : Math.abs(p.costBasis || 0);
+    grossExp += mv; if ((p.dir || 1) > 0) longExp += mv; else shortExp += mv;
+    posVals.push({ ticker: p.ticker, mv });
+  }
+  const netExp = longExp - shortExp;
+  const totalValue = startBank + acct.totalRealized + acct.totalUnrealized;
+  posVals.sort((a, b) => b.mv - a.mv);
+  const topConc = grossExp > 0 && posVals.length ? posVals[0].mv / grossExp * 100 : 0;
+  const top5Conc = grossExp > 0 ? posVals.slice(0, 5).reduce((x, p) => x + p.mv, 0) / grossExp * 100 : 0;
+  const grossLev = totalValue > 0 ? grossExp / totalValue : 0;
+  const cashPct = totalValue > 0 ? Math.max(0, (totalValue - grossExp) / totalValue * 100) : 0;
+
+  // ---- Beta / Alpha / R² vs SPY (CAPM) from date-aligned daily returns ----
+  let beta = null, alphaAnn = null, rsq = null, betaN = 0;
+  try {
+    const sh = (typeof getHistoryForTicker === 'function') ? (getHistoryForTicker('SPY') || getHistoryForTicker('^GSPC')) : null;
+    if (sh && sh.length > 5 && series.length > 5) {
+      const sm = new Map();
+      for (const x of sh) {
+        const d = Array.isArray(x) ? x[0] : x.date;
+        const v = Array.isArray(x) ? x[1] : (x.close != null ? x.close : x.price);
+        if (d && isFinite(v) && v > 0) sm.set(String(d).slice(0, 10), +v);
+      }
+      const br = [], sr = [];
+      for (let i = 1; i < series.length; i++) {
+        const s0 = sm.get(series[i - 1].date), s1 = sm.get(series[i].date);
+        const b0 = series[i - 1].value, b1 = series[i].value;
+        if (s0 > 0 && s1 > 0 && b0 > 0) { br.push((b1 - b0) / b0); sr.push((s1 - s0) / s0); }
+      }
+      betaN = br.length;
+      if (betaN >= 5) {
+        const mb = br.reduce((a, b) => a + b, 0) / betaN, ms = sr.reduce((a, b) => a + b, 0) / betaN;
+        let cov = 0, vs = 0, vb = 0;
+        for (let i = 0; i < betaN; i++) { cov += (br[i] - mb) * (sr[i] - ms); vs += (sr[i] - ms) ** 2; vb += (br[i] - mb) ** 2; }
+        cov /= betaN; vs /= betaN; vb /= betaN;
+        beta = vs > 0 ? cov / vs : null;
+        rsq = (vs > 0 && vb > 0) ? (cov * cov) / (vs * vb) : null;
+        const rfd2 = 0.044 / 252;
+        if (beta != null) alphaAnn = ((mb - rfd2) - beta * (ms - rfd2)) * 252;
+      }
+    }
+  } catch {}
+
+  // ---- Historical 1-day VaR / CVaR at 95% on the bot's own return distribution ----
+  let var95 = null, cvar95 = null;
+  if (n >= 10) {
+    const sd = rets.slice().sort((a, b) => a - b);
+    const k = Math.max(0, Math.floor(0.05 * sd.length) - 1);
+    var95 = sd[k];
+    const tail = sd.slice(0, k + 1);
+    cvar95 = tail.length ? tail.reduce((a, b) => a + b, 0) / tail.length : var95;
+  }
+
+  // ---- Sector exposure of the open book (% of gross) ----
+  const _sx = {};
+  for (const p of open) {
+    const row = (typeof getStockbookRow === 'function') ? getStockbookRow(p.ticker) : null;
+    const sec = (row && row.sector) ? row.sector : 'Other';
+    const mv = (p.live != null && isFinite(p.live)) ? Math.abs(p.shares * p.live) : Math.abs(p.costBasis || 0);
+    _sx[sec] = (_sx[sec] || 0) + mv;
+  }
+  const sectorBreakdown = Object.entries(_sx).map(([sector, mv]) => ({ sector, mv, pct: grossExp > 0 ? mv / grossExp * 100 : 0 })).sort((a, b) => b.mv - a.mv);
+
+  return { nDays: series.length, sharpe, sortino, annVol, maxDD, bestDay, worstDay, profitFactor,
+    avgWin, avgLoss, expectancy, grossExp, netExp, longExp, shortExp, grossLev, cashPct,
+    topConc, top5Conc, topTicker: posVals[0] ? posVals[0].ticker : null, closedCount: closed.length, totalValue,
+    beta, alphaAnn, rsq, betaN, var95, cvar95, sectorBreakdown };
+}
+
+// If a stored capitalBase disagrees with the deposit ledger, we can't know whether
+// that money was YOUR deposit or the bot's profit — and the two give different
+// all-time returns. Rather than silently pick one, ask once and record the answer.
+function _botCapitalReconcileCard(perf) {
+  const drift = perf && perf.baseDrift;
+  if (!drift || Math.abs(drift) < 1) return '';
+  try { if (localStorage.getItem('valuatio.bot.baseDriftAck') === String(drift)) return ''; } catch {}
+  const amt = Math.abs(drift).toLocaleString(undefined, { maximumFractionDigits: 0 });
+  const withPct = perf.netCapital ? (((perf.currentValue - (perf.netCapital + drift)) / (perf.netCapital + drift)) * 100).toFixed(2) : '—';
+  return `
+    <div class="company-card" id="bot-base-reconcile" style="border-left:3px solid var(--data-amber);margin:0 0 18px">
+      <h4>Was $${amt} a deposit? <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">· affects your all-time return</span></h4>
+      <div style="font-family:var(--mono);font-size:11px;line-height:1.65;color:var(--ink-dim)">
+        The saved capital base is $${amt} above the starting balance, but there's no matching deposit record.
+        If you <strong>added</strong> that cash it's capital (not profit) and all-time is
+        <strong>${withPct}%</strong>. If it was <strong>trading profit</strong>, all-time is
+        <strong>${perf.totalReturnPct >= 0 ? '+' : ''}${perf.totalReturnPct}%</strong> — what's shown now.
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:11px">
+        <button class="btn" id="bot-base-deposit" style="font-size:11px">I added $${amt} — count as capital</button>
+        <button class="btn btn-ghost" id="bot-base-profit" style="font-size:11px">It was profit — keep as is</button>
+      </div>
+    </div>`;
+}
+function _wireBotCapitalReconcile(perf) {
+  const host = document.getElementById('bot-base-reconcile');
+  if (!host || !perf) return;
+  const drift = perf.baseDrift;
+  host.querySelector('#bot-base-deposit')?.addEventListener('click', () => {
+    try {
+      const bot = (typeof loadBotState === 'function') ? loadBotState() : null;
+      if (bot) {
+        bot.transactions = bot.transactions || [];
+        bot.transactions.push({ id: `botcash-recon-${Date.now()}`, ts: new Date().toISOString(),
+          type: drift > 0 ? 'deposit' : 'withdrawal', amount: drift,
+          bankrollAfter: bot.bankroll, note: 'reconciled: confirmed external capital' });
+        bot.cashAdded = +((bot.cashAdded || 0) + drift).toFixed(2);
+        if (typeof saveBotState === 'function') saveBotState(bot);
+      }
+      localStorage.setItem('valuatio.bot.baseDriftAck', String(drift));
+    } catch {}
+    if (typeof flashStatus === 'function') flashStatus('Recorded as capital — all-time return now measured on the larger base', 'success');
+    if (typeof renderBetsTab === 'function') renderBetsTab();
+  });
+  host.querySelector('#bot-base-profit')?.addEventListener('click', () => {
+    try { localStorage.setItem('valuatio.bot.baseDriftAck', String(drift)); } catch {}
+    if (typeof flashStatus === 'function') flashStatus('Kept as trading profit', 'success');
+    if (typeof renderBetsTab === 'function') renderBetsTab();
+  });
+}
+
+function _botRiskCard() {
+  let r; try { r = botRiskMetrics(); } catch { return ''; }
+  const thin = r.nDays < 5;
+  const col = (v, good, bad) => v == null ? 'var(--ink-faint)' : v >= good ? 'var(--pos)' : v <= bad ? 'var(--neg)' : 'var(--ink)';
+  const pct = (v, dp = 1) => v == null ? '\u2014' : (v * 100).toFixed(dp) + '%';
+  const pf = r.profitFactor == null ? '\u2014' : (r.profitFactor === Infinity ? '\u221e' : r.profitFactor.toFixed(2));
+  const cell = (label, value, color, sub) => `
+    <div style="min-width:0">
+      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">${label}</div>
+      <div style="font-family:var(--mono);font-size:16px;font-weight:700;color:${color};margin-top:3px;white-space:nowrap">${value}</div>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${sub || ''}</div>
+    </div>`;
+  const cells = [
+    cell('Sharpe', r.sharpe == null ? '\u2014' : r.sharpe.toFixed(2), col(r.sharpe, 1, 0), 'ann. · 4.4% rf'),
+    cell('Sortino', r.sortino == null ? '\u2014' : r.sortino.toFixed(2), col(r.sortino, 1, 0), 'downside-adj'),
+    cell('Max Drawdown', pct(r.maxDD), r.maxDD <= -0.15 ? 'var(--neg)' : r.maxDD <= -0.05 ? 'var(--data-amber)' : 'var(--ink)', 'peak-to-trough'),
+    cell('Volatility', pct(r.annVol), 'var(--ink)', 'annualized'),
+    cell('Profit Factor', pf, r.profitFactor == null ? 'var(--ink-faint)' : (r.profitFactor >= 1.5 ? 'var(--pos)' : r.profitFactor >= 1 ? 'var(--ink)' : 'var(--neg)'), 'gross win / loss'),
+    cell('Expectancy', r.expectancy == null ? '\u2014' : (r.expectancy >= 0 ? '+' : '') + '$' + Math.abs(r.expectancy).toFixed(0), r.expectancy == null ? 'var(--ink-faint)' : (r.expectancy >= 0 ? 'var(--pos)' : 'var(--neg)'), 'per closed trade'),
+    cell('Gross Exposure', '$' + r.grossExp.toLocaleString(undefined, { maximumFractionDigits: 0 }), 'var(--ink)', `${r.grossLev.toFixed(2)}\u00d7 · ${r.cashPct.toFixed(0)}% cash`),
+    cell('Net Exposure', (r.netExp >= 0 ? '+' : '\u2212') + '$' + Math.abs(r.netExp).toLocaleString(undefined, { maximumFractionDigits: 0 }), r.netExp >= 0 ? 'var(--pos)' : 'var(--neg)', `L $${(r.longExp / 1000).toFixed(0)}k / S $${(r.shortExp / 1000).toFixed(0)}k`),
+    cell('Concentration', r.topConc ? r.topConc.toFixed(0) + '%' : '\u2014', r.topConc >= 40 ? 'var(--neg)' : r.topConc >= 25 ? 'var(--data-amber)' : 'var(--ink)', `${r.topTicker || ''} top · ${r.top5Conc.toFixed(0)}% top-5`),
+    cell('Best / Worst Day', pct(r.bestDay) + ' / ' + pct(r.worstDay), 'var(--ink)', 'daily returns'),
+    cell('Beta vs SPY', r.beta == null ? '\u2014' : r.beta.toFixed(2), r.beta == null ? 'var(--ink-faint)' : (r.beta > 1.2 ? 'var(--data-amber)' : 'var(--ink)'), r.rsq != null ? 'R\u00b2 ' + (r.rsq * 100).toFixed(0) + '% · ' + r.betaN + 'd' : 'market sensitivity'),
+    cell('Alpha (ann)', r.alphaAnn == null ? '\u2014' : (r.alphaAnn >= 0 ? '+' : '') + (r.alphaAnn * 100).toFixed(1) + '%', r.alphaAnn == null ? 'var(--ink-faint)' : (r.alphaAnn >= 0 ? 'var(--pos)' : 'var(--neg)'), 'CAPM vs SPY'),
+    cell('VaR 95% (1d)', pct(r.var95), r.var95 == null ? 'var(--ink-faint)' : 'var(--neg)', r.cvar95 != null ? 'CVaR ' + pct(r.cvar95) : 'historical'),
+  ].join('');
+  const secBars = (r.sectorBreakdown || []).slice(0, 6).map(x => {
+    const w = Math.max(2, Math.min(100, x.pct));
+    return `<div style="display:flex;align-items:center;gap:8px;margin-top:5px">
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-dim);width:120px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${x.sector}</div>
+      <div style="flex:1;height:7px;background:rgba(255,255,255,0.05);border-radius:3px;overflow:hidden"><div style="height:100%;width:${w}%;background:var(--amber);opacity:0.75"></div></div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink);width:38px;text-align:right">${x.pct.toFixed(0)}%</div>
+    </div>`;
+  }).join('');
+  return `
+    <div class="company-card" style="margin:0 0 18px">
+      <h4>Risk &amp; Performance <span style="color:var(--ink-faint);font-size:9px;text-transform:none;letter-spacing:0;font-weight:400">\u00b7 annualized from the daily equity series (${r.nDays} pts)${thin ? ' \u00b7 thin history \u2014 risk ratios firm up over time' : ''}</span></h4>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:14px 12px">${cells}</div>
+      ${secBars ? `<div style="margin-top:16px;border-top:1px solid var(--rule);padding-top:12px"><div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:2px">Sector Exposure <span style="text-transform:none;letter-spacing:0">· % of gross</span></div>${secBars}</div>` : ''}
+    </div>`;
+}
 
 function renderBetsTab() {
   const body = document.getElementById('bets-body');
@@ -47659,7 +48397,7 @@ function renderBetsTab() {
       <div class="company-card" style="margin:0;border-left:3px solid ${pnlColor(perf.totalPnl)};min-width:0;overflow:hidden">
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Portfolio Value</div>
         <div style="font-family:var(--mono);font-size:22px;font-weight:700;color:${pnlColor(perf.totalPnl)};margin-top:4px;white-space:nowrap">$${(book ? book.totalValue : perf.currentValue).toLocaleString(undefined,{maximumFractionDigits:0})}</div>
-        <div style="font-family:var(--mono);font-size:9px;color:${pnlColor(perf.totalPnl)};margin-top:2px">${perf.totalReturnPct >= 0 ? '+' : ''}${perf.totalReturnPct}% from $${(book && book.capitalBase ? book.capitalBase : 100000).toLocaleString(undefined,{maximumFractionDigits:0})}</div>
+        <div style="font-family:var(--mono);font-size:9px;color:${pnlColor(perf.totalPnl)};margin-top:2px">${perf.totalReturnPct >= 0 ? '+' : ''}${perf.totalReturnPct}% on $${(perf.netCapital || 100000).toLocaleString(undefined,{maximumFractionDigits:0})} capital${perf.cashAdded ? ` (${perf.cashAdded > 0 ? '+' : '−'}$${Math.abs(perf.cashAdded).toLocaleString(undefined,{maximumFractionDigits:0})} ${perf.cashAdded > 0 ? 'deposited' : 'withdrawn'})` : ''}</div>
       </div>
       ${book ? `<div class="company-card" style="margin:0;border-left:3px solid var(--amber);min-width:0;overflow:hidden">
         <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);letter-spacing:0.1em;text-transform:uppercase">Open Positions</div>
@@ -47705,7 +48443,9 @@ function renderBetsTab() {
           <div style="font-family:var(--mono);font-size:9px;color:var(--ink-faint);margin-top:2px">×${cf.factor.toFixed(2)} sizing · ${cf.sampleSize} settled · PF ${cf.profitFactor}</div>
         </div>`;
       })()}
-    </div>`;
+    </div>
+    ${_botCapitalReconcileCard(perf)}
+    ${_botRiskCard()}`;
 
   // ---- OPEN POSITIONS aggregation (computed here so the chart can offer the
   //      per-position view; the table that uses it renders further down). ----
@@ -47750,8 +48490,10 @@ function renderBetsTab() {
     const _upWin = _lastV >= _firstV;
     const _lineColor = _upWin ? 'var(--pos)' : 'var(--neg)';
     const _winPct = _firstV ? ((_lastV - _firstV) / _firstV * 100) : 0;
-    const _allPct = ((_lastV - BOT_STARTING_BANKROLL) / BOT_STARTING_BANKROLL * 100);
-    const _rangeTabs = [['week', '1W'], ['month', '1M'], ['year', '1Y'], ['all', 'ALL']].map(([k, lbl]) =>
+    const _winDollars = _lastV - _firstV;
+    const _origin = (perf && perf.originBase) ? perf.originBase : BOT_STARTING_BANKROLL;
+    const _allPct = ((_lastV - _origin) / _origin * 100);
+    const _rangeTabs = [['day', '1D'], ['week', '1W'], ['month', '1M'], ['ytd', 'YTD'], ['year', '1Y'], ['all', 'MAX']].map(([k, lbl]) =>
       `<button class="rng-tab ${activeWin === k ? 'active' : ''}" data-perfwin="${k}">${lbl}</button>`).join('');
     const _granTabs = (_bcd.opts.length > 1)
       ? `<div class="rng-tabs" id="bot-gran-tabs" title="Daily / Weekly / Monthly">${_bcd.opts.map(g => `<button class="rng-tab ${_bcd.gran === g ? 'active' : ''}" data-perfgran="${g}">${BOT_GRAN_LABEL[g]}</button>`).join('')}</div>`
@@ -47760,16 +48502,19 @@ function renderBetsTab() {
     <div class="bot-chart">
       <div class="bot-chart__head">
         <div style="min-width:0">
-          <div class="bot-chart__title">Bot Equity \u00b7 ${activeWin === 'all' ? 'all-time' : activeWin}</div>
-          <div class="bot-chart__val" style="color:${_lineColor}">$${_lastV.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
-          <div class="bot-chart__sub"><span style="color:${_upWin ? 'var(--pos)' : 'var(--neg)'};font-weight:700">${_winPct >= 0 ? '+' : ''}${_winPct.toFixed(2)}%</span> this window \u00b7 <span style="color:${_allPct >= 0 ? 'var(--pos)' : 'var(--neg)'}">${_allPct >= 0 ? '+' : ''}${_allPct.toFixed(2)}%</span> all-time</div>
+          <div class="bot-chart__title">Bot Equity</div>
+          <div class="bot-chart__val" id="bot-eq-val" style="color:${_upWin ? '#00c805' : '#ff5000'}">$${_lastV.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+          <div class="bot-chart__sub" id="bot-eq-sub"><span style="color:${_upWin ? '#00c805' : '#ff5000'};font-weight:700">${_winDollars >= 0 ? '+' : '\u2212'}$${Math.abs(_winDollars).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} (${_winPct >= 0 ? '+' : '\u2212'}${Math.abs(_winPct).toFixed(2)}%)</span> <span style="color:var(--ink-faint)">${({ day: 'Today', week: 'Past week', month: 'Past month', ytd: 'Year to date', year: 'Past year', all: 'All time' })[activeWin] || activeWin}</span></div>
         </div>
         <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end">
           <div class="rng-tabs">${_rangeTabs}</div>
           ${_granTabs}
         </div>
       </div>
-      <div class="bot-eq-plot"><canvas id="bot-eq-canvas"></canvas><div id="bot-eq-tooltip" class="bot-eq-tip"></div></div>
+      <div class="bot-eq-plot"><canvas id="bot-eq-canvas"
+        data-baseval="$${_lastV.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}"
+        data-basecol="${_upWin ? '#00c805' : '#ff5000'}"
+        data-basesub="${escapeHtml(`<span style="color:${_upWin ? '#00c805' : '#ff5000'};font-weight:700">${_winDollars >= 0 ? '+' : '\u2212'}$${Math.abs(_winDollars).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} (${_winPct >= 0 ? '+' : '\u2212'}${Math.abs(_winPct).toFixed(2)}%)</span> <span style="color:var(--ink-faint)">${({ day: 'Today', week: 'Past week', month: 'Past month', ytd: 'Year to date', year: 'Past year', all: 'All time' })[activeWin] || activeWin}</span>`)}"></canvas></div>
     </div>`;
   } else {
     chartHtml = `<div class="company-card" style="margin:0 0 18px"><div style="font-family:var(--mono);font-size:10px;color:var(--ink-faint);padding:8px 0">Equity curve builds as the bot runs daily — one point per day. Run the scan over multiple days to see the chart and weekly/monthly/yearly performance.</div></div>`;
@@ -48099,6 +48844,7 @@ function renderBetsTab() {
   });
   // Equity-curve hover: nearest-point crosshair + tooltip (mouse + touch).
   if (typeof renderBotEquityChart === 'function') { requestAnimationFrame(() => { try { renderBotEquityChart(); attachBotEquityHover(); } catch {} }); }
+  try { _wireBotCapitalReconcile(perf); } catch {}
   // Editable Cash card — feed the bot capital (recorded as a deposit).
   body.querySelector('#bets-cash-card')?.addEventListener('click', () => {
     if (typeof botEditCash === 'function') botEditCash();
