@@ -6902,6 +6902,10 @@
   <div class="masthead-meta">
     <div id="regime-badge" class="regime-badge" style="display:none"></div>
     <div class="live" id="data-source-badge">Alpha Vantage</div>
+    <!-- Live data pill: session state (open / pre / after-hours / holiday /
+         weekend) + the age of the newest backend intraday tape point. Click to
+         force a refresh. Populated by vRenderLivePill() in app.js. -->
+    <div id="live-data-pill" style="font-family:var(--mono);font-size:9px;letter-spacing:.06em;margin-top:4px;white-space:nowrap"></div>
     <div id="clock" style="margin-top:4px"></div>
   </div>
 </header>
@@ -8883,6 +8887,6 @@
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 </script>
-<script src="app.js?v=20260615z71"></script>
+<script src="app.js?v=20260615z72"></script>
 </body>
 </html>
