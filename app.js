@@ -23549,13 +23549,140 @@ function _etParts(d = new Date()) {
 // hasn't opened — but we still bucket pre-market ticks under today's date; the
 // chart simply treats the last daily close as the baseline until 9:30.
 function etTradingDate(d = new Date()) { return _etParts(d).date; }
-// Is the regular session open right now (9:30–16:00 ET, Mon–Fri)? Weekends/
-// holidays: we can't know holidays without a calendar, so weekends only.
-function isMarketOpenET(d = new Date()) {
+// ============================================================
+//   US MARKET CALENDAR — real sessions, not "any weekday".
+//
+//   The old check was weekends-only, with a comment conceding it couldn't know
+//   holidays. That is not a cosmetic gap: on Thanksgiving the app reports the
+//   market OPEN, keeps recording flat intraday ticks against a frozen quote,
+//   labels a two-day-old price "LIVE", and computes a 1D change from a session
+//   that never happened.
+//
+//   Rules are COMPUTED, never hardcoded, so the calendar cannot expire:
+//     New Year's Day · MLK (3rd Mon Jan) · Washington's Birthday (3rd Mon Feb)
+//     Good Friday (Easter − 2) · Memorial Day (last Mon May) · Juneteenth
+//     (from 2022) · Independence Day · Labor Day (1st Mon Sep) · Thanksgiving
+//     (4th Thu Nov) · Christmas.
+//   Saturday holidays observe Friday, Sunday holidays observe Monday — EXCEPT a
+//   Saturday New Year's Day, which the NYSE does not observe on Dec 31.
+//   Half days (13:00 ET close): day after Thanksgiving, Jul 3 when Jul 4 is a
+//   weekday other than Monday, and a weekday Christmas Eve.
+//
+//   Back-tested against the published NYSE schedules for 2024-2029 (the same
+//   fixture set the Python pipeline calendar passes) — see the deploy manifest.
+// ============================================================
+const MKT_OPEN_MIN = 570;    // 09:30 ET
+const MKT_CLOSE_MIN = 960;   // 16:00 ET
+const MKT_EARLY_CLOSE_MIN = 780;  // 13:00 ET
+const MKT_PREMARKET_MIN = 240;    // 04:00 ET
+const MKT_POSTMARKET_MIN = 1200;  // 20:00 ET
+
+function _mktEaster(year) {
+  const a = year % 19, b = Math.floor(year / 100), c = year % 100;
+  const d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3);
+  const h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4), k = c % 4;
+  const l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const month = Math.floor((h + l - 7 * m + 114) / 31);
+  const day = ((h + l - 7 * m + 114) % 31) + 1;
+  return new Date(Date.UTC(year, month - 1, day));
+}
+const _mktISO = (dt) => dt.toISOString().slice(0, 10);
+const _mktAddDays = (dt, n) => new Date(dt.getTime() + n * 86400000);
+function _mktNthWeekday(year, month0, weekday, nth) {
+  const d = new Date(Date.UTC(year, month0, 1));
+  d.setUTCDate(1 + ((weekday - d.getUTCDay()) + 7) % 7);
+  return _mktAddDays(d, 7 * (nth - 1));
+}
+function _mktLastWeekday(year, month0, weekday) {
+  const d = new Date(Date.UTC(year, month0 + 1, 0));   // last day of the month
+  return _mktAddDays(d, -(((d.getUTCDay() - weekday) + 7) % 7));
+}
+function _mktObserved(dt, allowFriday = true) {
+  const dow = dt.getUTCDay();
+  if (dow === 6) return allowFriday ? _mktAddDays(dt, -1) : null;   // Saturday
+  if (dow === 0) return _mktAddDays(dt, 1);                          // Sunday
+  return dt;
+}
+const _MKT_HOLIDAY_CACHE = {};
+function marketHolidays(year) {
+  if (_MKT_HOLIDAY_CACHE[year]) return _MKT_HOLIDAY_CACHE[year];
+  const s = new Set();
+  const ny = _mktObserved(new Date(Date.UTC(year, 0, 1)), false);
+  if (ny) s.add(_mktISO(ny));
+  s.add(_mktISO(_mktNthWeekday(year, 0, 1, 3)));                     // MLK
+  s.add(_mktISO(_mktNthWeekday(year, 1, 1, 3)));                     // Presidents'
+  s.add(_mktISO(_mktAddDays(_mktEaster(year), -2)));                 // Good Friday
+  s.add(_mktISO(_mktLastWeekday(year, 4, 1)));                       // Memorial
+  if (year >= 2022) s.add(_mktISO(_mktObserved(new Date(Date.UTC(year, 5, 19)))));
+  s.add(_mktISO(_mktObserved(new Date(Date.UTC(year, 6, 4)))));      // July 4
+  s.add(_mktISO(_mktNthWeekday(year, 8, 1, 1)));                     // Labor Day
+  s.add(_mktISO(_mktNthWeekday(year, 10, 4, 4)));                    // Thanksgiving
+  s.add(_mktISO(_mktObserved(new Date(Date.UTC(year, 11, 25)))));    // Christmas
+  _MKT_HOLIDAY_CACHE[year] = s;
+  return s;
+}
+function marketEarlyCloses(year) {
+  const hol = marketHolidays(year);
+  const out = new Set();
+  out.add(_mktISO(_mktAddDays(_mktNthWeekday(year, 10, 4, 4), 1)));  // Black Friday
+  const jul4 = new Date(Date.UTC(year, 6, 4));
+  if (jul4.getUTCDay() >= 1 && jul4.getUTCDay() <= 5 && jul4.getUTCDay() !== 1) {
+    out.add(_mktISO(_mktAddDays(jul4, -1)));
+  }
+  const xe = new Date(Date.UTC(year, 11, 24));
+  if (xe.getUTCDay() >= 1 && xe.getUTCDay() <= 5) out.add(_mktISO(xe));
+  return new Set([...out].filter(d => !hol.has(d)));
+}
+
+// Full session descriptor for an instant. This is the single source of truth
+// every freshness label, chart baseline and scheduler in the app reads.
+function marketSession(d = new Date()) {
   const p = _etParts(d);
-  const dow = new Date(`${p.date}T12:00:00Z`).getUTCDay();   // 0 Sun … 6 Sat
-  if (dow === 0 || dow === 6) return false;
-  return p.minutes >= 570 && p.minutes < 960;                // 9:30 … 16:00
+  const dow = new Date(`${p.date}T12:00:00Z`).getUTCDay();
+  const year = +p.date.slice(0, 4);
+  const iso = p.date;
+  let kind, closeMin = MKT_CLOSE_MIN;
+  if (dow === 0 || dow === 6) kind = 'weekend';
+  else if (marketHolidays(year).has(iso)) kind = 'holiday';
+  else if (marketEarlyCloses(year).has(iso)) { kind = 'early-close'; closeMin = MKT_EARLY_CLOSE_MIN; }
+  else kind = 'regular';
+  const tradingDay = kind === 'regular' || kind === 'early-close';
+  const m = p.minutes;
+  let phase = 'closed';
+  if (tradingDay) {
+    if (m >= MKT_OPEN_MIN && m < closeMin) phase = 'open';
+    else if (m >= MKT_PREMARKET_MIN && m < MKT_OPEN_MIN) phase = 'pre';
+    else if (m >= closeMin && m < MKT_POSTMARKET_MIN) phase = 'post';
+  }
+  return {
+    date: iso, etMinutes: m, etTime: `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`,
+    kind, phase, tradingDay, openMin: MKT_OPEN_MIN, closeMin,
+    isOpen: phase === 'open', isExtended: phase === 'pre' || phase === 'post',
+  };
+}
+
+// The most recent date on which the market actually traded (today if today is a
+// session, else walk back). Charts use this so a Sunday doesn't render blank.
+function lastTradingDate(d = new Date()) {
+  let cur = new Date(`${_etParts(d).date}T12:00:00Z`);
+  for (let i = 0; i < 12; i++) {
+    const iso = _mktISO(cur);
+    const dow = cur.getUTCDay();
+    if (dow !== 0 && dow !== 6 && !marketHolidays(+iso.slice(0, 4)).has(iso)) return iso;
+    cur = _mktAddDays(cur, -1);
+  }
+  return _mktISO(cur);
+}
+
+// Kept for back-compat with every existing call site — now holiday-aware.
+function isMarketOpenET(d = new Date()) { return marketSession(d).isOpen; }
+if (typeof window !== 'undefined') {
+  window.marketSession = marketSession; window.marketHolidays = marketHolidays;
+  window.marketEarlyCloses = marketEarlyCloses; window.lastTradingDate = lastTradingDate;
+  window.isMarketOpenET = isMarketOpenET;
 }
 
 function _loadIntraday() {
@@ -47341,6 +47468,14 @@ function _botPriceOf(tic) {
   const t = String(tic).toUpperCase();
   const lq = _botQuoteCache[t];
   if (lq && lq.live && isFinite(lq.price)) return Number(lq.price);
+  // The backend 15-minute tape is the next-best mark: it is USD-normalized at
+  // read time, stamped with its own asOf, and refreshed by the pipelines every
+  // ~4 minutes across the fleet — far fresher than a stockbook row that may
+  // date from whenever the user last did a full load.
+  if (typeof vTapePrice === 'function') {
+    const tp = vTapePrice(t);
+    if (tp && tp.price != null && isFinite(tp.price)) return Number(tp.price);
+  }
   const row = (typeof getStockbookRow === 'function') ? getStockbookRow(t) : null;
   if (row && row.price != null && isFinite(row.price)) {
     // Foreign rows quote in local currency (SK Hynix in KRW, etc.) — normalize to USD.
@@ -47432,7 +47567,15 @@ function botTickerLedger(bets, priceOf) {
         if (_ratio != null && _ratio >= 0.1 && _ratio <= 10) unrealized = +(shares * (live - avgCost) * bk.dir).toFixed(2);
       } else if (!bk.linear && bk.bet && isFinite(bk.bet.pnl)) unrealized = +Number(bk.bet.pnl).toFixed(2);
     }
-    const agg = byTicker[bk.ticker] || (byTicker[bk.ticker] = { ticker: bk.ticker, shares: 0, dir: bk.dir, avgCost: 0, costBasis: 0, realized: 0, unrealized: 0, open: false, live: null, linear: bk.linear });
+    // AGGREGATE PER (TICKER, DIRECTION) — not per ticker.
+    // Keying on the bare ticker merged a long book and a short book of the same
+    // name into ONE running average cost, and `dir` was then taken from
+    // whichever book happened to be replayed last. The blended avgCost is
+    // meaningless and the sign on the unrealized can invert outright. Long and
+    // short are economically separate positions and are now kept separate; the
+    // aggregate totals below are unchanged for the long-only case.
+    const aggKey = `${bk.ticker}|${bk.dir}`;
+    const agg = byTicker[aggKey] || (byTicker[aggKey] = { ticker: bk.ticker, shares: 0, dir: bk.dir, avgCost: 0, costBasis: 0, realized: 0, unrealized: 0, open: false, live: null, linear: bk.linear, unpriced: false });
     agg.realized += realized;
     if (open) {
       agg.open = true; agg.live = live; agg.dir = bk.dir; agg.linear = bk.linear;
@@ -47440,6 +47583,11 @@ function botTickerLedger(bets, priceOf) {
       agg.avgCost = ns > 0 ? (agg.avgCost * agg.shares + avgCost * shares) / ns : avgCost;
       agg.shares = ns; agg.costBasis += avgCost * shares;
       if (unrealized != null) agg.unrealized += unrealized;
+      // An open leg we could NOT mark (no quote, or a quote the >10x/<0.1x guard
+      // rejected as bad data) contributes 0 to unrealized. Reporting that 0 as a
+      // real mark is a silent lie — a broken feed reads as a flat position. Flag
+      // it so the UI can show "unpriced" instead of "$0.00".
+      if (unrealized == null) { agg.unpriced = true; agg.unpricedShares = (agg.unpricedShares || 0) + shares; }
     }
   }
   const positions = Object.values(byTicker).map(p => ({
@@ -47447,11 +47595,18 @@ function botTickerLedger(bets, priceOf) {
     costBasis: +p.costBasis.toFixed(2), realized: +p.realized.toFixed(2),
     unrealized: p.open ? +p.unrealized.toFixed(2) : null, live: p.live,
     status: p.open ? 'open' : 'closed', linear: p.linear,
+    unpriced: !!(p.open && p.unpriced),
+    unpricedShares: p.open && p.unpricedShares ? +p.unpricedShares.toFixed(6) : 0,
   }));
   const totalRealized = +positions.reduce((x, p) => x + p.realized, 0).toFixed(2);
   const totalUnrealized = +positions.reduce((x, p) => x + (p.unrealized || 0), 0).toFixed(2);
   const openPositions = positions.filter(p => p.status === 'open').sort((a, b) => (b.unrealized || 0) - (a.unrealized || 0));
-  return { legs, positions, openPositions, totalRealized, totalUnrealized };
+  // How much of the open book we could not mark. Anything > 0 means the
+  // unrealized total is INCOMPLETE, not zero, and must be labelled that way.
+  const unpricedPositions = openPositions.filter(p => p.unpriced);
+  const unpricedCostBasis = +unpricedPositions.reduce((x, p) => x + (p.costBasis || 0), 0).toFixed(2);
+  return { legs, positions, openPositions, totalRealized, totalUnrealized,
+           unpricedPositions, unpricedCount: unpricedPositions.length, unpricedCostBasis };
 }
 
 // NET EXTERNAL CAPITAL — the only thing the all-time return is measured against.
@@ -47904,9 +48059,42 @@ function _botDailySeries() {
   const byDay = new Map();
   for (const p of curve) { if (p && p.date && isFinite(p.value)) byDay.set(String(p.date).slice(0, 10), +p.value); }
   const series = Array.from(byDay.entries()).map(([date, value]) => ({ date, value })).sort((a, b) => a.date < b.date ? -1 : 1);
-  const openUnreal = (bot.bets || []).filter(b => b.status === 'open').reduce((s, b) => s + (isFinite(b.pnl) ? b.pnl : 0), 0);
+  // FOLD IN THE BACKEND 30-MINUTE EQUITY TAPE.
+  // Without this the daily series is reconstruction-only, so "1D" collapsed to
+  // two points (yesterday's close vs a single live mark) and no amount of
+  // granularity toggling could draw an intraday line. The tape carries a real
+  // mark every 30 minutes; its LAST value on each date is that date's close.
+  try {
+    const tape = Array.isArray(_botEquityTape) ? _botEquityTape : null;
+    if (tape && tape.length) {
+      const byD = new Map(series.map(p => [p.date, p.value]));
+      for (const pt of tape) {
+        if (!pt || !pt.t || !isFinite(pt.value)) continue;
+        byD.set(String(pt.t).slice(0, 10), +pt.value);   // tape is ascending ⇒ last wins
+      }
+      series = Array.from(byD.entries()).map(([date, value]) => ({ date, value }))
+        .sort((a, b) => a.date < b.date ? -1 : 1);
+    }
+  } catch {}
+  // LIVE ENDPOINT. Use the SAME per-ticker average-cost ledger the headline
+  // uses, not a raw sum of b.pnl: raw pnl is un-normalized for FX and skips the
+  // bad-mark guard, so the chart's last point could disagree with the value
+  // printed directly above it. Fall back to the raw sum only if the ledger is
+  // unavailable (e.g. called before botTickerLedger is defined).
+  let openUnreal;
+  try {
+    openUnreal = (typeof botTickerLedger === 'function')
+      ? botTickerLedger((bot.bets || []).filter(b => b.status === 'open'), _botPriceOf).totalUnrealized
+      : null;
+  } catch { openUnreal = null; }
+  if (openUnreal == null || !isFinite(openUnreal)) {
+    openUnreal = (bot.bets || []).filter(b => b.status === 'open').reduce((s, b) => s + (isFinite(b.pnl) ? b.pnl : 0), 0);
+  }
   const liveVal = +(((isFinite(bot.bankroll) ? bot.bankroll : BOT_STARTING_BANKROLL)) + openUnreal).toFixed(2);
-  const todayISO = new Date().toISOString().slice(0, 10);
+  // "Today" for a market series is the last TRADING date, not the wall-clock
+  // date. On a Saturday the old code appended a Saturday point, which invented
+  // a session and made every weekend chart end on a phantom bar.
+  const todayISO = (typeof lastTradingDate === 'function') ? lastTradingDate() : new Date().toISOString().slice(0, 10);
   if (series.length && series[series.length - 1].date === todayISO) series[series.length - 1] = { date: todayISO, value: liveVal };
   else series.push({ date: todayISO, value: liveVal });
   return series;
@@ -53180,3 +53368,480 @@ function loadGlobalTradeTab() {
     }, 60_000);
   }
 }
+
+
+// ============================================================================
+// ============================================================================
+//
+//   VALUATIO LIVE DATA LAYER  (z72)
+//
+//   WHY THIS EXISTS
+//   ---------------
+//   The pipelines now publish a bucketed 15-minute intraday tape from four
+//   repos (TRAPP2 :00/15/30/45, TRAPP2-2 :05/20/35/50, TRAPP2-3 :10/25/40/55,
+//   TRAPP2-1 :03/18/33/48), so a fresh price lands on GitHub roughly every four
+//   minutes through the session. None of that reaches the user unless the page
+//   actually re-reads it, and before this module it did not:
+//
+//     1. CACHING. raw.githubusercontent.com serves `cache-control: max-age=300`.
+//        Only 10 of ~99 fetch() calls in this file passed {cache:'no-store'}.
+//        A five-minute-old CDN copy silently defeats a four-minute push cadence,
+//        and the browser will happily serve it for far longer on a warm tab.
+//
+//     2. NO SCHEDULER. Prices refreshed on page load and on explicit button
+//        presses. A tab left open through the session showed the 9:31 quote at
+//        3:59pm with no indication anything was stale.
+//
+//     3. NO SESSION AWARENESS. Nothing knew whether the market was open, so a
+//        holiday looked identical to a live session.
+//
+//   WHAT IT DOES
+//   ------------
+//     * vFetchLive()  — always-fresh JSON fetch (no-store + a bucketed cache-
+//       busting query param, because no-store alone does not defeat every
+//       intermediary).
+//     * VTAPE         — reads data/intraday/latest.json from all four repos,
+//       merges them into one ticker→price map, FX-normalizes to USD through the
+//       SAME normalizeRowToUSD path the stockbook uses, and exposes per-ticker
+//       price + prevClose + asOf + age.
+//     * vTapeSeries() — today's per-ticker intraday series for charts, from the
+//       session day file.
+//     * A scheduler that polls on the bucket boundary while the market is open,
+//       backs off when it is not, pauses on a hidden tab, and catches up
+//       immediately on wake or reconnect.
+//     * A masthead status pill: session state + data age + LIVE/CACHED/STALE.
+//
+//   EPISTEMIC RULE: this module never invents a price. If the tape is missing,
+//   stale, or a currency has no FX rate, it says so and defers to the stockbook
+//   rather than presenting an unverified number as live.
+// ============================================================================
+// ============================================================================
+
+// ---- Always-fresh fetch ----------------------------------------------------
+// `cache: 'no-store'` covers the browser cache. It does NOT reliably defeat a
+// service worker, a corporate middlebox, or the CDN edge, all of which key on
+// the URL. Bucketing a cache-busting param to the tape cadence gives a stable
+// URL inside a bucket (so a burst of calls still shares one network trip) and a
+// brand-new URL the moment the bucket rolls.
+const V_TAPE_BUCKET_MS = 60 * 1000;   // URL rolls once a minute
+function vCacheBust(url, bucketMs) {
+  const b = Math.floor(Date.now() / (bucketMs || V_TAPE_BUCKET_MS));
+  return url + (url.indexOf('?') >= 0 ? '&' : '?') + '_v=' + b;
+}
+async function vFetchLive(url, opts) {
+  const o = Object.assign({ cache: 'no-store', redirect: 'follow' }, opts || {});
+  o.headers = Object.assign({ 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' }, o.headers || {});
+  const r = await fetch(vCacheBust(url, o._bucketMs), o);
+  if (!r.ok) throw new Error(`HTTP ${r.status} ${url}`);
+  return r;
+}
+async function vFetchLiveJson(url, opts) {
+  const r = await vFetchLive(url, opts);
+  const txt = await r.text();
+  try { return JSON.parse(txt); }
+  catch { return JSON.parse(txt.replace(/\bNaN\b/g, 'null')); }   // pipelines can emit bare NaN
+}
+if (typeof window !== 'undefined') { window.vFetchLive = vFetchLive; window.vFetchLiveJson = vFetchLiveJson; }
+
+// ---- The tape --------------------------------------------------------------
+const V_TAPE_REPOS = ['TRAPP2', 'TRAPP2-2', 'TRAPP2-3', 'TRAPP2-1'];
+const V_TAPE_BASE = (repo) => `https://raw.githubusercontent.com/GoodGlobeLLC/${repo}/main/data/intraday/`;
+// Beyond this, a tape point is no longer "now". Two full 15-minute buckets plus
+// slack for GitHub Actions queue lag, which is routinely minutes and has been
+// observed in hours on the first trigger of the day.
+const V_TAPE_LIVE_MAX_MIN = 35;
+const V_TAPE_STALE_MAX_MIN = 24 * 60;
+
+const VTAPE = {
+  loadedAt: 0,
+  inflight: null,
+  byTicker: Object.create(null),   // TIC → { price, prevClose, currency, repo, asOf }
+  perRepo: {},                     // repo → { asOf, ageMin, ok, session, count, error }
+  session: null,
+  asOf: null,
+  ageMin: null,
+  ok: false,
+  seriesCache: Object.create(null),
+  seriesCacheAt: 0,
+};
+
+function _vAgeMin(iso) {
+  if (!iso) return null;
+  const t = new Date(iso).getTime();
+  if (!isFinite(t)) return null;
+  return (Date.now() - t) / 60000;
+}
+
+// Convert one tape entry to USD using the app's existing normalizer, so the tape
+// and the stockbook can never disagree about what a KRW / GBX / USX quote means.
+function _vTapeToUSD(tic, price, currency) {
+  if (price == null || !isFinite(price)) return { price: null, converted: false };
+  if (!currency || currency === 'USD') return { price: +price, converted: true, currency: 'USD' };
+  if (typeof normalizeRowToUSD === 'function') {
+    try {
+      const n = normalizeRowToUSD({ ticker: tic, price: +price, currency, marketCap: null });
+      if (n && n.price != null && isFinite(n.price)) {
+        return { price: +n.price, converted: !!n.converted, currency: n.currency, rate: n.rate };
+      }
+    } catch {}
+  }
+  // No rate loaded — do NOT fabricate one. Return unconverted and flagged; the
+  // >10x/<0.1x guard downstream will reject it rather than book ₩2,917,000 as
+  // dollars (the original +$11.5M SK-Hynix failure).
+  return { price: +price, converted: false, currency };
+}
+
+// Pull latest.json from every repo and merge. First repo to carry a ticker wins;
+// the equity repos are listed before the macro repo so a US listing beats an
+// incidental duplicate.
+async function loadIntradayTape(force) {
+  if (!force && VTAPE.inflight) return VTAPE.inflight;
+  if (!force && VTAPE.loadedAt && (Date.now() - VTAPE.loadedAt) < 45000) return VTAPE;
+  VTAPE.inflight = (async () => {
+    const results = await Promise.all(V_TAPE_REPOS.map(async (repo) => {
+      try {
+        const j = await vFetchLiveJson(V_TAPE_BASE(repo) + 'latest.json');
+        if (!j || typeof j !== 'object' || !j.p) throw new Error('shape');
+        return { repo, ok: true, doc: j };
+      } catch (e) { return { repo, ok: false, error: String(e && e.message || e) }; }
+    }));
+    const merged = Object.create(null);
+    const perRepo = {};
+    let newestAsOf = null, session = null;
+    for (const r of results) {
+      if (!r.ok) { perRepo[r.repo] = { ok: false, error: r.error }; continue; }
+      const d = r.doc;
+      const age = _vAgeMin(d.asOf);
+      perRepo[r.repo] = { ok: true, asOf: d.asOf, ageMin: age, session: d.session,
+                          marketOpen: !!d.marketOpen, count: d.tickerCount || 0,
+                          staleExcluded: d.staleExcluded || 0, date: d.date };
+      if (!newestAsOf || (d.asOf && d.asOf > newestAsOf)) { newestAsOf = d.asOf; session = d.session; }
+      for (const tic of Object.keys(d.p)) {
+        if (merged[tic]) continue;
+        const ccy = (d.currency && d.currency[tic]) || 'USD';
+        const usd = _vTapeToUSD(tic, d.p[tic], ccy);
+        const pcRaw = d.prevClose && d.prevClose[tic];
+        const pc = (pcRaw != null) ? _vTapeToUSD(tic, pcRaw, ccy) : null;
+        merged[tic] = {
+          price: usd.price, converted: usd.converted, currency: usd.currency || ccy,
+          localPrice: (ccy && ccy !== 'USD') ? +d.p[tic] : null, localCurrency: ccy,
+          prevClose: pc ? pc.price : null, repo: r.repo, asOf: d.asOf, date: d.date,
+        };
+      }
+    }
+    VTAPE.byTicker = merged;
+    VTAPE.perRepo = perRepo;
+    VTAPE.asOf = newestAsOf;
+    VTAPE.ageMin = _vAgeMin(newestAsOf);
+    VTAPE.session = session;
+    VTAPE.ok = Object.keys(merged).length > 0;
+    VTAPE.loadedAt = Date.now();
+    VTAPE.seriesCache = Object.create(null);
+    VTAPE.inflight = null;
+    const okRepos = Object.keys(perRepo).filter(k => perRepo[k].ok).length;
+    console.log(`[tape] ${Object.keys(merged).length} tickers from ${okRepos}/${V_TAPE_REPOS.length} repos · asOf ${newestAsOf || '—'} · ${VTAPE.ageMin == null ? '—' : VTAPE.ageMin.toFixed(1)}m old`);
+    return VTAPE;
+  })();
+  return VTAPE.inflight;
+}
+if (typeof window !== 'undefined') window.loadIntradayTape = loadIntradayTape;
+
+// Tape price for one ticker, with an explicit freshness tier. Returns null when
+// the tape has nothing usable, so callers fall through to the stockbook rather
+// than receiving a stale number dressed up as live.
+function vTapePrice(ticker) {
+  const t = String(ticker || '').toUpperCase();
+  const e = VTAPE.byTicker[t];
+  if (!e || e.price == null || !isFinite(e.price)) return null;
+  // An un-normalized foreign quote is worse than no quote: it is off by the FX
+  // rate, and downstream code cannot tell. Withhold it.
+  if (e.currency && e.currency !== 'USD' && !e.converted) return null;
+  const age = _vAgeMin(e.asOf);
+  if (age != null && age > V_TAPE_STALE_MAX_MIN) return null;
+  const tier = (age == null) ? 'CACHED' : age <= V_TAPE_LIVE_MAX_MIN ? 'LIVE' : age <= 240 ? 'CACHED' : 'STALE';
+  const chgPct = (e.prevClose && e.prevClose > 0) ? ((e.price - e.prevClose) / e.prevClose) * 100 : null;
+  return { price: e.price, prevClose: e.prevClose, changePct: chgPct, asOf: e.asOf,
+           ageMin: age, tier, repo: e.repo, currency: e.currency,
+           localPrice: e.localPrice, localCurrency: e.localCurrency };
+}
+if (typeof window !== 'undefined') window.vTapePrice = vTapePrice;
+
+// Today's (or the last session's) intraday series for one ticker, shaped exactly
+// like normalized daily history rows so existing chart code consumes it as-is.
+async function vTapeSeries(ticker, dateISO) {
+  const t = String(ticker || '').toUpperCase();
+  const day = dateISO || (typeof lastTradingDate === 'function' ? lastTradingDate() : new Date().toISOString().slice(0, 10));
+  const ck = `${t}|${day}`;
+  if (VTAPE.seriesCache[ck] && (Date.now() - VTAPE.seriesCacheAt) < 60000) return VTAPE.seriesCache[ck];
+  const entry = VTAPE.byTicker[t];
+  // Fetch the day file only from the repo that actually carries this ticker —
+  // otherwise a single chart pulls four ~270 KB files to find one series.
+  const repos = entry ? [entry.repo] : V_TAPE_REPOS;
+  for (const repo of repos) {
+    try {
+      const doc = await vFetchLiveJson(V_TAPE_BASE(repo) + `${day}.json`, { _bucketMs: 5 * 60 * 1000 });
+      const snaps = Array.isArray(doc && doc.snapshots) ? doc.snapshots : [];
+      if (!snaps.length) continue;
+      const ccy = (doc.currency && doc.currency[t]) || 'USD';
+      const pts = [];
+      for (const s of snaps) {
+        const raw = s && s.p && s.p[t];
+        if (raw == null || !isFinite(raw)) continue;
+        const usd = _vTapeToUSD(t, raw, ccy);
+        if (usd.price == null) continue;
+        if (ccy !== 'USD' && !usd.converted) continue;   // never plot an unconverted quote
+        pts.push({ date: day, t: s.t, b: s.b, close: usd.price, price: usd.price, _intraday: true });
+      }
+      if (!pts.length) continue;
+      const pcRaw = doc.prevClose && doc.prevClose[t];
+      const pc = pcRaw != null ? _vTapeToUSD(t, pcRaw, ccy) : null;
+      const out = { date: day, points: pts, prevClose: pc ? pc.price : null,
+                    session: doc.session, bucketMinutes: doc.bucketMinutes || 15, repo };
+      VTAPE.seriesCache[ck] = out;
+      VTAPE.seriesCacheAt = Date.now();
+      return out;
+    } catch {}
+  }
+  VTAPE.seriesCache[ck] = null;
+  VTAPE.seriesCacheAt = Date.now();
+  return null;
+}
+if (typeof window !== 'undefined') window.vTapeSeries = vTapeSeries;
+
+// Merge the backend tape into the browser's own localStorage tick buffer, so a
+// chart drawn from getIntradayPoints() shows the FULL session — including the
+// hours the tab was closed — instead of only the ticks this browser witnessed.
+function vSeedIntradayFromTape() {
+  if (typeof recordIntradayTick !== 'function') return 0;
+  let n = 0;
+  for (const t of Object.keys(VTAPE.byTicker)) {
+    const e = VTAPE.byTicker[t];
+    if (e.price == null || !isFinite(e.price)) continue;
+    if (e.currency && e.currency !== 'USD' && !e.converted) continue;
+    const when = e.asOf ? new Date(e.asOf).getTime() : Date.now();
+    if (!isFinite(when)) continue;
+    try { recordIntradayTick(t, e.price, when); n++; } catch {}
+  }
+  return n;
+}
+if (typeof window !== 'undefined') window.vSeedIntradayFromTape = vSeedIntradayFromTape;
+
+// ---- Push the tape into the stockbook -------------------------------------
+// The stockbook is what every valuation, screen and chart reads. Refreshing it
+// in place is what makes the whole app "live" rather than just the ticker the
+// user is staring at. Only the mark moves — fundamentals are untouched.
+function vApplyTapeToStockbook() {
+  try {
+    const rows = (typeof state !== 'undefined' && state.stockbook && Array.isArray(state.stockbook.rows))
+      ? state.stockbook.rows : null;
+    if (!rows || !rows.length) return 0;
+    let n = 0;
+    for (const row of rows) {
+      const t = (row.ticker || '').toUpperCase();
+      if (!t) continue;
+      const tp = vTapePrice(t);
+      if (!tp || tp.tier === 'STALE') continue;
+      const prev = row.price;
+      if (prev != null && isFinite(prev) && prev > 0) {
+        // Bad-data guard, same shape as the ledger's: a >10x/<0.1x jump against
+        // the price already on the row is a feed error, not a market move.
+        const ratio = tp.price / prev;
+        if (!(ratio >= 0.1 && ratio <= 10)) {
+          console.warn(`[tape] rejected ${t}: ${prev} → ${tp.price} (${ratio.toFixed(2)}x)`);
+          continue;
+        }
+      }
+      row.price = tp.price;
+      row._tapeAsOf = tp.asOf;
+      row._tapeTier = tp.tier;
+      row.fetched_at = tp.asOf || row.fetched_at;
+      if (tp.prevClose != null) row.priorClose = tp.prevClose;
+      // The row is already USD here, so mark it normalized to stop
+      // ensureRowNormalized() from applying the FX rate a second time.
+      if (tp.currency === 'USD' || tp.converted !== false) row._usdNormalized = true;
+      n++;
+    }
+    if (n) console.log(`[tape] refreshed ${n} stockbook mark(s)`);
+    return n;
+  } catch (e) { console.warn('[tape] stockbook apply failed', e && e.message); return 0; }
+}
+if (typeof window !== 'undefined') window.vApplyTapeToStockbook = vApplyTapeToStockbook;
+
+// ---- Status pill -----------------------------------------------------------
+// Honest by construction: it reports the session from the calendar and the age
+// from the newest tape timestamp. It never claims LIVE off a clock alone.
+function vLiveStatus() {
+  const s = (typeof marketSession === 'function') ? marketSession() : null;
+  const age = VTAPE.ageMin;
+  let tier, tone;
+  if (!VTAPE.ok || age == null) { tier = 'NO TAPE'; tone = 'dim'; }
+  else if (age <= V_TAPE_LIVE_MAX_MIN) { tier = 'LIVE'; tone = 'pos'; }
+  else if (age <= 240) { tier = 'CACHED'; tone = 'warn'; }
+  else { tier = 'STALE'; tone = 'neg'; }
+  // Outside a session, "old data" is correct behaviour, not a failure — the
+  // market has not printed since the close. Say CLOSED, not STALE.
+  if (s && !s.isOpen && !s.isExtended && tier !== 'NO TAPE') { tier = 'CLOSED'; tone = 'dim'; }
+  const ageStr = age == null ? '—' : age < 1 ? 'just now'
+    : age < 60 ? `${Math.round(age)}m ago`
+    : age < 1440 ? `${Math.round(age / 60)}h ago` : `${Math.round(age / 1440)}d ago`;
+  let label;
+  if (!s) label = tier;
+  else if (s.kind === 'holiday') label = 'MARKET HOLIDAY';
+  else if (s.kind === 'weekend') label = 'WEEKEND';
+  else if (s.phase === 'open') label = s.kind === 'early-close' ? 'OPEN · EARLY CLOSE 1:00 ET' : 'MARKET OPEN';
+  else if (s.phase === 'pre') label = 'PRE-MARKET';
+  else if (s.phase === 'post') label = 'AFTER HOURS';
+  else label = 'MARKET CLOSED';
+  return { tier, tone, label, ageStr, ageMin: age, session: s, asOf: VTAPE.asOf,
+           tickers: Object.keys(VTAPE.byTicker).length, perRepo: VTAPE.perRepo };
+}
+if (typeof window !== 'undefined') window.vLiveStatus = vLiveStatus;
+
+function vRenderLivePill() {
+  const el = document.getElementById('live-data-pill');
+  if (!el) return;
+  const st = vLiveStatus();
+  const col = st.tone === 'pos' ? 'var(--pos)' : st.tone === 'neg' ? 'var(--neg)'
+    : st.tone === 'warn' ? 'var(--accent, #e0b04c)' : 'var(--ink-faint)';
+  const dot = st.tier === 'LIVE'
+    ? `<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:${col};margin-right:5px;animation:vLivePulse 2s ease-out infinite"></span>`
+    : `<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:${col};margin-right:5px;opacity:.6"></span>`;
+  el.innerHTML = `${dot}<span style="color:${col};font-weight:700">${st.tier}</span>` +
+                 `<span style="color:var(--ink-faint)"> · ${st.label} · ${st.ageStr}</span>`;
+  const repos = Object.entries(st.perRepo || {})
+    .map(([r, v]) => v.ok ? `${r}: ${v.count} tickers, ${v.ageMin == null ? '?' : v.ageMin.toFixed(0)}m old` : `${r}: ${v.error}`)
+    .join('\n');
+  el.title = `Backend intraday tape\nas of: ${st.asOf || '—'}\ntickers: ${st.tickers}\n${repos}\n\n` +
+             `LIVE = a tape point within ${V_TAPE_LIVE_MAX_MIN} minutes. CLOSED = the market is not trading, ` +
+             `so the last print is the correct value. Click to force a refresh.`;
+  el.style.cursor = 'pointer';
+}
+if (typeof window !== 'undefined') window.vRenderLivePill = vRenderLivePill;
+
+// ---- The scheduler ---------------------------------------------------------
+// Bucket-aligned rather than fixed-interval. A naive setInterval(15min) drifts
+// off the publish boundary and can sit 14 minutes behind a fresh push forever.
+// We aim just AFTER each 15-minute boundary, allowing for commit+CDN latency.
+const V_TAPE_LAG_SEC = 75;    // wait past the boundary for the push to land
+let _vTapeTimer = null;
+let _vTapeRefreshing = false;
+
+function _vNextPollDelayMs() {
+  const s = (typeof marketSession === 'function') ? marketSession() : null;
+  const now = new Date();
+  // Not a trading day, or deep overnight: nothing new will print. Idle at 30
+  // minutes purely so a tab left open over a weekend wakes correctly on Monday.
+  if (!s || (!s.isOpen && !s.isExtended)) return 30 * 60 * 1000;
+  const ms = now.getTime();
+  const period = 5 * 60 * 1000;   // the fleet publishes every ~4 min (4 repos × 15 min)
+  const next = Math.ceil((ms - V_TAPE_LAG_SEC * 1000) / period) * period + V_TAPE_LAG_SEC * 1000;
+  return Math.max(20000, next - ms);
+}
+
+async function vRefreshLiveData(reason) {
+  if (_vTapeRefreshing) return;
+  _vTapeRefreshing = true;
+  try {
+    await loadIntradayTape(true);
+    vApplyTapeToStockbook();
+    vSeedIntradayFromTape();
+    try { if (typeof loadBotEquityTape === 'function') await loadBotEquityTape(true); } catch {}
+    vRenderLivePill();
+    // Re-render only what is on screen. Re-rendering every tab on a timer is how
+    // a background refresh turns into a visible stutter every few minutes.
+    try {
+      const active = document.querySelector('.tab-content.active, [data-panel].active');
+      const id = active ? (active.id || active.getAttribute('data-panel') || '') : '';
+      if (/bets/i.test(id) && typeof renderBetsTab === 'function') renderBetsTab();
+      else if (/portfolio/i.test(id) && typeof renderPortfolioTab === 'function') renderPortfolioTab();
+      else if (/macro|regime/i.test(id) && typeof renderRegimeDashboard === 'function') renderRegimeDashboard();
+      if (typeof renderTickerTape === 'function') renderTickerTape();
+    } catch {}
+    console.log(`[live] refresh (${reason || 'scheduled'}) complete`);
+  } catch (e) {
+    console.warn('[live] refresh failed', e && e.message);
+    vRenderLivePill();
+  } finally {
+    _vTapeRefreshing = false;
+  }
+}
+if (typeof window !== 'undefined') window.vRefreshLiveData = vRefreshLiveData;
+
+function _vScheduleNextPoll() {
+  if (_vTapeTimer) clearTimeout(_vTapeTimer);
+  const delay = _vNextPollDelayMs();
+  _vTapeTimer = setTimeout(async () => {
+    // A hidden tab must not burn requests; the visibilitychange handler below
+    // catches it up the instant the user comes back.
+    if (typeof document !== 'undefined' && document.hidden) { _vScheduleNextPoll(); return; }
+    await vRefreshLiveData('scheduled');
+    _vScheduleNextPoll();
+  }, delay);
+}
+
+function vStartLiveScheduler() {
+  if (typeof window === 'undefined') return;
+  if (window._vLiveSchedulerStarted) return;
+  window._vLiveSchedulerStarted = true;
+
+  // A phone backgrounded for hours has a suspended timer AND a stale screen.
+  // Refresh immediately on return if we are more than one bucket behind.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) return;
+    const age = VTAPE.loadedAt ? (Date.now() - VTAPE.loadedAt) / 60000 : 999;
+    if (age > 3) vRefreshLiveData('tab-visible');
+    else vRenderLivePill();
+    _vScheduleNextPoll();
+  });
+  window.addEventListener('online', () => vRefreshLiveData('reconnect'));
+  window.addEventListener('focus', () => { vRenderLivePill(); });
+
+  // The pill is a manual refresh button too — the fastest possible answer to
+  // "is this number current?" is to press it and watch the age reset.
+  document.getElementById('live-data-pill')?.addEventListener('click', () => {
+    const el = document.getElementById('live-data-pill');
+    if (el) el.innerHTML = '<span style="color:var(--ink-faint)">refreshing…</span>';
+    vRefreshLiveData('manual');
+  });
+
+  // The age counter must tick even when no fetch happens, or a frozen "2m ago"
+  // reads as fresh when it is really thirty minutes old.
+  setInterval(() => { try { vRenderLivePill(); } catch {} }, 30000);
+
+  vRefreshLiveData('startup').then(_vScheduleNextPoll);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  try {
+    const st = document.createElement('style');
+    st.textContent = '@keyframes vLivePulse{0%{box-shadow:0 0 0 0 currentColor;opacity:1}70%{box-shadow:0 0 0 5px rgba(0,0,0,0);opacity:.85}100%{box-shadow:0 0 0 0 rgba(0,0,0,0);opacity:1}}';
+    (document.head || document.documentElement).appendChild(st);
+  } catch {}
+  // Delay past first paint so the tape fetch never competes with the initial
+  // stockbook load for connections on a phone.
+  setTimeout(() => { try { vStartLiveScheduler(); } catch (e) { console.warn('[live] scheduler failed', e); } }, 1200);
+});
+
+// ---- Console diagnostics ---------------------------------------------------
+// One command that answers "why does this number look wrong?" without a rebuild.
+function vDataStatus() {
+  const st = vLiveStatus();
+  const out = {
+    now: new Date().toISOString(),
+    session: st.session,
+    tape: { tier: st.tier, asOf: st.asOf, ageMin: st.ageMin, tickers: st.tickers, perRepo: st.perRepo },
+  };
+  try {
+    if (typeof botPerformance === 'function') {
+      const p = botPerformance();
+      out.bot = { value: p.currentValue, realized: p.realizedPnl, unrealized: p.totalPnl - p.realizedPnl,
+                  netCapital: p.netCapital, baseDrift: p.baseDrift,
+                  unpricedPositions: p._acct ? p._acct.unpricedCount : null,
+                  unpricedCostBasis: p._acct ? p._acct.unpricedCostBasis : null };
+    }
+  } catch (e) { out.bot = { error: String(e && e.message) }; }
+  console.table(st.perRepo || {});
+  console.log(out);
+  return out;
+}
+if (typeof window !== 'undefined') window.vDataStatus = vDataStatus;
